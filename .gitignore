@@ -1,0 +1,12 @@
+# Engine-generated declarations; generated on development loading.
+.claude-plugin/types/
+node_modules/
+coverage/
+dist/
+*.tsbuildinfo
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.*
+.claude/

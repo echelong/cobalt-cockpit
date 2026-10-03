@@ -1,0 +1,60 @@
+The particle rendering in hooks/progress-visual.ts, the Braille particle grid
+(hooks/pixels.ts) and the stage-pill glide are adapted from
+zycck/claude-mods, plugins/plan-progress/hooks/register.tsx
+https://github.com/zycck/claude-mods
+Reference commit: e56018a17f403939979730cdb6d4aac4a96b72a2
+
+Cobalt Cockpit has no runtime dependency on that project; the techniques were
+reworked into its own design system (hooks/theme.ts) and its own mascot
+(hooks/mascot.ts). No upstream code is vendored verbatim.
+
+MIT License
+
+Copyright (c) 2026 Kirill Serditov
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Run Ledger's event accounting, bounded usage readings, replay navigation and
+resume checkpoint architecture reference hamzafer/claude-code-mods:
+mods/mission-control, agent-radar, token-weather, replay-theater, session-saver.
+https://github.com/hamzafer/claude-code-mods
+Reference commit: 2b052fd9e5a7ec2cadd91ef3329e1180e5233670
+Reimplemented for Cockpit; upstream model summaries are excluded.
+
+MIT License
+
+Copyright (c) 2026 Hamza Zafar
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
