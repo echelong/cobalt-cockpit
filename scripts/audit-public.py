@@ -45,8 +45,8 @@ for name in ('const next', 'let next', 'var next', 'function next', '.next('):
  if name in module: findings.append(f'hooks/register.tsx: `{name}` in the hooks module (a pass-through named for something else)')
 blocks = [module[a:b] for a, b in zip([m.start() for m in re.finditer(r'\n  on\(', module)] + [len(module)], [m.start() for m in re.finditer(r'\n  on\(', module)][1:] + [len(module)])]
 for block in blocks:
- head = block.split('\n')[0]
- if head.strip().startswith(tuple(gating)) and '}).catch(' not in block: findings.append(f'hooks/register.tsx: {head.strip()[:60]} can refuse without a .catch handler')
+ head = block.lstrip('\n').split('\n')[0].strip()
+ if head.startswith(tuple(gating)) and '}).catch(' not in block: findings.append(f'hooks/register.tsx: {head[:60]} can refuse without a .catch handler')
 m=json.loads((root/'.claude-plugin/plugin.json').read_text()); market=json.loads((root/'.claude-plugin/marketplace.json').read_text())
 assert m['version']==market['plugins'][0]['version']=='0.3.2'
 assert m['name']==market['plugins'][0]['name']=='cobalt-cockpit'

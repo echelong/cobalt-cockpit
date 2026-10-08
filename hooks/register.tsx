@@ -2346,7 +2346,7 @@ export const register: Register = (on, options) => {
       default:
         return { text: HELP }
     }
-  })
+  }).catch(($, e, next) => next.called ? next(e) : { text: 'Cobalt: the cockpit command could not be read; nothing was changed.' })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (!isSupported || !config.hasHud || e.props.hasSurvey || (await read($, prefsAtom)).isHudHidden || e.props.maxRows < 1) {

@@ -83,10 +83,11 @@ describe('every hook that can refuse carries a handler that refuses for it', () 
     ['agent.offer'],
     ['agent.spawn'],
     ['config.set'],
+    ['command.run', 'cockpit'],
     ['classic.PostToolUse'],
   ]
 
-  test('all seventeen gating hooks have one', () => {
+  test('every hook that can answer or refuse has one', () => {
     const { of } = capture()
     for (const [pattern, command] of GATING) expect(of(pattern, command)?.catcher).toBeDefined()
   })
