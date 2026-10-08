@@ -236,7 +236,8 @@ test('unknown commander model is not presented as Opus in observation mode', asy
   await hud.unmount()
 })
 
-test('large stored results prune detail while preserving task dependencies and live ownership', () => {
+// This 128-task persistence stress test has a wider CI timeout than the default 5s.
+test('large stored results prune detail while preserving task dependencies and live ownership', { timeoutMs: 15000 }, () => {
   let swarm = emptySwarm({ sonnet: 128, total: 128, maxEvents: 512 })
   for (let n = 0; n < 128; n++) {
     const id = `stored-${n}`
