@@ -65,6 +65,22 @@ jobs:
           set -euo pipefail
           claude plugin test .
 
+      - name: Generate host TypeScript declarations
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Claude Code writes its own declarations when loading a plugin directory.
+          # A host-only slash command needs no model credentials or model inference.
+          if ! timeout 30s claude --plugin-dir "$PWD" -p '/cockpit version' \
+              > "$RUNNER_TEMP/cockpit-type-bootstrap.log" 2>&1; then
+            echo "::notice::Plugin bootstrap returned nonzero; checking generated declarations."
+          fi
+          if [[ ! -s .claude-plugin/types/tsconfig.json ]]; then
+            echo "::error::Claude Code did not generate plugin TypeScript declarations."
+            cat "$RUNNER_TEMP/cockpit-type-bootstrap.log"
+            exit 1
+          fi
+
       - name: Typecheck against Claude Code declarations
         shell: bash
         run: |
