@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cobalt-cockpit-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Plugin tests, types, validation and audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CI: "true"
+      DISABLE_AUTOUPDATER: "1"
+      CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: "1"
+      CLAUDE_CONFIG_DIR: ${{ runner.temp }}/cobalt-cockpit-ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install pinned Claude Code
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --silent --location \
+            https://claude.ai/install.sh \
+            --output "$RUNNER_TEMP/claude-install.sh"
+          bash "$RUNNER_TEMP/claude-install.sh" 2.1.294
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Claude Code version
+        shell: bash
+        run: |
+          set -euo pipefail
+          claude --version
+          claude --version | grep -F '2.1.294'
+
+      - name: Strict plugin validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          claude plugin validate --strict .
+          claude plugin validate --strict .claude-plugin/plugin.json
+          claude plugin validate --strict .claude-plugin/marketplace.json
+          claude plugin validate --strict agents
+
+      - name: Run offline plugin tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          claude plugin test .
+
+      - name: Typecheck against Claude Code declarations
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f .claude-plugin/types/tsconfig.json ]]; then
+            echo "::error::Claude Code has not generated .claude-plugin/types/tsconfig.json. Type checking cannot be claimed without host declarations."
+            exit 1
+          fi
+          npm exec --yes --package=typescript@5.9.3 -- tsc -p .
+
+      - name: Public portability and privacy audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/audit-public.py
+
+      - name: Check Git whitespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff --check HEAD^ HEAD
