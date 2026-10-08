@@ -3,6 +3,7 @@
 **Mission control for Claude Code.** Follow real task progress, coordinate bounded subagents, review verification gates, and replay what happened, without replacing Claude Code's native model and permission controls.
 
 [![Source branch: main](https://img.shields.io/badge/source-main-blue)](https://github.com/echelong/cobalt-cockpit/tree/main)
+[![CI](https://github.com/echelong/cobalt-cockpit/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/echelong/cobalt-cockpit/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 [Privacy](PRIVACY.md) · [Security](SECURITY.md)
