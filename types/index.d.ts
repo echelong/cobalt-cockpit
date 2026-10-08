@@ -337,6 +337,13 @@ export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type EffortRequest = EffortLevel | 'AUTO'
 /** Where an effort value came from: chosen from the task, named by hand, the engine's own report, or a capability fallback. */
 export type EffortSource = 'auto' | 'manual' | 'request' | 'engine' | 'fallback' | 'unknown'
+/**
+ * Who put the effort on a loop's last request: `host` when it went with the
+ * level the engine resolved itself (so the engine's own report describes it),
+ * `hook` when this plugin rewrote it in `turn.step` (which the engine's report
+ * does not reflect).
+ */
+export type EffortVia = 'host' | 'hook'
 /** Whether the reasoning mode chooses effort from the task or honours a fixed setting. */
 export type ReasoningMode = 'AUTO' | 'MANUAL'
 /** One effort step upward within a tier: recorded so history can explain it. */
@@ -359,6 +366,7 @@ export type SwarmTask = {
   /** The effort the commander requested for this task: a level, or AUTO to choose from the task. */
   requestedEffort: EffortRequest; /** Why that effort (or the AUTO selection) was chosen. */ effortReason: string
   /** The level last applied to this task's live agent requests, where observable; null before any request. */ appliedEffort: string | null
+  /** The level set natively on this task's Agent call; null or absent when the call carried none and `turn.step` sets the level instead. */ launchEffort?: string | null
   /** One effort step upward within the tier, recorded when it happened. */ effortEscalation: EffortEscalation | null
   createdAt: number; startedAt: number | null; endedAt: number | null; lastActivityAt: number; reason: string | null
 }
@@ -369,8 +377,8 @@ export type TaskInput = Pick<SwarmTask, 'id' | 'tier' | 'role' | 'objective'> & 
 
 export type Value<T> = T | typeof UNKNOWN
 export type Counts = { tools: number; reads: number; edits: number; writes: number; tests: number; builds: number; git: number; failures: number; retries: 'unknown' }
-export type Run = { id: string; turnId: string; parentRun: Value<string>; start: number; end: Value<number>; status: string; model: Value<string>; effort: Value<string>; effortSource: 'request' | 'engine' | 'unknown'; requestedEffort?: Value<string>; routingReason?: Value<string>; fallbackReason?: Value<string>; effectiveEffort?: Value<string>; latest: string; counts: Counts }
-export type LedgerAgent = { id: string; role: string; name: string; runId: Value<string>; originTurn: Value<string>; parentAgent: Value<string>; requestedModel: Value<string>; requestedEffort: Value<string>; model: Value<string>; effort: Value<string>; effortSource: 'request' | 'engine' | 'unknown'; routingReason?: Value<string>; fallbackReason?: Value<string>; effectiveEffort?: Value<string>; start: Value<number>; end: Value<number>; status: string; latest: string; counts: Counts; source: Value<string>; background: Value<boolean> }
+export type Run = { id: string; turnId: string; parentRun: Value<string>; start: number; end: Value<number>; status: string; model: Value<string>; effort: Value<string>; effortSource: 'request' | 'engine' | 'unknown'; effortVia?: EffortVia; requestedEffort?: Value<string>; routingReason?: Value<string>; fallbackReason?: Value<string>; effectiveEffort?: Value<string>; latest: string; counts: Counts }
+export type LedgerAgent = { id: string; role: string; name: string; runId: Value<string>; originTurn: Value<string>; parentAgent: Value<string>; requestedModel: Value<string>; requestedEffort: Value<string>; model: Value<string>; effort: Value<string>; effortSource: 'request' | 'engine' | 'unknown'; effortVia?: EffortVia; routingReason?: Value<string>; fallbackReason?: Value<string>; effectiveEffort?: Value<string>; start: Value<number>; end: Value<number>; status: string; latest: string; counts: Counts; source: Value<string>; background: Value<boolean> }
 export type ToolEntry = { id: string; runId: Value<string>; turnId: Value<string>; agentId: Value<string>; tool: string; family: string; durationMs: Value<number>; file: Value<string>; start: number; end: Value<number>; status: string; source: Value<string> }
 export type Reading = { at: number; turnId: Value<string>; tokens: Value<number>; window: Value<number>; percent: Value<number> }
 export type Request = { id: string; runId: Value<string>; turnId: string; agentId: Value<string>; requestedModel: Value<string>; requestedEffort: Value<string>; model: Value<string>; effort: Value<string>; effectiveEffort: Value<string>; input: Value<number>; output: Value<number>; cacheRead: Value<number>; cacheWrite: Value<number> }

@@ -293,6 +293,39 @@ test('effective effort, native tool duration and MCP provenance use exposed clas
   expect(l.tools[0]).toMatchObject({ durationMs: 31, source: 'local (plugin)' })
 })
 
+test('a request the engine resolved itself is the engine own level, and already an observation', () => {
+  const l = recordRequest(agent(), { turnId: 'ta1', index: 0, agentId: 'a1', model: 'sonnet', effort: 'high' }, { model: 'claude-sonnet-5-5', effort: 'medium', via: 'host', fallbackReason: 'the engine resolved medium' })
+  expect(l.agents[0]).toMatchObject({ requestedEffort: 'high', effort: 'medium', effortSource: 'engine', effortVia: 'host', effectiveEffort: 'medium', fallbackReason: 'the engine resolved medium' })
+  expect(l.requests.at(-1)).toMatchObject({ requestedEffort: 'high', effort: 'medium', effectiveEffort: 'medium' })
+  expect(ledgerLines(l, 2000, 'subscription').join('\n')).toContain('ACTUAL claude-sonnet-5-5 · medium (engine) · observed medium · fallback the engine resolved medium')
+})
+
+test('a request whose effort this plugin rewrote is requested, never observed, whatever the engine reports', () => {
+  let l = recordRequest(agent(), { turnId: 'ta1', index: 0, agentId: 'a1', model: 'sonnet', effort: 'high' }, { model: 'claude-sonnet-5-5', effort: 'high', via: 'hook' })
+  expect(l.agents[0]).toMatchObject({ effort: 'high', effortSource: 'request', effortVia: 'hook' })
+  expect(l.agents[0]?.effectiveEffort).toBeUndefined()
+  l = beginTool(l, { tool: 'Bash', tool_use_id: 'b1', agentId: 'a1' }, 1000)
+  // the engine reports the loop's own level, which the rewrite is not in
+  l = classicTelemetry(l, { tool_use_id: 'b1', agent_id: 'a1', effort: { level: 'medium' }, duration_ms: 12 })
+  expect(l.agents[0]).toMatchObject({ effort: 'high', effortSource: 'request' })
+  expect(l.agents[0]?.effectiveEffort).toBeUndefined()
+  expect(l.requests.at(-1)?.effectiveEffort).toBe('unknown')
+  // the rest of the telemetry is the tool's own and still lands
+  expect(l.tools[0]).toMatchObject({ durationMs: 12 })
+  expect(ledgerLines(l, 2000, 'subscription').join('\n')).toContain('ACTUAL claude-sonnet-5-5 · high (request) · observed unknown')
+})
+
+test('the main run follows the same rule as an agent', () => {
+  let l = recordRequest(run(), { turnId: 't1', index: 0, model: 'opus', effort: 'high' }, { model: 'claude-opus-5-5', effort: 'high', via: 'hook' })
+  l = beginTool(l, { tool: 'Bash', tool_use_id: 'b1' }, 1000)
+  l = classicTelemetry(l, { tool_use_id: 'b1', effort: { level: 'medium' } })
+  expect(l.runs[0]).toMatchObject({ effort: 'high', effortSource: 'request', effortVia: 'hook' })
+  expect(l.runs[0]?.effectiveEffort).toBeUndefined()
+  l = recordRequest(l, { turnId: 't1', index: 1, model: 'opus', effort: 'high' }, { model: 'claude-opus-5-5', effort: 'high', via: 'host' })
+  l = classicTelemetry(l, { tool_use_id: 'b1', effort: { level: 'high' } })
+  expect(l.runs[0]).toMatchObject({ effort: 'high', effortSource: 'engine', effortVia: 'host', effectiveEffort: 'high' })
+})
+
 
 test('durable storage bounds count UTF-8 bytes for Unicode repository paths', () => {
   let l = agent()

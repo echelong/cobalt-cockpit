@@ -22,6 +22,7 @@ import {
   isEffortRequest,
   modelFamily,
   nextEffort,
+  launchFallback,
   observeCapability,
   selectEffort,
   selectModel,
@@ -79,6 +80,18 @@ describe('declared capability and observation', () => {
     const downgraded = observeCapability(honoured, 'claude-sonnet-5-5', 'max', 'xhigh')
     expect(downgraded['claude-sonnet-5-5']).not.toContain('max')
     expect(downgraded['claude-sonnet-5-5']).toContain('xhigh')
+  })
+  test('a level applied above the requested one says nothing about the requested one', () => {
+    const before = { 'claude-sonnet-5-5': ['medium', 'high'] as const }
+    // an override ran the request at high: low was neither honoured nor refused
+    const overridden = observeCapability(before, 'claude-sonnet-5-5', 'low', 'high')
+    expect(overridden['claude-sonnet-5-5']).toEqual(['medium', 'high'])
+    // and a model with no observation yet gains none from it
+    expect(observeCapability({}, 'claude-haiku-5-5', 'low', 'medium')).toEqual({})
+  })
+  test('an honoured level is recorded once, however often it is seen', () => {
+    const once = observeCapability({}, 'claude-haiku-5-5', 'high', 'high')
+    expect(observeCapability(once, 'claude-haiku-5-5', 'high', 'high')['claude-haiku-5-5']).toEqual(['low', 'medium', 'high'])
   })
   test('a model that cannot reach the level names the fallback, never hides it', () => {
     const haiku = capabilityFor('claude-haiku-5-5')
@@ -203,6 +216,37 @@ describe('escalation, one step at a time', () => {
   })
 })
 
+describe('a natively launched level against what the engine resolved', () => {
+  const sonnet = capabilityFor('claude-sonnet-5-5')
+  const named = (level: 'low' | 'medium' | 'high' | 'xhigh' | 'max') => chooseEffort(level, { tier: 'SONNET' }, sonnet)
+  test('the engine resolving the launched level is no fallback', () => {
+    expect(launchFallback(named('high'), 'high', 'high', 'claude-sonnet-5-5')).toBeNull()
+  })
+  test('a level the engine resolved lower is named with both levels, never hidden', () => {
+    const reason = launchFallback(named('high'), 'high', 'medium', 'claude-sonnet-5-5')
+    expect(reason).toContain('engine resolved medium')
+    expect(reason).toContain('requested high')
+  })
+  test('an engine override above the launched level is named too', () => {
+    expect(launchFallback(named('low'), 'low', 'high', 'claude-sonnet-5-5')).toContain('engine resolved high')
+  })
+  test('a model the engine sends no effort is said to get none', () => {
+    expect(launchFallback(named('high'), 'high', undefined, 'claude-haiku-5-5')).toContain('no effort')
+  })
+  test('a capability clamp made at launch keeps its own reason', () => {
+    // max is above Sonnet's declared capability: launched at xhigh, and the engine gave xhigh
+    const clamped = named('max')
+    expect(clamped.applied).toBe('xhigh')
+    expect(launchFallback(clamped, 'xhigh', 'xhigh', 'claude-sonnet-5-5')).toContain('not supported')
+  })
+  test('a clamp the capability map no longer explains is still named', () => {
+    // launched at high when xhigh was clamped; the map has since moved on
+    const now = chooseEffort('xhigh', { tier: 'SONNET' }, capabilityFor('claude-sonnet-5-5', { 'claude-sonnet-5-5': ['low', 'medium'] }))
+    expect(now.applied).toBe('medium')
+    expect(launchFallback(now, 'high', 'high', 'claude-sonnet-5-5')).toBe('xhigh was clamped to high when the agent was launched')
+  })
+})
+
 describe('the policy the prompt states', () => {
   test('AUTO and MANUAL read differently, and the ceiling is named', () => {
     const auto = effortPolicyText('AUTO', 'max')
@@ -210,6 +254,7 @@ describe('the policy the prompt states', () => {
     expect(auto).toContain('AUTO names a level from the task')
     expect(auto).toContain('ceiling for any request is MAX')
     expect(auto).toContain('requested and applied effort are recorded separately')
+    expect(auto).toContain("A subagent's level is set on its Agent call from the assignment")
     const manual = effortPolicyText('MANUAL', 'high')
     expect(manual).toContain('Reasoning mode is MANUAL')
     expect(manual).toContain('ceiling for any request is HIGH')

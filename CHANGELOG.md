@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 — Effort fidelity
+
+- A subagent's reasoning level is now set natively, on its own Agent call's `effort` parameter (Claude Code 2.1.292 or newer), instead of by rewriting each request. It is per invocation, so parallel agents never share a setting, and the level the engine resolves is the one recorded as applied.
+- Fixed: a requested HIGH could silently become MEDIUM. The engine's reported level describes the loop's own settings and does not include a `turn.step` rewrite, so it read MEDIUM for a request that carried HIGH; that report was taken for a downgrade, the level was dropped from the observed capability map, and later requests really were clamped. A report of a request this plugin rewrote is no longer recorded as applied, warned about or learned from.
+- Fixed: a subagent's first request could arrive before its spawn was bound to its task and ran at the tier's baseline instead of the assigned level. The task is now found by the id its description carries.
+- The engine's own limits take precedence and are visible: `maxEffortLevel`, an organization's cap, `CLAUDE_CODE_EFFORT_LEVEL` and model support decide a subagent's final level, and a level resolved differently from the one asked for is named (`EFFORT FALLBACK`) with both levels.
+- A level put on the Agent call by hand is respected as the task's requested level when the assignment names none; the assignment's own level and the operator ceiling still win.
+- The Run Ledger distinguishes a level the engine resolved (`engine`, observed) from one this plugin requested by rewrite (`request`, observed unknown). `/cockpit version` names which of the two a subagent's level uses.
+- An observation of a level above the requested one no longer marks the requested level as supported.
+
 ## 0.3.0 — Dynamic reasoning
 
 - Task-aware reasoning effort: AUTO selects a level from the work, a commander can name one per assignment, and MANUAL honours fixed per-tier levels.

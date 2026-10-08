@@ -1,5 +1,5 @@
 // Pure, bounded accounting. Every absent measurement is literally unknown.
-import type { GitState, NwhoEvent, Task, Value, Counts, Run, LedgerAgent, ToolEntry, Reading, Request, Checkpoint, Ledger } from '../types'
+import type { EffortVia, GitState, NwhoEvent, Task, Value, Counts, Run, LedgerAgent, ToolEntry, Reading, Request, Checkpoint, Ledger } from '../types'
 export type { Value, Counts, Run, LedgerAgent, ToolEntry, Reading, Request, Checkpoint, Ledger } from '../types'
 import { appendReplay, safeFile, safeText, secretText } from './replay'
 import type { ReplayStep } from './replay'
@@ -40,7 +40,13 @@ export const addAgent = (l: Ledger, e: { agentId: string; subagentType: string; 
   }
 }
 export const warn = (l: Ledger, warning: string): Ledger => ({ ...l, warnings: [...l.warnings.filter(w => w !== warning), textOf(warning)].slice(-LIMITS.warnings) })
-export const recordRequest = (l: Ledger, e: { turnId: string; index: number; agentId?: string; model: string; effort?: unknown }, actual: { model?: string; effort?: unknown; usage?: Record<string, unknown> | null; routingReason?: string; fallbackReason?: string | null }): Ledger => {
+/**
+ * One model request, as it went. `actual.via` says who put the effort on it:
+ * `host` when it carried the level the engine resolved itself, which is then
+ * the engine's own and an observation of what was applied; `hook` when this
+ * plugin rewrote it, which the engine does not report back.
+ */
+export const recordRequest = (l: Ledger, e: { turnId: string; index: number; agentId?: string; model: string; effort?: unknown }, actual: { model?: string; effort?: unknown; usage?: Record<string, unknown> | null; routingReason?: string; fallbackReason?: string | null; via?: EffortVia }): Ledger => {
   const id = `${e.agentId ?? 'main'}:${e.turnId}:${e.index}`
   const runId = originOf(l, e.agentId)
   const u = actual.usage
@@ -48,8 +54,11 @@ export const recordRequest = (l: Ledger, e: { turnId: string; index: number; age
   const effort = actual.effort === undefined ? UNKNOWN : textOf(String(actual.effort))
   const reason = actual.routingReason === undefined ? UNKNOWN : textOf(actual.routingReason)
   const fallback = actual.fallbackReason === undefined || actual.fallbackReason === null ? UNKNOWN : textOf(actual.fallbackReason)
-  const request: Request = { id, runId, turnId: e.turnId, agentId: e.agentId ?? UNKNOWN, requestedModel: word(e.model), requestedEffort: e.effort === undefined ? UNKNOWN : textOf(String(e.effort)), model, effort, effectiveEffort: UNKNOWN, input: numberOf(u?.['input_tokens']), output: numberOf(u?.['output_tokens']), cacheRead: numberOf(u?.['cache_read_input_tokens']), cacheWrite: numberOf(u?.['cache_creation_input_tokens']) }
-  return { ...l, turns: Object.fromEntries(Object.entries({ ...l.turns, [e.agentId ?? 'main']: e.turnId }).filter(([key]) => key === 'main' || l.agents.some(a => a.id === key))), requests: [...l.requests.filter(r => r.id !== id), request].slice(-LIMITS.requests), runs: l.runs.map(r => r.id === runId && !e.agentId ? { ...r, model, effort, effortSource: effort === UNKNOWN ? 'unknown' as const : 'request' as const, requestedEffort: request.requestedEffort, routingReason: reason, fallbackReason: fallback } : r), agents: l.agents.map(a => a.id === e.agentId ? { ...a, model, effort, effortSource: effort === UNKNOWN ? 'unknown' as const : 'request' as const, requestedEffort: request.requestedEffort, routingReason: reason, fallbackReason: fallback } : a) }
+  const isOwn = actual.via === 'host' && effort !== UNKNOWN
+  const source = effort === UNKNOWN ? 'unknown' as const : isOwn ? 'engine' as const : 'request' as const
+  const seen = { ...(actual.via === undefined ? {} : { effortVia: actual.via }), ...(isOwn ? { effectiveEffort: effort } : {}) }
+  const request: Request = { id, runId, turnId: e.turnId, agentId: e.agentId ?? UNKNOWN, requestedModel: word(e.model), requestedEffort: e.effort === undefined ? UNKNOWN : textOf(String(e.effort)), model, effort, effectiveEffort: isOwn ? effort : UNKNOWN, input: numberOf(u?.['input_tokens']), output: numberOf(u?.['output_tokens']), cacheRead: numberOf(u?.['cache_read_input_tokens']), cacheWrite: numberOf(u?.['cache_creation_input_tokens']) }
+  return { ...l, turns: Object.fromEntries(Object.entries({ ...l.turns, [e.agentId ?? 'main']: e.turnId }).filter(([key]) => key === 'main' || l.agents.some(a => a.id === key))), requests: [...l.requests.filter(r => r.id !== id), request].slice(-LIMITS.requests), runs: l.runs.map(r => r.id === runId && !e.agentId ? { ...r, model, effort, effortSource: source, ...seen, requestedEffort: request.requestedEffort, routingReason: reason, fallbackReason: fallback } : r), agents: l.agents.map(a => a.id === e.agentId ? { ...a, model, effort, effortSource: source, ...seen, requestedEffort: request.requestedEffort, routingReason: reason, fallbackReason: fallback } : a) }
 }
 export const finishTurn = (l: Ledger, e: { turnId: string; agentId?: string; reason: string }, at: number): Ledger => ({ ...l, runs: l.runs.map(r => !e.agentId && r.turnId === e.turnId ? { ...r, end: at, status: e.reason === 'answer' ? 'success' : e.reason } : r), agents: l.agents.map(a => a.id === e.agentId ? { ...a, end: at, status: e.reason === 'answer' ? 'success' : e.reason } : a) })
 export const beginTool = (l: Ledger, e: Record<string, unknown>, at: number): Ledger => {
@@ -126,10 +135,15 @@ export const adoptAgent = (l: Ledger, info: { id: string; type: string; descript
 }
 
 
-export const classicTelemetry = (l: Ledger, e: { tool_use_id: string; agent_id?: string; effort?: { level: string }; duration_ms?: number; mcp_server?: { name: string; source: string } }): Ledger => {
+export const classicTelemetry = (l: Ledger, e: { tool_use_id: string; agent_id?: string; effort?: { level: string }; duration_ms?: number; mcp_server?: { name: string; source: string } }, sent?: EffortVia): Ledger => {
   const tool = l.tools.find(t => t.id === e.tool_use_id)
-  const level = e.effort === undefined ? UNKNOWN : word(e.effort.level)
   const runId = tool?.runId ?? originOf(l, e.agent_id)
+  // The engine reports the level its own settings resolve for the loop. A level
+  // this plugin rewrote onto the request in `turn.step` is not in that report,
+  // so for such a loop the report is not what was applied and is not recorded.
+  // `sent` is the channel of a request still in flight, not in the ledger yet.
+  const via = sent ?? (e.agent_id === undefined ? l.runs.find(r => r.id === runId)?.effortVia : l.agents.find(a => a.id === e.agent_id)?.effortVia)
+  const level = e.effort === undefined || via === 'hook' ? UNKNOWN : word(e.effort.level)
   const last = [...l.requests].reverse().find(r => r.agentId === (e.agent_id ?? UNKNOWN) && r.turnId === tool?.turnId)
   return { ...l,
     tools: l.tools.map(t => t.id === e.tool_use_id ? { ...t, durationMs: numberOf(e.duration_ms), source: e.mcp_server === undefined ? t.source : `${word(e.mcp_server.name)} (${word(e.mcp_server.source)})` } : t),

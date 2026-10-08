@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { emptySwarm, submitTask, admitTask, bindAgent, finishTask, requestCancel, reportResult, escalateTask, markStalled, setWave, verifyTask, summarizeSwarm, routeTask, ownershipAllows, overlaps, normalizeOwned, releaseReservation, configureSwarm, resolveEscalation } from '../hooks/swarm'
+import { emptySwarm, submitTask, admitTask, bindAgent, finishTask, requestCancel, reportResult, escalateTask, markStalled, setWave, verifyTask, summarizeSwarm, routeTask, ownershipAllows, overlaps, normalizeOwned, releaseReservation, configureSwarm, resolveEscalation, setLaunchEffort } from '../hooks/swarm'
 import type { Swarm, ModelTier, Handoff } from '../hooks/swarm'
 const add = (s: Swarm, id: string, tier: ModelTier = 'SONNET', owned = [`/${id}`], mode: 'read' | 'write' = 'read') => submitTask(s, { id, tier, role: 'Engineer', objective: `Task ${id}`, owned, mode }, 1).swarm
 const run = (s: Swarm, id: string) => bindAgent(admitTask(s, id, 2).swarm, id, `agent-${id}`, 3)
@@ -98,6 +98,22 @@ describe('adversarial ownership and lifecycle', () => {
     expect(() => submitTask(future, { id: 'y', tier: 'HAIKU', role: 'Scout', objective: 'Y', dependencies: ['x'] }, 2)).toThrow()
   })
 })
+describe('the level a task is launched with', () => {
+  test('a new task has none, and the native launch level is kept apart from the requested one', () => {
+    const s = run(add(emptySwarm(), 'a'), 'a')
+    expect(s.tasks[0]).toMatchObject({ requestedEffort: 'AUTO', launchEffort: null, appliedEffort: null })
+    const launched = setLaunchEffort(s, 'a', 'medium')
+    expect(launched.tasks[0]).toMatchObject({ requestedEffort: 'AUTO', launchEffort: 'medium', appliedEffort: null })
+    expect(setLaunchEffort(s, 'missing', 'high')).toBe(s)
+  })
+  test('a level named on the Agent call becomes the requested level only when the assignment named none', () => {
+    const auto = setLaunchEffort(run(add(emptySwarm(), 'a'), 'a'), 'a', 'high', 'high')
+    expect(auto.tasks[0]).toMatchObject({ requestedEffort: 'high', launchEffort: 'high', effortReason: 'named on the Agent call (high)' })
+    const named = submitTask(emptySwarm(), { id: 'b', tier: 'SONNET', role: 'Engineer', objective: 'Task b', owned: ['/b'], effort: 'low', effortReason: 'mechanical' }, 1).swarm
+    expect(setLaunchEffort(named, 'b', 'low', 'high').tasks[0]).toMatchObject({ requestedEffort: 'low', effortReason: 'mechanical', launchEffort: 'low' })
+  })
+})
+
 describe('routing, escalation and observable evidence', () => {
   test('semantic routing preserves commander authority and direct execution', () => {
     expect(routeTask({ trivial: true })).toBe('OPUS')

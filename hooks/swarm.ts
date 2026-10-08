@@ -51,7 +51,7 @@ export const submitTask = (s: Swarm, input: TaskInput, at: number): { swarm: Swa
   if (s.tasks.length >= s.config.maxTasks) throw new Error('Task storage budget reached; archive this run before adding work')
   if (cycle(s, input)) throw new Error('Task dependency cycle')
   if (input.parentTask && !s.tasks.some(t => t.id === input.parentTask && !terminal(t))) throw new Error('Parent task missing or terminal')
-  const task: SwarmTask = { ...input, parentTask: input.parentTask ?? null, parentAgent: input.parentAgent ?? null, agentId: null, scope: input.scope ?? '', dependencies: [...new Set(input.dependencies ?? [])], owned, mode: input.mode ?? 'read', wave: input.wave ?? s.wave, spawnReason: input.spawnReason ?? 'Commander bounded assignment', requestedEffort: input.effort ?? 'AUTO', effortReason: input.effortReason ?? (input.effort !== undefined && input.effort !== 'AUTO' ? `named by the commander (${input.effort})` : 'AUTO: chosen from the task'), appliedEffort: null, effortEscalation: null, state: 'queued', cancellationRequested: false, escalation: null, result: null, verification: 'pending', createdAt: at, startedAt: null, endedAt: null, lastActivityAt: at, reason: null }
+  const task: SwarmTask = { ...input, parentTask: input.parentTask ?? null, parentAgent: input.parentAgent ?? null, agentId: null, scope: input.scope ?? '', dependencies: [...new Set(input.dependencies ?? [])], owned, mode: input.mode ?? 'read', wave: input.wave ?? s.wave, spawnReason: input.spawnReason ?? 'Commander bounded assignment', requestedEffort: input.effort ?? 'AUTO', effortReason: input.effortReason ?? (input.effort !== undefined && input.effort !== 'AUTO' ? `named by the commander (${input.effort})` : 'AUTO: chosen from the task'), appliedEffort: null, launchEffort: null, effortEscalation: null, state: 'queued', cancellationRequested: false, escalation: null, result: null, verification: 'pending', createdAt: at, startedAt: null, endedAt: null, lastActivityAt: at, reason: null }
   const swarm = event({ ...s, tasks: [...s.tasks, task], requested: s.requested + 1 }, 'assignment', task.id, at, `${task.tier} ${task.role}: ${task.spawnReason}`)
   return { swarm, task, duplicate: false }
 }
@@ -120,6 +120,17 @@ export const escalateTask = (s: Swarm, id: string, h: Handoff, at: number): Swar
 }
 /** Records the level actually applied to a task's live requests, where observed. */
 export const setAppliedEffort = (s: Swarm, id: string, level: string | null): Swarm => s.tasks.some(t => t.id === id) ? update(s, id, { appliedEffort: level }) : s
+/**
+ * Records the level set natively on a task's Agent call, or null when a launch
+ * did not start. `named` is a level the commander put on the call by hand: it
+ * becomes the task's requested level when the assignment itself named none.
+ */
+export const setLaunchEffort = (s: Swarm, id: string, level: EffortLevel | null, named: EffortLevel | null = null): Swarm => {
+  const t = s.tasks.find(t => t.id === id)
+  if (!t) return s
+
+  return update(s, id, { launchEffort: level, ...(named !== null && t.requestedEffort === 'AUTO' ? { requestedEffort: named, effortReason: `named on the Agent call (${named})` } : {}) })
+}
 export const setWave = (s: Swarm, wave: Wave, at: number): Swarm => s.wave === wave ? s : event({ ...s, wave }, 'wave', null, at, `${s.wave} → ${wave}`)
 export const verifyTask = (s: Swarm, id: string, verification: Verification, at: number, evidence: string): Swarm => {
   const task = s.tasks.find(t => t.id === id)

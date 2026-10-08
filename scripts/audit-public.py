@@ -23,7 +23,7 @@ for p in sorted(root.rglob('*')):
   if private.search(line): findings.append(f'{rel}:{n}: personal reference')
   if credential.search(line): findings.append(f'{rel}:{n}: credential-like value (review synthetic fixtures)')
 m=json.loads((root/'.claude-plugin/plugin.json').read_text()); market=json.loads((root/'.claude-plugin/marketplace.json').read_text())
-assert m['version']==market['plugins'][0]['version']=='0.3.0'
+assert m['version']==market['plugins'][0]['version']=='0.3.1'
 assert m['name']==market['plugins'][0]['name']=='cobalt-cockpit'
 assert market['plugins'][0]['source']=='./'
 assert m['repository']=='https://github.com/echelong/cobalt-cockpit'

@@ -2,10 +2,17 @@
 //
 // This module is pure: it is arithmetic and naming over facts the commander,
 // the task and the engine already reported. It never calls a model, never
-// touches `$`, and never sets a global engine setting. The one place effort is
-// actually applied is `turn.step` in register.tsx, which rewrites a request's
-// `effort` for a single turn — so two agents running side by side can ask for
-// different levels without a global setting moving under either of them.
+// touches `$`, and never sets a global engine setting. Effort is applied in
+// register.tsx, per invocation and never globally, so two agents running side
+// by side can run at different levels without a setting moving under either:
+//
+//   - A subagent's level is set natively, on its Agent call's own `effort`
+//     parameter. The engine resolves it under its own caps and overrides and
+//     reports the result back, so what is recorded as applied is the engine's.
+//   - The main loop, and a subagent no Agent call launched (or an engine too
+//     old for the parameter), get the level by a `turn.step` rewrite of each
+//     request. The engine's reports do not reflect that rewrite, so there the
+//     recorded level is what was requested and nothing is learned from them.
 //
 // Three ideas are kept apart on purpose:
 //
@@ -105,7 +112,12 @@ export const supportsEffort = (capability: Capability, level: EffortLevel): bool
  * Folds one real observation into the capability map. The engine reports the
  * level it *actually* applied; when that is below what was requested, the
  * requested level is not supported and is removed; when it matches, the
- * requested level is known to work and is added. Nothing is invented.
+ * requested level is known to work and is added. A level above the requested
+ * one (an override) says nothing about the requested level, and changes
+ * nothing. Nothing is invented.
+ *
+ * Only a report of a request the engine resolved by itself is an observation:
+ * a level this plugin rewrote in `turn.step` is not in the engine's report.
  */
 export const observeCapability = (
   known: Readonly<Record<string, readonly EffortLevel[]>>,
@@ -118,8 +130,9 @@ export const observeCapability = (
 
     return tier === null ? UNKNOWN_CAPABILITY : DECLARED_CAPABILITY[tier]
   })()
-  const next = effortRank(actual) >= effortRank(requested)
-    ? byRank([...prior, requested])
+  if (effortRank(actual) > effortRank(requested)) return { ...known }
+  const next = actual === requested
+    ? byRank([...new Set([...prior, requested])])
     : byRank(prior.filter(level => level !== requested))
 
   return { ...known, [model]: next.length > 0 ? next : [actual] }
@@ -332,6 +345,21 @@ export const chooseEffort = (requested: EffortRequest, facts: EffortFacts, capab
   }
 }
 
+/**
+ * Why a natively launched loop is not running at the level its task selected,
+ * or null when it is. `launched` is the level set on the Agent call; `host` is
+ * the level the engine then resolved for the loop's request, read before it is
+ * sent. The engine's own caps, overrides and model support decide that level,
+ * and they win: a difference is named here, not fought.
+ */
+export const launchFallback = (resolution: EffortResolution, launched: EffortLevel, host: unknown, model: string): string | null => {
+  if (host === undefined) return `the engine sends ${model} no effort; requested ${launched}`
+  if (host !== launched) return `the engine resolved ${String(host)} for ${model}; requested ${launched} (an engine cap, an override or the model's support)`
+  if (resolution.applied === launched) return resolution.fallbackReason
+
+  return launched === resolution.selected ? null : `${resolution.selected} was clamped to ${launched} when the agent was launched`
+}
+
 // ---------------------------------------------------------------------------
 // Escalation: vertical (tier) and effort.
 // ---------------------------------------------------------------------------
@@ -390,5 +418,6 @@ Dynamic reasoning (Cobalt Cockpit):
 - Reasoning mode is ${mode}. Model selection and effort selection are separate decisions. Three tiers remain: Opus 5.5 commands and verifies, Sonnet 5.5 engineers, Haiku 5.5 scouts.
 - Effort is chosen per task, not fixed. ${mode === 'AUTO' ? 'AUTO names a level from the task: extractive inventories, classification and summaries run light; normal feature work and refactors run medium; complex debugging, concurrency, migrations, security and high-risk architectural reasoning run high or xhigh; unusually difficult high-stakes reasoning may use max.' : 'MANUAL honours the configured level unless a task is assigned an explicit effort.'}
 - A level is only ever requested. Every model does not support every level, so the applied level may be lower after a capability fallback; requested and applied effort are recorded separately and a fallback is named, never hidden.
+- A subagent's level is set on its Agent call from the assignment; leave the Agent tool's own effort parameter out unless overriding a level by hand. The engine's caps and overrides win, and a level it resolves differently is recorded as a fallback.
 - Escalate when a task is failing: raise effort by one step within the tier first, then move a tier (Haiku → Sonnet → Opus). Never jump straight to the top, and stop at the ceiling budget rather than retrying forever. Name the level per assignment with the swarm tool's effort field when the task itself makes it clear.
 - The ceiling for any request is ${ceiling.toUpperCase()}; a higher request falls back and is recorded.`
