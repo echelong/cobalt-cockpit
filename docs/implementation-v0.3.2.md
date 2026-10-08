@@ -2,7 +2,7 @@
 
 Starting SHA: `2a8f884` (Leave the main loop's effort to the host). Plugin and
 marketplace version are now 0.3.2. Branch: `release/0.3.2-directory-compliance`.
-v0.3.1 stays where it is: its tag, its docs and its manifest are untouched.
+Historical note: v0.3.1 was preserved during v0.3.2 development. Older release tags may be retired under the repository's main-only distribution policy; their commits remain in Git.
 
 This release changes what a directory scanner can see, and one thing a person
 can rely on: a hook of Cockpit's that fails now answers in its place instead of
@@ -292,7 +292,7 @@ in the Leaves column means nothing leaves this computer.
 | Environment reads by literal name: `CLAUDE_CODE_EFFORT_LEVEL`, `XDG_STATE_HOME`, `HOME`, `COBALT_REDUCED_MOTION` | `hostSignals`, `resolveLedger`, `session.start` | The main loop's effort origin, the ledger path, the guard's home comparison, reduced motion | No | none | no |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_MANTLE`: presence only | `probeAuth` | Whether the session is on API-style authentication, for `subscriptionOnly` and `/cockpit auth` | No — each value is reduced on the spot by `value !== undefined && value !== ''` and only the name is kept | none | no |
 | `$.settings.read()` | `probeAuth`, `hostSignals` | The advisor setting, the environment block's names, the saved effort level and cap | No | none | no |
-| `$.store` (the host's plugin store, on disk) | `persist`, `checkpoint`, the `/cockpit` preferences | Up to eight bounded run ledgers, bounded replay bodies, checkpoints, and the two preferences | No | none | yes — uninstalling the plugin clears it |
+| `$.store` (the host's plugin store, on disk) | `persist`, `checkpoint`, the `/cockpit` preferences | Up to eight bounded run ledgers, bounded replay bodies, checkpoints, and the two preferences | No | none | yes — local store persists without a Cockpit time limit; automatic uninstall cleanup is unverified. See PRIVACY.md for removal guidance |
 | `$.session.authorize`, `$.session.usage`, `$.session.model`, `$.agent.list`, `$.config.list`, `$.ui.*` | throughout | The engine's own readings for the HUD and the pane | No | none | no |
 | `prompt.compose` and `prompt.submit` | `register.tsx` | The discipline, safety and policy sections of the system prompt, and one task-status line | They ride the engine's own model request as part of the prompt | the prompt is the person's | follows the guards that own them |
 | Network | — | No `$.http.fetch`, no `$.model.*`, no `$.mcp.*`, no `fetch`, no WebSocket, no dynamic import, no `eval`, no `Function`, no `require`, no `child_process`, no `process.env` anywhere in the plugin | No | — | — |
