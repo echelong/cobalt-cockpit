@@ -1723,11 +1723,22 @@ export const register: Register = (on, options) => {
 
     return next({ ...e, context: [...(e.context ?? []), context] })
   }).catch(async ($, e, next) => {
-    // The one refusal this hook makes is the subscription policy's, so its
-    // handler makes it too; everything else is the person's own prompt.
-    if (next.called || !(await isApiRefused($).catch(() => false))) return next(e)
+    // The three drops this hook makes — the strict preset's advisor line, a
+    // session set to use Fable, and the subscription policy's — are made here
+    // too: forwarding them would send a request the policy exists to refuse.
+    if (next.called) return next(e)
+    if (config.isStrict && hasAdvisor) return { drop: 'COBALT STRICT / disable the external advisor before continuing.' }
+    if (config.blocksFable) {
+      const model = await $.session.model().catch(() => '')
+      if (isFable(model) || isAdvisorFable) {
+        await recordBlock($)
 
-    return { drop: API_REFUSAL }
+        return { drop: `${BLOCK_LINE}. This session is set to use Fable, which this workflow never runs. Nothing was sent.` }
+      }
+    }
+    if (await isApiRefused($).catch(() => false)) return { drop: API_REFUSAL }
+
+    return next(e)
   })
 
   on('command.run', { command: 'init' }, async ($, e, next) => {
@@ -2059,7 +2070,8 @@ export const register: Register = (on, options) => {
       // An explicit level on the task is the commander's, and wins; otherwise
       // AUTO names one from the task and MANUAL honours the fixed tier level.
       const named = task !== undefined && task.requestedEffort !== 'AUTO' ? task.requestedEffort : null
-      const capability = capabilityOf(wanted.model, (await read($, effortKnownAtom)))
+      const known = await quietly(() => read($, effortKnownAtom))
+      const capability = capabilityOf(wanted.model, known ?? {})
       const manual = config.reasoningMode === 'MANUAL' && named === null
       // A subagent no task is known for yet, on an engine that takes the level
       // on the Agent call: its request already carries what it was launched
@@ -2177,9 +2189,11 @@ export const register: Register = (on, options) => {
 
     return ran
   }).catch(($, e, next) => {
-    // The refusal is this hook's only in the preset, for a command that would
-    // change the advisor; every other line the person types runs.
-    if (next.called || !config.isStrict || e.args.trim() === '' || /^(off|none|disable)$/i.test(e.args.trim())) return next(e)
+    // The two refusals this hook makes, judged on the command it was given: a
+    // line that names Fable, and the strict preset's advisor change.
+    if (next.called) return next(e)
+    if (config.blocksFable && e.args.split(/[\s=,]+/).some(isFable)) return { text: `${BLOCK_LINE}. The advisor guard failed, so nothing was changed.` }
+    if (!config.isStrict || e.args.trim() === '' || /^(off|none|disable)$/i.test(e.args.trim())) return next(e)
 
     return { text: 'COBALT STRICT / the advisor guard failed, so nothing was changed.' }
   })
