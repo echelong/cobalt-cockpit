@@ -89,17 +89,18 @@ const hudText = async ($: Engine, columns = 120): Promise<string> => {
 }
 
 describe('AUTO effort reaches the engine', () => {
-  test('the main loop runs the Opus baseline the policy names', async ($, on) => {
+  test('the main loop is sent what the engine resolved: AUTO names no level for it', async ($, on) => {
     const w = world(on)
     const held = hostState(on, {})
     await start($)
     await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
-    await step($, OPUS)
+    await step($, OPUS, { effort: 'high' })
     expect(w.requests).toEqual([{ model: OPUS }])
     expect(w.efforts).toEqual([{ model: OPUS, effort: 'high' }])
     const run = ledgerOf(held).runs[0]!
-    expect(run).toMatchObject({ model: OPUS, effort: 'high', effortSource: 'request', requestedEffort: 'high' })
-    expect(run.routingReason).toContain('OPUS baseline')
+    expect(run).toMatchObject({ model: OPUS, effort: 'high', effortSource: 'engine', effortVia: 'host', requestedEffort: 'high', effectiveEffort: 'high' })
+    expect(run.routingReason).toContain('host-resolved high')
+    expect(run.routingReason).not.toContain('OPUS baseline')
   })
 
   test('a Sonnet engineering task is selected at medium; a Haiku inventory task at low', async ($, on) => {
@@ -151,14 +152,15 @@ describe('the operator ceiling and MANUAL mode', () => {
   test('MANUAL honours the fixed tier level and leaves Haiku unspecified', { options: { reasoningMode: 'MANUAL' } }, async ($, on) => {
     const w = world(on)
     await start($)
-    await step($, OPUS)
+    await step($, OPUS, { effort: 'low' })
     await assign($, 'man', { tier: 'SONNET', role: 'worker', mode: 'write' })
     const a = (await spawn($, 'man')).agentId!
     await step($, SONNET, { agentId: a })
     await assign($, 'man-scan', { tier: 'HAIKU', role: 'scout', mode: 'read' })
     const h = (await spawn($, 'man-scan')).agentId!
     await step($, HAIKU, { agentId: h })
-    expect(w.efforts[0]).toEqual({ model: OPUS, effort: 'high' })
+    // MANUAL fixes the subagent tiers; the main loop's level stays the person's
+    expect(w.efforts[0]).toEqual({ model: OPUS, effort: 'low' })
     expect(w.efforts[1]).toEqual({ model: SONNET, effort: 'medium', agentId: a })
     // no fixed level is named for Haiku, so the engine's own is left in place
     expect(w.efforts[2]).toEqual({ model: HAIKU, agentId: h })
@@ -408,18 +410,18 @@ describe('a request this hook rewrote is not confirmed by the engine', () => {
     expect(agentOf(held, a).effectiveEffort).toBeUndefined()
   })
 
-  test('the main loop is the same: a rewritten request is not overwritten by the engine report', async ($, on) => {
+  test('the main loop is not rewritten at all, so the engine report is of the request itself', async ($, on) => {
     const w = world(on)
     const held = hostState(on, {})
     await start($)
     await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
     await step($, OPUS, { effort: 'medium' })
-    expect(w.efforts[0]).toEqual({ model: OPUS, effort: 'high' })
+    // not raised to a baseline: what the engine resolved is what is sent
+    expect(w.efforts[0]).toEqual({ model: OPUS, effort: 'medium' })
     await $.classic.PostToolUse({ tool_name: 'Bash', tool_input: {}, tool_response: {}, tool_use_id: 'tu1', effort: { level: 'medium' } } as never)
-    expect(ledgerOf(held).runs[0]).toMatchObject({ effort: 'high', effortSource: 'request', effortVia: 'hook', requestedEffort: 'high' })
+    expect(ledgerOf(held).runs[0]).toMatchObject({ effort: 'medium', effortSource: 'engine', effortVia: 'host', requestedEffort: 'medium', effectiveEffort: 'medium' })
     expect(fallbacks(held)).toEqual([])
-    expect(knownOf(held)[OPUS]).toBeUndefined()
-    expect(await hudText($)).toContain('opus-5-5 · high')
+    expect(await hudText($)).toContain('opus-5-5 · medium')
   })
 
   test('a main loop request the engine already resolved at the policy level is the engine own, and observed', async ($, on) => {
@@ -432,12 +434,239 @@ describe('a request this hook rewrote is not confirmed by the engine', () => {
   })
 })
 
+// The main loop's effort is the person's. A `turn.step` rewrite outranks
+// `/effort`, `--effort`, the settings and `CLAUDE_CODE_EFFORT_LEVEL`, so the
+// plugin writes none: each case here hands the hooks the level the engine
+// resolved (`effort` on the step, as the engine does) and asserts that exactly
+// that level is what reached the engine and what the ledger says.
+describe('the main loop effort is the host own and is never rewritten', () => {
+  const run = (held: ReturnType<typeof hostState>) => ledgerOf(held).runs[0]!
+  const policyWarnings = (held: ReturnType<typeof hostState>) => ledgerOf(held).warnings.filter(warning => warning.includes('MODEL POLICY'))
+  const effortCommand = ($: Engine, args: string) =>
+    $.command.run({ command: 'effort', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } })
+
+  for (const level of ['low', 'medium', 'high', 'xhigh'] as const) {
+    test(`an explicit Opus ${level} saved in the settings is sent as ${level}`, async ($, on) => {
+      const w = world(on, { ...NATIVE, settings: { modelSettings: { [OPUS]: { effortLevel: level } } } })
+      const held = hostState(on, {})
+      await start($)
+      await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
+      await step($, OPUS, { effort: level })
+      expect(w.efforts).toEqual([{ model: OPUS, effort: level }])
+      expect(run(held)).toMatchObject({ model: OPUS, effort: level, effortSource: 'engine', effortVia: 'host', requestedEffort: level, effectiveEffort: level, fallbackReason: 'unknown' })
+      expect(run(held).routingReason).toBe(`host-resolved ${level}; matches the settings effortLevel`)
+      expect(fallbacks(held)).toEqual([])
+      expect(policyWarnings(held)).toEqual([])
+    })
+  }
+
+  test('a level typed with /effort this session is sent as typed, and named as the session own', async ($, on) => {
+    const w = world(on, { ...NATIVE, settings: { modelSettings: { [OPUS]: { effortLevel: 'high' } } } })
+    const held = hostState(on, {})
+    await start($)
+    await effortCommand($, 'max')
+    await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
+    await step($, OPUS, { effort: 'max' })
+    expect(w.efforts).toEqual([{ model: OPUS, effort: 'max' }])
+    expect(run(held)).toMatchObject({ effort: 'max', effortSource: 'engine', effortVia: 'host', requestedEffort: 'max' })
+    expect(run(held).routingReason).toContain('matches an /effort command of this session')
+    // a later choice in the picker is not visible: the earlier typed level is forgotten, not carried
+    await effortCommand($, '')
+    await $.turn.start({ text: 'Again', turnId: 't2' })
+    await step($, OPUS, { turnId: 't2', effort: 'low' })
+    expect(w.efforts[1]).toEqual({ model: OPUS, effort: 'low' })
+    expect(ledgerOf(held).runs[1]!.routingReason).toContain('no observed selection matches it')
+  })
+
+  test('CLAUDE_CODE_EFFORT_LEVEL is honoured over the saved level, and said to be why', async ($, on) => {
+    const w = world(on, { ...NATIVE, env: { CLAUDE_CODE_EFFORT_LEVEL: 'low' }, settings: { modelSettings: { [OPUS]: { effortLevel: 'high' } } } })
+    const held = hostState(on, {})
+    await start($)
+    await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
+    await step($, OPUS, { effort: 'low' })
+    expect(w.efforts).toEqual([{ model: OPUS, effort: 'low' }])
+    expect(run(held)).toMatchObject({ effort: 'low', effortSource: 'engine', effortVia: 'host', requestedEffort: 'low', effectiveEffort: 'low' })
+    expect(run(held).routingReason).toBe('host-resolved low; matches CLAUDE_CODE_EFFORT_LEVEL')
+    expect(fallbacks(held)).toEqual([])
+  })
+
+  test('CLAUDE_CODE_EFFORT_LEVEL=auto is the engine choice of the model default, left as resolved', async ($, on) => {
+    const w = world(on, { ...NATIVE, env: { CLAUDE_CODE_EFFORT_LEVEL: 'auto' }, settings: { modelSettings: { [OPUS]: { effortLevel: 'low' } } } })
+    const held = hostState(on, {})
+    await start($)
+    await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
+    await step($, OPUS, { effort: 'high' })
+    expect(w.efforts).toEqual([{ model: OPUS, effort: 'high' }])
+    expect(run(held).routingReason).toContain('CLAUDE_CODE_EFFORT_LEVEL=auto selects the model default')
+  })
+
+  test('maxEffortLevel caps the selected level: the cap is sent, and both levels are named', async ($, on) => {
+    const w = world(on, { ...NATIVE, settings: { maxEffortLevel: 'medium', modelSettings: { [OPUS]: { effortLevel: 'xhigh' } } } })
+    const held = hostState(on, {})
+    await start($)
+    await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
+    await step($, OPUS, { effort: 'medium' })
+    // not rewritten back above the cap
+    expect(w.efforts).toEqual([{ model: OPUS, effort: 'medium' }])
+    expect(run(held)).toMatchObject({ effort: 'medium', effortSource: 'engine', effortVia: 'host', requestedEffort: 'xhigh', effectiveEffort: 'medium' })
+    expect(run(held).routingReason).toContain('capped by maxEffortLevel medium')
+    expect(run(held).fallbackReason).toContain('maxEffortLevel medium capped xhigh')
+    expect(fallbacks(held)).toEqual(['EFFORT FALLBACK / engine applied medium; requested xhigh'])
+    // a cap of the host's is not something the model cannot do: nothing is unlearned
+    await $.classic.PostToolUse({ tool_name: 'Bash', tool_input: {}, tool_response: {}, tool_use_id: 'tu1', effort: { level: 'medium' } } as never)
+    expect(knownOf(held)[OPUS]).toBeUndefined()
+    expect(fallbacks(held)).toEqual(['EFFORT FALLBACK / engine applied medium; requested xhigh'])
+    expect(run(held)).toMatchObject({ effort: 'medium', effectiveEffort: 'medium' })
+  })
+
+  test('a per-model maxEffortLevel is the one read for the model', async ($, on) => {
+    const w = world(on, { ...NATIVE, settings: { maxEffortLevel: 'max', effortLevel: 'high', modelSettings: { 'claude-opus-5-5[1m]': { maxEffortLevel: 'low' } } } })
+    const held = hostState(on, {})
+    await start($)
+    await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
+    await step($, OPUS, { effort: 'low' })
+    expect(w.efforts).toEqual([{ model: OPUS, effort: 'low' }])
+    expect(run(held).routingReason).toContain('capped by maxEffortLevel low')
+  })
+
+  test('AUTO with no selection anywhere leaves the engine level alone and claims no origin for it', async ($, on) => {
+    const w = world(on, NATIVE)
+    const held = hostState(on, {})
+    await start($)
+    await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
+    await step($, OPUS, { effort: 'high' })
+    expect(w.efforts).toEqual([{ model: OPUS, effort: 'high' }])
+    expect(run(held)).toMatchObject({ effort: 'high', effortSource: 'engine', effortVia: 'host', requestedEffort: 'high', effectiveEffort: 'high' })
+    expect(run(held).routingReason).toContain('no observed selection matches it')
+    expect(fallbacks(held)).toEqual([])
+  })
+
+  test('a host default that is not the tier baseline is not raised to it', async ($, on) => {
+    const w = world(on, NATIVE)
+    await start($)
+    await step($, OPUS, { effort: 'medium' })
+    await step($, OPUS, { effort: 'xhigh', index: 1 })
+    expect(w.efforts).toEqual([{ model: OPUS, effort: 'medium' }, { model: OPUS, effort: 'xhigh' }])
+  })
+
+  test('a level the settings do not account for (--effort, the picker) is sent as resolved, with no origin invented', async ($, on) => {
+    // the settings say high; the engine resolved low from something a plugin cannot see
+    const w = world(on, { ...NATIVE, settings: { modelSettings: { [OPUS]: { effortLevel: 'high' } } } })
+    const held = hostState(on, {})
+    await start($)
+    await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
+    await step($, OPUS, { effort: 'low' })
+    expect(w.efforts).toEqual([{ model: OPUS, effort: 'low' }])
+    expect(run(held)).toMatchObject({ effort: 'low', effortSource: 'engine', effortVia: 'host', requestedEffort: 'low' })
+    expect(run(held).routingReason).toContain('no observed selection matches it')
+    expect(fallbacks(held)).toEqual([])
+  })
+
+  test('the operator ceiling is for what Cockpit asks of subagents: it does not lower the main loop', { options: { maxEffort: 'low' } }, async ($, on) => {
+    const w = world(on, NATIVE)
+    await start($)
+    await step($, OPUS, { effort: 'xhigh' })
+    expect(w.efforts).toEqual([{ model: OPUS, effort: 'xhigh' }])
+  })
+
+  test('MANUAL does not fix the main loop either', { options: { reasoningMode: 'MANUAL' } }, async ($, on) => {
+    const w = world(on, NATIVE)
+    await start($)
+    await step($, OPUS, { effort: 'medium' })
+    expect(w.efforts).toEqual([{ model: OPUS, effort: 'medium' }])
+  })
+
+  test('Sonnet and Haiku run at their own levels beside it, and no launch moves the main loop', async ($, on) => {
+    const w = world(on, { ...NATIVE, settings: { modelSettings: { [OPUS]: { effortLevel: 'low' } } } })
+    const held = hostState(on, {})
+    await start($)
+    await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
+    await step($, OPUS, { effort: 'low' })
+    await assign($, 'h-high', { tier: 'HAIKU', role: 'scout', mode: 'read', effort: 'high' })
+    await assign($, 's-xhigh', { tier: 'SONNET', role: 'worker', mode: 'write', effort: 'xhigh' })
+    await assign($, 'h-auto', { tier: 'HAIKU', role: 'scout', mode: 'read' })
+    await assign($, 's-auto', { tier: 'SONNET', role: 'worker', mode: 'write' })
+    const haiku = await launch($, w, 'h-high')
+    const sonnet = await launch($, w, 's-xhigh')
+    const scout = await launch($, w, 'h-auto')
+    const worker = await launch($, w, 's-auto')
+    expect([haiku, sonnet, scout, worker].map(one => one.sent['effort'])).toEqual(['high', 'xhigh', 'low', 'medium'])
+    // interleaved, as concurrent loops are
+    await step($, HAIKU, { agentId: haiku.agentId, effort: 'high' })
+    await step($, OPUS, { effort: 'low', index: 1 })
+    await step($, SONNET, { agentId: sonnet.agentId, effort: 'xhigh' })
+    await step($, HAIKU, { agentId: scout.agentId, effort: 'low' })
+    await step($, SONNET, { agentId: worker.agentId, effort: 'medium' })
+    await step($, OPUS, { effort: 'low', index: 2 })
+    expect(w.efforts).toEqual([
+      { model: OPUS, effort: 'low' },
+      { model: HAIKU, effort: 'high', agentId: haiku.agentId },
+      { model: OPUS, effort: 'low' },
+      { model: SONNET, effort: 'xhigh', agentId: sonnet.agentId },
+      { model: HAIKU, effort: 'low', agentId: scout.agentId },
+      { model: SONNET, effort: 'medium', agentId: worker.agentId },
+      { model: OPUS, effort: 'low' },
+    ])
+    expect(run(held)).toMatchObject({ model: OPUS, effort: 'low', effortSource: 'engine', effortVia: 'host', requestedEffort: 'low' })
+    for (const [one, level] of [[haiku, 'high'], [sonnet, 'xhigh'], [scout, 'low'], [worker, 'medium']] as const) {
+      expect(agentOf(held, one.agentId)).toMatchObject({ effort: level, effortSource: 'engine', effortVia: 'host', effectiveEffort: level })
+    }
+    expect(fallbacks(held)).toEqual([])
+    // no setting was written for any of it, and nothing left the machine
+    expect(w.configured).toEqual([])
+    expect(w.outbound).toEqual([])
+  })
+
+  test('the engine report of the main loop is its own level and is recorded as observed', async ($, on) => {
+    world(on, NATIVE)
+    const held = hostState(on, {})
+    await start($)
+    await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
+    await step($, OPUS, { effort: 'low' })
+    await $.classic.PostToolUse({ tool_name: 'Bash', tool_input: {}, tool_response: {}, tool_use_id: 'tu1', effort: { level: 'low' } } as never)
+    expect(run(held)).toMatchObject({ effort: 'low', effortSource: 'engine', effectiveEffort: 'low' })
+    expect(fallbacks(held)).toEqual([])
+    expect(await hudText($)).toContain('opus-5-5 · low')
+  })
+
+  test('a main request moved to Opus keeps the level it arrived with, and that level is not called observed', async ($, on) => {
+    const w = world(on, { ...NATIVE, model: SONNET })
+    const held = hostState(on, {})
+    await start($)
+    await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
+    await step($, SONNET, { effort: 'medium' })
+    // Opus still commands; no baseline is written over the level
+    expect(w.efforts).toEqual([{ model: OPUS, effort: 'medium' }])
+    expect(run(held)).toMatchObject({ model: OPUS, effort: 'medium', effortSource: 'request', effortVia: 'hook' })
+    expect(run(held).effectiveEffort).toBeUndefined()
+    expect(run(held).routingReason).toContain(`moved to ${OPUS}`)
+  })
+
+  test('with orchestration off the main request is untouched, model and effort alike', { options: { orchestration: false } }, async ($, on) => {
+    const w = world(on, { ...NATIVE, env: { CLAUDE_CODE_EFFORT_LEVEL: 'xhigh' } })
+    const held = hostState(on, {})
+    await start($)
+    await $.turn.start({ text: 'Ship the limiter', turnId: 't1' })
+    await step($, SONNET, { effort: 'xhigh' })
+    expect(w.efforts).toEqual([{ model: SONNET, effort: 'xhigh' }])
+    expect(run(held)).toMatchObject({ model: SONNET, effort: 'xhigh', effortSource: 'engine', effortVia: 'host' })
+  })
+})
+
 describe('what the HUD and the diagnostics say', () => {
   test('the HUD names the applied effort beside the model', async ($, on) => {
     world(on)
     await start($)
-    await step($, OPUS)
+    await step($, OPUS, { effort: 'high' })
     expect(await hudText($)).toContain('opus-5-5 · high')
+  })
+
+  test('a main loop the engine sends no effort shows none: nothing is invented for it', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await step($, OPUS)
+    expect(w.efforts).toEqual([{ model: OPUS }])
+    expect(await hudText($)).not.toContain('opus-5-5 · high')
   })
 
   test('/cockpit version names the mode, the ceiling and only the effort really observed', async ($, on) => {
@@ -449,6 +678,7 @@ describe('what the HUD and the diagnostics say', () => {
     await step($, SONNET, { agentId, effort: 'high' })
     const text = (await command($, 'version')).text ?? ''
     expect(text).toContain('REASONING / AUTO · ceiling MAX')
+    expect(text).toContain('MAIN EFFORT / host-resolved, never rewritten')
     expect(text).toContain('SUBAGENT EFFORT / set on the Agent call')
     expect(text).toContain('SOURCE /')
     expect(text).toContain('SESSION MODEL / claude-opus-5-5')
@@ -471,6 +701,29 @@ describe('what the HUD and the diagnostics say', () => {
     const pane = await paneText($)
     expect(pane).toContain('REASONING')
     expect(pane).toMatch(/REASONING\s+AUTO/)
+  })
+
+  test('the REASONING row and /cockpit version name the main loop level and where it was seen to come from', async ($, on) => {
+    world(on, { env: { CLAUDE_CODE_EFFORT_LEVEL: 'low' } })
+    await start($)
+    await step($, OPUS, { effort: 'low' })
+    expect(await paneText($)).toMatch(/REASONING\s+AUTO · main LOW · env/)
+    expect((await command($, 'version')).text ?? '').toContain('MAIN EFFORT / host-resolved, never rewritten · low (env)')
+    // a level the person chose is not second-guessed
+    expect((await command($, 'version')).text ?? '').not.toContain('AUTO would name')
+  })
+
+  test('with no selection seen, AUTO only says what it would name for the commander: advice, not a request', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await step($, OPUS, { effort: 'medium' })
+    expect(w.efforts).toEqual([{ model: OPUS, effort: 'medium' }])
+    expect((await command($, 'version')).text ?? '').toContain('MAIN EFFORT / host-resolved, never rewritten · medium (host) · AUTO would name high: /effort high to set it')
+    // nothing to advise when the host already resolved that level
+    await step($, OPUS, { effort: 'high', index: 1 })
+    expect((await command($, 'version')).text ?? '').toContain('MAIN EFFORT / host-resolved, never rewritten · high (host)')
+    expect((await command($, 'version')).text ?? '').not.toContain('AUTO would name')
+    expect(w.configured).toEqual([])
   })
 
   test('the policy text states AUTO and the ceiling in the composed prompt', async ($, on) => {

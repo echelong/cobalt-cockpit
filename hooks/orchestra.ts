@@ -271,7 +271,9 @@ export const orchestraRows = (view: OrchestraView, columns: number, colors: { ac
   const rows: Row[] = [pair(mainLabel(view.meter), mainWord(view), colors.accent)]
   // The reasoning mode is named only when the policy set one, so an older
   // observation-only view is byte-for-byte what it was.
-  if (view.meter.reasoningMode) rows.push(pair('REASONING', `${view.meter.reasoningMode}${view.meter.requestedEffort ? ` · asked ${view.meter.requestedEffort.toUpperCase()}` : ''}${view.meter.effortSource ? ` · ${view.meter.effortSource}` : ''}`, colors.steel))
+  // The mode is the policy's, for the subagents; the main loop's level is the
+  // host's own, shown with where it was seen to come from.
+  if (view.meter.reasoningMode) rows.push(pair('REASONING', `${view.meter.reasoningMode}${view.meter.effort ? ` · main ${view.meter.effort.toUpperCase()}` : ''}${view.meter.hostSource ? ` · ${view.meter.hostSource}` : ''}`, colors.steel))
   if (view.nwho !== null) rows.push(pair('NWHO / LOCAL', view.nwho, colors.steel))
   if (view.agents.length > 0) {
     rows.push(pair(groupLabel(view.agents), `${running(view.agents)}/${view.limit} running`, colors.accent))
@@ -316,7 +318,7 @@ export const orchestraRows = (view: OrchestraView, columns: number, colors: { ac
 export const orchestrationText = (limit: number): string => `
 
 Elastic swarm orchestration (Cobalt Cockpit):
-- You are the Opus 5.5 high commander: understand, plan, decompose, assign bounded ownership, manage dependencies, resolve architecture and escalations, integrate, verify independently and produce the final result. Do not delegate architectural responsibility.
+- You are the Opus 5.5 commander, at the reasoning effort the user set: understand, plan, decompose, assign bounded ownership, manage dependencies, resolve architecture and escalations, integrate, verify independently and produce the final result. Do not delegate architectural responsibility.
 - Execute directly when delegation adds overhead, the work is trivial or tightly coupled. Never manufacture subagent work.
 - Sonnet at medium effort engineers: substantial scoped implementation, debugging, refactoring, test engineering, investigation, research and fresh independent review. Haiku 5.5 scouts and processes: shallow reconnaissance, inventories, repetitive inspection, evidence collection, classification and bounded summaries. Use judgment rather than keyword routing.
 - Bundled cobalt-cockpit:worker, explorer, researcher and reviewer use Sonnet; cobalt-cockpit:scout and utility use Haiku. Multiple instances and other bounded semantic roles are supported. In MANUAL, Haiku effort is unspecified. Inherited forks are refused in enforced mode.

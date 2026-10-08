@@ -329,7 +329,7 @@ describe('the system prompt section', () => {
   const text = orchestrationText(3)
 
   test('it states the division of labour, the roles, the limit and the block', () => {
-    expect(text).toContain('Opus 5.5 high commander')
+    expect(text).toContain('Opus 5.5 commander, at the reasoning effort the user set')
     expect(text).toContain('cobalt-cockpit:worker, explorer, researcher and reviewer')
     expect(text).toContain('cobalt-cockpit:scout and utility')
     expect(text).toContain('Sonnet at medium effort')

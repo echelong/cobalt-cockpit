@@ -73,7 +73,7 @@
     "orchestration": {
       "type": "boolean",
       "title": "Orchestration rules",
-      "description": "Observe by default. Enable Opus 5.5 high commander, elastic Sonnet 5.5 medium engineering and Haiku 5.5 utility pools, task ownership and resource admission.",
+      "description": "Observe by default. Enable the Opus 5.5 commander at the effort you set, elastic Sonnet 5.5 engineering and Haiku 5.5 utility pools with task-aware effort, task ownership and resource admission.",
       "default": false
     },
     "maxSubagents": {
@@ -103,14 +103,14 @@
     "reasoningMode": {
       "type": "string",
       "title": "Reasoning mode",
-      "description": "AUTO names a reasoning level from each task: extractive work light, engineering medium, complex debugging, concurrency, migration, security and high-risk architecture high or xhigh. MANUAL honours the fixed per-tier levels. An explicit level on a task always wins.",
+      "description": "AUTO names a reasoning level from each task: extractive work light, engineering medium, complex debugging, concurrency, migration, security and high-risk architecture high or xhigh. MANUAL honours the fixed per-tier levels. An explicit level on a task always wins. The main loop's effort is always yours (/effort, --effort, CLAUDE_CODE_EFFORT_LEVEL): Cockpit reads it and never rewrites it.",
       "options": ["AUTO", "MANUAL"],
       "default": "AUTO"
     },
     "maxEffort": {
       "type": "string",
       "title": "Reasoning effort ceiling",
-      "description": "Nothing above this level is ever requested; a higher ask falls back and is recorded. Each model also has its own supported ceiling, so the applied level may still be lower.",
+      "description": "Nothing above this level is ever requested for a subagent; a higher ask falls back and is recorded. Each model also has its own supported ceiling, so the applied level may still be lower. The main loop's own level is not Cockpit's to cap: use maxEffortLevel in settings for that.",
       "options": ["low", "medium", "high", "xhigh", "max"],
       "default": "max"
     },

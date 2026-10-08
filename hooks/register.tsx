@@ -20,12 +20,14 @@ import {
   chooseEffort,
   effortPolicyText,
   factsFromRole,
+  hostEffort,
   isEffortLevel,
   isEffortRequest,
   launchFallback,
   observeCapability,
+  settingsEffort,
 } from './effort'
-import type { EffortFacts, EffortResolution } from './effort'
+import type { EffortFacts, EffortResolution, HostEffortSignals } from './effort'
 import { orchestrationGraph, orchestrationTape } from './field'
 import type { EngineInterface, On, Register, RenderElement, Timer } from 'claude-code'
 import { addAgent, adoptAgent, beginTool, checkpointOf, classicTelemetry, migrateLedger, emptyLedger, exportJSON, finishTool, finishTurn, ledgerLines, originOf, reading, recordRequest, receipts, storageLedger, jsonBytes, startRun, UNKNOWN, warn, word, withReplay } from './ledger'
@@ -308,6 +310,24 @@ const launchEffort = async ($: EngineInterface, call: Record<string, unknown>): 
   for (const old of [...launches.keys()].slice(0, -LAUNCHES_MAX)) launches.delete(old)
 }
 /**
+ * What can be seen of where the main loop's level comes from: the variable, a
+ * `/effort` typed this session, and the level and cap the settings hold for
+ * the model. Read once a turn; nothing is written. `--effort`, a level picked
+ * in the model picker and the model's default are not visible to a plugin, and
+ * nothing is claimed about them.
+ */
+const hostSignals = async ($: EngineInterface, turnId: string, model: string): Promise<HostEffortSignals> => {
+  if (hostSignalsAt?.turnId === turnId) return hostSignalsAt.signals
+  let env: string | undefined
+  let held: { level: string | null; cap: string | null } = { level: null, cap: null }
+  try { env = await $.env.get('CLAUDE_CODE_EFFORT_LEVEL') } catch { /* no environment to read: nothing is claimed about it */ }
+  try { held = settingsEffort(await $.settings.read(), model) } catch { /* no settings to read: nothing is claimed about them */ }
+  const signals: HostEffortSignals = { env, command: effortCommand, settings: held.level, cap: held.cap }
+  hostSignalsAt = { turnId, signals }
+
+  return signals
+}
+/**
  * The task a subagent's request belongs to. A subagent's first request can
  * arrive before its spawn has bound it to its task; the task is then found by
  * the id its Agent call's description carries, so that request runs at the
@@ -533,6 +553,10 @@ const LAUNCHES_MAX = 64
  * response can report back before the request is recorded in the ledger.
  */
 const sentVia = new Map<string, 'host' | 'hook'>()
+/** The level the last `/effort` command of this session named, as typed; null when none was seen. */
+let effortCommand: string | null = null
+/** What was last seen of the main loop's effort sources, and the turn it was read in. */
+let hostSignalsAt: { turnId: string; signals: HostEffortSignals } | null = null
 let ticker: Timer | null = null
 let gitTimer: Timer | null = null
 type MountedBand = { requestId: string; width: number; input: HudInput; visual: Visual; agents: AgentStrip[]; glide: Glide; motion: boolean; lastCells: Map<string, string>; waiting: boolean; field: { tape: Tape; state: string; rows: number; width: number; graph: Graph | null } | null }
@@ -1954,6 +1978,7 @@ export const register: Register = (on, options) => {
     const tier: ModelTier = !e.agentId ? 'OPUS' : (task?.tier ?? (tierOf(e.model) === 'HAIKU' ? 'HAIKU' : 'SONNET'))
     const subTier = tier === 'HAIKU' ? 'HAIKU' : 'SONNET'
     const wanted = desiredRequest(e.agentId, subTier)
+    const isMain = e.agentId === undefined
     let constrained = e
     let mismatch: string | null = null
     let resolution: EffortResolution | null = null
@@ -1962,7 +1987,13 @@ export const register: Register = (on, options) => {
     // it, under its own caps and overrides: that level is read, not rewritten.
     const launched = config.hasOrchestration && isEffortLevel(task?.launchEffort) ? task.launchEffort : null
     let hostReason: string | null = null
-    if (config.hasOrchestration) {
+    if (config.hasOrchestration && isMain) {
+      // Opus commands; how hard it thinks is the person's to say. A rewrite here
+      // would outrank `/effort`, `--effort`, the settings and the variable
+      // alike, so the main loop's effort is left exactly as the engine resolved it.
+      constrained = { ...e, model: wanted.model }
+      mismatch = policyMismatch(e.model, e.effort, e.agentId, subTier)
+    } else if (config.hasOrchestration) {
       const facts: EffortFacts = { tier, ...(task ? factsFromRole(task.role, task.mode) : {}) }
       // An explicit level on the task is the commander's, and wins; otherwise
       // AUTO names one from the task and MANUAL honours the fixed tier level.
@@ -1972,7 +2003,7 @@ export const register: Register = (on, options) => {
       // A subagent no task is known for yet, on an engine that takes the level
       // on the Agent call: its request already carries what it was launched
       // with, and the tier's baseline must not be written over that.
-      const isUnknown = hasNativeEffort && e.agentId !== undefined && task === undefined
+      const isUnknown = hasNativeEffort && task === undefined
       if (isUnknown || (manual && !isEffortLevel(wanted.effort))) {
         // MANUAL names no level for this tier (Haiku): leave the engine's own in place.
         constrained = { ...e, model: wanted.model }
@@ -1996,14 +2027,25 @@ export const register: Register = (on, options) => {
         await quiet(() => mutateLedger($, l => l.warnings.includes(said) ? l : warn(l, said)))
       }
     }
+    // The main loop's level is the host's, with what can be seen of where it
+    // came from. A request moved to another model is resolved again by the
+    // engine for that model, so the level it arrived with says nothing certain.
+    const host = isMain ? hostEffort(e.effort, await hostSignals($, e.turnId, e.model)) : null
+    const isMoved = isMain && constrained.model !== e.model
+    const mainReason = host === null ? undefined : isMoved ? `host-resolved ${e.effort === undefined ? 'no effort' : String(e.effort)} for ${e.model}; moved to ${constrained.model}, which the engine resolves again` : host.reason
+    if (host !== null && host.selected !== null && host.selected !== e.effort) {
+      const said = `EFFORT FALLBACK / engine applied ${String(e.effort)}; requested ${host.selected}`
+      await quiet(() => mutateLedger($, l => l.warnings.includes(said) ? l : warn(l, said)))
+    }
     // Who put the effort on this request: the engine, or this hook's rewrite.
-    const via = constrained.effort === e.effort ? 'host' as const : 'hook' as const
+    const via = constrained.effort === e.effort && !isMoved ? 'host' as const : 'hook' as const
     sentVia.set(e.agentId ?? 'main', via)
     if (e.agentId) await quiet(() => editAgent($, e.agentId!, a => ({ ...a, model: constrained.model, effort: constrained.effort === undefined ? null : String(constrained.effort) })))
-    // the main loop's effort, as this request really carries it
-    else if (isSupported) await quiet(() => setMeter($, { model: constrained.model, effort: constrained.effort === undefined ? null : String(constrained.effort), reasoningMode: config.reasoningMode, effortSource: resolution?.source ?? null, requestedEffort: e.effort === undefined ? null : String(e.effort), effortReason: resolution?.reason ?? null }))
+    // the main loop's effort, as the engine resolved it for this request
+    else if (isSupported) await quiet(() => setMeter($, { model: constrained.model, effort: e.effort === undefined ? null : String(e.effort), reasoningMode: config.reasoningMode, effortSource: e.effort === undefined ? null : 'engine', requestedEffort: host?.selected ?? (e.effort === undefined ? null : String(e.effort)), effortReason: mainReason ?? null, hostSource: host?.source ?? null }))
     const result = yield* next(constrained)
-    await quiet(() => ledgerRequest($, resolution === null ? e : { ...e, effort: resolution.selected }, { model: constrained.model, effort: constrained.effort, usage: result.usage, routingReason: resolution?.reason, fallbackReason: launched === null ? resolution?.fallbackReason : hostReason, via }, mismatch))
+    const asked = host !== null ? { ...e, effort: host.selected ?? e.effort } : resolution === null ? e : { ...e, effort: resolution.selected }
+    await quiet(() => ledgerRequest($, asked, { model: constrained.model, effort: constrained.effort, usage: result.usage, routingReason: host !== null ? mainReason : resolution?.reason, fallbackReason: host !== null ? host.capReason : launched === null ? resolution?.fallbackReason : hostReason, via }, mismatch))
     if (result.usage && result.usage.model !== constrained.model) await quiet(() => mutateLedger($, l => warn(l, `MODEL POLICY / response mismatch: ${result.usage!.model}`)))
     // What answered is read off the response itself. With the refusal above it
     // is never Fable; if it ever were, the count says so.
@@ -2028,6 +2070,19 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'model' }, async ($, e, next) => (await guardModelCommand($, e.args)) ?? next(e))
+
+  on('command.run', { command: 'effort' }, async ($, e, next) => {
+    // The person's own choice for the session, and all of it a plugin can see:
+    // the level as typed. It is only noted, to name where the main loop's level
+    // came from; the command runs as it was given. A choice made in the picker
+    // (no argument) is not visible, and nothing is noted for it.
+    const ran = await next(e)
+    const typed = e.args.trim().split(/\s+/)[0] ?? ''
+    effortCommand = typed === '' ? null : typed.toLowerCase()
+    hostSignalsAt = null
+
+    return ran
+  })
 
   on('command.run', { command: 'advisor' }, async ($, e, next) => {
     if (config.isStrict && e.args.trim() && !/^(off|none|disable)$/i.test(e.args.trim())) return { text: 'COBALT STRICT / external advisor disabled.' }
@@ -2083,7 +2138,9 @@ export const register: Register = (on, options) => {
         const observed = e.agent_id === undefined ? run?.model : agent?.model
         if (agent !== undefined) await editAgent($, e.agent_id!, a => ({ ...a, effort: level }))
         if (expected !== undefined && expected !== UNKNOWN && expected !== level) await mutateLedger($, l => warn(l, `EFFORT FALLBACK / engine applied ${level}; requested ${expected}`))
-        if (observed !== undefined && observed !== UNKNOWN && isEffortLevel(expected) && isEffortLevel(level)) await update($, effortKnownAtom, known => observeCapability(known, observed, expected, level))
+        // The main loop's requested level is the person's own selection: a lower
+        // applied level there is a cap of the host's, not something the model cannot do.
+        if (observed !== undefined && observed !== UNKNOWN && isEffortLevel(expected) && isEffortLevel(level) && (e.agent_id !== undefined || expected === level)) await update($, effortKnownAtom, known => observeCapability(known, observed, expected, level))
       }
       await persist($)
     })
@@ -2172,6 +2229,12 @@ export const register: Register = (on, options) => {
         try { version = /"version"\s*:\s*"([^"]+)"/.exec(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`))?.[1] ?? UNKNOWN } catch { /* manifest unreadable: version stays unknown */ }
         const observed = Object.entries(await read($, effortKnownAtom))
         const model = await $.session.model().catch(() => '')
+        const meter = await read($, meterAtom)
+        // What AUTO would name for the commander is advice only, and only when
+        // no selection of the person's was seen: the level stays the host's.
+        const advised = config.hasOrchestration && config.reasoningMode === 'AUTO' && meter.hostSource === 'host'
+          ? chooseEffort('AUTO', { tier: 'OPUS' }, capabilityOf(MAIN_MODEL, Object.fromEntries(observed)), config.maxEffort).applied
+          : undefined
 
         return {
           text: [
@@ -2179,6 +2242,8 @@ export const register: Register = (on, options) => {
             `SOURCE / ${$.plugin.root}`,
             `SESSION MODEL / ${model === '' ? UNKNOWN : model}`,
             `REASONING / ${config.reasoningMode} · ceiling ${config.maxEffort.toUpperCase()}`,
+            // the main loop's level is the host's: read, with what was seen of its origin
+            `MAIN EFFORT / host-resolved, never rewritten${meter.effort ? ` · ${meter.effort}${meter.hostSource ? ` (${meter.hostSource})` : ''}` : ''}${advised !== undefined && meter.effort && advised !== meter.effort ? ` · AUTO would name ${advised}: /effort ${advised} to set it` : ''}`,
             // how a subagent's level reaches the engine, and whether the engine's reports can confirm it
             ...(config.hasOrchestration ? [`SUBAGENT EFFORT / ${hasNativeEffort ? 'set on the Agent call · engine-resolved level recorded' : 'turn.step rewrite · the engine does not report it back'}`] : []),
             ...(observed.length ? [`OBSERVED EFFORT / ${observed.map(([id, levels]) => `${id} ${[...levels].join('/')}`).join(' · ')}`] : []),

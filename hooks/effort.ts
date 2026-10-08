@@ -9,10 +9,16 @@
 //   - A subagent's level is set natively, on its Agent call's own `effort`
 //     parameter. The engine resolves it under its own caps and overrides and
 //     reports the result back, so what is recorded as applied is the engine's.
-//   - The main loop, and a subagent no Agent call launched (or an engine too
-//     old for the parameter), get the level by a `turn.step` rewrite of each
-//     request. The engine's reports do not reflect that rewrite, so there the
-//     recorded level is what was requested and nothing is learned from them.
+//   - The main loop's level is the host's and is never written here. A
+//     `turn.step` rewrite outranks `/effort`, `--effort`, the settings and
+//     `CLAUDE_CODE_EFFORT_LEVEL` alike, and most of those cannot be seen from a
+//     plugin, so there is no way to offer a level beneath the person's own
+//     choice. The level the engine resolved is read and recorded, with what
+//     can be observed of where it came from (`hostEffort`).
+//   - A subagent no Agent call launched (or an engine too old for the
+//     parameter) gets the level by a `turn.step` rewrite of each request. The
+//     engine's reports do not reflect that rewrite, so there the recorded
+//     level is what was requested and nothing is learned from them.
 //
 // Three ideas are kept apart on purpose:
 //
@@ -24,8 +30,8 @@
 // A requested level that a model cannot honour is not silently pretended: the
 // applied level is the closest supported one and the fallback is named.
 
-import type { EffortEscalation, EffortLevel, EffortRequest, EffortSource, ModelTier } from '../types'
-export type { EffortEscalation, EffortLevel, EffortRequest, EffortSource } from '../types'
+import type { EffortEscalation, EffortLevel, EffortRequest, EffortSource, HostEffortSource, ModelTier } from '../types'
+export type { EffortEscalation, EffortLevel, EffortRequest, EffortSource, HostEffortSource } from '../types'
 
 /** The engine's effort levels, weakest first. Order is the escalation order. */
 export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
@@ -361,6 +367,98 @@ export const launchFallback = (resolution: EffortResolution, launched: EffortLev
 }
 
 // ---------------------------------------------------------------------------
+// The main loop: the host's level, read and never written.
+// ---------------------------------------------------------------------------
+
+/**
+ * What a plugin can see of where the main loop's level may have come from.
+ * `--effort`, a level picked in the model picker, a skill's own level and the
+ * model's default are not among them: the engine hands none of those over.
+ */
+export type HostEffortSignals = {
+  /** `CLAUDE_CODE_EFFORT_LEVEL` as the environment holds it; absent when unset. */
+  env?: string | undefined
+  /** The level a `/effort` command of this session named, as typed; null when none was seen. */
+  command?: string | null
+  /** The `effortLevel` the settings hold for the model; null when they hold none. */
+  settings?: string | null
+  /** The `maxEffortLevel` the settings hold for the model; null when they hold none. */
+  cap?: string | null
+}
+
+export type HostEffort = {
+  /** The observed selection the resolved level agrees with, or `host` when none does. */
+  source: HostEffortSource
+  /** The level that selection names; null when no observed selection accounts for the level. */
+  selected: EffortLevel | null
+  /** One line for the ledger: the resolved level and what is known of its origin. */
+  reason: string
+  /** Set when the settings' cap is what lowered the selected level. */
+  capReason: string | null
+}
+
+/** A level as the engine spells it, or null: `med` is its alias for `medium`. */
+const levelOf = (value: unknown): EffortLevel | null => {
+  if (typeof value !== 'string') return null
+  const word = value.trim().toLowerCase()
+  const level = word === 'med' ? 'medium' : word
+
+  return isEffortLevel(level) ? level : null
+}
+
+/**
+ * The `effortLevel` and `maxEffortLevel` a settings object holds for a model:
+ * its own `modelSettings` entry first (the id, with or without a `[1m]`
+ * suffix), then the top-level key. Read, not interpreted: whether the engine
+ * applies a given key to this model is the engine's to decide.
+ */
+export const settingsEffort = (settings: Readonly<Record<string, unknown>>, model: string): { level: string | null; cap: string | null } => {
+  const plain = (id: string): string => id.trim().toLowerCase().replace(/\[[^\]]*\]$/, '')
+  const table = settings['modelSettings']
+  const entry = typeof table === 'object' && table !== null && !Array.isArray(table)
+    ? Object.entries(table as Record<string, unknown>).find(([id]) => plain(id) === plain(model))?.[1]
+    : undefined
+  const own = typeof entry === 'object' && entry !== null ? entry as Record<string, unknown> : {}
+  const text = (value: unknown): string | null => (typeof value === 'string' && value !== '' ? value : null)
+
+  return { level: text(own['effortLevel']) ?? text(settings['effortLevel']), cap: text(own['maxEffortLevel']) ?? text(settings['maxEffortLevel']) }
+}
+
+/**
+ * What is known of the level the engine resolved for a main loop request.
+ *
+ * The level itself is the engine's and is taken as given. Its origin is named
+ * only when an observed selection agrees with it, looked at in the engine's
+ * own order of precedence (the variable, a `/effort` of this session, the
+ * settings): the same level, or the settings' cap when the selection is above
+ * it. Anything else is `host`: resolved by the engine from something a plugin
+ * cannot see, and no origin is invented for it.
+ */
+export const hostEffort = (resolved: unknown, signals: HostEffortSignals = {}): HostEffort => {
+  const said = resolved === undefined ? 'no effort' : String(resolved)
+  const env = typeof signals.env === 'string' ? signals.env.trim().toLowerCase() : ''
+  // `auto` and `unset` tell the engine to use the model's default over the session and the settings
+  if (env === 'auto' || env === 'unset') return { source: 'env', selected: null, reason: `host-resolved ${said}; CLAUDE_CODE_EFFORT_LEVEL=${env} selects the model default`, capReason: null }
+  const cap = levelOf(signals.cap)
+  const observed: readonly (readonly [HostEffortSource, string, EffortLevel | null])[] = [
+    ['env', 'CLAUDE_CODE_EFFORT_LEVEL', levelOf(signals.env)],
+    ['session', 'an /effort command of this session', levelOf(signals.command)],
+    ['settings', 'the settings effortLevel', levelOf(signals.settings)],
+  ]
+  if (isEffortLevel(resolved)) {
+    for (const [source, name, selected] of observed) {
+      if (selected === null) continue
+      if (selected === resolved) return { source, selected, reason: `host-resolved ${resolved}; matches ${name}`, capReason: null }
+      if (cap !== null && cap !== 'max' && resolved === cap && effortRank(selected) > effortRank(cap)) {
+        return { source, selected, reason: `host-resolved ${resolved}; ${name} names ${selected}, capped by maxEffortLevel ${cap}`, capReason: `maxEffortLevel ${cap} capped ${selected} (${name})` }
+      }
+    }
+  }
+
+  return { source: 'host', selected: null, reason: `host-resolved ${said}; no observed selection matches it (a model default, --effort or a picker choice cannot be told apart)`, capReason: null }
+}
+
+// ---------------------------------------------------------------------------
 // Escalation: vertical (tier) and effort.
 // ---------------------------------------------------------------------------
 
@@ -418,6 +516,7 @@ Dynamic reasoning (Cobalt Cockpit):
 - Reasoning mode is ${mode}. Model selection and effort selection are separate decisions. Three tiers remain: Opus 5.5 commands and verifies, Sonnet 5.5 engineers, Haiku 5.5 scouts.
 - Effort is chosen per task, not fixed. ${mode === 'AUTO' ? 'AUTO names a level from the task: extractive inventories, classification and summaries run light; normal feature work and refactors run medium; complex debugging, concurrency, migrations, security and high-risk architectural reasoning run high or xhigh; unusually difficult high-stakes reasoning may use max.' : 'MANUAL honours the configured level unless a task is assigned an explicit effort.'}
 - A level is only ever requested. Every model does not support every level, so the applied level may be lower after a capability fallback; requested and applied effort are recorded separately and a fallback is named, never hidden.
+- The main loop's effort is the user's. Cockpit never sets or rewrites it: /effort, --effort, CLAUDE_CODE_EFFORT_LEVEL, the settings and the host's caps decide it, and launching a subagent does not change it.
 - A subagent's level is set on its Agent call from the assignment; leave the Agent tool's own effort parameter out unless overriding a level by hand. The engine's caps and overrides win, and a level it resolves differently is recorded as a fallback.
 - Escalate when a task is failing: raise effort by one step within the tier first, then move a tier (Haiku → Sonnet → Opus). Never jump straight to the top, and stop at the ceiling budget rather than retrying forever. Name the level per assignment with the swarm tool's effort field when the task itself makes it clear.
 - The ceiling for any request is ${ceiling.toUpperCase()}; a higher request falls back and is recorded.`

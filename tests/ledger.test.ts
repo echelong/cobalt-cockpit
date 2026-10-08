@@ -136,10 +136,10 @@ describe('replay and deterministic checkpoint', () => {
 })
 
 describe('policy and Activity Field topology', () => {
-  test('Opus high coordinator allowed', () => { expect(policyMismatch('claude-opus-5-5', 'high')).toBeNull() })
+  test('Opus coordinator allowed at whatever effort the host resolved', () => { for (const effort of ['low', 'medium', 'high', 'xhigh', 'max', undefined]) expect(policyMismatch('claude-opus-5-5', effort)).toBeNull(); expect(policyMismatch('claude-sonnet-5-5', 'high')).toContain('MODEL POLICY') })
   test('Sonnet medium worker allowed', () => { expect(policyMismatch('claude-sonnet-5-5', 'medium', 'a1')).toBeNull() })
   test('invalid model and effort produce a mismatch', () => { expect(policyMismatch('haiku', 'low', 'a1')).toContain('MODEL POLICY') })
-  test('supported request constraints are exact 5.5 models', () => { expect(desiredRequest()).toEqual({ model: 'claude-opus-5-5', effort: 'high' }); expect(desiredRequest('a1')).toEqual({ model: 'claude-sonnet-5-5', effort: 'medium' }); expect(desiredRequest('h1', 'HAIKU')).toEqual({ model: 'claude-haiku-5-5' }) })
+  test('supported request constraints are exact 5.5 models', () => { expect(desiredRequest()).toEqual({ model: 'claude-opus-5-5' }); expect(desiredRequest('a1')).toEqual({ model: 'claude-sonnet-5-5', effort: 'medium' }); expect(desiredRequest('h1', 'HAIKU')).toEqual({ model: 'claude-haiku-5-5' }) })
   test('no spawn means no orchestration graph', () => { expect(orchestrationGraph(run())).toBeNull(); expect(orchestrationTape(run(), 100)).toBeNull() })
   test('actual parallel agents make separate graph branches', () => { const l = agent(agent(), 'a2'); expect(orchestrationGraph(l)?.branches.length).toBe(2); expect(orchestrationTape(l, 100)?.text).toContain('┬') })
   test('completion converges to integrate', () => { const l = finishTurn(agent(), { turnId: 'ta1', agentId: 'a1', reason: 'answer' }, 3000); expect(orchestrationGraph(l)?.label).toBe('MAIN / INTEGRATE'); expect(orchestrationTape(l, 100)?.text).toContain('┴') })
@@ -155,7 +155,9 @@ describe('ledger through the installed engine test harness', () => {
     await $.tool.call({ tool: 'Read', tool_use_id: 'read1', file_path: '/work/a.ts', agentId: id } as never)
     await complete($, 'ta1', id)
     const l = held.get('run-ledger')?.value as Ledger
-    expect(l.runs[0]).toMatchObject({ model: 'claude-opus-5-5', effort: 'high', status: 'success' })
+    // the model is the policy's; the effort is the one the request arrived with, never raised to a baseline
+    expect(l.runs[0]).toMatchObject({ model: 'claude-opus-5-5', effort: 'low', status: 'success' })
+    expect(w.efforts[0]).toEqual({ model: 'claude-opus-5-5', effort: 'low' })
     expect(l.agents[0]).toMatchObject({ runId: `${l.sessionId}:t1`, model: 'claude-sonnet-5-5', effort: 'medium', status: 'success' })
     expect(l.agents[0]?.counts.tools).toBe(1)
     expect(w.requests.map(r => r.model)).toEqual(['claude-opus-5-5', 'claude-sonnet-5-5'])

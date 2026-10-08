@@ -14,7 +14,9 @@ describe('elastic model policy and presentation', () => {
   test('Haiku is a genuine request tier with unspecified effort', () => {
     expect(desiredRequest('H1', 'HAIKU')).toEqual({ model: HAIKU_MODEL })
     expect(desiredRequest('S1')).toEqual({ model: 'claude-sonnet-5-5', effort: 'medium' })
-    expect(desiredRequest()).toEqual({ model: 'claude-opus-5-5', effort: 'high' })
+    // the main loop names a model only: its effort is the host's
+    expect(desiredRequest()).toEqual({ model: 'claude-opus-5-5' })
+    expect(policyMismatch('claude-opus-5-5', 'low')).toBeNull()
     expect(policyMismatch(HAIKU_MODEL, undefined, 'H1', 'HAIKU')).toBeNull()
     expect(policyMismatch('claude-sonnet-5-5', 'medium', 'H1', 'HAIKU')).not.toBeNull()
   })
@@ -49,6 +51,6 @@ describe('elastic model policy and presentation', () => {
   })
   test('prompt preserves authority and observable compressed handoffs', () => {
     const prompt = orchestrationText(16)
-    for (const term of ['Opus 5.5 high commander', 'Haiku 5.5', '[task:ID]', 'swarm action assign', 'escalate', 'read-only', 'Unknown']) expect(prompt).toContain(term)
+    for (const term of ['Opus 5.5 commander, at the reasoning effort the user set', 'Haiku 5.5', '[task:ID]', 'swarm action assign', 'escalate', 'read-only', 'Unknown']) expect(prompt).toContain(term)
   })
 })

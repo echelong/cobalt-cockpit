@@ -188,6 +188,8 @@ export type Meter = {
   requestedEffort?: string | null
   /** One line on why this level was chosen. */
   effortReason?: string | null
+  /** The main loop's level is the host's own: where it was seen to come from. */
+  hostSource?: HostEffortSource | null
 }
 
 export type GuardFinding = { rule: string; title: string; effect: string }
@@ -344,6 +346,12 @@ export type EffortSource = 'auto' | 'manual' | 'request' | 'engine' | 'fallback'
  * does not reflect).
  */
 export type EffortVia = 'host' | 'hook'
+/**
+ * Where the main loop's level was seen to come from: the environment variable,
+ * a `/effort` of this session, the settings, or `host` when the engine resolved
+ * it from something a plugin cannot see (a model default, `--effort`, a picker).
+ */
+export type HostEffortSource = 'env' | 'session' | 'settings' | 'host'
 /** Whether the reasoning mode chooses effort from the task or honours a fixed setting. */
 export type ReasoningMode = 'AUTO' | 'MANUAL'
 /** One effort step upward within a tier: recorded so history can explain it. */

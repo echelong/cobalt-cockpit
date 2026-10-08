@@ -61,6 +61,8 @@ export type World = {
   answersAs: string | null
   /** Toasts the plugin showed. */
   toasts: string[]
+  /** Every `/config` row the plugin set by itself, by key: a setting written, not read. */
+  configured: string[]
   /**
    * Every way out to a model or the network the plugin took by itself, named:
    * `http.fetch`, `model.complete`, `model.fork`, `model.classify`, `mcp.call`.
@@ -107,6 +109,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
     efforts: [],
     answersAs: null,
     toasts: [],
+    configured: [],
     outbound: [],
     ...overrides,
   }
@@ -133,7 +136,11 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
   on('session.model', () => ({ value: w.model }))
   on('session.authorize', () => ({ value: w.credential }))
   on('settings.read', () => ({ value: w.settings }))
-  on('config.set', ($, e) => ({ value: e.value }))
+  on('config.set', ($, e) => {
+    w.configured.push(e.key)
+
+    return { value: e.value }
+  })
   on('http.fetch', ($, e) => {
     w.outbound.push(`http.fetch ${e.url}`)
 

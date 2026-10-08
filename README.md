@@ -65,7 +65,7 @@ A `--plugin-dir` copy stops loading when you omit the flag next session.
 
 Observation works with users' existing models and authentication. Public defaults do not block Fable, rewrite model requests, enforce a subagent limit, or require subscription authentication. Bundled explorer, researcher, worker and reviewer definitions select Sonnet 5.5; scout and utility select Haiku 5.5. Observation does not rewrite host requests.
 
-**Strict Cobalt is optional.** Enable `cobaltStrict` to request Opus 5.5 high for main, Sonnet 5.5 medium engineering and Haiku 5.5 utility pools with independent resource budgets, isolated agents rather than inherited forks, Fable blocking, external advisor disabled, and subscription-style authentication only. These model IDs must be available to your account; there is no model fallback. Requested effort is observable; effective model-internal effort remains unknown.
+**Strict Cobalt is optional.** Enable `cobaltStrict` to request Opus 5.5 for main at the effort you set, Sonnet 5.5 engineering and Haiku 5.5 utility pools with independent resource budgets, isolated agents rather than inherited forks, Fable blocking, external advisor disabled, and subscription-style authentication only. These model IDs must be available to your account; there is no model fallback. Requested effort is observable; effective model-internal effort remains unknown.
 
 The preset takes precedence over the individual enforcement switches. Disable it to return to observation. NobodyWho remains optional even in strict mode: Cockpit reads its telemetry if installed; it never installs it or routes decisions/pruning itself.
 
@@ -80,9 +80,9 @@ Run waves are reconnaissance → engineering → review → integration → veri
 `/cockpit` groups observed tiers, compresses pools larger than eight agents and reports task progress, queue, blockers, ownership conflicts and escalations. The Activity Field retains its crawler/spine identity and aggregates utility pools. The Run Ledger and replay explain assignment, spawn reason, wave, completion, escalation and verification. Escalated results remain unresolved after their host stops; the commander uses `swarm resolve` with evidence before dependent work can proceed. Queued dispatch stays under the commander through Agent, rather than automatic spawn loops. Active cancellation suppresses further model/tool actions and retains ownership until host termination is observed (the host exposes no stop API). For a running pre-v0.2 agent with unknown ownership, the commander explicitly assigns its scope then uses `swarm adopt` with the observed `agent_id`; until then further agent tool effects are held. Older ledgers default to an empty swarm; unavailable telemetry stays unknown. NobodyWho boundaries remain read-only.
 
 ```text
-Opus 5.5 High — commander / integration / final verification
-  ├─ Sonnet 5.5 Medium — 0..N bounded engineering and review
-  └─ Haiku 5.5        — 0..N scouts and utility work
+Opus 5.5          — commander / integration / final verification, at your /effort
+  ├─ Sonnet 5.5     — 0..N bounded engineering and review, effort per task
+  └─ Haiku 5.5      — 0..N scouts and utility work, effort per task
        escalation → Sonnet → Opus
 Cobalt Cockpit — ownership / waves / backpressure / HUD / ledger / replay
 NobodyWho     — local Decision / Pruning / read-only control telemetry
@@ -90,16 +90,17 @@ NobodyWho     — local Decision / Pruning / read-only control telemetry
 
 ## Dynamic reasoning
 
-Model selection and effort selection are separate decisions. The two 5.5 tiers still command, engineer and scout; effort is chosen per task rather than fixed per tier.
+Model selection and effort selection are separate decisions. The 5.5 tiers still command, engineer and scout. **You control the main Opus loop's effort; Cockpit manages the subagents'**, per task rather than fixed per tier.
 
 - **AUTO** (default) names a level from the task: extractive inventories, classification and summaries run light; normal feature work, bug fixes and refactors run medium; complex debugging, concurrency, migrations, security analysis and high-risk architectural reasoning run high or xhigh; unusually difficult high-stakes reasoning may use max. A task that names no class falls back to its tier's baseline.
 - A commander can name a level explicitly per assignment with the `swarm` tool's `effort` field (LOW / MEDIUM / HIGH / XHIGH / MAX, or AUTO). A named level wins AUTO. **MANUAL** mode instead honours the fixed per-tier levels and leaves Haiku unspecified.
 - A level is only ever *requested*. Each model supports its own ceiling and the operator's `maxEffort` caps every request, so the *applied* level may be lower after a fallback. Requested and applied effort are recorded separately in the Run Ledger, a fallback is named (`EFFORT FALLBACK`), and the model's real capability is learned only from what the engine reports it applied — never assumed.
 - A subagent's level is set natively, on its own Agent call's `effort` parameter (Claude Code 2.1.292 or newer): one level per invocation, with no global setting for parallel agents to race on. It overrides the agent definition's `effort` frontmatter and a per-model `effortLevel` for that subagent only. The engine's own limits still win — `maxEffortLevel`, an organization's cap, `CLAUDE_CODE_EFFORT_LEVEL` and the model's support — and the level the engine resolves is what the ledger records as applied. When that is not the level asked for, the difference is named with both levels; it is never rewritten back.
-- The main loop, and a subagent on an older engine, get their level from a per-request `turn.step` rewrite instead. The engine does not report that rewrite back, so there the ledger shows the level as *requested* (`request`), leaves *observed* unknown, and learns nothing about capability from the engine's reports.
+- **The main loop's effort is never written by Cockpit.** A `turn.step` rewrite sits above everything in the engine's order (rewrite, then `CLAUDE_CODE_EFFORT_LEVEL`, then a session level from `/effort`, `--effort` or the model picker, then the settings' `effortLevel`, then the model's default, all under `maxEffortLevel`), and most of those cannot be seen from a plugin, so there is no way to offer a level *beneath* your own choice. The level the engine resolved is sent untouched and recorded as `engine`, with what was seen of its origin: the variable, a `/effort` typed this session, the settings, or `host` when none of those accounts for it. A cap that lowered your selection is named with both levels. AUTO and MANUAL, the `maxEffort` ceiling and every subagent launch leave it alone. With no selection of your own the main loop runs at the host's default for the model, which is not necessarily the level AUTO would name: `/cockpit version` then says what AUTO would name, as advice, and `/effort <level>` sets it.
+- A subagent on an older engine, or one that no Agent call launched, gets its level from a per-request `turn.step` rewrite instead. The engine does not report that rewrite back, so there the ledger shows the level as *requested* (`request`), leaves *observed* unknown, and learns nothing about capability from the engine's reports.
 - A failing task escalates one step at a time: raise effort within the tier first, then move a tier (Haiku → Sonnet → Opus). It never jumps to the top and stops at the budget rather than retrying forever.
 
-The HUD shows the applied effort beside the model; `/cockpit version` prints the reasoning mode, the ceiling, how a subagent's level reaches the engine, and only the capability this session has really observed.
+The HUD shows the applied effort beside the model; `/cockpit version` prints the reasoning mode, the ceiling, the main loop's host-resolved level and where it was seen to come from, how a subagent's level reaches the engine, and only the capability this session has really observed.
 
 ## HUD states
 
@@ -152,8 +153,8 @@ Reload plugins after changing configuration.
 | `maxSubagents` | 0 = AUTO (16 total); explicit resource budget 1–128 |
 | `maxSonnetAgents`, `maxHaikuAgents` | -1 = AUTO (8 Sonnet / 16 Haiku); 0 disables a pool; subject to total budget |
 | `blockFable`, `subscriptionOnly`, `cobaltStrict` | false |
-| `reasoningMode` | `AUTO`; `MANUAL` honours fixed per-tier levels |
-| `maxEffort` | `max`; lower ceilings cap every request and are recorded |
+| `reasoningMode` | `AUTO`; `MANUAL` honours fixed per-tier levels for subagents; the main loop's effort stays yours |
+| `maxEffort` | `max`; lower ceilings cap every subagent request and are recorded |
 
 ## Compatibility
 

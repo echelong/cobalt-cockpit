@@ -18,6 +18,8 @@ import {
   escalationFor,
   escalationLine,
   factsFromRole,
+  hostEffort,
+  settingsEffort,
   isEffortLevel,
   isEffortRequest,
   modelFamily,
@@ -247,6 +249,65 @@ describe('a natively launched level against what the engine resolved', () => {
   })
 })
 
+describe('the main loop level is the host own: what is known of where it came from', () => {
+  test('the origin is named only when an observed selection agrees with the resolved level', () => {
+    expect(hostEffort('low', { env: 'low' })).toEqual({ source: 'env', selected: 'low', reason: 'host-resolved low; matches CLAUDE_CODE_EFFORT_LEVEL', capReason: null })
+    expect(hostEffort('max', { command: 'MAX' })).toMatchObject({ source: 'session', selected: 'max' })
+    expect(hostEffort('medium', { command: 'med' })).toMatchObject({ source: 'session', selected: 'medium' })
+    expect(hostEffort('xhigh', { settings: 'xhigh' })).toMatchObject({ source: 'settings', selected: 'xhigh' })
+  })
+
+  test('the engine order of precedence is the order looked in: the variable, the session, the settings', () => {
+    expect(hostEffort('high', { env: 'high', command: 'high', settings: 'high' }).source).toBe('env')
+    expect(hostEffort('high', { command: 'high', settings: 'high' }).source).toBe('session')
+    // a selection that does not agree with the level is not what decided it
+    expect(hostEffort('high', { env: 'low', command: 'medium', settings: 'high' }).source).toBe('settings')
+  })
+
+  test('a level no observed selection accounts for is the host own, and no selection is invented', () => {
+    for (const signals of [{}, { settings: 'high' }, { env: 'bogus' }, { command: 'ultracode' }, { command: null, settings: null, cap: null }]) {
+      const read = hostEffort('low', signals)
+      expect(read).toMatchObject({ source: 'host', selected: null, capReason: null })
+      expect(read.reason).toContain('no observed selection matches it')
+    }
+    // an indistinguishable host default is not taken for an explicit choice
+    expect(hostEffort('high')).toMatchObject({ source: 'host', selected: null })
+  })
+
+  test('a cap of the settings explains a selection above it, and only then', () => {
+    const capped = hostEffort('medium', { settings: 'xhigh', cap: 'medium' })
+    expect(capped).toMatchObject({ source: 'settings', selected: 'xhigh' })
+    expect(capped.reason).toBe('host-resolved medium; the settings effortLevel names xhigh, capped by maxEffortLevel medium')
+    expect(capped.capReason).toBe('maxEffortLevel medium capped xhigh (the settings effortLevel)')
+    expect(hostEffort('medium', { env: 'max', cap: 'medium' })).toMatchObject({ source: 'env', selected: 'max' })
+    // a selection at or under the cap, a level that is not the cap, and `max` (no cap) explain nothing
+    expect(hostEffort('low', { settings: 'xhigh', cap: 'medium' }).source).toBe('host')
+    expect(hostEffort('medium', { settings: 'low', cap: 'medium' }).source).toBe('host')
+    expect(hostEffort('high', { settings: 'xhigh', cap: 'max' }).source).toBe('host')
+  })
+
+  test('auto and unset in the variable are the engine choice of the model default', () => {
+    expect(hostEffort('high', { env: 'auto', settings: 'low' })).toMatchObject({ source: 'env', selected: null, reason: 'host-resolved high; CLAUDE_CODE_EFFORT_LEVEL=auto selects the model default' })
+    expect(hostEffort('high', { env: ' UNSET ' }).reason).toContain('CLAUDE_CODE_EFFORT_LEVEL=unset')
+  })
+
+  test('a model the engine sends no effort, or a numeric level, is said as it is', () => {
+    expect(hostEffort(undefined, { settings: 'high' })).toMatchObject({ source: 'host', selected: null })
+    expect(hostEffort(undefined).reason).toContain('host-resolved no effort')
+    expect(hostEffort(42, { env: 'high' })).toMatchObject({ source: 'host', selected: null })
+  })
+
+  test('the settings are read for the model: its own entry first, then the top level', () => {
+    const settings = { effortLevel: 'low', maxEffortLevel: 'high', modelSettings: { 'claude-opus-5-5': { effortLevel: 'xhigh' }, 'claude-sonnet-5-5[1m]': { maxEffortLevel: 'medium' } } }
+    expect(settingsEffort(settings, 'claude-opus-5-5')).toEqual({ level: 'xhigh', cap: 'high' })
+    expect(settingsEffort(settings, 'claude-opus-5-5[1m]')).toEqual({ level: 'xhigh', cap: 'high' })
+    expect(settingsEffort(settings, 'claude-sonnet-5-5')).toEqual({ level: 'low', cap: 'medium' })
+    expect(settingsEffort(settings, 'claude-haiku-5-5')).toEqual({ level: 'low', cap: 'high' })
+    expect(settingsEffort({}, 'claude-opus-5-5')).toEqual({ level: null, cap: null })
+    expect(settingsEffort({ modelSettings: ['not', 'a', 'table'], effortLevel: 7 }, 'claude-opus-5-5')).toEqual({ level: null, cap: null })
+  })
+})
+
 describe('the policy the prompt states', () => {
   test('AUTO and MANUAL read differently, and the ceiling is named', () => {
     const auto = effortPolicyText('AUTO', 'max')
@@ -255,6 +316,8 @@ describe('the policy the prompt states', () => {
     expect(auto).toContain('ceiling for any request is MAX')
     expect(auto).toContain('requested and applied effort are recorded separately')
     expect(auto).toContain("A subagent's level is set on its Agent call from the assignment")
+    expect(auto).toContain("The main loop's effort is the user's. Cockpit never sets or rewrites it")
+    expect(effortPolicyText('MANUAL', 'high')).toContain("The main loop's effort is the user's")
     const manual = effortPolicyText('MANUAL', 'high')
     expect(manual).toContain('Reasoning mode is MANUAL')
     expect(manual).toContain('ceiling for any request is HIGH')
