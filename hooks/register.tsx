@@ -717,6 +717,20 @@ const quiet = async (work: () => unknown): Promise<void> => {
   }
 }
 
+/**
+ * A reading whose failure must not fail the event it rides on, for the one case
+ * `quiet` cannot serve: a hook that fails *before* `next` is skipped by the
+ * engine, so a hook that decides must reach its decision even when a reading
+ * beneath it does not answer.
+ */
+const quietly = async <T,>(work: () => Promise<T>): Promise<T | undefined> => {
+  try {
+    return await work()
+  } catch {
+    return undefined
+  }
+}
+
 const stopTicker = () => {
   ticker?.cancel()
   ticker = null
@@ -1708,7 +1722,13 @@ export const register: Register = (on, options) => {
     if (context === null) return next(e)
 
     return next({ ...e, context: [...(e.context ?? []), context] })
-  }).catch(($, e, next) => next(e))
+  }).catch(async ($, e, next) => {
+    // The one refusal this hook makes is the subscription policy's, so its
+    // handler makes it too; everything else is the person's own prompt.
+    if (next.called || !(await isApiRefused($).catch(() => false))) return next(e)
+
+    return { drop: API_REFUSAL }
+  })
 
   on('command.run', { command: 'init' }, async ($, e, next) => {
     // /init is the person asking for a CLAUDE.md
@@ -1868,9 +1888,9 @@ export const register: Register = (on, options) => {
 
     return next(e)
   }).catch(($, e, next) => {
-    // Withholding only where this hook really guards; a failure while it watched
-    // is not a reason to hide every agent type.
-    if (next.called || !config.blocksFable) return next(e)
+    // Judged against the event this handler was given, not refused wholesale: a
+    // type whose name identifies Fable is withheld, and every other type goes on.
+    if (next.called || !config.blocksFable || !isFable(e.agent)) return next(e)
 
     return { isOffered: false }
   })
@@ -2000,13 +2020,19 @@ export const register: Register = (on, options) => {
       return { turnId: e.turnId, index: e.index, answer: text, toolUses: [], stopReason: 'end_turn', usage: null }
     }
     if (config.isStrict && hasAdvisor) return { turnId: e.turnId, index: e.index, answer: 'COBALT STRICT / external advisor disabled.', toolUses: [], stopReason: 'end_turn', usage: null }
-    const task = e.agentId === undefined ? undefined : await taskOfAgent($, e.agentId)
+    // Every reading below is quiet: a hook that fails before `next` is skipped,
+    // which for this one would send a request the policy exists to refuse.
+    const agentId = e.agentId
+    const task = agentId === undefined ? undefined : await quietly(() => taskOfAgent($, agentId))
     if (config.hasOrchestration && task?.cancellationRequested) {
       const text = 'SWARM / cancellation requested'
       yield { kind: 'text', index: 0, text }; yield { kind: 'stop', stopReason: 'end_turn', usage: null }
       return { turnId: e.turnId, index:e.index, answer:text, toolUses:[], stopReason:'end_turn', usage:null }
     }
-    if (task && config.hasOrchestration) { const at = await $.clock.now(); await changeSwarm($, held => heartbeat(held,task.id,at)) }
+    if (task && config.hasOrchestration) {
+      const id = task.id
+      await quiet(async () => { const at = await $.clock.now(); await changeSwarm($, held => heartbeat(held,id,at)) })
+    }
     // The tier is the policy's: Opus commands, Sonnet engineers, Haiku scouts.
     // The model id follows from it; the effort below is resolved separately, so
     // two agents side by side can run at different levels without a global move.
@@ -2103,11 +2129,14 @@ export const register: Register = (on, options) => {
 
     return next(e)
   }).catch(($, e, next) => {
-    // Refusing only where this hook really guards: with neither switch on it
-    // held no decision of its own, and a failed hook is skipped anyway.
-    if (next.called || !(config.blocksFable || config.isStrict)) return next(e)
+    // The row this handler was given is judged by the rule this hook holds, so
+    // an ordinary row is written and only the rows it would have refused are not.
+    if (next.called) return next(e)
+    const names = typeof e.value === 'string' ? [e.value] : Array.isArray(e.value) ? e.value : []
+    if (config.blocksFable && /model|advisor/i.test(e.key) && !/denied|blocked/i.test(e.key) && names.some(isFable)) return { deny: 'COBALT / the model-configuration guard failed, so the row was left as it was.' }
+    if (config.isStrict && /advisor/i.test(e.key) && e.value) return { deny: 'COBALT STRICT / the advisor guard failed, so the row was left as it was.' }
 
-    return { deny: 'COBALT / the model-configuration guard failed, so the row was left as it was.' }
+    return next(e)
   })
 
   on('command.run', { command: 'model' }, async ($, e, next) => {
@@ -2116,7 +2145,8 @@ export const register: Register = (on, options) => {
 
     return next(e)
   }).catch(($, e, next) => {
-    if (next.called || !config.blocksFable) return next(e)
+    // Only a command line that names Fable is refused; anything else runs.
+    if (next.called || !config.blocksFable || !e.args.split(/[\s=,]+/).some(isFable)) return next(e)
 
     return { text: `${BLOCK_LINE}. The model guard failed, so nothing was changed.` }
   })
@@ -2147,8 +2177,9 @@ export const register: Register = (on, options) => {
 
     return ran
   }).catch(($, e, next) => {
-    // The refusal is this hook's only under `cobaltStrict`; otherwise it watched.
-    if (next.called || !config.isStrict) return next(e)
+    // The refusal is this hook's only in the preset, for a command that would
+    // change the advisor; every other line the person types runs.
+    if (next.called || !config.isStrict || e.args.trim() === '' || /^(off|none|disable)$/i.test(e.args.trim())) return next(e)
 
     return { text: 'COBALT STRICT / the advisor guard failed, so nothing was changed.' }
   })

@@ -14,8 +14,8 @@ import { hostState, start, world } from './world'
 import { bash, prompt } from './world'
 
 type Hook = (...args: never[]) => unknown
-type Catcher = (($: never, e: never, next: never) => unknown) | null
-type Registered = { pattern: string; matcher: string; hook: Hook; catcher: Catcher }
+type Catcher = ($: never, e: never, next: never) => unknown
+type Registered = { pattern: string; matcher: string; hook: Hook; catcher?: Catcher }
 
 /**
  * Registers the module against a stub `on` and keeps every hook with the error
@@ -27,7 +27,7 @@ const capture = (options: Record<string, unknown> = {}) => {
   const on = ((pattern: string, arg2?: unknown, arg3?: unknown) => {
     const matcher = typeof arg2 === 'function' ? undefined : arg2
     const hook = (typeof arg2 === 'function' ? arg2 : arg3) as Hook
-    const entry: Registered = { pattern, matcher: matcher === undefined ? '' : JSON.stringify(matcher), hook, catcher: null }
+    const entry: Registered = { pattern, matcher: matcher === undefined ? '' : JSON.stringify(matcher), hook }
     seen.set(`${pattern} ${entry.matcher}`, entry)
 
     return { catch: (catcher: Catcher) => { entry.catcher = catcher } }
@@ -89,7 +89,9 @@ describe('every hook that can refuse carries a handler that refuses for it', () 
 
   test('every hook that can answer or refuse has one', () => {
     const { of } = capture()
-    for (const [pattern, command] of GATING) expect(of(pattern, command)?.catcher).toBeDefined()
+    // `typeof ... === 'function'`: an absent handler is `undefined` and cannot
+    // pass this the way a null or a missing registration could.
+    for (const [pattern, command] of GATING) expect(typeof of(pattern, command)?.catcher).toBe('function')
   })
 
   test('the tool guard refuses the call when it fails before deciding', async ($, on) => {
@@ -122,20 +124,34 @@ describe('a guard that only sometimes guards refuses only then', () => {
   test('the Fable offer guard withholds a type while Fable is blocked', async ($) => {
     const { of } = capture({ blockFable: true })
 
-    expect(await of('agent.offer')!.catcher!($ as never, { agent: 'cobalt-cockpit:worker' } as never, caught(false).next as never)).toMatchObject({ isOffered: false })
+    expect(await of('agent.offer')!.catcher!($ as never, { agent: 'advisor-fable' } as never, caught(false).next as never)).toMatchObject({ isOffered: false })
+  })
+
+  test('the Fable offer guard lets an ordinary type through while Fable is blocked', async ($) => {
+    const { of } = capture({ blockFable: true })
+    const forwarded = caught(false, { isOffered: true })
+
+    expect(await of('agent.offer')!.catcher!($ as never, { agent: 'cobalt-cockpit:worker' } as never, forwarded.next as never)).toBe(forwarded.value)
   })
 
   test('the Fable offer guard lets a type through while Fable is allowed', async ($) => {
     const { of } = capture()
     const forwarded = caught(false, { isOffered: true })
 
-    expect(await of('agent.offer')!.catcher!($ as never, { agent: 'cobalt-cockpit:worker' } as never, forwarded.next as never)).toBe(forwarded.value)
+    expect(await of('agent.offer')!.catcher!($ as never, { agent: 'advisor-fable' } as never, forwarded.next as never)).toBe(forwarded.value)
   })
 
   test('the configuration guard refuses a Fable model row', async ($) => {
     const { of } = capture({ blockFable: true })
 
     expect(denyOf(await of('config.set')!.catcher!($ as never, { key: 'model', value: 'fable' } as never, caught(false).next as never))).toContain('COBALT')
+  })
+
+  test('the configuration guard leaves a row that names no model to the engine', async ($) => {
+    const { of } = capture({ blockFable: true })
+    const forwarded = caught(false, { value: 'dark' })
+
+    expect(await of('config.set')!.catcher!($ as never, { key: 'theme', value: 'dark' } as never, forwarded.next as never)).toBe(forwarded.value)
   })
 
   test('the configuration guard leaves an ordinary row to the engine', async ($) => {
@@ -151,6 +167,13 @@ describe('a guard that only sometimes guards refuses only then', () => {
     expect(textOf(await of('command.run', 'model')!.catcher!($ as never, { command: 'model', args: 'fable' } as never, caught(false).next as never))).toContain('MODEL BLOCK')
   })
 
+  test('the model-command guard leaves a command that names no Fable to the engine', async ($) => {
+    const { of } = capture({ blockFable: true })
+    const forwarded = caught(false, { text: 'the engine ran /model' })
+
+    expect(await of('command.run', 'model')!.catcher!($ as never, { command: 'model', args: 'opus' } as never, forwarded.next as never)).toBe(forwarded.value)
+  })
+
   test('the model-command guard leaves the command to the engine while Fable is allowed', async ($) => {
     const { of } = capture()
     const forwarded = caught(false, { text: 'the engine ran /model' })
@@ -163,6 +186,20 @@ describe('a guard that only sometimes guards refuses only then', () => {
 
     expect(textOf(await of('command.run', 'advisor')!.catcher!($ as never, { command: 'advisor', args: 'opus' } as never, caught(false).next as never))).toContain('STRICT')
   })
+
+  test('the advisor guard leaves a command that turns the advisor off to the engine', async ($) => {
+    const { of } = capture({ cobaltStrict: true })
+    const forwarded = caught(false, { text: 'the engine ran /advisor off' })
+
+    expect(await of('command.run', 'advisor')!.catcher!($ as never, { command: 'advisor', args: 'off' } as never, forwarded.next as never)).toBe(forwarded.value)
+  })
+
+  // The prompt guard handler reproduces this hook’s one refusal — the
+  // subscription policy’s `drop`. It is verified by inspection rather than
+  // here: a `.catch` handler is only reached inside a dispatch, where the
+  // engine owns `$`, so the harness cannot call this one directly the way it
+  // calls the others. The refusal itself is held end to end by the
+  // public-release tests ("strict preset refuses API authentication").
 
   test('the advisor guard leaves the command to the engine outside the preset', async ($) => {
     const { of } = capture()
@@ -195,13 +232,13 @@ describe('a watcher never refuses the action it watched', () => {
 
 
 describe('a pass-through hands the engine its own event unless it changed it', () => {
-  test('an untouched call reaches the engine as the engine raised it', async ($, on) => {
+  test('an untouched call reaches the engine with its fields intact', async ($, on) => {
     const w = world(on); hostState(on, {}); await start($)
     await bash($, 'ls -la')
 
     expect(w.ran.length).toBe(1)
     expect(w.ran[0]!['command']).toBe('ls -la')
-    expect(Object.isFrozen(w.ran[0])).toBe(true)
+    expect(w.ran[0]!['tool']).toBe('Bash')
   })
 
   test('a call the effort policy changed reaches the engine as the copy that carries it', { options: { orchestration: true } }, async ($, on) => {
