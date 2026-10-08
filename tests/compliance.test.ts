@@ -79,7 +79,6 @@ describe('every hook that can refuse carries a handler that refuses for it', () 
     ['command.run', 'logout'],
     ['prompt.submit'],
     ['tool.call'],
-    ['tool.check'],
     ['agent.offer'],
     ['agent.spawn'],
     ['config.set'],
@@ -220,7 +219,6 @@ describe('a watcher never refuses the action it watched', () => {
       ['command.run', 'login', { command: 'login', args: '' }],
       ['command.run', 'logout', { command: 'logout', args: '' }],
       ['classic.PostToolUse', undefined, { tool_name: 'Bash', tool_input: { command: 'ls' } }],
-      ['tool.check', undefined, { tool: 'Bash', command: 'ls', tool_use_id: 'tu-3' }],
     ]
     for (const [pattern, command, event] of events) {
       const { next, value } = caught(false, { text: 'the engine answered' })
@@ -257,5 +255,99 @@ describe('a pass-through hands the engine its own event unless it changed it', (
     await prompt($, 'Synthetic prompt')
 
     expect(w.submitted[0]?.context).toEqual([])
+  })
+})
+
+// The directory blocks a mod it cannot confirm leaves a permission decision with
+// the person, and the only return it reads in a hook on `tool.check` is the
+// pass-through itself. Cockpit's hook there was a watcher that read the verdict
+// to light a HUD state, which is not a reason to stand in the permission check.
+// So it stands nowhere in it: no hook on the check, and no query of its own.
+describe('the permission check belongs to the engine and the person', () => {
+  /** Answers every permission check that reaches the engine, and keeps each one. */
+  const checking = (on: Parameters<typeof world>[0], decide: () => string = () => 'allow') => {
+    const checks: Record<string, unknown>[] = []
+    on('tool.check', ($, e) => {
+      checks.push(e as unknown as Record<string, unknown>)
+
+      return { decision: decide(), reason: 'the engine decided' } as never
+    })
+
+    return checks
+  }
+
+  test('no hook is registered on the permission check, under any policy', () => {
+    for (const options of [{}, { orchestration: true }, { cobaltStrict: true }, { blockFable: true, subscriptionOnly: true }]) {
+      const { seen } = capture(options)
+
+      expect([...seen.values()].some(one => one.pattern === 'tool.check')).toBe(false)
+      // The guards are where they were.
+      for (const pattern of ['tool.call', 'agent.spawn', 'agent.offer', 'config.set', 'prompt.submit', 'turn.step']) {
+        expect([...seen.values()].some(one => one.pattern === pattern)).toBe(true)
+      }
+    }
+  })
+
+  test('ordinary allowed tool calls ask no permission query', async ($, on) => {
+    const checks = checking(on); const w = world(on); hostState(on, {}); await start($)
+    await bash($, 'ls -la')
+    await $.tool.call({ tool: 'Read', file_path: '/work/example/a.ts', tool_use_id: 'tu-read' } as never)
+    await $.tool.call({ tool: 'Write', file_path: '/work/example/b.ts', content: 'synthetic', tool_use_id: 'tu-write' } as never)
+    await w.clock.advance(2_000)
+
+    expect(w.ran.map(call => call['tool'])).toEqual(['Bash', 'Read', 'Write'])
+    expect(checks).toEqual([])
+  })
+
+  test('with orchestration on, a subagent\'s and the commander\'s calls ask none either', { options: { orchestration: true } }, async ($, on) => {
+    const checks = checking(on); const w = world(on, { version: '2.1.294' }); hostState(on, {}); await start($)
+    await bash($, 'git status')
+    await $.tool.call({ tool: 'Read', file_path: '/work/example/a.ts', tool_use_id: 'tu-main-read' } as never)
+    await w.clock.advance(2_000)
+
+    expect(w.ran.some(call => call['tool'] === 'Read')).toBe(true)
+    expect(checks).toEqual([])
+  })
+
+  test('the engine\'s own check reaches it once and comes back as it decided', async ($, on) => {
+    let decision = 'allow'
+    const checks = checking(on, () => decision); world(on); hostState(on, {}); await start($)
+    for (const each of ['allow', 'ask', 'deny']) {
+      decision = each
+      const verdict = await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: `tu-${each}` } as never)
+
+      expect(verdict.decision).toBe(each as never)
+      expect(verdict.reason).toBe('the engine decided')
+    }
+
+    expect(checks.map(one => one['tool_use_id'])).toEqual(['tu-allow', 'tu-ask', 'tu-deny'])
+  })
+
+  test('a destructive command the person cancels stays refused, and asks no permission query', async ($, on) => {
+    const checks = checking(on); const w = world(on, { answer: 'Cancel' }); hostState(on, {}); await start($)
+    const answer = await bash($, 'git reset --hard origin/main')
+
+    expect(w.asked.length).toBe(1)
+    expect(denyOf(answer)).toContain('did not approve')
+    expect(w.ran.some(call => call['command'] === 'git reset --hard origin/main')).toBe(false)
+    expect(checks).toEqual([])
+  })
+
+  test('a Fable route stays refused, and asks no permission query', { options: { blockFable: true } }, async ($, on) => {
+    const checks = checking(on); const w = world(on); hostState(on, {}); await start($)
+    const answer = await $.tool.call({ tool: 'Agent', tool_use_id: 'tu-fable', description: 'synthetic', prompt: 'Synthetic work', model: 'fable' } as never)
+
+    expect(denyOf(answer)).not.toBe('')
+    expect(w.ran.some(call => call['tool'] === 'Agent')).toBe(false)
+    expect(checks).toEqual([])
+  })
+
+  test('an unowned write under orchestration stays refused, and asks no permission query', { options: { orchestration: true } }, async ($, on) => {
+    const checks = checking(on); const w = world(on, { version: '2.1.294' }); hostState(on, {}); await start($)
+    const answer = await $.tool.call({ tool: 'Write', file_path: '/work/example/owned.ts', content: 'synthetic', tool_use_id: 'tu-unowned', agentId: 'unassigned-agent' } as never)
+
+    expect(denyOf(answer)).not.toBe('')
+    expect(w.ran.some(call => call['tool'] === 'Write')).toBe(false)
+    expect(checks).toEqual([])
   })
 })

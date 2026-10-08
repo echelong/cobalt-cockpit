@@ -18,7 +18,7 @@ import { tierOf } from './orchestra'
 //     for a prune or decision that was not observed, so no junction and no branch
 //     is ever drawn from imagination.
 
-import type { NwhoEvent } from '../types'
+import type { Ledger, NwhoEvent } from '../types'
 import { summarizeSwarm } from './swarm'
 import type { Swarm } from './swarm'
 import { currentOf, settledIds } from './activity'
@@ -471,7 +471,7 @@ export const fieldSvg = (
 
 // Real spawned branches share the existing Activity Field/crawler geometry.
 // Parent and origin are facts retained by the Run Ledger, never task guesses.
-export const orchestrationGraph = (ledger: import('./ledger').Ledger, now = 0): Graph | null => {
+export const orchestrationGraph = (ledger: Ledger, now = 0): Graph | null => {
   if (ledger.swarm?.tasks.length) return swarmGraph(ledger.swarm, ledger.currentRun ?? undefined, tierOf(ledger.runs.find(r=>r.id===ledger.currentRun)?.model) ?? 'MAIN / MODEL unknown')
 
   const known = ledger.agents.filter(a => a.runId !== 'unknown' && ledger.runs.some(r => r.id === a.runId))
@@ -485,7 +485,7 @@ export const orchestrationGraph = (ledger: import('./ledger').Ledger, now = 0): 
   const label = running.length ? main === 'MAIN' ? 'MAIN · MODEL unknown' : `${main} MAIN` : verified ? `${main} / VERIFY` : `${main} / INTEGRATE`
   return { kind: 'orchestration', runId: focus, label, chosen: null, branches: agents.filter(a => a.status === 'running' || a.end === 'unknown' || now - a.end < 5000).slice(-3).map((a, i) => ({ state: a.status === 'error' || a.status === 'refusal' ? 'dropped' : 'kept', label: `${a.role} ${a.id}`, at: (i + 1) / 4, lit: a.status === 'running' ? 1 : 0.5 })) }
 }
-export const orchestrationTape = (ledger: import('./ledger').Ledger, columns: number, now = 0): Tape | null => {
+export const orchestrationTape = (ledger: Ledger, columns: number, now = 0): Tape | null => {
   const graph = orchestrationGraph(ledger, now)
   if (!graph) return null
   if (ledger.swarm?.tasks.length) return swarmTape(ledger.swarm, columns, tierOf(ledger.runs.find(r=>r.id===ledger.currentRun)?.model) ?? 'MAIN / MODEL unknown')

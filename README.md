@@ -152,7 +152,7 @@ The HUD shows the applied effort beside the model; `/cockpit version` prints the
 | IDLE | No active work |
 | SCAN | Main loop working without a tool in flight |
 | ACTIVE | Tool or agent activity observed |
-| QUERY | Waiting for user input |
+| QUERY | Waiting on a question put to you, or on one of Cockpit's own asks. Claude Code's permission dialog is not tracked |
 | FAULT | Failure or blocker |
 | VERIFIED | Milestones complete and required gates satisfied |
 
@@ -167,6 +167,8 @@ Replay retains at most 24 snapshots, with a 96,000-character aggregate budget an
 ## Safety
 
 Blast-radius protection asks before recognized destructive shell commands. Repository hygiene checks attribution and unsolicited instruction-file creation. These guards supplement Claude Code permissions; they are heuristic and cannot recognize every shell program or obfuscated command. Verification gates use observed exit status and explicit reported evidence, not proof of correctness.
+
+Cockpit does not take part in Claude Code's permission check. It registers no hook on it and makes no permission query; its guards run before it and can only refuse a call or ask you about it, never approve one.
 
 ## NobodyWho integration
 

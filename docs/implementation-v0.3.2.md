@@ -58,6 +58,180 @@ measurement.
   report, and each file's front matter is valid YAML with `description` as one
   text value.
 
+The first of these was settled afterwards, from the portal itself: see the next
+section. Rows 1 and 2 above were real defects and stay fixed, but neither was
+one of the portal's two blocking findings.
+
+## The portal's per-finding report, and the two blockers it names
+
+Read on 2026-10-08 from the portal's own **Validate** on `main @ 310da52`:
+2 blocking, 9 warnings, 15 policy holds; **Skills, agents, commands, hooks** and
+**Directory lints** failed, and the other five checks passed. This time each
+finding was opened and its rule, file and line copied out, so nothing in this
+section is inferred from a summary line.
+
+### The two blocking findings
+
+| Rule | The portal's title | File and line | What was there | Behaviour, or what a scanner can read | Correction |
+| - | - | - | - | - | - |
+| `MOD_PERMISSION_ANSWER_UNREAD` | "The directory couldn't confirm that the mod leaves a permission decision with the user" | `hooks/register.tsx:1888` | The `tool.check` watcher's last line, `return verdict`, where `verdict` was `await next(e)` | What a scanner can read. The hook never changed the verdict: it read `verdict.decision` to light the HUD's "Needs approval" state and returned the same object. The portal's detail says why that was not enough: "it returns a name", and "an answer has to be written in the return itself. What it could not confirm could end in an allow" | The hook is removed. Cockpit has no hook on the permission check |
+| `MOD_IMPORT_DYNAMIC_MISSING` | "Mod loads a path while it runs that isn't a code file in the plugin" | `hooks/replay.ts:36` | `replayTimeline`'s parameter type, written as a call: the keyword `import`, then `('../types').Ledger` | What a scanner can read. That is a TypeScript type, erased when the module is compiled; nothing is loaded while the mod runs. The portal read it as a runtime load of `../types`, which is a declarations folder and not a code file | The type is named in the static `import type` the file already had |
+
+The portal's fix text for the first is the whole rule: "To pass the check on,
+return next(e) with the hook's own event. To answer, return an object written in
+the return with a fixed 'deny' or 'ask'." A hook on `tool.check` may therefore
+pass the check on unread or answer it; it may not hold the verdict in a name.
+
+### Why the 0.3.2 pass did not clear them
+
+The per-finding text was not available then (the section above says so), so the
+two blockers were named from the portal's summary wording and the checklist.
+Both guesses found real defects, and both fixes stand: an invisible character in
+a regex, and seventeen guards that failed open. Neither was what the portal was
+blocking on. The handler pass even edited this hook, adding its `.catch`, and
+left `return verdict` one line above it. Both lines predate 0.3.2: the return has
+been there since 0.1.1, and the type since the 0.2.0 and 0.3.0 commit. Whether
+the earlier report's two blockers were these same two cannot be shown, because
+that report's findings were never copied out.
+
+Passing local checks was never evidence either way, and that is now measured.
+Five minimal mods were written as fixtures outside the repository and run through
+`claude plugin validate --strict` on Claude Code 2.1.294:
+
+| Fixture | Shape | Local validator |
+| - | - | - |
+| direct, literal | a `tool.check` hook in `register` whose return is `next(e)` | passes |
+| helper, literal | the same hook registered inside a helper that is handed `on` | passes |
+| returns a name | `const verdict = await next(e)`, then `return verdict` | passes |
+| type written as a call | a parameter typed the way `hooks/replay.ts:36` was | passes |
+| type imported statically | the same type through `import type` | passes |
+
+The local validator accepts the two shapes the portal refuses, so it cannot tell
+them apart. Nothing in the fixtures says the portal will pass the corrected
+source; only the portal's own re-validation does.
+
+### What the report settles about the registrations
+
+- **A hook registered inside a helper is recognised.** The portal cites lines
+  1518, 1522 and 1524, all inside `registerLedger(on)`, and its count of hooks on
+  an event that is also a call (12) is the ten `command.run` hooks plus
+  `config.set` and `agent.spawn`, which includes the three registered there.
+  Moving those registrations would change nothing.
+- **Every other hook's returns were accepted.** No other registration, handler,
+  conditional return, computed refusal or changed event is named by a blocking
+  finding, so none was touched.
+- **A returned name is not read on `classic.SessionStart` either.** The same
+  shape there (line 1522) is a policy hold, `MOD_ANSWERS_PERMISSION`, not a
+  blocker. It is listed below and left as it is.
+
+### The correction, and the one that was rejected
+
+`tool.check` enforced nothing. Its only work was the "Needs approval" state, and
+that needs the verdict, which is exactly what the rule says a hook there may not
+hold. A hook reduced to `return next(e)` would do nothing at all and would still
+cost a dispatch on every tool call, so the registration is gone, with the two
+maps (`pendingUses`, `waitingUses`) that existed only to serve it. The change to
+`hooks/register.tsx` is 28 deleted lines and no added one.
+
+A first attempt kept the state by asking the engine instead: a `$.tool.check`
+query for each tool call in flight. It passed every local check and ran in the
+real engine, and it was withdrawn before it was committed, for these reasons:
+
+- It was a new permission operation on every tool call, added to keep a cosmetic
+  state. In the real engine each one cost a hook dispatch of 10.0 and 12.5 ms in
+  the two runs measured, and every other mod's `tool.check` hook saw it too.
+- A query is not the call. The engine documents it as asked "outside any loop",
+  with no `agentId`, no `PreToolUse` hook and no classifier, so it could answer
+  differently from the real check, for a subagent's call in particular.
+- The portal has never read this mod making that call. Trading a known blocker
+  for an unknown one is not a fix.
+
+The four type positions are now plain names. `Ledger` in `hooks/replay.ts` and
+`hooks/field.ts` (twice) and `Swarm` in `hooks/orchestra.ts` come from each
+file's existing `import type … from '../types'`, which is where `./ledger` and
+`./swarm` re-export them from. The last three were the portal's three
+`MOD_IMPORT_DYNAMIC` warnings: the same construct, pointing at files that exist.
+All four are type-only, so no module gains a runtime import.
+
+### What changed for a person, and what did not
+
+**Lost:** the HUD no longer shows QUERY, and a subagent's row no longer reads
+"Needs approval", while Claude Code's own permission dialog is open. The dialog
+itself is unchanged and is where the person answers. QUERY still shows for a
+question put to the person and for Cockpit's own asks (the blast-radius question
+and the instruction-file question), which are raised in `tool.call`.
+
+**Unchanged:** everything that guards. The blast-radius guard, the attribution
+guard, ownership and collision admission, the Fable block, the subscription rule
+and every fail-closed handler live in `tool.call`, `agent.spawn`, `agent.offer`,
+`config.set`, `prompt.submit`, `turn.step` and the command hooks. None of those
+lines moved. Cockpit's guards run before the engine's permission check and only
+ever refuse or ask; nothing in the plugin approves a call, and now nothing in it
+stands in the permission check at all.
+
+Whether the state can come back is a question for the portal, not for this
+machine: its own detail says there is a name it reads on `tool.check`, "one that
+holds what next gave back", and the hook's `verdict` was not read as one. Which
+exact shape it accepts can only be learned by validating small fixtures through
+the portal, which needs a public repository of its own. That was not done.
+
+### Verification of the correction
+
+- `claude plugin test .` — 987 pass, 0 fail (980 before; 7 added, and two list
+  entries for the removed hook dropped).
+- `tsc -p .` — clean.
+- `claude plugin validate --strict .` — exit 0. 17 gating hooks, each with a
+  handler (18 before: `tool.check` is gone). `tool.check` appears nowhere in the
+  hooks or the calls the validator lists.
+- `python3 scripts/audit-public.py` — no findings. Its new rules, run against the
+  sources at `310da52`, report exactly the portal's five locations: the
+  `tool.check` return, and the four type positions.
+- `git diff --check` — clean.
+- The real engine, twice (Claude Code 2.1.294, headless, this repository loaded
+  with `--plugin-dir`, every Bash call allowed by rule so that only Cockpit's own
+  guard stood in the way). An ordinary command ran. `git clean -fdx` came back
+  refused by Cockpit ("the user did not approve this destructive command"). The
+  debug log lists the module's events without `tool.check` and records no
+  dispatch of one.
+
+The seven new tests in `tests/compliance.test.ts` hold that no hook is registered
+on the permission check under any policy while every guard still is; that
+ordinary allowed calls, with and without orchestration, cause no permission
+query; that the engine's own check reaches it once and comes back as decided, for
+allow, ask and deny; and that a cancelled destructive command, a Fable route and
+an unowned write under orchestration are each still refused, without a query. A
+query injected into `tool.call` on purpose fails two of them.
+
+**Not verified:** that the portal accepts the corrected source. That needs the
+change on the public branch and **Re-validate** on the form. The first rule can
+no longer apply to a mod with no hook on the event; the second follows the
+portal's own instruction for the same construct ("Use a static import at the top
+of the file"). Neither statement is a substitute for the portal's result.
+
+### The other findings on `310da52`
+
+Policy holds, each read by a reviewer and none blocking:
+
+| Rule | Where | What it is | Disposition |
+| - | - | - | - |
+| `MOD_LOCAL_DATA_LEAVES`, `MOD_SESSION_DATA_LEAVES` | `hooks/register.tsx:201` | The mod reads files and the prompt, and also runs programs; the portal "has not found that what is read is sent" | Kept. The process inventory below is the disclosure |
+| `MOD_PROCESS_COMMAND_COMPUTED`, `MOD_RUNS_PROCESS` | `hooks/register.tsx:201` | `$.process.run` with an argv that is not all fixed text (the audio player, `git`, `realpath`, `tail`) | Kept; disclosed below |
+| `MOD_READS_CREDENTIAL_ENV` | `hooks/register.tsx:829` | The presence-only reads of authentication variables (row 7) | Kept; disclosed |
+| `MOD_ANSWERS_PERMISSION` | `hooks/register.tsx:1522` | `classic.SessionStart` returns a name that holds what `next` gave back | Kept. Returning `next(e)` there would move the resume restore relative to the engine's own start, and the finding does not block |
+| `MOD_HOOKS_PERMISSION_CHECK` | `hooks/register.tsx:1876` | The mod had a hook on `tool.check` | Expected to clear: the hook is gone |
+| `UNREAD_ASSET_REFERENCED` (3) | this document, `scripts/make-icon.py`, `plugin.json` | Each names the listing icon's path | Kept; nothing runs the image |
+| `MCP_FORWARDS_CREDENTIAL_ENV` (4) | `tests/activity.test.ts`, `tests/auth.test.ts`, `tests/orchestration.test.ts`, `plugin.json` | Synthetic credential-shaped fixtures beside a placeholder host in tests, and `hooks/auth.ts` read together with a host named in the README | Kept; the fixtures are what the secret filters are tested against |
+| `BINARIES_NOT_INSPECTED` | `assets/sounds/*.wav` | The two cues (row 6) | Kept |
+
+Warnings: `UNKNOWN_KEY_CROSS_TOOL` (`icon`, "No action needed") and `UNKNOWN_KEY`
+(`types`, row 5); `MOD_IMPORT_DYNAMIC` at `hooks/field.ts:474`, `:488` and
+`hooks/orchestra.ts:221`, expected to clear with this change; `MOD_REFLECTION`
+at `hooks/nwho.ts:83` (a property named `caller`, which is the decision router's
+own field in a ledger record); `MOD_REWRITES_TOOL_INPUT` at
+`hooks/register.tsx:1846` (row 4, and the effort and read-only rewrites the
+README describes); `RUNTIME_FETCH_EXEC` in `SECURITY.md` and this document (text
+only). The remaining entries are notes that ask for nothing.
+
 
 ## The handlers, and what each one does
 
@@ -66,7 +240,9 @@ made; "forwards" means the action goes on as the engine decided, because the
 hook only watched it. The `next.called` guard is the engine's rule that a hook
 which already passed the event on leaves that result standing.
 
-The engine's validator lists 18 gating hooks and every one carries a handler.
+The engine's validator listed 18 gating hooks at `310da52` and lists 17 now (the
+`tool.check` watcher was removed afterwards, see the section above); every one
+carries a handler.
 Cockpit's own audit additionally requires one on every command-answering hook, so
 a future command hook cannot be added without it.
 
@@ -85,7 +261,7 @@ a future command hook cannot be added without it.
 | `prompt.submit` | Makes all three drops the hook itself makes | The strict preset's advisor line, a session set to use Fable (or with Fable as its advisor, counted as a block), and the subscription policy's API refusal. Everything else is the person's own prompt, which a lost reading must not swallow. It is the one handler the harness cannot call directly (a `.catch` handler is only reached inside a dispatch), so it is verified by inspection and its refusals end to end |
 | `command.run{init}` | Forwards | `/init` is the person asking for a CLAUDE.md, and the hook only notes it |
 | `command.run{effort}`, `command.run{login}`, `command.run{logout}` | Forward | Each only notes or re-reads something after the engine's own command ran |
-| `tool.check` | Forwards | It watches the verdict the engine reached. Refusing here would block every tool call over a drawing bug. The engine's advice for a guard on this event (`{ decision: 'deny' }`) is right for a hook that decides, and this one does not |
+| `tool.check` | No hook any more | It only watched the verdict, and the directory does not confirm a hook there that holds one. Cockpit registers nothing on the permission check |
 | `classic.PostToolUse` | Forwards | The tool call already ran; the hook records what the engine reported |
 | `turn.step` | No handler; its pre-decision readings are wrapped instead | For a streaming event the handler must itself be a generator, and the engine's failure rule for one is not verifiable from here. `taskOfAgent` and the ownership heartbeat are wrapped in `quietly`, so the hook reaches its Fable, subscription and strict-advisor decisions even when a reading beneath it does not answer |
 
@@ -93,7 +269,7 @@ a future command hook cannot be added without it.
 
 | Kind | Hooks | What it is |
 | - | - | - |
-| Observes only | `session.start`, `session.end`, `turn.start`, `turn.complete`, `session.measure`, `classic.PostToolUse`, `command.run{init}`, `command.run{effort}`, `command.run{login}`, `command.run{logout}`, `tool.check`, `ui.render` (all five sites) | Reads state, draws, records. Each answer it gives is the engine's own |
+| Observes only | `session.start`, `session.end`, `turn.start`, `turn.complete`, `session.measure`, `classic.PostToolUse`, `command.run{init}`, `command.run{effort}`, `command.run{login}`, `command.run{logout}`, `ui.render` (all five sites) | Reads state, draws, records. Each answer it gives is the engine's own |
 | Modifies | `prompt.compose` (adds the discipline, hygiene, safety and policy sections to the system prompt), `prompt.submit` (adds one task-status line to the request's context), `attribution.text` (empties the engine's commit/PR attribution while the guard is on), `agent.spawn` (names the model of an admitted subagent when it differs), `turn.step` (names the model, and a subagent's reasoning level, while orchestration is on), `tool.call` (a subagent's read-only `git` calls get `--no-pager --no-ext-diff --no-textconv`) | Changes the event it passes on, never a permission rule |
 | Refuses | `tool.call` (blast radius, attribution, ownership, wildcard scope, serialization), `agent.spawn` (ownership, dependency, resource admission, Fable), `agent.offer` (Fable), `config.set` (Fable rows, the strict advisor row), `command.run{model}`, `command.run{advisor}` (Fable, the strict advisor), `turn.step` (Fable, API authentication under `subscriptionOnly`, the strict advisor, cancellation) | Returns `{ deny }`, `{ isOffered: false }` or the block line. Nothing is sent and nothing runs |
 | Asks | `tool.call` puts the blast-radius question to the person through the engine's own dialog (`$.ui.ask`) before a destructive command runs, and asks before a `CLAUDE.md`/`AGENTS.md` is created unasked. The person's answer decides the call | Cockpit draws around the engine's dialog and never answers it |
@@ -256,9 +432,14 @@ here because it cannot be measured on an older engine from this machine.
   identifier named `next` that was not a pass-through renamed; the Replay pane's
   Next button keyed `advance`.
 - `hooks/policy.ts` — the invisible-character class written as escapes.
+- After the portal's per-finding report: the `tool.check` watcher and its two
+  maps removed from `hooks/register.tsx`; `hooks/replay.ts`, `hooks/field.ts` and
+  `hooks/orchestra.ts` name `Ledger` and `Swarm` through their static
+  `import type`; three rules added to `scripts/audit-public.py`.
 - `hooks/swarm.ts` — `next` locals renamed in `admitTask` and `markStalled`.
 - `tests/policy.test.ts` — the two invisible characters written as escapes.
-- `tests/compliance.test.ts` — new; 20 tests.
+- `tests/compliance.test.ts` — new; 20 tests, then 7 more for the permission
+  check (no hook on it, no query, and each refusal still refusing).
 - `scripts/audit-public.py` — the format-character check, the hooks-module
   checks, the engine-generated declarations excluded, version 0.3.2.
 - `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` — version

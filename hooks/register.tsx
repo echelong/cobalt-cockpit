@@ -566,8 +566,6 @@ let isLight = false
 let reducedMotion = false
 let foldTimer: Timer | null = null
 const agentSvgCache = new Map<string, { signature: string; source: string }>()
-const pendingUses = new Map<string, string | null>()
-const waitingUses = new Set<string>()
 const svgCache = new Map<string, { signature: string; base: string; overlay: string }>()
 let isTurnRunning = false
 let cwd = ''
@@ -1661,8 +1659,6 @@ export const register: Register = (on, options) => {
     // The ledger watcher is cancelled here, so no timer outlives the session.
     stopLedgerWatch()
     band = null
-    pendingUses.clear()
-    waitingUses.clear()
     foldTimer?.cancel()
     foldTimer = null
     gitTimer?.cancel()
@@ -1836,7 +1832,6 @@ export const register: Register = (on, options) => {
     // does not recognize contributes nothing at all.
     const fieldEvent = callOf(call, await $.clock.now())
     if (fieldEvent !== null) await quiet(() => update($, eventsAtom, log => push(log, fieldEvent)))
-    if (e.tool_use_id) pendingUses.set(e.tool_use_id, e.agentId ?? null)
     const isQuestion = e.tool === 'AskUserQuestion'
     if (isQuestion) {
       await quiet(() => e.agentId ? editAgent($, e.agentId, a => ({ ...a, state: 'waiting', tool: 'Needs input' })) : update($, visualAtom, old => ({ ...old, waiting: old.waiting + 1 })))
@@ -1846,10 +1841,6 @@ export const register: Register = (on, options) => {
     try { ran = await next(isChanged() ? call : e) }
     catch (error) { await ledgerToolEnd($, call, { isError: true }); throw error }
     finally {
-      if (e.tool_use_id) {
-        pendingUses.delete(e.tool_use_id)
-        if (waitingUses.delete(e.tool_use_id)) await quiet(() => e.agentId ? editAgent($, e.agentId, a => ({ ...a, state: 'running', tool: e.tool })) : update($, visualAtom, old => ({ ...old, waiting: Math.max(0, old.waiting - 1) })))
-      }
       if (isQuestion) await quiet(() => e.agentId ? editAgent($, e.agentId, a => ({ ...a, state: 'running', tool: 'Thinking' })) : update($, visualAtom, old => ({ ...old, waiting: Math.max(0, old.waiting - 1) })))
     }
     await ledgerToolEnd($, call, ran, beforeWrite)
@@ -1872,25 +1863,6 @@ export const register: Register = (on, options) => {
     return ran
     } finally { commanderEffects.delete(effectToken) }
   }).catch(($, e, next) => next.called ? next(e) : { deny: `COCKPIT / the tool guard failed, so this call did not run (${next.error.kind}). Do not reach the same effect another way; reload the plugin first.` })
-
-  on('tool.check', async ($, e, next) => {
-    const verdict = await next(e)
-    const useId = e.tool_use_id
-    if (useId && verdict.decision === 'ask' && pendingUses.has(useId)) {
-      $.clock.after(600, async () => {
-        if (!pendingUses.has(useId) || waitingUses.has(useId)) return
-        waitingUses.add(useId)
-        const agentId = pendingUses.get(useId)
-        await quiet(() => agentId ? editAgent($, agentId, a => ({ ...a, state: 'waiting', tool: 'Needs approval' })) : update($, visualAtom, old => ({ ...old, waiting: old.waiting + 1 })))
-        stopTicker()
-      })
-    }
-    return verdict
-  }).catch(($, e, next) => {
-    // Watching only: a failure loses the HUD's waiting state, and the verdict
-    // the engine already reached stands. Nothing here refuses a call.
-    return next(e)
-  })
 
   on('agent.offer', ($, e, next) => {
     // A type whose name identifies Fable is withheld from the listing, and its

@@ -2,7 +2,7 @@
 export const REPLAY_MAX = 24
 export const REPLAY_BYTES = 96_000
 export const STEP_BYTES = 12_000
-import type { ReplayStep } from '../types'
+import type { Ledger, ReplayStep } from '../types'
 export type { ReplayStep } from '../types'
 export const safeText = (text: string): string => text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '')
 export const secretText = (text: string): boolean => /(?:-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY|(?:api[_-]?key|access[_-]?(?:token|key)(?:[_-]?id)?|token|password|secret|authorization)["']?\s*[=:]\s*["']?[^\s"']+|\bBearer\s+[A-Za-z0-9._~-]{8,}|\b(?:sk-ant-|sk-live-|sk_live_|sk_test_|ghp_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]+|\bAKIA[A-Z0-9]{16}\b|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/i.test(text)
@@ -33,7 +33,7 @@ export const diffLines = (step: ReplayStep): string[] => {
 }
 
 /** A common bounded timeline preserves v1 deltas and adds lifecycle explanations. */
-export const replayTimeline = (ledger: import('../types').Ledger): { at:number; title:string; lines:string[] }[] => [
+export const replayTimeline = (ledger: Ledger): { at:number; title:string; lines:string[] }[] => [
   ...ledger.replay.map(step => ({ at:step.at, title:`${step.kind} · ${step.file}`, lines:diffLines(step) })),
   ...(ledger.swarm?.events ?? []).map(e => {
     const task = ledger.swarm?.tasks.find(t=>t.id===e.taskId)

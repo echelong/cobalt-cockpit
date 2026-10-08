@@ -18,7 +18,7 @@
 // a model off the id the engine resolved, an activity off the agent's own tool
 // call. An agent that was never spawned has no row.
 
-import type { Activity, ActivityKind, AgentRole, AgentStrip, Meter, Orchestra, Task } from '../types'
+import type { Activity, ActivityKind, AgentRole, AgentStrip, Meter, Orchestra, Swarm, Task } from '../types'
 import { cellsOf, fitText } from './pixels'
 import { FABLE_RULE } from './policy'
 import { STAGE_LABEL } from './theme'
@@ -218,7 +218,7 @@ export type OrchestraView = {
   nwho: string | null
   limit: number
   now: number
-  swarm?: import('./swarm').Swarm
+  swarm?: Swarm
 }
 
 const running = (agents: readonly AgentStrip[]): number => agents.filter(a => a.state === 'running' || a.state === 'waiting').length

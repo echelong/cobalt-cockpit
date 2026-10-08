@@ -51,6 +51,22 @@ blocks = [module[a:b] for a, b in zip([m.start() for m in re.finditer(r'\n  on\(
 for block in blocks:
  head = block.lstrip('\n').split('\n')[0].strip()
  if head.startswith(tuple(gating)) and '}).catch(' not in block: findings.append(f'hooks/register.tsx: {head[:60]} can refuse without a .catch handler')
+ # The directory confirms a permission hook only where it can read the return,
+ # and the one return it reads on `tool.check` is the pass-through itself: a
+ # returned name was refused (MOD_PERMISSION_ANSWER_UNREAD). Cockpit registers no
+ # hook there now; one added later returns `next(e)` and nothing else.
+ if head.startswith("on('tool.check'"):
+  for line in block.split('\n'):
+   if line.strip().startswith('return') and line.strip() != 'return next(e)': findings.append(f'hooks/register.tsx: the tool.check hook returns `{line.strip()[:60]}`, not `return next(e)`')
+for p in sorted((root / 'hooks').glob('*.ts*')):
+ for n, line in enumerate(p.read_text().splitlines(), 1):
+  # The directory reads `import(` as a file loaded while the mod runs, in a type
+  # position too: a type written that way was refused as a path that is not a
+  # code file in the plugin (MOD_IMPORT_DYNAMIC_MISSING).
+  if re.search(r'\bimport\s*\(', line): findings.append(f'hooks/{p.name}:{n}: import() expression; use a static import at the top of the file')
+  # Cockpit asks no permission decision of its own. A query on every tool call
+  # would be a second permission operation that nothing here needs.
+  if re.search(r'\$\s*\.\s*tool\s*\.\s*check\b', line): findings.append(f'hooks/{p.name}:{n}: a permission query ($.tool.check) in the hooks module')
 m=json.loads((root/'.claude-plugin/plugin.json').read_text()); market=json.loads((root/'.claude-plugin/marketplace.json').read_text())
 assert m['version']==market['plugins'][0]['version']=='0.3.2'
 assert m['name']==market['plugins'][0]['name']=='cobalt-cockpit'
