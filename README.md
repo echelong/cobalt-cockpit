@@ -2,7 +2,7 @@
 
 **Mission control for Claude Code.** Follow real task progress, coordinate bounded subagents, review verification gates, and replay what happened, without replacing Claude Code's native model and permission controls.
 
-[![GitHub release](https://img.shields.io/github/v/release/echelong/cobalt-cockpit?label=release)](https://github.com/echelong/cobalt-cockpit/releases/latest)
+[![Source branch: main](https://img.shields.io/badge/source-main-blue)](https://github.com/echelong/cobalt-cockpit/tree/main)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 [Privacy](PRIVACY.md) · [Security](SECURITY.md)
@@ -48,7 +48,7 @@ Opus remains **one main commander** and keeps the reasoning effort you select in
 
 ## Quick start
 
-Requires Claude Code with mods/plugins enabled. **Claude Code 2.1.292+ is needed for native per-invocation subagent effort**; v0.3.1 was live-tested on 2.1.294. Check `claude --version` first. Older hosts have reduced effort observability and compatibility fallbacks.
+Requires Claude Code with mods/plugins enabled. **Claude Code 2.1.292+ is needed for native per-invocation subagent effort**; native subagent effort was live-tested on Claude Code 2.1.294. Check `claude --version` first. Older hosts have reduced effort observability and compatibility fallbacks.
 
 Install from this repository's **public GitHub marketplace**:
 
