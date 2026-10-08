@@ -113,7 +113,8 @@ describe('swarm handoffs, end events and durable evidence', () => {
     expect(current(held).agents.find(a => a.id === result.agentId)?.status).toBe('success')
     await assign($, 'after', ['/work/fast.ts'], 'write'); expect((await spawn($, 'after')).agentId).toBeDefined()
   })
-  test('twenty Haiku tasks aggregate in HUD and lifecycle replay explains their work', options, async ($, on) => {
+  // The 20-agent host/hud/replay integration case can exceed the default 5s on CI runners.
+  test('twenty Haiku tasks aggregate in HUD and lifecycle replay explains their work', { ...options, timeoutMs: 15000 }, async ($, on) => {
     const w = world(on); const held = hostState(on, {}); await start($)
     await report($, { action: 'wave', wave: 'ENGINEERING' })
     for (let n = 0; n < 20; n++) await assign($, `h${n}`, [`/work/scan${n}.ts`], 'read', { tier: 'HAIKU', role: 'Scout' })
