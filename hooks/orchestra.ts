@@ -6,7 +6,7 @@
 // model: every decision in this module is arithmetic over state the engine
 // already reported.
 //
-//   - LIMIT. At most `limit` subagents run at once (3 unless configured).
+//   - LIMIT. At most `limit` subagents run at once (AUTO selects a resource budget unless configured).
 //   - DEFAULT MODEL. A spawn that names no model runs on Sonnet rather than
 //     inheriting the parent's.
 //   - REVIEWER. A reviewer is admitted for a failure that repeated, for the
@@ -24,12 +24,13 @@ import { FABLE_RULE } from './policy'
 import { STAGE_LABEL } from './theme'
 import { duration } from './view'
 import type { Row } from './view'
+import { summarizeSwarm } from './swarm'
 
 export type { AgentRole, Orchestra } from '../types'
 
 export const DEFAULT_SUBAGENT_MODEL = 'sonnet'
-export const DEFAULT_LIMIT = 3
-export const LIMIT_MAX = 8
+export const DEFAULT_LIMIT = 16
+export const LIMIT_MAX = 128
 /** The same failure this many times in a row is a repeated error. */
 export const REVIEW_AFTER = 2
 /** A task this large earns one final review. */
@@ -53,7 +54,7 @@ export const EMPTY_ORCHESTRA: Orchestra = {
 export const limitOf = (value: unknown): number => {
   const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : DEFAULT_LIMIT
 
-  return Math.max(1, Math.min(LIMIT_MAX, n))
+  return n === 0 ? DEFAULT_LIMIT : Math.max(1, Math.min(LIMIT_MAX, n))
 }
 
 /**
@@ -62,6 +63,8 @@ export const limitOf = (value: unknown): number => {
  */
 export const roleOf = (subagentType: string): AgentRole => {
   const name = subagentType.toLowerCase().replace(/^.*:/, '')
+  if (/^(scout|inventory)$/.test(name)) return 'SCOUT'
+  if (/^(utility|triage)$/.test(name)) return 'UTILITY'
   if (/review/.test(name)) return 'REVIEWER'
   if (/^(explore|explorer)$/.test(name)) return 'EXPLORER'
   if (/^(researcher|research|claude-code-guide)$/.test(name)) return 'RESEARCHER'
@@ -95,7 +98,7 @@ export const modelFor = (spawn: { model?: string | undefined; fork: boolean }): 
 export const admitSpawn = (running: number, limit: number): string | null =>
   running < limit
     ? null
-    : `SUBAGENT LIMIT / ${limit}. ${running} subagent${running === 1 ? ' is' : 's are'} already running, the most this workflow runs at once, so nothing was started. Wait for one to finish or do this part in the main session; do not split the same work across more agents.`
+    : `SUBAGENT LIMIT / ${limit}. ${running} subagent${running === 1 ? ' is' : 's are'} already running, the current resource budget, so nothing was started. Wait for one to finish or do this part in the main session; do not split the same work across more agents.`
 
 /**
  * One main-loop result folded into the failure streak.
@@ -215,6 +218,7 @@ export type OrchestraView = {
   nwho: string | null
   limit: number
   now: number
+  swarm?: import('./swarm').Swarm
 }
 
 const running = (agents: readonly AgentStrip[]): number => agents.filter(a => a.state === 'running' || a.state === 'waiting').length
@@ -265,16 +269,42 @@ const pair = (name: string, value: string, color?: string): Row => [
  */
 export const orchestraRows = (view: OrchestraView, columns: number, colors: { accent: string; ok: string; bad: string; steel: string }): Row[] => {
   const rows: Row[] = [pair(mainLabel(view.meter), mainWord(view), colors.accent)]
+  // The reasoning mode is named only when the policy set one, so an older
+  // observation-only view is byte-for-byte what it was.
+  if (view.meter.reasoningMode) rows.push(pair('REASONING', `${view.meter.reasoningMode}${view.meter.requestedEffort ? ` · asked ${view.meter.requestedEffort.toUpperCase()}` : ''}${view.meter.effortSource ? ` · ${view.meter.effortSource}` : ''}`, colors.steel))
   if (view.nwho !== null) rows.push(pair('NWHO / LOCAL', view.nwho, colors.steel))
   if (view.agents.length > 0) {
     rows.push(pair(groupLabel(view.agents), `${running(view.agents)}/${view.limit} running`, colors.accent))
+    const groups = new Map<string, AgentStrip[]>()
     for (const a of view.agents) {
-      const text = hasRole(a) ? roleStrip(a, Math.max(20, columns - 2), view.now) : fitText(`${a.title} ${a.tool} ${tailOf(a, view.now)}`, Math.max(20, columns - 2))
-      rows.push([{ text: ` ${text}`, ...(a.state === 'error' ? { color: colors.bad } : a.state === 'done' ? { isDim: true } : {}) }])
+      const tier = tierOf(a.model) ?? 'UNKNOWN'
+      groups.set(tier, [...(groups.get(tier) ?? []), a])
+    }
+    for (const [tier, agents] of groups) {
+      if (agents.length > 8) {
+        const count = (state: AgentStrip['state']) => agents.filter(a => a.state === state).length
+        rows.push(pair(`${tier} / POOL`, `${agents.length} observed · ${count('running')} active · ${count('waiting')} waiting · ${count('done')} done · ${count('error')} failed`, colors.accent))
+        // Preserve individual failures without letting tiny utility tasks flood the HUD.
+        for (const a of agents.filter(a => a.state === 'error').slice(-2)) rows.push([{ text: ` ${fitText(`${a.id} ${a.title} ${a.tool}`, Math.max(20, columns - 2))}`, color: colors.bad }])
+      } else for (const a of agents) {
+        const text = hasRole(a) ? roleStrip(a, Math.max(20, columns - 2), view.now) : fitText(`${a.title} ${a.tool} ${tailOf(a, view.now)}`, Math.max(20, columns - 2))
+        rows.push([{ text: ` ${text}`, ...(a.state === 'error' ? { color: colors.bad } : a.state === 'done' ? { isDim: true } : {}) }])
+      }
     }
     if (isBackToMain(view)) rows.push(pair('BACK TO MAIN', mainWord(view), colors.ok))
   }
 
+  if (view.swarm && view.swarm.tasks.length) {
+    const s = summarizeSwarm(view.swarm)
+    rows.push(pair('WAVE', s.wave, colors.accent))
+    rows.push(pair('TASK GRAPH', `${s.completed}/${s.total} complete · parallel ${s.parallelism} · queue ${s.queue} · blocked ${s.blocked}`, colors.steel))
+    rows.push(pair('POOL / ACTIVE', `SONNET ${s.sonnet} · HAIKU ${s.haiku} · high-water ${s.highWater}`, colors.steel))
+    if (s.escalations.length) rows.push(pair('ESCALATIONS', s.escalations.slice(-3).map(e => `${e.task} ${e.from} → ${e.to}`).join(' · '), colors.bad))
+    if (s.effortEscalations.length) rows.push(pair('EFFORT STEPS', s.effortEscalations.slice(-3).map(e => `${e.task} ${e.from.toUpperCase()} → ${e.to.toUpperCase()}`).join(' · '), colors.bad))
+    rows.push(pair('CONFLICTS', String(s.conflicts), s.conflicts ? colors.bad : colors.steel))
+    const tasks = view.swarm.tasks
+    rows.push(pair('VERIFICATION', `${tasks.filter(t => t.verification === 'pass').length} pass · ${tasks.filter(t => t.verification === 'fail').length} fail · ${tasks.filter(t => t.verification === 'pending').length} pending · ${tasks.filter(t => t.verification === 'unknown').length} unknown`, colors.steel))
+  }
   return rows
 }
 
@@ -285,11 +315,15 @@ export const orchestraRows = (view: OrchestraView, columns: number, colors: { ac
  */
 export const orchestrationText = (limit: number): string => `
 
-Orchestration for this user (enforced by Cobalt Cockpit, not only asked for):
-- You are the main session: understand the task, plan, decompose substantial work, delegate what is genuinely isolated, integrate the results, review the important changes, run the final verification and write the final answer. There is no advisor model. Do your own planning; do not ask another model to review routine tool calls.
-- Do the work yourself when it is a one-file change, a simple fix, a sequence of dependent steps, or anything tightly tied to this conversation's context. Do not spawn a subagent for a trivial task.
-- When delegation helps, use the Agent tool with these agent types, which run on Sonnet at medium effort: cobalt-cockpit:worker (implementation, focused edits, tests), cobalt-cockpit:explorer (read-only: inspect the repository, trace code paths, find the relevant files), cobalt-cockpit:researcher (documentation, APIs, external sources), cobalt-cockpit:reviewer (independent review). A subagent that names no model runs on Sonnet. Every main request is constrained to Opus 5.5 / high; every subagent request to Sonnet 5.5 / medium. Explicit spawn choices are recorded, then constrained at the request boundary; inherited forks are refused. Give each a self-contained brief and expect results only.
-- At most ${limit} subagents run at once; a spawn past that is refused. Use the fewest that help (one isolated implementation task: one worker), and never give two agents the same work.
-- A reviewer is admitted only for a failure that has repeated, for the one final check of a substantial task, or when the user asks for a review. On a repeated error, recover normally first and follow the local decision router where the user's instructions wire it; Cockpit says when a reviewer is permitted.
-- Before calling the task done, verify it yourself. The verification gates decide 100%; a subagent's claim does not.
-- ${FABLE_RULE}`
+Elastic swarm orchestration (Cobalt Cockpit):
+- You are the Opus 5.5 high commander: understand, plan, decompose, assign bounded ownership, manage dependencies, resolve architecture and escalations, integrate, verify independently and produce the final result. Do not delegate architectural responsibility.
+- Execute directly when delegation adds overhead, the work is trivial or tightly coupled. Never manufacture subagent work.
+- Sonnet at medium effort engineers: substantial scoped implementation, debugging, refactoring, test engineering, investigation, research and fresh independent review. Haiku 5.5 scouts and processes: shallow reconnaissance, inventories, repetitive inspection, evidence collection, classification and bounded summaries. Use judgment rather than keyword routing.
+- Bundled cobalt-cockpit:worker, explorer, researcher and reviewer use Sonnet; cobalt-cockpit:scout and utility use Haiku. Multiple instances and other bounded semantic roles are supported. Haiku effort is unspecified. Inherited forks are refused in enforced mode.
+- At most ${limit} subagents run at once under the current resource budget, not a fixed three-agent product cap. Use separate Sonnet and Haiku resource budgets, queue useful work, avoid duplicate tasks, and serialize overlapping writers including generated files, manifests, shared schemas and configuration. Read-only work may overlap safely. Failed siblings must not stop unrelated work.
+- Before each delegated spawn, use swarm action assign with task_id, parent_task, tier (SONNET or HAIKU), role, objective, scope, dependencies, owned_resources, mode (read or write) and spawn_reason. Use exact [task:ID] in the Agent description. After checking dependencies and budgets, request Agent; its admission hook reserves ownership or leaves the assignment queued/blocked. Retry denied assignments only when their blocker clears. Include task ID and owned resources in the brief. Do not let children recursively spawn agents.
+- Execution waves: reconnaissance (prefer Haiku), engineering (Sonnet), review (fresh Sonnet where warranted), integration (Opus), verification (real project gates). Record transitions with swarm action wave. Waves inform work; dependencies and ownership determine safe concurrency.
+- Use swarm status to inspect tasks. Existing running agents from old ledgers can be explicitly scoped with assign then adopt (agent_id); never infer missing ownership. Use result for compressed conclusion, evidence, changes, verification, unresolved issues and uncertainty; raw detail belongs in bounded artifacts. Use escalate for a structured handoff: original objective, discoveries, evidence, unresolved question, risk, next action and relevant files. Haiku → Sonnet → Opus, skipping levels when appropriate. Escalation differs from completion: when its host stops it releases ownership but remains unresolved. Use swarm resolve with integration conclusion and evidence before dependent work or pass verification.
+- Use cancel for unnecessary, failed or stalled work and verify for independent task verification. Task completion cannot bypass unresolved dependencies. Fresh parallel Sonnet reviewers are allowed for explicitly assigned independent scopes; legacy unassigned reviewers retain their admission grounds. Review independent scopes when warranted; do not merely confirm the implementer's claim. The engine controls observed start/end state; a reported result is evidence, not proof.
+- Before calling the mission done, inspect integrated changes and run real verification gates yourself. Unknown model activity, effective effort, cost and token usage remain unknown.
+- NobodyWho remains local Decision, Pruning and read-only control telemetry. ${FABLE_RULE}`

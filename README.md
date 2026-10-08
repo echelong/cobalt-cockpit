@@ -1,4 +1,4 @@
-# Cobalt Cockpit
+# Cobalt Cockpit v0.3 — Dynamic Reasoning
 
 A live mission-control layer for Claude Code: see what is happening, what is verified, and what is safe to run.
 
@@ -6,11 +6,12 @@ A live mission-control layer for Claude Code: see what is happening, what is ver
 
 ## What it does
 
-Cockpit adds a cyberpunk HUD and local dashboard to Claude Code. Progress follows milestones; DONE requires verification gates. The dashboard makes no model calls.
+Cockpit adds a cyberpunk HUD and local dashboard to Claude Code. Progress follows milestones; DONE requires verification gates. Reasoning effort is chosen per task in AUTO, so a cheap inventory and a difficult migration are not run at the same level. The dashboard makes no model calls.
 
 ## Features
 
 - VECTOR / Activity Field, milestone progress, verification-gated DONE, context usage and Git/activity tracking.
+- Dynamic, task-aware reasoning effort: AUTO selection, a commander-named level per assignment, an operator ceiling and capability fallback, with requested and applied effort kept apart.
 - Main and subagent orchestration telemetry, subagent radar, observed model/effort and token usage.
 - Local Run Ledger, sanitized JSON export, bounded replay, and park/resume checkpoints.
 - Blast-radius protection, repository hygiene, optional sounds and hot reload persistence.
@@ -62,11 +63,41 @@ A `--plugin-dir` copy stops loading when you omit the flag next session.
 
 ## Orchestration
 
-Observation works with users' existing models and authentication. Public defaults do not block Fable, rewrite model requests, enforce a subagent limit, or require subscription authentication. Bundled explorer, researcher, worker and reviewer agents inherit the user's model choice.
+Observation works with users' existing models and authentication. Public defaults do not block Fable, rewrite model requests, enforce a subagent limit, or require subscription authentication. Bundled explorer, researcher, worker and reviewer definitions select Sonnet 5.5; scout and utility select Haiku 5.5. Observation does not rewrite host requests.
 
-**Strict Cobalt is optional.** Enable `cobaltStrict` to request Opus 5.5 high for main, Sonnet 5.5 medium for subagents, at most three subagents, isolated agents rather than inherited forks, Fable blocking, external advisor disabled, and subscription-style authentication only. These model IDs must be available to your account; there is no model fallback. Requested effort is observable; effective model-internal effort remains unknown.
+**Strict Cobalt is optional.** Enable `cobaltStrict` to request Opus 5.5 high for main, Sonnet 5.5 medium engineering and Haiku 5.5 utility pools with independent resource budgets, isolated agents rather than inherited forks, Fable blocking, external advisor disabled, and subscription-style authentication only. These model IDs must be available to your account; there is no model fallback. Requested effort is observable; effective model-internal effort remains unknown.
 
 The preset takes precedence over the individual enforcement switches. Disable it to return to observation. NobodyWho remains optional even in strict mode: Cockpit reads its telemetry if installed; it never installs it or routes decisions/pruning itself.
+
+### Elastic execution
+
+Opus remains the single commander: architecture, planning, decomposition, integration, escalation decisions and final verification. Sonnet engineers substantial bounded changes and independent reviews. Haiku scouts repositories and processes extractive, repetitive work. Small or tightly coupled work stays in the main session.
+
+The `swarm` tool records bounded assignments before spawning. Each assignment carries a task ID, parent, tier, semantic role, objective, scope, dependencies, resource ownership, read/write mode and spawn reason. Include the exact `[task:ID]` marker in the Agent description. Queued tasks wait for resource capacity; blocked tasks wait for dependencies; intersecting write scopes are serialized. Read-only scopes may overlap. Scoped agents use Read/Grep/Glob for inspection and Edit/Write for changes. Shell or custom tools require exclusive wildcard ownership; a narrow set of safe Git inspection commands remains available for wildcard read-only tasks. Path canonicalization fails conservatively to wildcard when unavailable. Resource budgets replace the old three-agent ceiling; AUTO provides backpressure rather than uncontrolled fan-out.
+
+Run waves are reconnaissance → engineering → review → integration → verification. Waves are observable phases; they do not replace dependency checks. Haiku may escalate reasoning to Sonnet; Sonnet escalates ambiguity, architecture and high-risk changes to Opus. Handoffs preserve objectives, discoveries, evidence, unresolved questions, risk and next actions. Escalation is distinct from ordinary completion. Agents return concise conclusion/evidence/change/check/uncertainty artifacts; commanders verify claims independently.
+
+`/cockpit` groups observed tiers, compresses pools larger than eight agents and reports task progress, queue, blockers, ownership conflicts and escalations. The Activity Field retains its crawler/spine identity and aggregates utility pools. The Run Ledger and replay explain assignment, spawn reason, wave, completion, escalation and verification. Escalated results remain unresolved after their host stops; the commander uses `swarm resolve` with evidence before dependent work can proceed. Queued dispatch stays under the commander through Agent, rather than automatic spawn loops. Active cancellation suppresses further model/tool actions and retains ownership until host termination is observed (the host exposes no stop API). For a running pre-v0.2 agent with unknown ownership, the commander explicitly assigns its scope then uses `swarm adopt` with the observed `agent_id`; until then further agent tool effects are held. Older ledgers default to an empty swarm; unavailable telemetry stays unknown. NobodyWho boundaries remain read-only.
+
+```text
+Opus 5.5 High — commander / integration / final verification
+  ├─ Sonnet 5.5 Medium — 0..N bounded engineering and review
+  └─ Haiku 5.5        — 0..N scouts and utility work
+       escalation → Sonnet → Opus
+Cobalt Cockpit — ownership / waves / backpressure / HUD / ledger / replay
+NobodyWho     — local Decision / Pruning / read-only control telemetry
+```
+
+## Dynamic reasoning
+
+Model selection and effort selection are separate decisions. The two 5.5 tiers still command, engineer and scout; effort is chosen per task rather than fixed per tier.
+
+- **AUTO** (default) names a level from the task: extractive inventories, classification and summaries run light; normal feature work, bug fixes and refactors run medium; complex debugging, concurrency, migrations, security analysis and high-risk architectural reasoning run high or xhigh; unusually difficult high-stakes reasoning may use max. A task that names no class falls back to its tier's baseline.
+- A commander can name a level explicitly per assignment with the `swarm` tool's `effort` field (LOW / MEDIUM / HIGH / XHIGH / MAX, or AUTO). A named level wins AUTO. **MANUAL** mode instead honours the fixed per-tier levels and leaves Haiku unspecified.
+- A level is only ever *requested*. Each model supports its own ceiling and the operator's `maxEffort` caps every request, so the *applied* level may be lower after a fallback. Requested and applied effort are recorded separately in the Run Ledger, a fallback is named (`EFFORT FALLBACK`), and the model's real capability is learned only from what the engine reports it applied — never assumed.
+- A failing task escalates one step at a time: raise effort within the tier first, then move a tier (Haiku → Sonnet → Opus). It never jumps to the top and stops at the budget rather than retrying forever.
+
+The HUD shows the applied effort beside the model; `/cockpit version` prints the reasoning mode, the ceiling and only the capability this session has really observed.
 
 ## HUD states
 
@@ -85,7 +116,7 @@ A completed turn does not complete a task. Missing measurements stay unknown.
 
 Ledger records observed runs, agents, tools, usage, verification and optional local-control receipts. It keeps up to eight sessions in the host's plugin store, with a 384,000-byte budget per stored ledger and bounded detail windows. Live agents and originating runs are retained; oldest detail is evicted first. `/park` stores phase, explicit goal/milestones, blockers and Git checkpoint data. Resuming the same session restores its checkpoint; this is not an automatic new-session handoff or model summary.
 
-Replay retains at most 24 snapshots, with a 96,000-character aggregate budget and 12,000-character per-step budget. Sensitive filenames, detected credentials and oversized content are omitted. JSON export excludes snapshot bodies, agent descriptions and checkpoint prose.
+Replay retains at most 24 snapshots, with a 96,000-character aggregate budget and 12,000-character per-step budget. Sensitive filenames, detected credentials and oversized content are omitted. JSON export excludes snapshot bodies, agent descriptions and checkpoint prose. It includes sanitized structured task assignments, ownership, results and lifecycle evidence.
 
 ## Safety
 
@@ -116,8 +147,11 @@ Reload plugins after changing configuration.
 | `localControl` | true, optional detection |
 | `ledgerPath` | empty, resolves from the environment |
 | `orchestration` | false (observe); true enforces model/admission policy |
-| `maxSubagents` | 3, enforced only with orchestration; capped at 3 |
+| `maxSubagents` | 0 = AUTO (16 total); explicit resource budget 1–128 |
+| `maxSonnetAgents`, `maxHaikuAgents` | -1 = AUTO (8 Sonnet / 16 Haiku); 0 disables a pool; subject to total budget |
 | `blockFable`, `subscriptionOnly`, `cobaltStrict` | false |
+| `reasoningMode` | `AUTO`; `MANUAL` honours fixed per-tier levels |
+| `maxEffort` | `max`; lower ceilings cap every request and are recorded |
 
 ## Compatibility
 

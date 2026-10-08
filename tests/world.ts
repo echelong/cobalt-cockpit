@@ -50,11 +50,13 @@ export type World = {
   /** What `$.session.model()` answers: the main loop's model. */
   model: string
   /** The session's subagents, as `$.agent.list()` answers them. */
-  agents: { id: string; description: string; type: string; status: string }[]
+  agents: { id: string; description: string; type: string; status: 'pending' | 'running' | 'waiting' | 'idle' | 'completed' | 'failed' | 'killed' }[]
   /** The spawns that reached the engine, as they arrived: what really started. */
   spawns: Record<string, unknown>[]
   /** The model requests that reached the engine: what was really sent. */
   requests: { model: string; agentId?: string }[]
+  /** The effort each request really carried after the hooks rewrote it. */
+  efforts: { model: string; effort?: unknown; agentId?: string }[]
   /** The model that answers a request, when it is not the one asked for. */
   answersAs: string | null
   /** Toasts the plugin showed. */
@@ -67,7 +69,7 @@ export type World = {
   outbound: string[]
 }
 
-const MODEL_ALIAS: Record<string, string> = { sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5', haiku: 'claude-haiku-4-5' }
+const MODEL_ALIAS: Record<string, string> = { sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5', haiku: 'claude-haiku-5-5' }
 
 export const CLEAN_REPO = '# branch.oid 1111111aaaaaaa\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n'
 
@@ -102,6 +104,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
     agents: [],
     spawns: [],
     requests: [],
+    efforts: [],
     answersAs: null,
     toasts: [],
     outbound: [],
@@ -165,6 +168,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
   // it named unless the test says another one answers.
   on('turn.step', async function* ($, e) {
     w.requests.push({ model: e.model, ...(e.agentId === undefined ? {} : { agentId: e.agentId }) })
+    w.efforts.push({ model: e.model, ...(e.effort === undefined ? {} : { effort: e.effort }), ...(e.agentId === undefined ? {} : { agentId: e.agentId }) })
     const usage = { model: w.answersAs ?? e.model, input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
     yield { kind: 'text', index: 0, text: 'ok' } as never
     yield { kind: 'stop', stopReason: 'end_turn', usage } as never
@@ -210,6 +214,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
   on('process.run', async ($, e) => {
     w.runs.push([...e.argv])
     const program = e.argv[0] ?? ''
+    if (program === 'realpath') return ran(0, String(e.argv.at(-1)) + '\n')
     if (program === 'git') {
       if (w.gitStatus === null) return ran(128)
 

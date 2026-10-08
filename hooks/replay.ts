@@ -31,3 +31,15 @@ export const diffLines = (step: ReplayStep): string[] => {
   while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail++
   return [`@@ ${step.scope} delta · line ${head + 1} @@`, ...a.slice(head, a.length - tail).map(s => `- ${s}`), ...b.slice(head, b.length - tail).map(s => `+ ${s}`)].slice(0, 240)
 }
+
+/** A common bounded timeline preserves v1 deltas and adds lifecycle explanations. */
+export const replayTimeline = (ledger: import('../types').Ledger): { at:number; title:string; lines:string[] }[] => [
+  ...ledger.replay.map(step => ({ at:step.at, title:`${step.kind} · ${step.file}`, lines:diffLines(step) })),
+  ...(ledger.swarm?.events ?? []).map(e => {
+    const task = ledger.swarm?.tasks.find(t=>t.id===e.taskId)
+    return { at:e.at, title:`${e.kind.toUpperCase()} · ${e.taskId ?? e.wave}`, lines:[
+      `agent ${e.agentId ?? 'unknown'} · wave ${e.wave}`, e.detail,
+      ...(task ? [`${task.tier} · ${task.role} · why ${task.spawnReason}`, `objective ${task.objective}`, `ownership ${task.mode}: ${task.owned.join(', ')}`, `dependencies ${task.dependencies.join(', ') || 'none'}`, `current outcome ${task.state} · verification ${task.verification}`, `result ${task.result?.conclusion ?? 'unknown'}`] : []),
+    ].map(line => secretText(line) ? 'unknown' : safeText(line)) }
+  }),
+].sort((a,b)=>a.at-b.at).slice(-280)

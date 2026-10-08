@@ -8,15 +8,29 @@
 // in variables (timers, the mounted waveform) is rebuilt as events arrive.
 // No bookkeeping in this file may fail a tool call: it runs under `quiet`.
 
+import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, overlaps, ownershipAllows, setAppliedEffort } from './swarm'
+import type { Swarm, ModelTier, Wave, Verification } from './swarm'
+import { textOf } from './ledger'
 import { atom, read, update } from 'claude-code'
-import { desiredRequest, policyMismatch, AGENT_MODEL } from './model-policy'
+import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL } from './model-policy'
+import {
+  DEFAULT_CEILING,
+  capabilityFor,
+  chooseEffort,
+  effortPolicyText,
+  factsFromRole,
+  isEffortLevel,
+  isEffortRequest,
+  observeCapability,
+} from './effort'
+import type { EffortFacts, EffortResolution } from './effort'
 import { orchestrationGraph, orchestrationTape } from './field'
 import type { EngineInterface, On, Register, RenderElement, Timer } from 'claude-code'
-import { addAgent, adoptAgent, beginTool, checkpointOf, classicTelemetry, emptyLedger, exportJSON, finishTool, finishTurn, ledgerLines, originOf, reading, recordRequest, receipts, storageLedger, startRun, UNKNOWN, warn, word, withReplay } from './ledger'
+import { addAgent, adoptAgent, beginTool, checkpointOf, classicTelemetry, migrateLedger, emptyLedger, exportJSON, finishTool, finishTurn, ledgerLines, originOf, reading, recordRequest, receipts, storageLedger, jsonBytes, startRun, UNKNOWN, warn, word, withReplay } from './ledger'
 import type { Ledger } from './ledger'
-import { diffLines, safeFile, STEP_BYTES } from './replay'
+import { replayTimeline, safeFile, STEP_BYTES } from './replay'
 
-import type { Activity, ActivityLog, AgentStrip, AuthState, Credential, GitState, GuardFinding, GuardRequest, Meter, Prefs, Task } from '../types'
+import type { Activity, ActivityLog, AgentStrip, AuthState, Credential, EffortLevel, EffortRequest, GitState, GuardFinding, GuardRequest, Meter, Prefs, ReasoningMode, Task } from '../types'
 import { ASSETS, PLAYERS, PLAY_TIMEOUT_MS, clampVolume } from './audio'
 import type { Player } from './audio'
 import { EMPTY_LOG, EVENT_TTL_MS, callOf, closeOf, liveOf, push } from './activity'
@@ -34,7 +48,7 @@ import {
 import type { Attribution } from './hygiene'
 import { applyAction, newTask, noteFailure, oneLine, setGate, settle, summaryOf, touchFile } from './model'
 import type { Cue, ProgressInput } from './model'
-import { basename } from './shell'
+import { basename, parseShell, unwrap } from './shell'
 import { COLORS, fit, heading, hudRows, paneRows, visualStateOf } from './view'
 import {
   FOLD_MS,
@@ -84,7 +98,6 @@ import {
   hasRole,
   headerText,
   limitOf,
-  modelFor,
   noteOutcome,
   orchestraRows,
   orchestrationText,
@@ -93,6 +106,7 @@ import {
   reviewVerdict,
   roleOf,
   roleStrip,
+  tierOf,
 } from './orchestra'
 import type { OrchestraView } from './orchestra'
 import { BLOCK_DENY, BLOCK_LINE, EMPTY_POLICY, FABLE_RULE, answered, blocked, fableConfigured, fableRoute, isFable } from './policy'
@@ -140,6 +154,154 @@ const eventsAtom = atom({ plugin: 'cobalt-cockpit', key: 'events' } as const, EM
 const policyAtom = atom({ plugin: 'cobalt-cockpit', key: 'policy' } as const, EMPTY_POLICY)
 const authAtom = atom({ plugin: 'cobalt-cockpit', key: 'auth' } as const, null as AuthState | null)
 const orchestraAtom = atom({ plugin: 'cobalt-cockpit', key: 'orchestra' } as const, EMPTY_ORCHESTRA)
+// The effort capability this session has really observed, by model id: folded
+// in from the engine's own applied level, so a declared baseline is replaced
+// only by a fact. It lives in `$.state`, so a hot reload keeps it.
+const effortKnownAtom = atom({ plugin: 'cobalt-cockpit', key: 'effort-known' } as const, {} as Record<string, readonly EffortLevel[]>)
+
+// Synchronous fence covers the whole awaited commander effect, including path resolution.
+const commanderEffects = new Set<symbol>()
+const SWARM_TOOL_NAME = 'mcp__cobalt-cockpit__swarm'
+const poolBudget = (v: unknown): number | 'AUTO' => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.min(128,Math.floor(v)) : 'AUTO'
+// Operator-declared effort capability, by model id: a level or a list of them.
+// Anything else is ignored rather than guessed.
+const parseModelEffort = (v: unknown): Record<string, readonly EffortLevel[]> => {
+  if (v === null || typeof v !== 'object') return {}
+  const out: Record<string, readonly EffortLevel[]> = {}
+  for (const [model, levels] of Object.entries(v as Record<string, unknown>)) {
+    const allowed = Array.isArray(levels) ? levels.filter(isEffortLevel) : isEffortLevel(levels) ? [levels] : []
+    if (allowed.length > 0) out[model] = allowed
+  }
+
+  return out
+}
+const SWARM_TOOL = {
+  name: 'swarm', description: 'Commander task ownership and elastic admission. Assign before Agent; put [task:ID] in Agent description. Queue is commander dispatched: retry Agent after dependencies/resources clear. Result/escalate preserve locks until observed turn completion. No automatic model spawning. Read-only tools may run within declared scope; scoped writers cannot use Bash (declare exclusive * ownership for shell work).',
+  inputSchema: { type: 'object', properties: {
+    action: { type: 'string', enum: ['assign','status','wave','result','escalate','cancel','verify','resolve','adopt'] },
+    task_id: { type: 'string' }, agent_id: { type: 'string', description: 'adopt: existing running host agent ID; commander binds an explicit assignment when old ownership was unavailable' }, tier: { type: 'string', enum: ['OPUS','SONNET','HAIKU'] }, role: { type: 'string' }, objective: { type: 'string' }, scope: { type: 'string' },
+    dependencies: { type: 'array', items: { type: 'string' } }, owned_resources: { type: 'array', items: { type: 'string' } }, mode: { type: 'string', enum: ['read','write'] },
+    parent_task: { type: 'string' }, spawn_reason: { type: 'string' }, wave: { type: 'string', enum: ['RECONNAISSANCE','ENGINEERING','REVIEW','INTEGRATION','VERIFICATION'] },
+    conclusion: { type: 'string' }, evidence: { type: 'array', items: { type: 'string' } }, changes: { type: 'array', items: { type: 'string' } }, verification: { type: 'array', items: { type: 'string' } }, unresolved: { type: 'array', items: { type: 'string' } }, confidence: { type: 'string' },
+    to: { type: 'string', enum: ['SONNET','OPUS'] }, discoveries: { type: 'array', items: { type: 'string' } }, question: { type: 'string' }, risk: { type: 'string' }, next_action: { type: 'string' }, locations: { type: 'array', items: { type: 'string' } }, state: { type: 'string', enum: ['pending','pass','fail','unknown'] },
+    effort: { type: 'string', enum: ['AUTO','low','medium','high','xhigh','max'], description: 'assign/escalate: the reasoning level this task deserves, or AUTO to choose from the task' }, effort_reason: { type: 'string', description: 'assign/escalate: why that level was chosen' },
+  }, required: ['action'] },
+} as const
+// Canonicalize both assignment and use. Unknown aliases conservatively lock all.
+const canonicalResource = async ($: EngineInterface, path: string): Promise<string> => {
+  if (!path || /[*?\[\]{}]/.test(path)) return '*'
+  try {
+    const r = await $.process.run(['realpath','-m','--', path.startsWith('/') ? path : `${cwd}/${path}`], { timeoutMs: 2000 })
+    return r.exitCode === 0 && !r.isStdoutTruncated ? normalizeOwned(r.stdout.trim()) : '*'
+  } catch { return '*' }
+}
+const swarmState = (l: Ledger): Swarm => l.swarm ?? emptySwarm()
+const changeSwarm = async ($: EngineInterface, f: (s: Swarm) => Swarm): Promise<Swarm> => {
+  const l = await update($, ledgerAtom, old => ({ ...old, schema: 2 as const, swarm: f(swarmState(old)) }))
+  return l.swarm!
+}
+const finishObserved = (s: Swarm, id: string, reason: string, conclusion: string, at: number): Swarm => {
+  const task = s.tasks.find(t=>t.id===id)
+  if (!task) return s
+  const result = task.result ?? { conclusion, unresolved:['Structured result unavailable; commander verification pending'] }
+  const state = task.cancellationRequested || ['aborted','cancelled'].includes(reason) ? 'cancelled' : ['answer','completed'].includes(reason) ? 'completed' : 'failed'
+  try { return finishTask(s,id,state,result,at) } catch {
+    return finishTask(s,id,'failed',{ ...result, unresolved:[...('unresolved' in result ? result.unresolved : []),'Host stopped with unresolved dependencies/child work; completion rejected'] },at)
+  }
+}
+const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promise<{ result: string; isError?: boolean }> => {
+  try {
+    const action = String(e['action'] ?? ''), id = String(e['task_id'] ?? ''), agent = typeof e['agentId'] === 'string' ? e['agentId'] : undefined
+    const at = await $.clock.now()
+    const str = (k: string) => textOf(e[k])
+    const list = (k: string) => Array.isArray(e[k]) ? (e[k] as unknown[]).filter((v): v is string => typeof v === 'string').slice(0, 64).map(textOf) : []
+    const s = await changeSwarm($, held => markStalled(held,at)); const task = s.tasks.find(t => t.id === id)
+    if (agent && (!task || task.agentId !== agent || !['result','escalate','status'].includes(action))) throw new Error('Only commander assigns, verifies, cancels or changes waves; agents report their own task only')
+    if (action === 'status') {
+      const selected = id ? s.tasks.filter(t=>t.id===id) : [...s.tasks.filter(t=>!['completed','failed','cancelled'].includes(t.state)), ...s.tasks.filter(t=>['completed','failed','cancelled'].includes(t.state)).slice(-8)].slice(0,32)
+      return { result: JSON.stringify({ ...summarizeSwarm(s), tasks: selected.map(t => ({ id:t.id, tier:t.tier, role:t.role, state:t.state, reason:t.reason, agent:t.agentId, effort:t.requestedEffort, appliedEffort:t.appliedEffort, effortReason:t.effortReason, result:t.result ? { conclusion:t.result.conclusion.slice(0,160), evidence:t.result.evidence.slice(0,3).map(x=>x.slice(0,160)), unresolved:t.result.unresolved.slice(0,3).map(x=>x.slice(0,160)) } : null, escalation:t.escalation ? { to:t.escalation.to, effort:t.escalation.effort ?? null, question:t.escalation.question.slice(0,160), risk:t.escalation.risk.slice(0,160) } : null, verification:t.verification })) }) }
+    }
+    if (action === 'assign') {
+      if (typeof e['objective'] !== 'string' || !e['objective'].trim()) throw new Error('Bounded objective required')
+      if (!/^[\w.-]{1,80}$/.test(id) || !['OPUS','SONNET','HAIKU'].includes(String(e['tier']))) throw new Error('Valid task_id and tier required')
+      const owned = await Promise.all(list('owned_resources').map(p => canonicalResource($, p)))
+      const next = await changeSwarm($, held => { const submitted = submitTask(held, { id, tier: e['tier'] as ModelTier, role: str('role'), objective: str('objective'), scope: str('scope'), dependencies:list('dependencies'), owned, mode: e['mode'] === 'write' ? 'write' : 'read', parentTask: typeof e['parent_task'] === 'string' ? e['parent_task'] : null, spawnReason: str('spawn_reason'), ...(isEffortRequest(e['effort']) ? { effort: e['effort'] } : {}), ...(typeof e['effort_reason'] === 'string' ? { effortReason: str('effort_reason') } : {}) }, at).swarm; if (jsonBytes(submitted.tasks.map(t=>({ ...t,result:null,escalation:null }))) > 192_000) throw new Error('Ownership metadata storage budget reached; finish/archive work before assigning more'); return submitted })
+      const assigned = next.tasks.find(t => t.id === id)
+      return { result: assigned ? `Task ${id} ${assigned.state}; use Agent description [task:${id}]. OPUS tasks stay in main.` : 'Duplicate suppressed; see swarm status for existing task.' }
+    }
+    if (action === 'wave') { if (!['RECONNAISSANCE','ENGINEERING','REVIEW','INTEGRATION','VERIFICATION'].includes(String(e['wave']))) throw new Error('Valid wave required'); await changeSwarm($, held => setWave(held, e['wave'] as Wave, at)) }
+    else {
+      if (!task) throw new Error('Unknown task')
+      if (action === 'adopt') {
+        const existingId = String(e['agent_id'] ?? '')
+        const listed = await $.agent.list()
+        if (!listed.some(a=>a.id===existingId && a.status==='running')) throw new Error('Adoption requires an observed running host agent')
+        await changeSwarm($, held => { const admitted = admitTask(held,id,at); if (!admitted.ok) throw new Error(admitted.reason!); return bindAgent(admitted.swarm,id,existingId,at,'adopt') })
+      } else if (action === 'result') {
+        await changeSwarm($, held => {
+          let next = held
+          if (task.tier === 'OPUS' && ['queued','blocked'].includes(task.state)) { const admitted = admitTask(held,id,at); if (!admitted.ok) throw new Error(admitted.reason!); next = admitted.swarm }
+          next = reportResult(next, id, { conclusion:str('conclusion'), evidence:list('evidence'), changes:list('changes'), verification:list('verification'), unresolved:list('unresolved'), confidence: typeof e['confidence'] === 'string' ? str('confidence') : null }, at)
+          return task.tier === 'OPUS' ? finishTask(next,id,'completed',next.tasks.find(t=>t.id===id)!.result,at) : next
+        })
+      } else if (action === 'escalate') {
+        if (!['SONNET','OPUS'].includes(String(e['to']))) throw new Error('Valid escalation destination required')
+        await changeSwarm($, held => escalateTask(held,id,{ objective: task.objective, discoveries:list('discoveries'), evidence:list('evidence'), question:str('question'), risk:str('risk'), nextAction:str('next_action'), locations:list('locations'), to:e['to'] as ModelTier, effort: isEffortLevel(e['effort']) ? e['effort'] : null, effortReason: typeof e['effort_reason'] === 'string' ? str('effort_reason') : null },at))
+      } else if (action === 'resolve') await changeSwarm($, held => resolveEscalation(held,id,{ conclusion:str('conclusion'),evidence:list('evidence'), changes:list('changes'), verification:list('verification'), unresolved:list('unresolved') },at))
+      else if (action === 'cancel') await changeSwarm($, held => requestCancel(held,id,at))
+      else if (action === 'verify') { if (!['pending','pass','fail','unknown'].includes(String(e['state']))) throw new Error('Valid verification state required'); await changeSwarm($, held => verifyTask(held,id,e['state'] as Verification,at,list('evidence').join('; '))) }
+      else throw new Error('Unknown swarm action')
+    }
+    await persist($)
+    return { result: `Swarm ${action} recorded; host completion and commander verification remain distinct.` }
+  } catch (error) { return { result: `SWARM / ${error instanceof Error ? error.message : 'invalid input'}`, isError: true } }
+}
+// Bounded inspection shell compatibility. No substitutions, redirects, wrappers,
+// output flags or arbitrary commands; scoped writes still require Edit/Write.
+const readOnlyShell = (command: string): boolean => {
+  if (/[<>`\n]/.test(command) || command.includes('$') || /--(?:output|ext-diff|textconv)|--no-index/.test(command)) return false
+  try {
+    const parsed = parseShell(command)
+    if (!parsed.pipelines.length || parsed.substitutions.length) return false
+    return parsed.pipelines.every(p => p.commands.every(c => {
+      const r = unwrap(c.argv)
+      return !!r && r.program === 'git' && ['diff','status','log','show','ls-files','rev-parse','grep'].includes(r.args[0] ?? '') && !r.args.some(a=>a === '-c' || a.startsWith('--output') || a === '--exec' || a === '--help' || a === '-h' || a.startsWith('--open') || a.startsWith('-O') || a.startsWith('--out') || a.startsWith('--ext') || a.startsWith('--text')) && r.wrappers.length === 0 && c.argv[0] === 'git'
+    }))
+  } catch { return false }
+}
+const guardSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promise<string | null> => {
+  if (!config.hasOrchestration) return null
+  const agent = typeof e['agentId'] === 'string' ? e['agentId'] : undefined
+  const s = swarmState(await read($, ledgerAtom)), task = s.tasks.find(t => t.agentId === agent && agent !== undefined)
+  if (task?.cancellationRequested) return 'SWARM / cancellation requested; awaiting observed termination'
+  const observedAt = await $.clock.now()
+  if (task) await changeSwarm($, held => heartbeat(held,task.id,observedAt))
+  const tool = String(e['tool'])
+  if (tool === SWARM_TOOL_NAME || tool === TOOL) return null
+  if (agent && !task) return 'SWARM / agent has no bound ownership; commander must assign before further tools'
+  if (agent && (tool === 'Agent' || tool === 'Task')) return 'SWARM / only commander delegates; escalate instead'
+  const write = ['Edit','Write','MultiEdit','NotebookEdit'].includes(tool)
+  if (!agent && ['Agent','Task','TaskOutput','TaskStop','SendMessage'].includes(tool)) return null
+  const readTool = ['Read','Grep','Glob','WebFetch','WebSearch'].includes(tool) || (tool === 'Bash' && readOnlyShell(String(e['command'] ?? '')))
+  if (task && task.mode === 'read' && !readTool) return 'SWARM / read-only tasks may use inspection tools only; shell/custom effects require commander investigation'
+  if (task && ['Read','Grep','Glob'].includes(tool)) {
+    const path = String(e['file_path'] ?? e['path'] ?? '*')
+    if (!ownershipAllows(s,task.id,await canonicalResource($,path),'read')) return 'SWARM / read outside owned resources'
+  }
+  if (task && tool === 'Bash' && !task.owned.includes('*')) return 'SWARM / shell inspection requires declared wildcard read scope'
+  if (write) {
+    const paths = tool === 'MultiEdit' && Array.isArray(e['edits']) ? (e['edits'] as Record<string,unknown>[]).map(x=>String(x['file_path'] ?? e['file_path'] ?? '')) : [String(e['file_path'] ?? e['notebook_path'] ?? '')]
+    for (const path of paths) {
+      const canonical = await canonicalResource($,path)
+      if (task && !ownershipAllows(s,task.id,canonical)) return 'SWARM / write outside owned resources'
+      if (!task && s.tasks.some(t=>t.tier !== 'OPUS' && t.endedAt === null && (['reserved','running'].includes(t.state) || (!['completed','failed','cancelled'].includes(t.state) && (t.agentId !== null || t.startedAt !== null))) && t.owned.some(p=>overlaps(p,canonical)))) return 'SWARM / commander write conflicts with active ownership'
+    }
+  } else if (!readTool) {
+    if (task && !task.owned.includes('*')) return 'SWARM / shell/custom tools require exclusive wildcard ownership'
+    if (!task && s.tasks.some(t=>t.tier !== 'OPUS' && t.endedAt === null && (['reserved','running'].includes(t.state) || (!['completed','failed','cancelled'].includes(t.state) && (t.agentId !== null || t.startedAt !== null))))) return 'SWARM / shell/custom effects held until active ownership releases'
+  }
+  return null
+}
 
 const PROGRESS_TOOL = {
   name: 'progress',
@@ -209,6 +371,7 @@ const HELP =
   '/cockpit mute       silence the cues (kept across sessions); unmute to undo\n' +
   '/cockpit hud off    hide the HUD (kept across sessions); hud on to undo\n' +
   '/cockpit auth       print how the session is authenticated and the Fable policy\n' +
+  '/cockpit version    print the loaded plugin version, its source path and the reasoning mode\n' +
   '/cockpit sound      play both cues'
 
 const isAtLeast = (version: string, floor: readonly number[]): boolean => {
@@ -273,13 +436,33 @@ type Config = {
   hasOrchestration: boolean
   /** The most subagents that run at once. */
   maxSubagents: number
+  maxSonnet: number | 'AUTO'
+  maxHaiku: number | 'AUTO'
   /** Whether a session on API-style authentication is refused its model requests. */
   isSubscriptionOnly: boolean
+  /** AUTO chooses reasoning effort from the task; MANUAL honours the fixed tier levels. */
+  reasoningMode: ReasoningMode
+  /** Nothing above this level is ever requested; a higher ask falls back and is recorded. */
+  maxEffort: EffortLevel
+  /** Operator-declared effort capability per model id, overriding the built-in table. */
+  modelEffort: Readonly<Record<string, readonly EffortLevel[]>>
 }
+
+// The model each tier is requested on. The tier is the policy's; the model id is
+// what the engine was asked for, and the capability table reads it.
+const MODEL_FOR: Record<ModelTier, string> = { OPUS: MAIN_MODEL, SONNET: AGENT_MODEL, HAIKU: HAIKU_MODEL }
+
+/**
+ * The severity the effort policy may ask for, from the runtime observations the
+ * session has really made, the operator's declared overrides, and the built-in
+ * baseline. It is read-only over the facts and never assumes a level works.
+ */
+const capabilityOf = (model: string, known: Readonly<Record<string, readonly EffortLevel[]>>) =>
+  capabilityFor(model, known, config.modelEffort)
 
 // Set by register(); the rest is rebuilt as events arrive after a reload.
 // Nothing a drawing depends on lives here: that is all in `$.state`.
-let config: Config = { hasHud: true, isAnimated: true, hasSounds: true, hasGuard: true, hasAttributionGuard: true, volume: 0.6, hasLocalControl: true, ledgerPath: '', blocksFable: false, isStrict: false, hasOrchestration: false, maxSubagents: 3, isSubscriptionOnly: false }
+let config: Config = { hasHud: true, isAnimated: true, hasSounds: true, hasGuard: true, hasAttributionGuard: true, volume: 0.6, hasLocalControl: true, ledgerPath: '', blocksFable: false, isStrict: false, hasOrchestration: false, maxSubagents: 16, maxSonnet: 'AUTO', maxHaiku: 'AUTO', isSubscriptionOnly: false, reasoningMode: 'AUTO', maxEffort: DEFAULT_CEILING, modelEffort: {} }
 let isSupported = true
 let ticker: Timer | null = null
 let gitTimer: Timer | null = null
@@ -1122,9 +1305,20 @@ export const ledgerSpawn = async ($: EngineInterface, e: { subagentType: string;
 }
 const adoptLedgerAgents = async ($: EngineInterface): Promise<void> => {
   const listed = await $.agent.list()
+  const at = await $.clock.now()
+  await changeSwarm($, held => {
+    let next = held
+    for (const info of listed) {
+      const t = next.tasks.find(t=>t.agentId === info.id && !['completed','failed','cancelled'].includes(t.state))
+      if (t && ['completed','failed','error','cancelled','aborted'].includes(info.status)) {
+        next = finishObserved(next,t.id,info.status,'Host reports stopped; result unavailable',at)
+      }
+    }
+    return markStalled(next,at)
+  })
   await mutateLedger($, l => listed.reduce((next, info) => adoptAgent(next, info), l))
 }
-export const ledgerRequest = async ($: EngineInterface, e: { turnId: string; index: number; agentId?: string; model: string; effort?: unknown }, actual: { model?: string; effort?: unknown; usage?: unknown }, warning?: string | null): Promise<void> => {
+export const ledgerRequest = async ($: EngineInterface, e: { turnId: string; index: number; agentId?: string; model: string; effort?: unknown }, actual: { model?: string; effort?: unknown; usage?: unknown; routingReason?: string; fallbackReason?: string | null }, warning?: string | null): Promise<void> => {
   if (e.agentId && !(await read($, ledgerAtom)).agents.some(a => a.id === e.agentId)) await hush(() => adoptLedgerAgents($))
   await mutateLedger($, l => {
     const noted = recordRequest(l, e, { ...actual, usage: actual.usage as Record<string, unknown> | null })
@@ -1158,12 +1352,12 @@ const restore = async ($: EngineInterface) => {
   const held = await read($, ledgerAtom)
   const stored = await $.store.get(`ledger:${id}`) as Ledger | undefined
   if (held.sessionId !== id) {
-    await mutateLedger($, () => stored?.schema === 1 && stored.sessionId === id ? stored : emptyLedger(id))
+    await mutateLedger($, () => stored && (stored.schema === 1 || stored.schema === 2) && stored.sessionId === id ? migrateLedger(stored) : emptyLedger(id))
     if (stored?.checkpoint) {
       await update($, resumeAtom, () => true)
       await $.ui.toast(`COBALT / RESUME · ${stored.checkpoint.phase} · ${stored.checkpoint.remaining.length} milestones remaining`, { timeoutMs: 8000 })
     }
-  }
+  } else if (!held.swarm || held.schema === 1) await mutateLedger($, migrateLedger)
 }
 export const ledgerStart = async ($: EngineInterface) => {
       await hush(() => restore($))
@@ -1172,7 +1366,20 @@ export const ledgerStart = async ($: EngineInterface) => {
       await hush(() => sample($))
     }
 export const ledgerTurnStart = async ($: EngineInterface, turnId: string) => { await hush(async () => { await restore($); const at = await $.clock.now(); await mutateLedger($, l => startRun(l, turnId, at)) }) }
-export const ledgerTurnComplete = async ($: EngineInterface, e: { turnId: string; agentId?: string; reason: string }) => { await hush(async () => { const at = await $.clock.now(); await mutateLedger($, l => finishTurn(l, e, at)); if (!e.agentId) await sample($); await checkpoint($) }) }
+export const ledgerTurnComplete = async ($: EngineInterface, e: { turnId: string; agentId?: string; reason: string; answer?: string }) => {
+  await hush(async () => {
+    const at = await $.clock.now()
+    await mutateLedger($, l => {
+      const ended = finishTurn(l,e,at)
+      if (!e.agentId) return ended
+      const completed = [...(ended.observedCompletions ?? []).filter(c=>c.agentId!==e.agentId), { agentId:e.agentId,reason:e.reason,conclusion:textOf(e.answer),at }].slice(-128)
+      const task = swarmState(ended).tasks.find(t=>t.agentId===e.agentId)
+      return { ...ended, observedCompletions:completed, swarm:task ? finishObserved(swarmState(ended),task.id,e.reason,textOf(e.answer),at) : swarmState(ended) }
+    })
+    if (!e.agentId) await sample($)
+    await checkpoint($)
+  })
+}
 export const ledgerEnd = async ($: EngineInterface) => { await hush(() => checkpoint($)) }
 export const ledgerMeasure = async ($: EngineInterface) => { await hush(() => sample($)) }
 export const ledgerPrompt = async ($: EngineInterface) => { await hush(() => update($, resumeAtom, () => false)) }
@@ -1215,10 +1422,10 @@ export const registerLedger = (on: On): void => {
   })
   on('command.run', { command: 'replay' }, async $ => {
     const l = await read($, ledgerAtom)
-    if (!l.replay.length) return { text: 'No successful Edit/Write snapshots observed.' }
+    if (!replayTimeline(l).length) return { text: 'No successful Edit/Write snapshots observed.' }
     await update($, positionAtom, () => 0)
     await $.ui.open({ id: REPLAY_PANE, title: 'COBALT / REPLAY', focus: true })
-    return { text: `COBALT / REPLAY · ${l.replay.length} steps` }
+    return { text: `COBALT / REPLAY · ${replayTimeline(l).length} steps` }
   })
   on('ui.render', { component: 'Pane', requestId: LEDGER_PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
@@ -1228,10 +1435,10 @@ export const registerLedger = (on: On): void => {
   })
   on('ui.render', { component: 'Pane', requestId: REPLAY_PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const steps = (await read($, ledgerAtom)).replay
+    const steps = replayTimeline(await read($, ledgerAtom))
     const pos = Math.min(await read($, positionAtom), Math.max(0, steps.length - 1))
     const step = steps[pos]
-    return <Box flexDirection="column"><Text color={COLORS.accent}>{step ? `COBALT / REPLAY · ${pos + 1}/${steps.length} · ${step.kind} · ${step.file}` : 'No snapshots'}</Text>{step && diffLines(step).map((line, i) => <Text key={String(i)} color={line.startsWith('+') ? COLORS.ok : line.startsWith('-') ? COLORS.bad : undefined} wrap="truncate-end">{line}</Text>)}<Box flexDirection="row"><Button key="previous" label="Previous" hotkey="p" onPress={() => update($, positionAtom, n => Math.max(0, n - 1))} /><Button key="next" label="Next" hotkey="n" onPress={() => update($, positionAtom, n => Math.min(steps.length - 1, n + 1))} /><Button key="close" label="Close" hotkey="q" role="dismiss" onPress={() => $.ui.close({ id: REPLAY_PANE })} /></Box></Box>
+    return <Box flexDirection="column"><Text color={COLORS.accent}>{step ? `COBALT / REPLAY · ${pos + 1}/${steps.length} · ${step.title}` : 'No snapshots'}</Text>{step && step.lines.map((line, i) => <Text key={String(i)} color={line.startsWith('+') ? COLORS.ok : line.startsWith('-') ? COLORS.bad : undefined} wrap="truncate-end">{line}</Text>)}<Box flexDirection="row"><Button key="previous" label="Previous" hotkey="p" onPress={() => update($, positionAtom, n => Math.max(0, n - 1))} /><Button key="next" label="Next" hotkey="n" onPress={() => update($, positionAtom, n => Math.min(steps.length - 1, n + 1))} /><Button key="close" label="Close" hotkey="q" role="dismiss" onPress={() => $.ui.close({ id: REPLAY_PANE })} /></Box></Box>
   })
 }
 
@@ -1254,8 +1461,13 @@ export const register: Register = (on, options) => {
     blocksFable: options['cobaltStrict'] === true || options['blockFable'] === true,
     isStrict: options['cobaltStrict'] === true,
     hasOrchestration: options['cobaltStrict'] === true || options['orchestration'] === true,
-    maxSubagents: Math.min(3, limitOf(options['maxSubagents'])),
+    maxSubagents: limitOf(options['maxSubagents']),
+    maxSonnet: poolBudget(options['maxSonnet'] ?? options['maxSonnetAgents']),
+    maxHaiku: poolBudget(options['maxHaiku'] ?? options['maxHaikuAgents']),
     isSubscriptionOnly: options['cobaltStrict'] === true || options['subscriptionOnly'] === true,
+    reasoningMode: options['reasoningMode'] === 'MANUAL' ? 'MANUAL' : 'AUTO',
+    maxEffort: isEffortLevel(options['maxEffort']) ? options['maxEffort'] : DEFAULT_CEILING,
+    modelEffort: parseModelEffort(options['modelEffort']),
   }
 
   registerLedger(on)
@@ -1271,11 +1483,12 @@ export const register: Register = (on, options) => {
     if (!isSupported) return next(e)
 
     await quiet(() => $.tool.register(PROGRESS_TOOL))
+    await quiet(() => $.tool.register(SWARM_TOOL))
     await quiet(() =>
       $.command.register({
         name: 'cockpit',
         description: 'Mission Control: task progress, milestones, verification gates, git and context',
-        argumentHint: '[status|reset|mute|unmute|hud on|hud off|auth|sound]',
+        argumentHint: '[status|reset|mute|unmute|hud on|hud off|auth|version|sound]',
         immediate: true,
       }),
     )
@@ -1303,6 +1516,7 @@ export const register: Register = (on, options) => {
       }
     })
     await ledgerStart($)
+    await changeSwarm($, held => configureSwarm(held, { total: config.maxSubagents, sonnet: config.maxSonnet, haiku: config.maxHaiku }))
     void refreshGit($)
     void refreshMeter($)
     // The NobodyWho watcher: read-only, stat-gated, and started only once the
@@ -1443,7 +1657,7 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', async ($, e, next) => {
-    const call = e as typeof e & Record<string, unknown>
+    const call = { ...e } as typeof e & Record<string, unknown>
     // Fable first, on every engine version and in every loop: a pure check
     // that cannot throw, so no failure below can let the call through.
     if (config.blocksFable && fableRoute(e.tool, call)) {
@@ -1452,13 +1666,22 @@ export const register: Register = (on, options) => {
       return { deny: BLOCK_DENY }
     }
     if (!isSupported) return next(e)
+    const effect = config.hasOrchestration && !e.agentId && !['Read','Grep','Glob','WebFetch','WebSearch','Agent','Task','TaskOutput','TaskStop','SendMessage',TOOL,SWARM_TOOL_NAME].includes(String(e.tool)) && !(e.tool === 'Bash' && readOnlyShell(String(call['command'] ?? '')))
+    if (effect && (spawning.size || commanderEffects.size)) return { deny:'SWARM / commander effect or agent admission in flight; serialize this operation' }
+    const effectToken = Symbol(e.tool_use_id)
+    if (effect) commanderEffects.add(effectToken)
+    try {
     await ledgerToolStart($, call)
+    if (String(e.tool) === SWARM_TOOL_NAME) { const r = await serveSwarm($, call); await ledgerToolEnd($, call, r); return r }
+    const swarmRefusal = await guardSwarm($, call)
+    if (swarmRefusal) { await ledgerToolEnd($, call, { deny: swarmRefusal }); return { deny: swarmRefusal } }
     if (e.tool === TOOL) { const r = await serveProgress($, call as ProgressInput & { agentId?: string }); await ledgerToolEnd($, call, r); return r }
 
     // a guard that fails must not take every tool call down with it
     const refusal = await guard($, call).catch(() => null)
     if (refusal !== null) { await ledgerToolEnd($, call, refusal); return refusal }
 
+    if (config.hasOrchestration && e.agentId && e.tool === 'Bash' && readOnlyShell(String(call['command'] ?? ''))) (call as Record<string,unknown>)['command'] = String(call['command']).replace(/\bgit\s+(diff|show|log)\b/g, 'git $1 --no-ext-diff --no-textconv').replace(/\bgit\b/g,'git --no-pager')
     const beforeWrite = e.tool === 'Write' ? await ledgerBeforeWrite($, call['file_path']) : undefined
 
     await quiet(() => noteStart($, call))
@@ -1474,7 +1697,7 @@ export const register: Register = (on, options) => {
       stopTicker()
     }
     let ran
-    try { ran = await next(e) }
+    try { ran = await next(call) }
     catch (error) { await ledgerToolEnd($, call, { isError: true }); throw error }
     finally {
       if (e.tool_use_id) {
@@ -1501,6 +1724,7 @@ export const register: Register = (on, options) => {
     }
 
     return ran
+    } finally { commanderEffects.delete(effectToken) }
   })
 
   on('tool.check', async ($, e, next) => {
@@ -1530,6 +1754,8 @@ export const register: Register = (on, options) => {
     }
     if (!isSupported) return next(e)
     const role = roleOf(e.subagentType)
+    let assignedId = /\[task:([\w.-]+)\]/.exec(e.description)?.[1]
+    let reservedId: string | undefined
     // Reserved before the first await, so the spawns of one message are counted
     // in the order they arrived.
     const token = Symbol(e.tool_use_id)
@@ -1537,6 +1763,7 @@ export const register: Register = (on, options) => {
     spawning.set(token, null)
     try {
       if (config.hasOrchestration) {
+        if (commanderEffects.size) return { deny:'SWARM / commander effect in flight; assignment remains queued until it completes' }
         const running = await runningAgents($)
         // the spawns ahead of this one that the list does not show yet
         const pending = ahead.filter(one => spawning.has(one) && !running.has(spawning.get(one) ?? '')).length
@@ -1546,7 +1773,7 @@ export const register: Register = (on, options) => {
 
           return { deny: refusal }
         }
-        if (role === 'REVIEWER') {
+        if (role === 'REVIEWER' && !assignedId) {
           const strips = (await read($, visualAtom)).agents
           const task = await read($, taskAtom)
           const verdict = reviewVerdict(await read($, orchestraAtom), {
@@ -1566,24 +1793,47 @@ export const register: Register = (on, options) => {
         await quiet(() => mutateLedger($, l => warn(l, 'MODEL POLICY / fork refused: forks inherit parent model')))
         return { deny: 'MODEL POLICY / fork inherits its parent model; use an isolated Sonnet agent.' }
       }
-      const model = config.hasOrchestration ? modelFor(e) : e.model
-      if (config.hasOrchestration && e.model && e.model !== 'sonnet' && e.model !== AGENT_MODEL) await quiet(() => mutateLedger($, l => warn(l, 'MODEL POLICY / explicit spawn choice observed; constrained to Sonnet 5.5 / medium before its first request')))
+      let assigned = swarmState(await read($, ledgerAtom)).tasks.find(t => t.id === assignedId)
+      if (config.hasOrchestration) {
+        if (e.parentAgentId) return { deny: 'SWARM / only commander delegates; escalate a structured handoff' }
+        if (assignedId && !assigned) return { deny: 'SWARM / unknown assignment' }
+        const at = await $.clock.now()
+        if (!assigned) {
+          assignedId = `legacy-${e.tool_use_id}-${(await read($, orchestraAtom)).spawned}`.replace(/[^\w.-]/g,'-')
+          const tier = tierOf(e.model) === 'HAIKU' || role === 'SCOUT' || role === 'UTILITY' ? 'HAIKU' : 'SONNET'
+          const state = await changeSwarm($, held => submitTask(held, { id: assignedId!, tier, role, objective: textOf(e.description || e.subagentType), mode: ['EXPLORER','RESEARCHER','REVIEWER','SCOUT','UTILITY'].includes(role) ? 'read' : 'write', owned:['*'], spawnReason:'Legacy Agent call; unknown scope conservatively exclusive' },at).swarm)
+          assigned = state.tasks.find(t => t.id === assignedId)
+          if (!assigned) return { deny: 'SWARM / duplicate work suppressed; inspect swarm status' }
+        }
+        if (assigned.tier === 'OPUS') return { deny: 'SWARM / OPUS task stays in commander; no coordinator subagent' }
+        let admission: ReturnType<typeof admitTask> | undefined
+        await changeSwarm($, held => { admission = admitTask(held,assignedId!,at); return admission.swarm })
+        if (!admission!.ok) return { deny: `SWARM / queued ${assignedId}: ${admission!.reason}; retry after dependency/ownership/resource clears` }
+        reservedId = assignedId
+      }
+      const model = config.hasOrchestration ? (assigned?.tier === 'HAIKU' ? HAIKU_MODEL : AGENT_MODEL) : e.model
       const originLedger = await read($, ledgerAtom)
       const spawnAt = await $.clock.now()
       const spawned = await next(model === e.model || model === undefined ? e : { ...e, model })
+      if (reservedId && spawned.agentId) await changeSwarm($, held => bindAgent(held,reservedId!,spawned.agentId!,spawnAt))
+      else if (reservedId) await changeSwarm($, held => releaseReservation(held,reservedId!,spawnAt,spawned.deny ?? 'Host did not report agent ID'))
       await quiet(() => ledgerSpawn($, e, spawned, originLedger, spawnAt))
+      if (reservedId && spawned.agentId) await mutateLedger($, l => { const done = l.observedCompletions?.find(c=>c.agentId===spawned.agentId); return done ? { ...finishTurn(l,{ turnId:l.turns[spawned.agentId!] ?? UNKNOWN,agentId:spawned.agentId!,reason:done.reason },done.at), swarm:finishObserved(swarmState(l),reservedId!,done.reason,done.conclusion,done.at) } : l })
       if (spawned.agentId) {
         spawning.set(token, spawned.agentId)
         await quiet(async () => {
           const now = await $.clock.now()
           const seq = (await update($, orchestraAtom, old => ({ ...old, spawned: old.spawned + 1 }))).spawned
           const ledgerAgent = (await read($, ledgerAtom)).agents.find(a => a.id === spawned.agentId)
-          const agent: AgentStrip = { parentRun: ledgerAgent?.runId, originTurn: ledgerAgent?.originTurn, toolCount: 0, id: spawned.agentId!, title: oneLine(e.description || e.subagentType, 60), model: spawned.model ?? null, effort: null, tool: 'Starting', state: 'running', startedAt: now, endedAt: null, role, seq }
-          await update($, visualAtom, old => ({ ...old, agents: [...old.agents.filter(a => a.id !== agent.id), agent].slice(-32) }))
+          const agent: AgentStrip = { parentRun: ledgerAgent?.runId, originTurn: ledgerAgent?.originTurn, toolCount: 0, id: spawned.agentId!, title: oneLine(e.description || e.subagentType, 60), model: spawned.model ?? null, effort: null, tool: ledgerAgent?.status === 'success' ? 'Done' : ledgerAgent && ledgerAgent.status !== 'running' ? 'Failed' : 'Starting', state: ledgerAgent?.status === 'success' ? 'done' : ledgerAgent && ledgerAgent.status !== 'running' ? 'error' : 'running', startedAt: now, endedAt: typeof ledgerAgent?.end === 'number' ? ledgerAgent.end : null, role: assigned?.role ?? role, seq }
+          await update($, visualAtom, old => ({ ...old, agents: [...old.agents.filter(a => a.id !== agent.id), agent].filter((a,i,all)=>a.endedAt === null || i >= all.length - 32) }))
         })
       }
 
       return spawned
+    } catch (error) {
+      if (reservedId) { const at = await $.clock.now(); await changeSwarm($, held => { const t = held.tasks.find(t=>t.id===reservedId); return t?.state === 'reserved' && !t.agentId ? releaseReservation(held,reservedId!,at,'Host spawn failed') : held }) }
+      throw error
     } finally {
       spawning.delete(token)
     }
@@ -1611,13 +1861,45 @@ export const register: Register = (on, options) => {
       return { turnId: e.turnId, index: e.index, answer: text, toolUses: [], stopReason: 'end_turn', usage: null }
     }
     if (config.isStrict && hasAdvisor) return { turnId: e.turnId, index: e.index, answer: 'COBALT STRICT / external advisor disabled.', toolUses: [], stopReason: 'end_turn', usage: null }
-    const constrained = config.hasOrchestration ? { ...e, ...desiredRequest(e.agentId) } : e
-    const mismatch = config.hasOrchestration ? policyMismatch(e.model, e.effort, e.agentId) : null
+    const task = swarmState(await read($, ledgerAtom)).tasks.find(t => t.agentId === e.agentId && e.agentId !== undefined)
+    if (config.hasOrchestration && task?.cancellationRequested) {
+      const text = 'SWARM / cancellation requested'
+      yield { kind: 'text', index: 0, text }; yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+      return { turnId: e.turnId, index:e.index, answer:text, toolUses:[], stopReason:'end_turn', usage:null }
+    }
+    if (task && config.hasOrchestration) { const at = await $.clock.now(); await changeSwarm($, held => heartbeat(held,task.id,at)) }
+    // The tier is the policy's: Opus commands, Sonnet engineers, Haiku scouts.
+    // The model id follows from it; the effort below is resolved separately, so
+    // two agents side by side can run at different levels without a global move.
+    const tier: ModelTier = !e.agentId ? 'OPUS' : (task?.tier ?? (tierOf(e.model) === 'HAIKU' ? 'HAIKU' : 'SONNET'))
+    const subTier = tier === 'HAIKU' ? 'HAIKU' : 'SONNET'
+    const wanted = desiredRequest(e.agentId, subTier)
+    let constrained = e
+    let mismatch: string | null = null
+    let resolution: EffortResolution | null = null
+    if (config.hasOrchestration) {
+      const facts: EffortFacts = { tier, ...(task ? factsFromRole(task.role, task.mode) : {}) }
+      // An explicit level on the task is the commander's, and wins; otherwise
+      // AUTO names one from the task and MANUAL honours the fixed tier level.
+      const named = task !== undefined && task.requestedEffort !== 'AUTO' ? task.requestedEffort : null
+      const capability = capabilityOf(wanted.model, (await read($, effortKnownAtom)))
+      const manual = config.reasoningMode === 'MANUAL' && named === null
+      if (manual && !isEffortLevel(wanted.effort)) {
+        // MANUAL names no level for this tier (Haiku): leave the engine's own in place.
+        constrained = { ...e, model: wanted.model }
+      } else {
+        const requested: EffortRequest = manual ? wanted.effort as EffortLevel : named ?? 'AUTO'
+        resolution = chooseEffort(requested, facts, capability, config.maxEffort)
+        constrained = { ...e, model: wanted.model, ...(resolution.applied === undefined ? {} : { effort: resolution.applied }) }
+      }
+      mismatch = policyMismatch(e.model, e.effort, e.agentId, subTier)
+      if (task && resolution?.applied !== undefined && task.appliedEffort !== resolution.applied) await quiet(() => changeSwarm($, held => setAppliedEffort(held, task.id, resolution!.applied!)))
+    }
     if (e.agentId) await quiet(() => editAgent($, e.agentId!, a => ({ ...a, model: constrained.model, effort: constrained.effort === undefined ? null : String(constrained.effort) })))
     // the main loop's effort, as this request really carries it
-    else if (isSupported) await quiet(() => setMeter($, { model: constrained.model, effort: constrained.effort === undefined ? null : String(constrained.effort) }))
+    else if (isSupported) await quiet(() => setMeter($, { model: constrained.model, effort: constrained.effort === undefined ? null : String(constrained.effort), reasoningMode: config.reasoningMode, effortSource: resolution?.source ?? null, requestedEffort: e.effort === undefined ? null : String(e.effort), effortReason: resolution?.reason ?? null }))
     const result = yield* next(constrained)
-    await quiet(() => ledgerRequest($, e, { model: constrained.model, effort: constrained.effort, usage: result.usage }, mismatch))
+    await quiet(() => ledgerRequest($, resolution === null ? e : { ...e, effort: resolution.selected }, { model: constrained.model, effort: constrained.effort, usage: result.usage, routingReason: resolution?.reason, fallbackReason: resolution?.fallbackReason }, mismatch))
     if (result.usage && result.usage.model !== constrained.model) await quiet(() => mutateLedger($, l => warn(l, `MODEL POLICY / response mismatch: ${result.usage!.model}`)))
     // What answered is read off the response itself. With the refusal above it
     // is never Fable; if it ever were, the count says so.
@@ -1669,14 +1951,29 @@ export const register: Register = (on, options) => {
   })
 
   on('classic.PostToolUse', async ($, e, next) => {
+    const level = e.effort?.level
     if (isSupported) await quiet(async () => {
       await mutateLedger($, l => classicTelemetry(l, e))
-      if (e.agent_id && e.effort) await editAgent($, e.agent_id, a => ({ ...a, effort: e.effort!.level }))
-      const wanted = desiredRequest(e.agent_id).effort
-      if (e.effort && e.effort.level !== wanted) await mutateLedger($, l => warn(l, `MODEL POLICY / engine applied ${e.effort!.level}; expected ${wanted}`))
+      if (level !== undefined) {
+        // What the engine really applied this turn, next to what this request
+        // asked for: when they differ the request was downgraded, and the fact
+        // is recorded and folded into the model's observed capability.
+        const held = await read($, ledgerAtom)
+        const agent = e.agent_id === undefined ? undefined : held.agents.find(a => a.id === e.agent_id)
+        const run = held.runs.find(r => r.id === held.currentRun)
+        // `classicTelemetry` has already replaced `effort` with the engine's
+        // applied level, so the comparison this warning exists for must be made
+        // against what this plugin *requested* (`requestedEffort`), not against
+        // the value that was just overwritten. Otherwise `expected` would always
+        // equal `level` and neither the fallback nor the observation could fire.
+        const expected = e.agent_id === undefined ? run?.requestedEffort : agent?.requestedEffort
+        const observed = e.agent_id === undefined ? run?.model : agent?.model
+        if (agent !== undefined) await editAgent($, e.agent_id!, a => ({ ...a, effort: level }))
+        if (expected !== undefined && expected !== UNKNOWN && expected !== level) await mutateLedger($, l => warn(l, `EFFORT FALLBACK / engine applied ${level}; requested ${expected}`))
+        if (observed !== undefined && observed !== UNKNOWN && isEffortLevel(expected) && isEffortLevel(level)) await update($, effortKnownAtom, known => observeCapability(known, observed, expected, level))
+      }
       await persist($)
     })
-    const level = e.effort?.level
     if (isSupported && e.agent_id === undefined && level !== undefined && level !== lastEffort) {
       lastEffort = level
       await quiet(() => setMeter($, { effort: level }))
@@ -1704,7 +2001,7 @@ export const register: Register = (on, options) => {
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     if (!isSupported || e.traits.includes('bare')) return composed
-    const text = `${DISCIPLINE}${config.hasAttributionGuard ? HYGIENE : ''}${config.hasGuard ? SAFETY : ''}${config.hasOrchestration ? orchestrationText(config.maxSubagents) : ''}${config.blocksFable ? `\n\n${FABLE_RULE}` : ''}`
+    const text = `${DISCIPLINE}${config.hasAttributionGuard ? HYGIENE : ''}${config.hasGuard ? SAFETY : ''}${config.hasOrchestration ? orchestrationText(config.maxSubagents) + effortPolicyText(config.reasoningMode, config.maxEffort) : ''}${config.blocksFable ? `\n\n${FABLE_RULE}` : ''}`
 
     return { sections: [...composed.sections, { id: 'cobalt-cockpit:discipline', text, scope: 'session' }] }
   })
@@ -1751,6 +2048,27 @@ export const register: Register = (on, options) => {
         await savePrefs({ isHudHidden })
 
         return { text: isHudHidden ? 'Cockpit: HUD hidden.' : 'Cockpit: HUD shown.' }
+      }
+      case 'version':
+      case 'source': {
+        // What is really loaded, and where from: the manifest on disk, not a
+        // version this module remembers. A stale install and a live source tree
+        // are told apart by the path, which is the failure this diagnostic exists
+        // for. The observed effort capability is printed only when one was seen.
+        let version: string = UNKNOWN
+        try { version = /"version"\s*:\s*"([^"]+)"/.exec(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`))?.[1] ?? UNKNOWN } catch { /* manifest unreadable: version stays unknown */ }
+        const observed = Object.entries(await read($, effortKnownAtom))
+        const model = await $.session.model().catch(() => '')
+
+        return {
+          text: [
+            `PLUGIN / ${$.plugin.name} ${version}`,
+            `SOURCE / ${$.plugin.root}`,
+            `SESSION MODEL / ${model === '' ? UNKNOWN : model}`,
+            `REASONING / ${config.reasoningMode} · ceiling ${config.maxEffort.toUpperCase()}`,
+            ...(observed.length ? [`OBSERVED EFFORT / ${observed.map(([id, levels]) => `${id} ${[...levels].join('/')}`).join(' · ')}`] : []),
+          ].join('\n'),
+        }
       }
       case 'auth': {
         await quiet(() => probeAuth($, false))
@@ -1803,7 +2121,7 @@ export const register: Register = (on, options) => {
     // The orchestration line sits above the strips and is paid for out of their
     // rows, so the band is never taller for it; with one row to spare the strips
     // keep it and the line is left out.
-    const crew = visibleAgents(session.agents, now, 32).shown
+    const crew = visibleAgents(session.agents, now, session.agents.length).shown
     const hasCrew = config.hasOrchestration && room >= 2 && crew.some(hasRole)
     const stripRoom = hasCrew ? room - 1 : room
     let agents = visibleAgents(session.agents, now, Math.min(3, stripRoom))
@@ -2030,7 +2348,8 @@ export const register: Register = (on, options) => {
       task: input.task,
       activity,
       isWorking: activity.isWorking,
-      agents: session.agents.slice(-8),
+      agents: session.agents,
+      swarm: (await read($, ledgerAtom)).swarm,
       nwho: newest === null ? null : stripText(newest).replace(/^NWHO · /, ''),
       limit: config.maxSubagents,
       now: paneNow,

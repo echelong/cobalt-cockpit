@@ -33,7 +33,7 @@ export type EventKind =
  * `failed` when it really errored. Nothing else sets `failed`, so the crawler
  * can never show a break that did not happen.
  */
-export type EventState = 'running' | 'done' | 'failed'
+export type EventState = 'running' | 'waiting' | 'done' | 'failed'
 
 /**
  * One normalized observation, safe to draw.
@@ -180,6 +180,14 @@ export type Meter = {
   window: number | null
   model: string | null
   effort: string | null
+  /** AUTO or MANUAL: whether the level was chosen from the task or named. */
+  reasoningMode?: ReasoningMode | null
+  /** Where the displayed effort came from, when it is known. */
+  effortSource?: EffortSource | null
+  /** The level the task asked for before any capability fallback. */
+  requestedEffort?: string | null
+  /** One line on why this level was chosen. */
+  effortReason?: string | null
 }
 
 export type GuardFinding = { rule: string; title: string; effect: string }
@@ -198,7 +206,7 @@ export type GuardRequest = {
  * What a subagent was started as, read off the agent type the engine spawned:
  * the four Cockpit roles, or `AGENT` for any other type.
  */
-export type AgentRole = 'WORKER' | 'EXPLORER' | 'RESEARCHER' | 'REVIEWER' | 'AGENT'
+export type AgentRole = 'WORKER' | 'EXPLORER' | 'RESEARCHER' | 'REVIEWER' | 'SCOUT' | 'UTILITY' | 'AGENT' | (string & {})
 
 /**
  * One subagent's row. `role`, `seq` and `kind` are set from the spawn and the
@@ -311,18 +319,62 @@ declare module 'claude-code' {
       'replay-position': number
       'ledger-resume': boolean
       'control-cursor': Cursor | null
+      'effort-known': Record<string, readonly EffortLevel[]>
     }
   }
 }
 
+export type ModelTier = 'OPUS' | 'SONNET' | 'HAIKU'
+
+/**
+ * How hard a request asks a model to think, in the engine's own order. `xhigh`
+ * sits between `high` and `max`. Every level is not supported by every model,
+ * account or CLI version, so a level is only ever *requested*; what the engine
+ * actually applied is recorded separately (and may be a silent downgrade).
+ */
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+/** A level the commander names, or `AUTO` to let the policy choose from the task. */
+export type EffortRequest = EffortLevel | 'AUTO'
+/** Where an effort value came from: chosen from the task, named by hand, the engine's own report, or a capability fallback. */
+export type EffortSource = 'auto' | 'manual' | 'request' | 'engine' | 'fallback' | 'unknown'
+/** Whether the reasoning mode chooses effort from the task or honours a fixed setting. */
+export type ReasoningMode = 'AUTO' | 'MANUAL'
+/** One effort step upward within a tier: recorded so history can explain it. */
+export type EffortEscalation = { from: EffortLevel; to: EffortLevel; reason: string; at: number }
+
+export type Wave = 'RECONNAISSANCE' | 'ENGINEERING' | 'REVIEW' | 'INTEGRATION' | 'VERIFICATION'
+export type TaskState = 'queued' | 'blocked' | 'reserved' | 'running' | 'completed' | 'failed' | 'cancelled' | 'stalled' | 'escalated'
+export type Verification = 'pending' | 'pass' | 'fail' | 'unknown'
+export type SwarmResult = { conclusion: string; evidence: string[]; changes: string[]; verification: string[]; unresolved: string[]; confidence: string | null; escalation: string | null; rawRef: string | null }
+/**
+ * A structured handoff toward the commander. `to` moves the tier; `effort`,
+ * when set, moves the reasonning level instead or as well (an effort-only
+ * escalation keeps the tier and adds reasoning).
+ */
+export type Handoff = { objective: string; discoveries: string[]; evidence: string[]; question: string; risk: string; nextAction: string; locations: string[]; to: ModelTier; effort?: EffortLevel | null; effortReason?: string | null }
+export type SwarmTask = {
+  id: string; parentTask: string | null; parentAgent: string | null; agentId: string | null; tier: ModelTier; role: string
+  objective: string; scope: string; dependencies: string[]; owned: string[]; mode: 'read' | 'write'; state: TaskState
+  cancellationRequested: boolean; wave: Wave; spawnReason: string; escalation: Handoff | null; result: SwarmResult | null; verification: Verification
+  /** The effort the commander requested for this task: a level, or AUTO to choose from the task. */
+  requestedEffort: EffortRequest; /** Why that effort (or the AUTO selection) was chosen. */ effortReason: string
+  /** The level last applied to this task's live agent requests, where observable; null before any request. */ appliedEffort: string | null
+  /** One effort step upward within the tier, recorded when it happened. */ effortEscalation: EffortEscalation | null
+  createdAt: number; startedAt: number | null; endedAt: number | null; lastActivityAt: number; reason: string | null
+}
+export type SwarmEvent = { seq: number; at: number; kind: string; taskId: string | null; agentId: string | null; wave: Wave; detail: string }
+export type SwarmConfig = { sonnet: number | 'AUTO'; haiku: number | 'AUTO'; total: number | 'AUTO'; maxTasks: number; maxEvents: number; stallMs: number }
+export type Swarm = { version: 2; wave: Wave; config: SwarmConfig; tasks: SwarmTask[]; events: SwarmEvent[]; sequence: number; requested: number; actual: number; highWater: number; conflicts: number; droppedEvents: number }
+export type TaskInput = Pick<SwarmTask, 'id' | 'tier' | 'role' | 'objective'> & Partial<Pick<SwarmTask, 'parentTask' | 'parentAgent' | 'scope' | 'dependencies' | 'owned' | 'mode' | 'wave' | 'spawnReason'>> & { /** Requested reasoning level, or AUTO to choose from the task. */ effort?: EffortRequest; /** Why the effort was chosen. */ effortReason?: string }
+
 export type Value<T> = T | typeof UNKNOWN
 export type Counts = { tools: number; reads: number; edits: number; writes: number; tests: number; builds: number; git: number; failures: number; retries: 'unknown' }
-export type Run = { id: string; turnId: string; parentRun: Value<string>; start: number; end: Value<number>; status: string; model: Value<string>; effort: Value<string>; effortSource: 'request' | 'engine' | 'unknown'; latest: string; counts: Counts }
-export type LedgerAgent = { id: string; role: string; name: string; runId: Value<string>; originTurn: Value<string>; parentAgent: Value<string>; requestedModel: Value<string>; requestedEffort: Value<string>; model: Value<string>; effort: Value<string>; effortSource: 'request' | 'engine' | 'unknown'; start: Value<number>; end: Value<number>; status: string; latest: string; counts: Counts; source: Value<string>; background: Value<boolean> }
+export type Run = { id: string; turnId: string; parentRun: Value<string>; start: number; end: Value<number>; status: string; model: Value<string>; effort: Value<string>; effortSource: 'request' | 'engine' | 'unknown'; requestedEffort?: Value<string>; routingReason?: Value<string>; fallbackReason?: Value<string>; effectiveEffort?: Value<string>; latest: string; counts: Counts }
+export type LedgerAgent = { id: string; role: string; name: string; runId: Value<string>; originTurn: Value<string>; parentAgent: Value<string>; requestedModel: Value<string>; requestedEffort: Value<string>; model: Value<string>; effort: Value<string>; effortSource: 'request' | 'engine' | 'unknown'; routingReason?: Value<string>; fallbackReason?: Value<string>; effectiveEffort?: Value<string>; start: Value<number>; end: Value<number>; status: string; latest: string; counts: Counts; source: Value<string>; background: Value<boolean> }
 export type ToolEntry = { id: string; runId: Value<string>; turnId: Value<string>; agentId: Value<string>; tool: string; family: string; durationMs: Value<number>; file: Value<string>; start: number; end: Value<number>; status: string; source: Value<string> }
 export type Reading = { at: number; turnId: Value<string>; tokens: Value<number>; window: Value<number>; percent: Value<number> }
 export type Request = { id: string; runId: Value<string>; turnId: string; agentId: Value<string>; requestedModel: Value<string>; requestedEffort: Value<string>; model: Value<string>; effort: Value<string>; effectiveEffort: Value<string>; input: Value<number>; output: Value<number>; cacheRead: Value<number>; cacheWrite: Value<number> }
 export type Checkpoint = { at: number; goal: string; phase: string; completed: string[]; remaining: string[]; latest: string; gates: Record<string, string>; branch: string; startingSha: string; currentSha: string; repo: string; dirty: Value<number>; blockers: string[]; backgroundAgents: string[] }
-export type Ledger = { schema: 1; sessionId: string; currentRun: Value<string>; turns: Record<string, string>; runs: Run[]; agents: LedgerAgent[]; tools: ToolEntry[]; requests: Request[]; usage: Reading[]; receipts: NwhoEvent[]; warnings: string[]; replay: ReplayStep[]; checkpoint: Checkpoint | null }
+export type Ledger = { schema: 1 | 2; observedCompletions?: { agentId: string; reason: string; conclusion: string; at: number }[]; swarm?: Swarm; sessionId: string; currentRun: Value<string>; turns: Record<string, string>; runs: Run[]; agents: LedgerAgent[]; tools: ToolEntry[]; requests: Request[]; usage: Reading[]; receipts: NwhoEvent[]; warnings: string[]; replay: ReplayStep[]; checkpoint: Checkpoint | null }
 export type ReplayStep = { id: string; runId: string; turnId: string; agentId: string; file: string; kind: 'Edit' | 'Write'; at: number; before: string; after: string; scope: 'fragment' | 'file'; omitted: boolean }
 export type Cursor = { offset: number; size: number; seen: string[]; primed: boolean }

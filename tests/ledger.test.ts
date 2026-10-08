@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { addAgent, adoptAgent, beginTool, checkpointOf, classicTelemetry, emptyLedger, elapsed, exportJSON, finishTool, finishTurn, ledgerLines, LIMITS, reading, receipts, recordRequest, startRun, storageLedger, jsonBytes, STORE_LEDGER_BYTES, UNKNOWN, withReplay } from '../hooks/ledger'
+import { addAgent, adoptAgent, beginTool, checkpointOf, classicTelemetry, emptyLedger, elapsed, exportJSON, finishTool, finishTurn, ledgerLines, migrateLedger, LIMITS, reading, receipts, recordRequest, startRun, storageLedger, jsonBytes, STORE_LEDGER_BYTES, UNKNOWN, withReplay } from '../hooks/ledger'
 import type { Ledger } from '../hooks/ledger'
 import { appendReplay, diffLines, REPLAY_BYTES, REPLAY_MAX, replayStep, safeFile } from '../hooks/replay'
 import type { ReplayStep } from '../hooks/replay'
@@ -20,7 +20,12 @@ const step = async ($: Parameters<typeof start>[0], agentId?: string, model = 'c
   while (!r.done) r = await stream.next()
   return r.value
 }
-const spawn = ($: Parameters<typeof start>[0], model?: string, over: Record<string, unknown> = {}) => $.agent.spawn({ prompt: 'Read auth', description: 'Inspect auth', subagentType: 'explorer', tool_use_id: 'spawn1', provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-opus-5-5', background: true, fork: false, ...(model ? { model } : {}), ...over } as never)
+let spawnSeq = 0
+const spawn = async ($: Parameters<typeof start>[0], model?: string, over: Record<string, unknown> = {}) => {
+  const taskId = `ledger-task-${++spawnSeq}`
+  await $.tool.call({ tool: 'mcp__cobalt-cockpit__swarm', action: 'assign', task_id: taskId, tier: 'SONNET', role: 'EXPLORER', objective: `Read auth ${taskId}`, scope: 'Synthetic read-only discovery', owned_resources: [`/work/synthetic/${taskId}`], mode: 'read', dependencies: [], spawn_reason: 'Independent ledger fixture' } as never)
+  return $.agent.spawn({ prompt: 'Read auth', subagentType: 'explorer', tool_use_id: 'spawn1', provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-opus-5-5', background: true, fork: false, ...(model ? { model } : {}), ...over, description: `[task:${taskId}] Inspect auth` } as never)
+}
 const complete = ($: Parameters<typeof start>[0], turnId: string, agentId?: string) => $.turn.complete({ turnId, answer: 'ok', reason: 'answer', durationMs: 100, isAborted: false, ...(agentId ? { agentId } : {}) })
 
 describe('bounded execution accounting', () => {
@@ -126,7 +131,7 @@ describe('replay and deterministic checkpoint', () => {
     expect(c).toMatchObject({ goal: 'Fix auth', phase: 'RESEARCH', completed: [], remaining: ['Inspect', 'Verify'], backgroundAgents: ['a1'], branch: UNKNOWN })
     expect(JSON.stringify(c)).not.toContain('lastPrompt')
   })
-  test('JSON export excludes snapshots and free checkpoint prose', () => { let l = withReplay(agent(), snapshot({ before: 'private repo content' })); l = { ...l, checkpoint: { ...checkpointOf(l, null, null, 1000), goal: 'private goal' } }; const out = exportJSON(l); expect(JSON.parse(out).schema).toBe(1); expect(out).not.toMatch(/private repo content|private goal|Inspect auth/) })
+  test('JSON export excludes snapshots and free checkpoint prose', () => { let l = withReplay(agent(), snapshot({ before: 'private repo content' })); l = { ...l, checkpoint: { ...checkpointOf(l, null, null, 1000), goal: 'private goal' } }; const out = exportJSON(l); expect(JSON.parse(out).schema).toBe(2); expect(out).not.toMatch(/private repo content|private goal|Inspect auth/) })
   test('ledger renders all nine dossier sections', () => { const text = ledgerLines(agent(), 2000, 'SUBSCRIPTION').join('\n'); for (const name of ['01 RUN', '02 ORCHESTRATION', '03 SUBAGENTS', '04 NOBODYWHO', '05 USAGE', '06 FILES', '07 FAILURES', '08 VERIFICATION', '09 REPLAY']) expect(text).toContain(name); expect(text).toContain('AUTH / SUBSCRIPTION'); expect(text).toContain('ACTUAL claude-sonnet-5-5') })
 })
 
@@ -134,7 +139,7 @@ describe('policy and Activity Field topology', () => {
   test('Opus high coordinator allowed', () => { expect(policyMismatch('claude-opus-5-5', 'high')).toBeNull() })
   test('Sonnet medium worker allowed', () => { expect(policyMismatch('claude-sonnet-5-5', 'medium', 'a1')).toBeNull() })
   test('invalid model and effort produce a mismatch', () => { expect(policyMismatch('haiku', 'low', 'a1')).toContain('MODEL POLICY') })
-  test('supported request constraints are exact 5.5 models', () => { expect(desiredRequest()).toEqual({ model: 'claude-opus-5-5', effort: 'high' }); expect(desiredRequest('a1')).toEqual({ model: 'claude-sonnet-5-5', effort: 'medium' }) })
+  test('supported request constraints are exact 5.5 models', () => { expect(desiredRequest()).toEqual({ model: 'claude-opus-5-5', effort: 'high' }); expect(desiredRequest('a1')).toEqual({ model: 'claude-sonnet-5-5', effort: 'medium' }); expect(desiredRequest('h1', 'HAIKU')).toEqual({ model: 'claude-haiku-5-5' }) })
   test('no spawn means no orchestration graph', () => { expect(orchestrationGraph(run())).toBeNull(); expect(orchestrationTape(run(), 100)).toBeNull() })
   test('actual parallel agents make separate graph branches', () => { const l = agent(agent(), 'a2'); expect(orchestrationGraph(l)?.branches.length).toBe(2); expect(orchestrationTape(l, 100)?.text).toContain('┬') })
   test('completion converges to integrate', () => { const l = finishTurn(agent(), { turnId: 'ta1', agentId: 'a1', reason: 'answer' }, 3000); expect(orchestrationGraph(l)?.label).toBe('MAIN / INTEGRATE'); expect(orchestrationTape(l, 100)?.text).toContain('┴') })
@@ -156,7 +161,7 @@ describe('ledger through the installed engine test harness', () => {
     expect(w.requests.map(r => r.model)).toEqual(['claude-opus-5-5', 'claude-sonnet-5-5'])
     expect(w.outbound).toEqual([])
   })
-  test('maximum useful parallel subagents is three', { options: { orchestration: true, maxSubagents: 8 } }, async ($, on) => { const w = world(on); await start($); for (let n = 0; n < 3; n++) await spawn($, 'sonnet', { tool_use_id: `spawn${n}` }); expect((await spawn($)).deny).toContain('SUBAGENT LIMIT / 3'); expect(w.spawns.length).toBe(3) })
+  test('explicit three-agent resource budget remains supported', { options: { orchestration: true, maxSubagents: 3 } }, async ($, on) => { const w = world(on); await start($); for (let n = 0; n < 3; n++) await spawn($, 'sonnet', { tool_use_id: `spawn${n}` }); expect((await spawn($)).deny).toContain('SUBAGENT LIMIT / 3'); expect(w.spawns.length).toBe(3) })
   test('fork refusing inherited coordinator prevents an invalid agent', { options: { orchestration: true } }, async ($, on) => { const w = world(on); await start($); expect((await spawn($, 'opus', { fork: true })).deny).toContain('fork'); expect(w.spawns.length).toBe(0) })
   test('successful Edit and Write appear in replay; failures do not', async ($, on) => {
     const w = world(on); const held = hostState(on, {}); await start($); await $.turn.start({ turnId: 't1', text: '' })
@@ -173,7 +178,7 @@ describe('ledger through the installed engine test harness', () => {
     await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'npm test --token private-secret-value' } as never)
     expect((await slash($, 'park')).text).toContain('PARKED')
     const exported = (await slash($, 'ledger', 'export json')).text
-    expect(JSON.parse(exported!).schema).toBe(1); expect(exported).not.toMatch(/private raw prompt|private-secret-value/)
+    expect(JSON.parse(exported!).schema).toBe(2); expect(exported).not.toMatch(/private raw prompt|private-secret-value/)
     await slash($, 'ledger'); expect(w.opened).toContain('cobalt-run-ledger'); expect(w.outbound).toEqual([]); expect(w.requests).toEqual([])
     expect((held.get('run-ledger')?.value as Ledger).checkpoint?.goal).toBe('Fix auth')
   })
@@ -186,7 +191,8 @@ describe('ledger through the installed engine test harness', () => {
   test('Cockpit field and existing strips carry real agents', async ($, on) => {
     world(on); await start($); await $.turn.start({ turnId: 't1', text: '' }); await spawn($)
     const hud = await mountHud($, 'terminal', 120, true)
-    expect((await fieldRowsOf(hud)).join('\n')).toContain('EXPLORER')
+    expect((await fieldRowsOf(hud)).join('\n')).toContain('SONNET ×1')
+    expect((await rowsOf(hud)).join('\n')).toContain('EXPLORER')
     expect((await rowsOf(hud)).join('\n')).not.toContain('COBALT CONTROL / RUN LEDGER')
     await hud.unmount()
   })
@@ -225,7 +231,7 @@ describe('durable resume and dossier surfaces', () => {
     await start($); await $.turn.start({ turnId: 't1', text: '' }); await slash($, 'park')
     held.get('run-ledger')!.value = emptyLedger()
     await start($)
-    expect(held.get('run-ledger')?.value).toMatchObject({ schema: 1, sessionId: 'durable-session', currentRun: 'durable-session:t1' })
+    expect(held.get('run-ledger')?.value).toMatchObject({ schema: 2, sessionId: 'durable-session', currentRun: 'durable-session:t1' })
   })
   test('a background origin captured before delayed spawn is preserved', () => {
     const prior = run(); const current = startRun(prior, 't2', 3000)
@@ -292,4 +298,18 @@ test('durable storage bounds count UTF-8 bytes for Unicode repository paths', ()
   let l = agent()
   for (let n = 0; n < 600; n++) l = finishTool(beginTool(l, { tool: 'Read', tool_use_id: `u${n}`, file_path: '/work/' + '界'.repeat(230) }, n), `u${n}`, false, n)
   expect(jsonBytes(storageLedger(l))).toBeLessThanOrEqual(STORE_LEDGER_BYTES)
+})
+
+
+test('pre-v0.2 ledger migrates without inventing swarm activity or losing replay', () => {
+  const current = withReplay(agent(), snapshot())
+  const { swarm: _swarm, ...legacyFields } = current
+  const legacy = { ...legacyFields, schema: 1 as const }
+  const migrated = migrateLedger(legacy)
+  expect(migrated.schema).toBe(2)
+  expect(migrated.runs).toEqual(current.runs)
+  expect(migrated.agents).toEqual(current.agents)
+  expect(migrated.replay).toEqual(current.replay)
+  expect(migrated.swarm!.tasks).toEqual([])
+  expect(migrated.swarm!.events).toEqual([])
 })

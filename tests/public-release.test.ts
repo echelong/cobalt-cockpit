@@ -10,7 +10,12 @@ const request = async ($: Parameters<typeof start>[0], model: string, agentId?: 
   while (!next.done) next = await stream.next()
   return next.value
 }
-const spawn = ($: Parameters<typeof start>[0], model = 'opus') => $.agent.spawn({ prompt: 'Synthetic task', description: 'Synthetic task', tool_use_id: 'public-spawn', subagentType: 'cobalt-cockpit:worker', model, background: false, fork: false, parentModel: 'haiku', provider: { plugin: 'cobalt-cockpit' } } as never)
+let publicSeq = 0
+const spawn = async ($: Parameters<typeof start>[0], model = 'opus') => {
+  const taskId = `public-task-${++publicSeq}`
+  await $.tool.call({ tool: 'mcp__cobalt-cockpit__swarm', action: 'assign', task_id: taskId, tier: 'SONNET', role: 'ENGINEER', objective: `Synthetic task ${taskId}`, scope: 'Synthetic task', owned_resources: [`/work/synthetic/${taskId}`], mode: 'read', dependencies: [], spawn_reason: 'Independent public fixture' } as never)
+  return $.agent.spawn({ prompt: 'Synthetic task', tool_use_id: 'public-spawn', subagentType: 'cobalt-cockpit:worker', model, background: false, fork: false, parentModel: 'haiku', provider: { plugin: 'cobalt-cockpit' }, description: `[task:${taskId}] Synthetic task` } as never)
+}
 
 describe('public first run', () => {
   test('clean store, no NobodyWho, commands and progress work', async ($, on) => {

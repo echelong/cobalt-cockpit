@@ -6,13 +6,14 @@
 
 import { describe, expect, test as engineTest } from 'claude-code/testing'
 
+import { roleOf } from '../hooks/orchestra'
 import { BLOCK_LINE } from '../hooks/policy'
 import { FIVE, bash, command, hostState, mountHud, mountPane, passAllGates, planAndComplete, progress, prompt, rowsOf, start, TOOL, world } from './world'
 import type { World } from './world'
 
 const test: typeof engineTest = ((name: string, optionsOrRun: any, run?: any) => {
   const options = typeof optionsOrRun === 'function' ? {} : optionsOrRun
-  return engineTest(name, { ...options, options: { orchestration: true, blockFable: true, subscriptionOnly: true, ...options.options } }, run ?? optionsOrRun)
+  return engineTest(name, { ...options, options: { orchestration: true, blockFable: true, subscriptionOnly: true, maxSubagents: 3, ...options.options } }, run ?? optionsOrRun)
 }) as unknown as typeof engineTest
 
 type Engine = Parameters<typeof start>[0]
@@ -37,10 +38,13 @@ const step = async ($: Engine, model: string, over: Record<string, unknown> = {}
 
 let uses = 0
 /** The Agent tool starting a subagent, as the engine raises it. */
-const spawn = ($: Engine, over: Record<string, unknown> = {}) =>
-  $.agent.spawn({
+const spawn = async ($: Engine, over: Record<string, unknown> = {}) => {
+  const taskId = `engine-task-${++uses}`
+  const legacyReviewer = String(over['subagentType'] ?? '').includes('reviewer')
+  const tier = String(over['model'] ?? '').includes('haiku') ? 'HAIKU' : 'SONNET'
+  if (!legacyReviewer && !Object.values(over).some(value => typeof value === 'string' && /fable/i.test(value))) await $.tool.call({ tool: 'mcp__cobalt-cockpit__swarm', action: 'assign', task_id: taskId, tier, role: roleOf(String(over['subagentType'] ?? 'worker')), objective: `Isolated work ${taskId}`, scope: 'Synthetic independent scope', owned_resources: [String(over['description'] ?? '').startsWith('Implement the limiter') ? '/work/example/src/limiter.ts' : String(over['subagentType'] ?? '').includes('explorer') && String(over['description'] ?? '').includes('bid') ? '/work/example/src/bids.ts' : `/work/example/synthetic/${taskId}`], mode: String(over['description'] ?? '').startsWith('Implement the limiter') ? 'write' : 'read', dependencies: [], spawn_reason: 'Independent engine fixture' } as never)
+  return $.agent.spawn({
     prompt: 'Do the isolated piece',
-    description: 'Isolated piece',
     tool_use_id: `use-${++uses}`,
     subagentType: 'cobalt-cockpit:worker',
     provider: { plugin: 'cobalt-cockpit', tier: 'user' },
@@ -48,7 +52,9 @@ const spawn = ($: Engine, over: Record<string, unknown> = {}) =>
     background: true,
     fork: false,
     ...over,
+    description: legacyReviewer ? String(over['description'] ?? 'Isolated review') : `[task:${taskId}] ${String(over['description'] ?? 'Isolated piece')}`,
   } as never)
+}
 
 const finish = ($: Engine, agentId: string, reason: 'answer' | 'error' = 'answer') =>
   $.turn.complete({ agentId, turnId: `turn-${agentId}`, reason, answer: 'Results only.', durationMs: 1000, isAborted: false } as never)
@@ -213,7 +219,7 @@ describe('nothing falls back to Fable, and nothing is substituted for it', () =>
     const w = world(on)
     await start($)
     await spawn($)
-    expect(w.spawns[0]?.['model']).toBe('sonnet')
+    expect(w.spawns[0]?.['model']).toBe(SONNET)
   })
 
   test('if anything beneath the plugin ever answered as Fable, the count would say so', async ($, on) => {
@@ -348,12 +354,12 @@ describe('what is allowed', () => {
     expect(w.transcript).toEqual([])
   })
 
-  test('a spawn that names Opus or Haiku keeps the model it named', async ($, on) => {
+  test('commander policy maps engineering to Sonnet and utility to Haiku', async ($, on) => {
     const w = world(on)
     await start($)
-    expect((await spawn($, { model: 'opus' })).model).toBe(OPUS)
-    expect((await spawn($, { model: 'haiku' })).model).toBe('claude-haiku-4-5')
-    expect(w.spawns.map(one => one['model'])).toEqual(['opus', 'haiku'])
+    expect((await spawn($, { model: 'opus' })).model).toBe(SONNET)
+    expect((await spawn($, { model: 'haiku' })).model).toBe('claude-haiku-5-5')
+    expect(w.spawns.map(one => one['model'])).toEqual([SONNET, 'claude-haiku-5-5'])
   })
 
   test('NobodyWho runs locally: its commands pass and its receipts are drawn', { options: { ledgerPath: '/home/tester/.local/state/decision-router/ledger.jsonl' } }, async ($, on) => {
@@ -634,7 +640,7 @@ describe('orchestration telemetry', () => {
     expect(pane).toMatch(/02 EXPLORER/)
     expect(pane).toMatch(/03 RESEARCHER/)
     // the three spawns are all that started, each on Sonnet
-    expect(w.spawns.map(one => one['model'])).toEqual(['sonnet', 'sonnet', 'sonnet'])
+    expect(w.spawns.map(one => one['model'])).toEqual([SONNET, SONNET, SONNET])
   })
 
   test('when they return, the work is back with main', async ($, on) => {
@@ -667,7 +673,7 @@ describe('orchestration telemetry', () => {
     await prompt($, 'Please review the limiter change')
     await $.turn.start({ text: 'review', turnId: 't1' })
     expect((await spawn($, { subagentType: 'cobalt-cockpit:reviewer' })).agentId).toBe('spawned-1')
-    await call($, 'Bash', { command: 'git diff', agentId: 'spawned-1' })
+    expect((await call($, 'Bash', { command: 'git diff', agentId: 'spawned-1' }) as { deny?: string }).deny).toBeUndefined()
     expect(await hudText($)).toMatch(/01 REVIEWER\s+SONNET\s+(GIT|BASH)/)
   })
 
@@ -716,10 +722,10 @@ describe('orchestration telemetry', () => {
     await start($)
     const { sections } = await $.prompt.compose({ model: OPUS, promptModel: OPUS, surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] })
     const mine = sections.find(section => section.id === 'cobalt-cockpit:discipline')
-    expect(mine?.text).toContain('You are the main session')
+    expect(mine?.text).toContain('Opus 5.5 high commander')
     expect(mine?.text).toContain('cobalt-cockpit:worker')
     expect(mine?.text).toContain('At most 3 subagents run at once')
-    expect(mine?.text).toContain('There is no advisor model')
+    expect(mine?.text).toContain('Haiku → Sonnet → Opus')
     expect(mine?.text).toContain('Fable is never used')
     // what was there before is all still there
     expect(mine?.text).toContain('Inspect before editing')
@@ -799,7 +805,7 @@ describe('a repeated error', () => {
     // one reviewer is admitted, on Sonnet
     const reviewer = await spawn($, { subagentType: 'cobalt-cockpit:reviewer' })
     expect(reviewer).toMatchObject({ agentId: 'spawned-1', model: SONNET })
-    expect(w.spawns[0]?.['model']).toBe('sonnet')
+    expect(w.spawns[0]?.['model']).toBe(SONNET)
     // not a second beside it, and not another for the same failure after it
     expect((await spawn($, { subagentType: 'cobalt-cockpit:reviewer' })).deny).toContain('already running')
     await finish($, 'spawned-1')
@@ -954,4 +960,20 @@ describe('final verification still gates 100%', () => {
     await spawn($, { model: 'fable' })
     expect(await progress($, { action: 'status' })).toBe(before)
   })
+})
+
+
+test('independent mixed pools exceed the old three-agent ceiling and issue native requests', { options: { maxSubagents: 12, maxSonnet: 6, maxHaiku: 8 } }, async ($, on) => {
+  const w = world(on); const held = hostState(on, {})
+  await start($)
+  const agents = await Promise.all(Array.from({ length: 8 }, (_, n) => spawn($, { model: n < 4 ? 'sonnet' : 'haiku', subagentType: n < 4 ? 'cobalt-cockpit:worker' : 'cobalt-cockpit:scout' })))
+  expect(agents.every(a => a.agentId !== undefined)).toBe(true)
+  expect(w.spawns).toHaveLength(8)
+  for (let n = 0; n < agents.length; n++) await step($, OPUS, { agentId: agents[n]!.agentId, effort: 'high' })
+  expect(w.requests.filter(r => r.model === SONNET)).toHaveLength(4)
+  expect(w.requests.filter(r => r.model === 'claude-haiku-5-5')).toHaveLength(4)
+  const ledger = held.get('run-ledger')?.value as import('../types').Ledger
+  expect(ledger.swarm?.highWater).toBe(8)
+  expect(ledger.swarm?.tasks.filter(t => t.state === 'running')).toHaveLength(8)
+  expect(w.outbound).toEqual([])
 })

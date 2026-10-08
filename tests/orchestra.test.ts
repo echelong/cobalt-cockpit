@@ -100,16 +100,17 @@ describe('roles and models, from what the engine spawned', () => {
 })
 
 describe('the subagent limit', () => {
-  test('three by default, held to a whole number between one and eight', () => {
-    expect(DEFAULT_LIMIT).toBe(3)
-    expect(limitOf(undefined)).toBe(3)
-    expect(limitOf('5')).toBe(3)
-    expect(limitOf(Number.NaN)).toBe(3)
+  test('resource budget defaults beyond three and preserves explicit limits', () => {
+    expect(DEFAULT_LIMIT).toBe(16)
+    expect(limitOf(undefined)).toBe(16)
+    expect(limitOf('5')).toBe(16)
+    expect(limitOf(Number.NaN)).toBe(16)
     expect(limitOf(2)).toBe(2)
     expect(limitOf(2.9)).toBe(2)
-    expect(limitOf(0)).toBe(1)
+    expect(limitOf(0)).toBe(16)
     expect(limitOf(-4)).toBe(1)
-    expect(limitOf(99)).toBe(8)
+    expect(limitOf(99)).toBe(99)
+    expect(limitOf(999)).toBe(128)
   })
 
   test('one more may start below the limit and not at it', () => {
@@ -328,18 +329,19 @@ describe('the system prompt section', () => {
   const text = orchestrationText(3)
 
   test('it states the division of labour, the roles, the limit and the block', () => {
-    expect(text).toContain('You are the main session')
-    for (const type of ['cobalt-cockpit:worker', 'cobalt-cockpit:explorer', 'cobalt-cockpit:researcher', 'cobalt-cockpit:reviewer']) expect(text).toContain(type)
+    expect(text).toContain('Opus 5.5 high commander')
+    expect(text).toContain('cobalt-cockpit:worker, explorer, researcher and reviewer')
+    expect(text).toContain('cobalt-cockpit:scout and utility')
     expect(text).toContain('Sonnet at medium effort')
     expect(text).toContain('At most 3 subagents run at once')
-    expect(text).toContain('There is no advisor model')
+    expect(text).toContain('Haiku → Sonnet → Opus')
     expect(text).toContain('MODEL BLOCK / FABLE / POLICY')
     expect(orchestrationText(1)).toContain('At most 1 subagents run at once')
   })
 
   test('it tells main not to delegate the trivial', () => {
-    expect(text).toContain('one-file change')
-    expect(text).toContain('Do not spawn a subagent for a trivial task')
-    expect(text).toContain('never give two agents the same work')
+    expect(text).toContain('trivial or tightly coupled')
+    expect(text).toContain('Never manufacture subagent work')
+    expect(text).toContain('avoid duplicate tasks')
   })
 })

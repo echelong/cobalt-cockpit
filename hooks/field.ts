@@ -1,3 +1,4 @@
+import { tierOf } from './orchestra'
 // The Activity Field: a bounded, in-place tape of real activity above the
 // prompt, and the surface the crawler physically traverses.
 //
@@ -18,6 +19,8 @@
 //     is ever drawn from imagination.
 
 import type { NwhoEvent } from '../types'
+import { summarizeSwarm } from './swarm'
+import type { Swarm } from './swarm'
 import { currentOf, settledIds } from './activity'
 import type { ActivityEvent } from './activity'
 import { limbsAt, paceOf, poseAt, stepToward } from './crawler'
@@ -469,6 +472,8 @@ export const fieldSvg = (
 // Real spawned branches share the existing Activity Field/crawler geometry.
 // Parent and origin are facts retained by the Run Ledger, never task guesses.
 export const orchestrationGraph = (ledger: import('./ledger').Ledger, now = 0): Graph | null => {
+  if (ledger.swarm?.tasks.length) return swarmGraph(ledger.swarm, ledger.currentRun ?? undefined, tierOf(ledger.runs.find(r=>r.id===ledger.currentRun)?.model) ?? 'MAIN / MODEL unknown')
+
   const known = ledger.agents.filter(a => a.runId !== 'unknown' && ledger.runs.some(r => r.id === a.runId))
   const focus = known.some(a => a.runId === ledger.currentRun && a.status === 'running') ? ledger.currentRun : known.find(a => a.status === 'running')?.runId ?? (known.some(a => a.runId === ledger.currentRun) ? ledger.currentRun : undefined)
   const agents = known.filter(a => a.runId === focus)
@@ -483,6 +488,7 @@ export const orchestrationGraph = (ledger: import('./ledger').Ledger, now = 0): 
 export const orchestrationTape = (ledger: import('./ledger').Ledger, columns: number, now = 0): Tape | null => {
   const graph = orchestrationGraph(ledger, now)
   if (!graph) return null
+  if (ledger.swarm?.tasks.length) return swarmTape(ledger.swarm, columns, tierOf(ledger.runs.find(r=>r.id===ledger.currentRun)?.model) ?? 'MAIN / MODEL unknown')
   const run = ledger.runs.find(r => r.id === graph.runId)
   const agents = ledger.agents.filter(a => a.runId === graph.runId && (a.status === 'running' || a.end === 'unknown' || now - a.end < 5000)).slice(-3)
   const events: ActivityEvent[] = [{ id: run?.id ?? ledger.sessionId, kind: 'AGENT', label: graph.label, detail: '', state: agents.some(a => a.status === 'running') ? 'running' : 'done', startedAt: run?.start ?? 0, endedAt: run?.end === 'unknown' ? null : run?.end ?? null }, ...agents.map(a => ({ id: a.id, kind: 'AGENT' as const, label: a.role, detail: a.parentAgent === 'unknown' ? '' : `←${a.parentAgent}`, state: a.status === 'running' ? 'running' as const : a.status === 'success' ? 'done' as const : 'failed' as const, startedAt: a.start === 'unknown' ? 0 : a.start, endedAt: a.end === 'unknown' ? null : a.end }))]
@@ -490,4 +496,38 @@ export const orchestrationTape = (ledger: import('./ledger').Ledger, columns: nu
   // Replace spine separators with branch junctions at the same cell positions.
   tape.text = tape.text.replace(/ ─╼─ /g, agents.some(a => a.status === 'running') ? ' ┬── ' : ' ┴── ')
   return tape
+}
+
+/** Tier/state aggregation shares crawler geometry, with bounded nodes even for
+ * large utility pools. Every count comes from recorded task ownership state. */
+export const swarmGraph = (swarm: Swarm, runId?: string, commander = 'MAIN / MODEL unknown'): Graph | null => {
+  if (!swarm.tasks.length) return null
+  const summary = summarizeSwarm(swarm)
+  const branches: Branch[] = []
+  for (const tier of ['SONNET', 'HAIKU', 'OPUS'] as const) {
+    const tasks = swarm.tasks.filter(t => t.tier === tier)
+    if (!tasks.length) continue
+    const count = (states: string[]) => tasks.filter(t => states.includes(t.state)).length
+    const escalated = tasks.filter(t => t.escalation !== null).length
+    const review = tasks.filter(t => t.wave === 'REVIEW').length
+    const verification = tasks.filter(t => t.wave === 'VERIFICATION').length
+    const label = `${tier} ${tasks.length} · active ${count(['reserved', 'running'])} · queue ${count(['queued'])} · blocked ${count(['blocked', 'stalled'])} · done ${count(['completed'])} · failed ${count(['failed'])}${escalated ? ` · ↑${escalated}` : ''}${review ? ` · review ${review}` : ''}${verification ? ` · verify ${verification}` : ''}`
+    branches.push({ state: count(['failed']) === tasks.length ? 'dropped' : 'kept', label, at: 0, lit: count(['reserved', 'running']) ? 1 : 0.5 })
+  }
+  branches.forEach((b, i) => { b.at = (i + 1) / (branches.length + 1) })
+  return { kind: 'orchestration', runId, chosen: null, label: `${commander} · ${summary.wave} · parallel ${summary.parallelism} · queue ${summary.queue} · blocked ${summary.blocked}`, branches }
+}
+export const swarmTape = (swarm: Swarm, columns: number, commander = 'MAIN / MODEL unknown'): Tape | null => {
+  const graph = swarmGraph(swarm,undefined,commander)
+  if (!graph) return null
+  const events: ActivityEvent[] = [{ id: 'swarm:commander', kind: 'AGENT', label: `${commander} ${swarm.wave}`, detail: '', state: summarizeSwarm(swarm).parallelism ? 'running' : 'done', startedAt: 0, endedAt: null }]
+  for (const b of graph.branches) {
+    const tier = b.label.split(' ')[0]!
+    const tasks = swarm.tasks.filter(t => t.tier === tier)
+    const live = tasks.filter(t => t.state === 'running' || t.state === 'reserved').length
+    const blocked = tasks.filter(t => t.state === 'blocked' || t.state === 'stalled').length
+    const escalated = tasks.filter(t => t.escalation !== null).length
+    events.push({ id: `swarm:${tier}`, kind: 'AGENT', label: `${tier} ×${tasks.length}`, detail: `${live} active${blocked ? ` !${blocked}` : ''}${escalated ? ` ↑${escalated}` : ''} ${tasks.filter(t => t.state === 'queued').length} queued ${tasks.filter(t => t.state === 'completed').length} done`, state: live ? 'running' : b.state === 'dropped' ? 'failed' : tasks.every(t => t.state === 'completed') ? 'done' : 'waiting', startedAt: Math.min(...tasks.map(t => t.createdAt)), endedAt: null })
+  }
+  return tapeOf(events, columns)
 }
