@@ -20,7 +20,7 @@ Cockpit adds a cyberpunk HUD and local dashboard to Claude Code. Progress follow
 
 ## Quick start
 
-Requires **Claude Code 2.1.287 or later** with mods enabled. Tested on 2.1.288. Check `claude --version` first.
+Requires **Claude Code 2.1.287 or later** with mods enabled. Tested on 2.1.288 (the suite's default) and 2.1.294 (the native-effort and directory-validation paths). Check `claude --version` first.
 
 After the repository is published:
 
@@ -165,6 +165,16 @@ Sounds try PipeWire, PulseAudio, ALSA, ffplay, mpv, SoX, Canberra, macOS afplay,
 ## Privacy
 
 Run Ledger is local. Cockpit observes tool calls, paths, agent events, token/context telemetry, Git state and verification. In-session task state can contain user text; persisted checkpoints retain explicit goals and milestone labels. Hidden reasoning is never stored. Redaction is heuristic: review exports before sharing, and never export secrets. See [SECURITY.md](SECURITY.md).
+
+### What Cockpit runs, reads and sends
+
+Cockpit installs no launcher and downloads nothing. It runs local processes, with your privileges and without prompting, for four reasons: `realpath -m` canonicalizes a path a subagent claims as its own (orchestration only), `tail -c` reads the end of a telemetry ledger larger than 512 KiB, `git status --porcelain=v2` and `git rev-parse --show-toplevel` feed the HUD, and one of nine audio players plays the optional cues (`pw-play`, `paplay`, `aplay`, `ffplay`, `mpv`, `play`, `canberra-gtk-play`, `afplay`, then a terminal bell). Each is an argument array: no shell string is ever built from model or user text.
+
+It reads files: the decision-router ledger (read-only, optional, `localControl`), a file about to be written (a bounded replay snapshot), and Claude Code's settings. It reads environment variables **by name**: `CLAUDE_CODE_EFFORT_LEVEL`, `XDG_STATE_HOME`, `HOME`, `COBALT_REDUCED_MOTION`, and eight authentication variables — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_MANTLE` — whose values are reduced to set-or-not-set on the spot and never stored, logged, exported or sent. It writes nothing outside the host's plugin store, which holds up to eight bounded run ledgers, bounded replay bodies, checkpoints and two preferences.
+
+It makes no network request of its own: no fetch, no model call, no MCP call. Its two prompt hooks add text to the request Claude Code already sends — the discipline, safety and policy sections of the system prompt, and one line of task status — which is the only route by which anything Cockpit observed reaches a model. Every path above is listed with its call site in [docs/implementation-v0.3.2.md](docs/implementation-v0.3.2.md).
+
+The guards are not a sandbox: they use recognizable syntax and your confirmation. Keep Claude Code's permission controls enabled.
 
 ## Development
 

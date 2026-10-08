@@ -33,7 +33,7 @@ export const EMPTY_POLICY: PolicyState = { blocks: 0, calls: 0, lastBlockAt: nul
 // `mcp__fable__ask`. Letters on either side make it another word (`affable`,
 // `fables`), which is not the model.
 const FABLE = /(^|[^a-z])fable([^a-z]|$)/i
-const INVISIBLE = /[­​-‏⁠-⁤﻿]/g
+const INVISIBLE = /[\u00AD\u200B-\u200F\u2060-\u2064\uFEFF]/g
 
 /**
  * Whether a model, provider, agent or tool name identifies Fable.

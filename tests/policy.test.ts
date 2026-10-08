@@ -47,8 +47,8 @@ describe('a name that identifies Fable', () => {
   test('a name dressed up with compatibility forms or invisible characters is still read', () => {
     // fullwidth letters fold to ASCII, and a zero-width space is dropped
     expect(isFable('ｆａｂｌｅ')).toBe(true)
-    expect(isFable('fa​ble')).toBe(true)
-    expect(isFable('claude-⁠fable')).toBe(true)
+    expect(isFable('fa\u200Bble')).toBe(true)
+    expect(isFable('claude-\u2060fable')).toBe(true)
   })
 
   for (const name of [

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2 — Directory compliance and fail-closed guards
+
+- A hook that fails no longer lets an action through. The engine skips a hook that throws, times out or answers a wrong shape and runs what is beneath it, so every Cockpit hook that can refuse now carries a `.catch` handler that refuses in its place: the tool guard, the agent-offer and agent-spawn guards, the `/config` row guard, the `/model` and `/advisor` guards, and the checkpoint commands. This closes a real fail-open in the blast-radius, ownership and Fable gates. Hooks that only observe still forward.
+- Decided with the engine's own rule for each event: a guard that had already passed the call on leaves that result standing (`next.called`), and a guard that only guards under a switch (Fable blocking, the strict preset) refuses only while that switch is on.
+- An unescaped invisible character was removed from the hooks module: the Fable policy's character class and two test strings carried six format code points (U+00AD, U+200B, U+200F, U+2060, U+2064, U+FEFF) typed literally. They are written as escapes now, with the same meaning. No other file in the repository carries a format character.
+- The name `next` is the pass-through parameter and nothing else: the preferences patch, an iterator step, a React key and the swarm accumulators that shared the name are renamed, so a reader or a scanner cannot mistake them for a pass-through.
+- `tool.call` hands the engine its own event when the guards, the effort policy and the read-only shell rewrite changed nothing; the copy goes on only when something in it was changed. `agent.spawn` and `prompt.submit` write their one intentional change as an explicit branch instead of a ternary.
+- `agent.offer` and `attribution.text` are block-bodied hooks with explicit answers.
+- `scripts/audit-public.py` now refuses an unescaped format character in any shipped file, a pass-through named for something else in the hooks module, and any hook that can refuse without a `.catch` handler.
+- 16 new tests (`tests/compliance.test.ts`) hold every handler, its fail-closed decision, and the event-identity rule above. Suite: 960 → 976.
+- Documentation: `docs/implementation-v0.3.2.md` records the directory findings, what could not be reproduced locally, the external-behaviour inventory, and how to re-run the portal's validation.
+
 ## 0.3.1 — Effort fidelity
 
 - A subagent's reasoning level is now set natively, on its own Agent call's `effort` parameter (Claude Code 2.1.292 or newer), instead of by rewriting each request. It is per invocation, so parallel agents never share a setting, and the level the engine resolves is the one recorded as applied.

@@ -76,12 +76,12 @@ export const admitTask = (s: Swarm, id: string, at: number): { swarm: Swarm; ok:
   if (reason) {
     const task = s.tasks.find(t => t.id === id); const waiting = task && ['queued', 'blocked'].includes(task.state)
     const conflict = reason.startsWith('ownership conflict')
-    let next = waiting ? update(s, id, { state: 'blocked', reason }) : s
-    if (conflict) next = { ...next, conflicts: next.conflicts + 1 }
-    return { swarm: event(next, conflict ? 'conflict' : 'blocked', id, at, reason), ok: false, reason }
+    let moved = waiting ? update(s, id, { state: 'blocked', reason }) : s
+    if (conflict) moved = { ...moved, conflicts: moved.conflicts + 1 }
+    return { swarm: event(moved, conflict ? 'conflict' : 'blocked', id, at, reason), ok: false, reason }
   }
-  const next = update(s, id, { state: 'reserved', startedAt: at, lastActivityAt: at, reason: null })
-  return { swarm: event({ ...next, highWater: Math.max(s.highWater, active(next).length) }, 'reserved', id, at, 'Slot and ownership reserved before host spawn'), ok: true, reason: null }
+  const reserved = update(s, id, { state: 'reserved', startedAt: at, lastActivityAt: at, reason: null })
+  return { swarm: event({ ...reserved, highWater: Math.max(s.highWater, active(reserved).length) }, 'reserved', id, at, 'Slot and ownership reserved before host spawn'), ok: true, reason: null }
 }
 export const bindAgent = (s: Swarm, id: string, agentId: string, at: number, kind: 'spawn' | 'adopt' = 'spawn'): Swarm => {
   const t = s.tasks.find(t => t.id === id)
@@ -99,9 +99,9 @@ export const finishTask = (s: Swarm, id: string, state: 'completed' | 'failed' |
 /** Call only after the host confirms stop/failure: terminal transitions release locks. */
 export const heartbeat = (s: Swarm, id: string, at: number): Swarm => update(s, id, { lastActivityAt: at, ...(s.tasks.find(t=>t.id===id)?.state === 'stalled' ? { state: s.tasks.find(t=>t.id===id)?.agentId ? 'running' as const : 'reserved' as const, reason:null } : {}) })
 export const markStalled = (s: Swarm, at: number): Swarm => {
-  let next = s
-  for (const t of active(s)) if (t.state !== 'stalled' && at - t.lastActivityAt >= s.config.stallMs) next = event(update(next, t.id, { state: 'stalled', reason: 'Awaiting host cancellation or recovery; ownership retained' }), 'stalled', t.id, at, 'No observed activity')
-  return next
+  let stalled = s
+  for (const t of active(s)) if (t.state !== 'stalled' && at - t.lastActivityAt >= s.config.stallMs) stalled = event(update(stalled, t.id, { state: 'stalled', reason: 'Awaiting host cancellation or recovery; ownership retained' }), 'stalled', t.id, at, 'No observed activity')
+  return stalled
 }
 const levelOf = (t: SwarmTask): EffortLevel => isEffortLevel(t.appliedEffort) ? t.appliedEffort : isEffortLevel(t.requestedEffort) ? t.requestedEffort : BASE_EFFORT[t.tier]
 export const escalateTask = (s: Swarm, id: string, h: Handoff, at: number): Swarm => {
