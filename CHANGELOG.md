@@ -11,7 +11,8 @@
 - `agent.offer` and `attribution.text` are block-bodied hooks with explicit answers.
 - `scripts/audit-public.py` now refuses an unescaped format character in any shipped file, a pass-through named for something else in the hooks module, and any hook that can refuse without a `.catch` handler.
 - 20 new tests (`tests/compliance.test.ts`) hold every handler, its fail-closed decision, the event it judges, and the pass-through rule above. Suite: 960 → 980. `claude plugin validate --strict --json` lists 18 gating hooks, every one with a handler.
-- Documentation: `docs/implementation-v0.3.2.md` records the directory findings, what could not be reproduced locally, the external-behaviour inventory, and how to re-run the portal's validation.
+- The listing icon is VECTOR's own portrait, rendered rather than redrawn: `scripts/make-icon.py` prints `mascotSvg` from `hooks/mascot.ts` and scales it whole, 36×, onto the page's void ground. 1024×1024, 8-bit RGB, 32,706 bytes, no text or profile chunks, byte-identical across runs. The manifest's `icon` field names it (kept out of the marketplace entry, where the validator reads that field as unknown). `scripts/audit-public.py` now checks it: square, 512–2048 px, under 2 MB, complete PNG, no metadata.
+- Documentation: `docs/implementation-v0.3.2.md` records the directory findings, what could not be reproduced locally, the external-behaviour inventory, the icon's provenance, and how to re-run the portal's validation.
 
 ## 0.3.1 — Effort fidelity
 
