@@ -1,12 +1,37 @@
-# Cobalt Cockpit v0.3 — Dynamic Reasoning
+# Cobalt Cockpit v0.3.1 — Elastic Swarm + Adaptive Intelligence
 
-A live mission-control layer for Claude Code: see what is happening, what is verified, and what is safe to run.
+**Mission control for Claude Code.** Follow real task progress, coordinate bounded subagents, review verification gates, and replay what happened, without replacing Claude Code's native model and permission controls.
 
-<!-- Hero screenshot / GIF placeholder: add a synthetic session capture before promotion. -->
+[![GitHub release](https://img.shields.io/github/v/release/echelong/cobalt-cockpit?label=release)](https://github.com/echelong/cobalt-cockpit/releases/tag/v0.3.1)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ## What it does
 
-Cockpit adds a cyberpunk HUD and local dashboard to Claude Code. Progress follows milestones; DONE requires verification gates. Reasoning effort is chosen per task in AUTO, so a cheap inventory and a difficult migration are not run at the same level. The dashboard makes no model calls.
+Cobalt Cockpit adds a cyberpunk HUD, orchestration controls, and a local Run Ledger to Claude Code. It tracks **observed** milestones and verification rather than inventing progress. With orchestration enabled, Opus coordinates bounded Sonnet engineering and Haiku utility tasks, each with task-aware reasoning effort. The dashboard itself makes no model calls.
+
+## How the swarm works
+
+```mermaid
+flowchart TD
+    U["You: goal and Opus effort preference"] --> O["Opus 5.5 · commander<br/>Plan · delegate · integrate · verify"]
+    O <--> C["Cobalt Cockpit<br/>Admission · task ownership · waves · safety"]
+    C --> D{"Delegate only when useful"}
+    D -->|"Bounded investigation / routine work"| H["Haiku 5.5 pool<br/>Scout · inventory · classify<br/>Per-task effort"]
+    D -->|"Implementation / deep review"| S["Sonnet 5.5 pool<br/>Engineer · debug · review<br/>Per-task effort"]
+    D -->|"Architecture / small coupled task"| O
+    H -. "Complexity escalation" .-> S
+    S -. "Architectural escalation" .-> O
+    H --> R["Structured evidence and results"]
+    S --> R
+    R --> O
+    O --> V["Verification gates<br/>Tests · typecheck · build · review"]
+    V --> L["Run Ledger · HUD · replay"]
+    N["NobodyWho (optional)<br/>Read-only local decision/pruning receipts"] -.-> C
+```
+
+Opus remains **one main commander** and keeps the reasoning effort you select in Claude Code. Sonnet handles well-scoped engineering and review; Haiku handles bounded reconnaissance and repetitive processing. Cockpit tracks ownership, dependencies, escalation, and evidence. It is not an independent model router or a guarantee that every available agent slot will be used.
+
+**AUTO resource budgets:** up to 8 Sonnet, up to 16 Haiku, and **16 total subagents** under Cockpit's default admission policy. Actual Claude Code concurrency and model availability may be lower. Independent tasks can run in parallel; competing writers are serialized.
 
 ## Features
 
@@ -20,16 +45,33 @@ Cockpit adds a cyberpunk HUD and local dashboard to Claude Code. Progress follow
 
 ## Quick start
 
-Requires **Claude Code 2.1.287 or later** with mods enabled. Tested on 2.1.288. Check `claude --version` first.
+Requires Claude Code with mods/plugins enabled. **Claude Code 2.1.292+ is needed for native per-invocation subagent effort**; v0.3.1 was live-tested on 2.1.294. Check `claude --version` first. Older hosts have reduced effort observability and compatibility fallbacks.
 
-After the repository is published:
+Install from this repository's **public GitHub marketplace**:
 
 ```sh
 claude plugin marketplace add echelong/cobalt-cockpit
 claude plugin install cobalt-cockpit@cobalt-cockpit
 ```
 
-Restart Claude Code, or run `/reload-plugins` in an open session. Open `/cockpit`.
+Restart Claude Code, open `/cockpit`, and inspect `/cockpit version`. By default Cockpit **observes**; orchestration enforcement is opt-in.
+
+To enable orchestration with the supported configuration CLI:
+
+```sh
+printf '%s\n' '{"orchestration":"true"}' | claude plugin configure cobalt-cockpit@cobalt-cockpit --values-stdin
+```
+
+Restart Claude Code again after changing settings. Enabling orchestration activates model/admission and ownership policy; it does not enable Fable blocking unless you also opt into `blockFable` or `cobaltStrict`.
+
+**Updating an existing public-marketplace installation:**
+
+```sh
+claude plugin update cobalt-cockpit@cobalt-cockpit
+```
+
+The marketplace name in this repository is `cobalt-cockpit`. Some existing private/local setups use a separately registered marketplace alias such as `cobalt`; for those, use the identity shown by `claude plugin list` rather than copying the public suffix.
+
 For development or a single-session trial:
 
 ```sh
@@ -63,11 +105,11 @@ A `--plugin-dir` copy stops loading when you omit the flag next session.
 
 ## Orchestration
 
-Observation works with users' existing models and authentication. Public defaults do not block Fable, rewrite model requests, enforce a subagent limit, or require subscription authentication. Bundled explorer, researcher, worker and reviewer definitions select Sonnet 5.5; scout and utility select Haiku 5.5. Observation does not rewrite host requests.
+**Observation is the public default.** With `orchestration: false`, Cockpit observes your existing Claude Code activity without enforcing model routing, subagent budgets, Fable blocking, or subscription-only authentication. The bundled explorer/researcher/worker/reviewer agent definitions use Sonnet 5.5; scout/utility use Haiku 5.5.
 
-**Strict Cobalt is optional.** Enable `cobaltStrict` to request Opus 5.5 for main at the effort you set, Sonnet 5.5 engineering and Haiku 5.5 utility pools with independent resource budgets, isolated agents rather than inherited forks, Fable blocking, external advisor disabled, and subscription-style authentication only. These model IDs must be available to your account; there is no model fallback. Requested effort is observable; effective model-internal effort remains unknown.
+Set **`orchestration: true`** to enforce the Opus/Sonnet/Haiku policy, independent pool resource budgets, and explicit task ownership. Orchestration does not by itself block Fable outside routed work. **`blockFable` is a separate opt-in**. **`cobaltStrict`** is an optional stricter preset that also blocks Fable/external advisor selection and requires subscription-style authentication. These models must be available to your account; Cockpit cannot grant model access.
 
-The preset takes precedence over the individual enforcement switches. Disable it to return to observation. NobodyWho remains optional even in strict mode: Cockpit reads its telemetry if installed; it never installs it or routes decisions/pruning itself.
+The strict preset takes precedence over individual enforcement switches. NobodyWho remains optional and read-only: Cockpit observes its local receipts if configured; it does not install it or route requests to it.
 
 ### Elastic execution
 
@@ -94,7 +136,7 @@ Model selection and effort selection are separate decisions. The 5.5 tiers still
 
 - **AUTO** (default) names a level from the task: extractive inventories, classification and summaries run light; normal feature work, bug fixes and refactors run medium; complex debugging, concurrency, migrations, security analysis and high-risk architectural reasoning run high or xhigh; unusually difficult high-stakes reasoning may use max. A task that names no class falls back to its tier's baseline.
 - A commander can name a level explicitly per assignment with the `swarm` tool's `effort` field (LOW / MEDIUM / HIGH / XHIGH / MAX, or AUTO). A named level wins AUTO. **MANUAL** mode instead honours the fixed per-tier levels and leaves Haiku unspecified.
-- A level is only ever *requested*. Each model supports its own ceiling and the operator's `maxEffort` caps every request, so the *applied* level may be lower after a fallback. Requested and applied effort are recorded separately in the Run Ledger, a fallback is named (`EFFORT FALLBACK`), and the model's real capability is learned only from what the engine reports it applied — never assumed.
+- A task's level is *requested*, not guaranteed. The operator's `maxEffort` cap applies to subagents, and the host can apply its own limits. The Ledger distinguishes the requested level from the **engine-resolved** level and names a mismatch (`EFFORT FALLBACK`). This is host-resolution evidence, **not an independently captured wire receipt**. Unknown stays unknown.
 - A subagent's level is set natively, on its own Agent call's `effort` parameter (Claude Code 2.1.292 or newer): one level per invocation, with no global setting for parallel agents to race on. It overrides the agent definition's `effort` frontmatter and a per-model `effortLevel` for that subagent only. The engine's own limits still win — `maxEffortLevel`, an organization's cap, `CLAUDE_CODE_EFFORT_LEVEL` and the model's support — and the level the engine resolves is what the ledger records as applied. When that is not the level asked for, the difference is named with both levels; it is never rewritten back.
 - **The main loop's effort is never written by Cockpit.** A `turn.step` rewrite sits above everything in the engine's order (rewrite, then `CLAUDE_CODE_EFFORT_LEVEL`, then a session level from `/effort`, `--effort` or the model picker, then the settings' `effortLevel`, then the model's default, all under `maxEffortLevel`), and most of those cannot be seen from a plugin, so there is no way to offer a level *beneath* your own choice. The level the engine resolved is sent untouched and recorded as `engine`, with what was seen of its origin: the variable, a `/effort` typed this session, the settings, or `host` when none of those accounts for it. A cap that lowered your selection is named with both levels. AUTO and MANUAL, the `maxEffort` ceiling and every subagent launch leave it alone. With no selection of your own the main loop runs at the host's default for the model, which is not necessarily the level AUTO would name: `/cockpit version` then says what AUTO would name, as advice, and `/effort <level>` sets it.
 - A subagent on an older engine, or one that no Agent call launched, gets its level from a per-request `turn.step` rewrite instead. The engine does not report that rewrite back, so there the ledger shows the level as *requested* (`request`), leaves *observed* unknown, and learns nothing about capability from the engine's reports.
@@ -133,13 +175,14 @@ Only `caller: "claude"` receipts arriving after startup are shown. Decision come
 
 ## Configuration
 
-Use `/config` or `claude plugin configure cobalt-cockpit@cobalt-cockpit` to inspect options. CLI values are strings:
+Use `/config` or `claude plugin configure cobalt-cockpit@cobalt-cockpit` to inspect options. CLI input values are strings, even for Boolean options:
 
 ```sh
+# Full opt-in policy: orchestration plus Fable and external-advisor blocking
 printf '%s\n' '{"cobaltStrict":"true"}' | claude plugin configure cobalt-cockpit@cobalt-cockpit --values-stdin
 ```
 
-Reload plugins after changing configuration.
+Restart Claude Code after changing configuration. To enable just Fable blocking alongside orchestration, configure `blockFable: true` separately. No external router is required.
 
 | Option | Public default |
 | --- | --- |
