@@ -232,8 +232,8 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
       if (typeof e['objective'] !== 'string' || !e['objective'].trim()) throw new Error('Bounded objective required')
       if (!/^[\w.-]{1,80}$/.test(id) || !['OPUS','SONNET','HAIKU'].includes(String(e['tier']))) throw new Error('Valid task_id and tier required')
       const owned = await Promise.all(list('owned_resources').map(p => canonicalResource($, p)))
-      const next = await changeSwarm($, held => { const submitted = submitTask(held, { id, tier: e['tier'] as ModelTier, role: str('role'), objective: str('objective'), scope: str('scope'), dependencies:list('dependencies'), owned, mode: e['mode'] === 'write' ? 'write' : 'read', parentTask: typeof e['parent_task'] === 'string' ? e['parent_task'] : null, spawnReason: str('spawn_reason'), ...(isEffortRequest(e['effort']) ? { effort: e['effort'] } : {}), ...(typeof e['effort_reason'] === 'string' ? { effortReason: str('effort_reason') } : {}) }, at).swarm; if (jsonBytes(submitted.tasks.map(t=>({ ...t,result:null,escalation:null }))) > 192_000) throw new Error('Ownership metadata storage budget reached; finish/archive work before assigning more'); return submitted })
-      const assigned = next.tasks.find(t => t.id === id)
+      const assignedSwarm = await changeSwarm($, held => { const submitted = submitTask(held, { id, tier: e['tier'] as ModelTier, role: str('role'), objective: str('objective'), scope: str('scope'), dependencies:list('dependencies'), owned, mode: e['mode'] === 'write' ? 'write' : 'read', parentTask: typeof e['parent_task'] === 'string' ? e['parent_task'] : null, spawnReason: str('spawn_reason'), ...(isEffortRequest(e['effort']) ? { effort: e['effort'] } : {}), ...(typeof e['effort_reason'] === 'string' ? { effortReason: str('effort_reason') } : {}) }, at).swarm; if (jsonBytes(submitted.tasks.map(t=>({ ...t,result:null,escalation:null }))) > 192_000) throw new Error('Ownership metadata storage budget reached; finish/archive work before assigning more'); return submitted })
+      const assigned = assignedSwarm.tasks.find(t => t.id === id)
       return { result: assigned ? `Task ${id} ${assigned.state}; use Agent description [task:${id}]. OPUS tasks stay in main.` : 'Duplicate suppressed; see swarm status for existing task.' }
     }
     if (action === 'wave') { if (!['RECONNAISSANCE','ENGINEERING','REVIEW','INTEGRATION','VERIFICATION'].includes(String(e['wave']))) throw new Error('Valid wave required'); await changeSwarm($, held => setWave(held, e['wave'] as Wave, at)) }
@@ -246,10 +246,10 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
         await changeSwarm($, held => { const admitted = admitTask(held,id,at); if (!admitted.ok) throw new Error(admitted.reason!); return bindAgent(admitted.swarm,id,existingId,at,'adopt') })
       } else if (action === 'result') {
         await changeSwarm($, held => {
-          let next = held
-          if (task.tier === 'OPUS' && ['queued','blocked'].includes(task.state)) { const admitted = admitTask(held,id,at); if (!admitted.ok) throw new Error(admitted.reason!); next = admitted.swarm }
-          next = reportResult(next, id, { conclusion:str('conclusion'), evidence:list('evidence'), changes:list('changes'), verification:list('verification'), unresolved:list('unresolved'), confidence: typeof e['confidence'] === 'string' ? str('confidence') : null }, at)
-          return task.tier === 'OPUS' ? finishTask(next,id,'completed',next.tasks.find(t=>t.id===id)!.result,at) : next
+          let chain = held
+          if (task.tier === 'OPUS' && ['queued','blocked'].includes(task.state)) { const admitted = admitTask(held,id,at); if (!admitted.ok) throw new Error(admitted.reason!); chain = admitted.swarm }
+          chain = reportResult(chain, id, { conclusion:str('conclusion'), evidence:list('evidence'), changes:list('changes'), verification:list('verification'), unresolved:list('unresolved'), confidence: typeof e['confidence'] === 'string' ? str('confidence') : null }, at)
+          return task.tier === 'OPUS' ? finishTask(chain,id,'completed',chain.tasks.find(t=>t.id===id)!.result,at) : chain
         })
       } else if (action === 'escalate') {
         if (!['SONNET','OPUS'].includes(String(e['to']))) throw new Error('Valid escalation destination required')
@@ -717,6 +717,20 @@ const quiet = async (work: () => unknown): Promise<void> => {
   }
 }
 
+/**
+ * A reading whose failure must not fail the event it rides on, for the one case
+ * `quiet` cannot serve: a hook that fails *before* `next` is skipped by the
+ * engine, so a hook that decides must reach its decision even when a reading
+ * beneath it does not answer.
+ */
+const quietly = async <T,>(work: () => Promise<T>): Promise<T | undefined> => {
+  try {
+    return await work()
+  } catch {
+    return undefined
+  }
+}
+
 const stopTicker = () => {
   ticker?.cancel()
   ticker = null
@@ -836,19 +850,19 @@ const probeAuth = async ($: EngineInterface, announce: boolean): Promise<void> =
   } catch {
     // no settings to read: nothing is claimed about them
   }
-  const next = authOf(credential, present, await $.clock.now())
+  const fresh = authOf(credential, present, await $.clock.now())
   const old = await read($, authAtom)
-  const isSame = old !== null && old.mode === next.mode && old.credential === next.credential && old.sources.join() === next.sources.join()
+  const isSame = old !== null && old.mode === fresh.mode && old.credential === fresh.credential && old.sources.join() === fresh.sources.join()
   if (isSame) return
-  await update($, authAtom, () => next)
+  await update($, authAtom, () => fresh)
   if (!announce) return
   // The startup diagnostic: a few seconds over the transcript, then gone, so
   // nothing about Fable holds a row of the HUD.
-  await quiet(() => $.ui.toast(authLines(next, config.blocksFable).join(' · '), { timeoutMs: AUTH_TOAST_MS }))
-  if (next.mode === 'api') {
+  await quiet(() => $.ui.toast(authLines(fresh, config.blocksFable).join(' · '), { timeoutMs: AUTH_TOAST_MS }))
+  if (fresh.mode === 'api') {
     await quiet(() =>
       $.ui.log(
-        `AUTH / API DETECTED (${[...(next.credential === 'api-key' ? ['engine holds an API key'] : []), ...next.sources].join(', ')}). ${
+        `AUTH / API DETECTED (${[...(fresh.credential === 'api-key' ? ['engine holds an API key'] : []), ...fresh.sources].join(', ')}). ${
           config.isSubscriptionOnly ? 'Cockpit sends no model request on API-style authentication.' : 'The subscriptionOnly option is off, so requests are allowed.'
         }`,
       ),
@@ -980,9 +994,9 @@ const refreshGit = async ($: EngineInterface): Promise<void> => {
       timeoutMs: GIT_TIMEOUT_MS,
     })
     const old = await read($, gitAtom)
-    let next: GitState
+    let state: GitState
     if (status.exitCode !== 0) {
-      next = {
+      state = {
         isRepo: false,
         project: projectOf(cwd),
         branch: null,
@@ -999,7 +1013,7 @@ const refreshGit = async ($: EngineInterface): Promise<void> => {
       const project = projectOf(top.exitCode === 0 && top.stdout.trim() !== '' ? top.stdout.trim() : cwd)
       const parsed = parseStatus(status.stdout)
       const isSameRepo = old !== null && old.isRepo && old.project === project
-      next = {
+      state = {
         isRepo: true,
         project,
         ...parsed,
@@ -1007,7 +1021,7 @@ const refreshGit = async ($: EngineInterface): Promise<void> => {
         at: now,
       }
     }
-    if (!isSameGit(old, next)) await update($, gitAtom, () => next)
+    if (!isSameGit(old, state)) await update($, gitAtom, () => state)
   } catch {
     // git missing or slow: the HUD keeps what it had
   }
@@ -1021,11 +1035,11 @@ const scheduleGit = ($: EngineInterface) => {
   })
 }
 
-const setMeter = async ($: EngineInterface, next: Partial<Meter>): Promise<void> => {
+const setMeter = async ($: EngineInterface, patch: Partial<Meter>): Promise<void> => {
   const old = await read($, meterAtom)
-  const merged = { ...old, ...next }
+  const merged = { ...old, ...patch }
   const isSame = (Object.keys(merged) as (keyof Meter)[]).every(key => merged[key] === old[key])
-  if (!isSame) await update($, meterAtom, current => ({ ...current, ...next }))
+  if (!isSame) await update($, meterAtom, current => ({ ...current, ...patch }))
 }
 
 const refreshMeter = async ($: EngineInterface): Promise<void> => {
@@ -1258,11 +1272,11 @@ const noteEnd = async (
 
   if (edits.length > 0 || readings.length > 0) {
     await change($, (task, now) => {
-      let next = task
-      for (const edit of edits) next = touchFile(next, edit.path, edit.added, edit.removed)
-      for (const reading of readings) next = setGate(next, reading.gate, reading.state, reading.evidence, 'auto', now)
+      let chain = task
+      for (const edit of edits) chain = touchFile(chain, edit.path, edit.added, edit.removed)
+      for (const reading of readings) chain = setGate(chain, reading.gate, reading.state, reading.evidence, 'auto', now)
 
-      return next
+      return chain
     })
   }
   // The failure streak: the same check failing again, or the same tool erroring
@@ -1400,16 +1414,16 @@ const adoptLedgerAgents = async ($: EngineInterface): Promise<void> => {
   const listed = await $.agent.list()
   const at = await $.clock.now()
   await changeSwarm($, held => {
-    let next = held
+    let chain = held
     for (const info of listed) {
-      const t = next.tasks.find(t=>t.agentId === info.id && !['completed','failed','cancelled'].includes(t.state))
+      const t = chain.tasks.find(t=>t.agentId === info.id && !['completed','failed','cancelled'].includes(t.state))
       if (t && ['completed','failed','error','cancelled','aborted'].includes(info.status)) {
-        next = finishObserved(next,t.id,info.status,'Host reports stopped; result unavailable',at)
+        chain = finishObserved(chain,t.id,info.status,'Host reports stopped; result unavailable',at)
       }
     }
-    return markStalled(next,at)
+    return markStalled(chain,at)
   })
-  await mutateLedger($, l => listed.reduce((next, info) => adoptAgent(next, info), l))
+  await mutateLedger($, l => listed.reduce((chain, info) => adoptAgent(chain, info), l))
 }
 export const ledgerRequest = async ($: EngineInterface, e: { turnId: string; index: number; agentId?: string; model: string; effort?: unknown }, actual: { model?: string; effort?: unknown; usage?: unknown; routingReason?: string; fallbackReason?: string | null; via?: 'host' | 'hook' }, warning?: string | null): Promise<void> => {
   if (e.agentId && !(await read($, ledgerAtom)).agents.some(a => a.id === e.agentId)) await hush(() => adoptLedgerAgents($))
@@ -1499,12 +1513,19 @@ export const ledgerBeforeWrite = async ($: EngineInterface, path: unknown): Prom
 }
 
 export const registerLedger = (on: On): void => {
-  on('classic.SessionStart', async ($, e, next) => { const r = await next(e); if (e.source === 'resume') await hush(() => restore($)); return r })
+  // The session's own start. `restore` rides on it, and a hook that fails
+  // before `next` is skipped, so its handler lets the session start.
+  on('classic.SessionStart', async ($, e, next) => {
+    const ran = await next(e)
+    if (e.source === 'resume') await hush(() => restore($))
+
+    return ran
+  }).catch(($, e, next) => next(e))
   on('command.run', { command: 'park' }, async $ => {
     await checkpoint($)
     const c = (await read($, ledgerAtom)).checkpoint!
     return { text: `COBALT / PARKED · ${c.phase}\nCompleted ${c.completed.length} · remaining ${c.remaining.length} · background agents ${c.backgroundAgents.length}\nResume with Claude Code's normal session resume.` }
-  })
+  }).catch(($, e, next) => next.called ? next(e) : { text: 'COBALT / the checkpoint could not be written; nothing was parked.' })
   on('command.run', { command: 'ledger' }, async ($, e) => {
     await checkpoint($)
     const l = await read($, ledgerAtom)
@@ -1512,14 +1533,14 @@ export const registerLedger = (on: On): void => {
     if (e.args.trim() !== '') return { text: 'Usage: /ledger | /ledger export json' }
     await $.ui.open({ id: LEDGER_PANE, title: 'COBALT / RUN LEDGER', focus: true })
     return { text: 'COBALT / RUN LEDGER' }
-  })
+  }).catch(($, e, next) => next.called ? next(e) : { text: 'Cobalt: the Run Ledger could not be read; nothing was opened.' })
   on('command.run', { command: 'replay' }, async $ => {
     const l = await read($, ledgerAtom)
     if (!replayTimeline(l).length) return { text: 'No successful Edit/Write snapshots observed.' }
     await update($, positionAtom, () => 0)
     await $.ui.open({ id: REPLAY_PANE, title: 'COBALT / REPLAY', focus: true })
     return { text: `COBALT / REPLAY · ${replayTimeline(l).length} steps` }
-  })
+  }).catch(($, e, next) => next.called ? next(e) : { text: 'Cobalt: the replay timeline could not be read; nothing was opened.' })
   on('ui.render', { component: 'Pane', requestId: LEDGER_PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const auth = await read($, { plugin: 'cobalt-cockpit', key: 'auth' })
@@ -1531,7 +1552,7 @@ export const registerLedger = (on: On): void => {
     const steps = replayTimeline(await read($, ledgerAtom))
     const pos = Math.min(await read($, positionAtom), Math.max(0, steps.length - 1))
     const step = steps[pos]
-    return <Box flexDirection="column"><Text color={COLORS.accent}>{step ? `COBALT / REPLAY · ${pos + 1}/${steps.length} · ${step.title}` : 'No snapshots'}</Text>{step && step.lines.map((line, i) => <Text key={String(i)} color={line.startsWith('+') ? COLORS.ok : line.startsWith('-') ? COLORS.bad : undefined} wrap="truncate-end">{line}</Text>)}<Box flexDirection="row"><Button key="previous" label="Previous" hotkey="p" onPress={() => update($, positionAtom, n => Math.max(0, n - 1))} /><Button key="next" label="Next" hotkey="n" onPress={() => update($, positionAtom, n => Math.min(steps.length - 1, n + 1))} /><Button key="close" label="Close" hotkey="q" role="dismiss" onPress={() => $.ui.close({ id: REPLAY_PANE })} /></Box></Box>
+    return <Box flexDirection="column"><Text color={COLORS.accent}>{step ? `COBALT / REPLAY · ${pos + 1}/${steps.length} · ${step.title}` : 'No snapshots'}</Text>{step && step.lines.map((line, i) => <Text key={String(i)} color={line.startsWith('+') ? COLORS.ok : line.startsWith('-') ? COLORS.bad : undefined} wrap="truncate-end">{line}</Text>)}<Box flexDirection="row"><Button key="previous" label="Previous" hotkey="p" onPress={() => update($, positionAtom, n => Math.max(0, n - 1))} /><Button key="advance" label="Next" hotkey="n" onPress={() => update($, positionAtom, n => Math.min(steps.length - 1, n + 1))} /><Button key="close" label="Close" hotkey="q" role="dismiss" onPress={() => $.ui.close({ id: REPLAY_PANE })} /></Box></Box>
   })
 }
 
@@ -1696,7 +1717,28 @@ export const register: Register = (on, options) => {
       if (task !== null && task.milestones.length > 0) context = `Cobalt Cockpit, state of the task in progress: ${summaryOf(task)}`
     })
 
-    return next(context === null ? e : { ...e, context: [...(e.context ?? []), context] })
+    // A prompt goes on either way: this hook adds what it observed to the
+    // context, and a hook that fails would be skipped rather than drop one.
+    if (context === null) return next(e)
+
+    return next({ ...e, context: [...(e.context ?? []), context] })
+  }).catch(async ($, e, next) => {
+    // The three drops this hook makes — the strict preset's advisor line, a
+    // session set to use Fable, and the subscription policy's — are made here
+    // too: forwarding them would send a request the policy exists to refuse.
+    if (next.called) return next(e)
+    if (config.isStrict && hasAdvisor) return { drop: 'COBALT STRICT / disable the external advisor before continuing.' }
+    if (config.blocksFable) {
+      const model = await $.session.model().catch(() => '')
+      if (isFable(model) || isAdvisorFable) {
+        await recordBlock($)
+
+        return { drop: `${BLOCK_LINE}. This session is set to use Fable, which this workflow never runs. Nothing was sent.` }
+      }
+    }
+    if (await isApiRefused($).catch(() => false)) return { drop: API_REFUSAL }
+
+    return next(e)
   })
 
   on('command.run', { command: 'init' }, async ($, e, next) => {
@@ -1704,7 +1746,7 @@ export const register: Register = (on, options) => {
     await quiet(() => change($, task => ({ ...task, hasInstructionFileRequest: true })))
 
     return next(e)
-  })
+  }).catch(($, e, next) => next(e))
 
   on('turn.start', async ($, e, next) => {
     if (isSupported) await ledgerTurnStart($, e.turnId)
@@ -1752,7 +1794,13 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', async ($, e, next) => {
+    // The event is copied because the guards, the effort policy and the
+    // read-only shell rewrite may change it; `isChanged` answers whether that
+    // copy differs from the event the engine raised.
     const call = { ...e } as typeof e & Record<string, unknown>
+    const isChanged = (): boolean =>
+      Object.keys(call).length !== Object.keys(e).length ||
+      Object.keys(e).some(key => (call as Record<string, unknown>)[key] !== (e as Record<string, unknown>)[key])
     // Fable first, on every engine version and in every loop: a pure check
     // that cannot throw, so no failure below can let the call through.
     if (config.blocksFable && fableRoute(e.tool, call)) {
@@ -1795,7 +1843,7 @@ export const register: Register = (on, options) => {
       stopTicker()
     }
     let ran
-    try { ran = await next(call) }
+    try { ran = await next(isChanged() ? call : e) }
     catch (error) { await ledgerToolEnd($, call, { isError: true }); throw error }
     finally {
       if (e.tool_use_id) {
@@ -1823,7 +1871,7 @@ export const register: Register = (on, options) => {
 
     return ran
     } finally { commanderEffects.delete(effectToken) }
-  })
+  }).catch(($, e, next) => next.called ? next(e) : { deny: `COCKPIT / the tool guard failed, so this call did not run (${next.error.kind}). Do not reach the same effect another way; reload the plugin first.` })
 
   on('tool.check', async ($, e, next) => {
     const verdict = await next(e)
@@ -1838,9 +1886,25 @@ export const register: Register = (on, options) => {
       })
     }
     return verdict
+  }).catch(($, e, next) => {
+    // Watching only: a failure loses the HUD's waiting state, and the verdict
+    // the engine already reached stands. Nothing here refuses a call.
+    return next(e)
   })
 
-  on('agent.offer', ($, e, next) => (config.blocksFable && isFable(e.agent) ? { isOffered: false } : next(e)))
+  on('agent.offer', ($, e, next) => {
+    // A type whose name identifies Fable is withheld from the listing, and its
+    // dispatch is refused with it.
+    if (config.blocksFable && isFable(e.agent)) return { isOffered: false }
+
+    return next(e)
+  }).catch(($, e, next) => {
+    // Judged against the event this handler was given, not refused wholesale: a
+    // type whose name identifies Fable is withheld, and every other type goes on.
+    if (next.called || !config.blocksFable || !isFable(e.agent)) return next(e)
+
+    return { isOffered: false }
+  })
 
   on('agent.spawn', async ($, e, next) => {
     // Refused before the engine resolves a model: a spawn that names Fable, an
@@ -1918,7 +1982,9 @@ export const register: Register = (on, options) => {
       // The launch level is on the task before the subagent exists: its first
       // request can arrive before the spawn below has returned and bound it.
       if (reservedId) await changeSwarm($, held => setLaunchEffort(held, reservedId!, launch?.level ?? null, launch?.named ?? null))
-      const spawned = await next(model === e.model || model === undefined ? e : { ...e, model })
+      const spawned = model === undefined || model === e.model
+        ? await next(e)
+        : await next({ ...e, model })
       if (reservedId && spawned.agentId) await changeSwarm($, held => bindAgent(held,reservedId!,spawned.agentId!,spawnAt))
       else if (reservedId) await changeSwarm($, held => setLaunchEffort(releaseReservation(held,reservedId!,spawnAt,spawned.deny ?? 'Host did not report agent ID'), reservedId!, null))
       await quiet(() => ledgerSpawn($, e, spawned, originLedger, spawnAt))
@@ -1941,7 +2007,7 @@ export const register: Register = (on, options) => {
     } finally {
       spawning.delete(token)
     }
-  })
+  }).catch(($, e, next) => next.called ? next(e) : { deny: 'COCKPIT / the agent-admission guard failed, so no subagent started. Nothing was sent; reload the plugin before retrying.' })
 
   on('turn.step', async function* ($, e, next) {
     // The one place every model request passes, main's and a subagent's, with
@@ -1965,13 +2031,19 @@ export const register: Register = (on, options) => {
       return { turnId: e.turnId, index: e.index, answer: text, toolUses: [], stopReason: 'end_turn', usage: null }
     }
     if (config.isStrict && hasAdvisor) return { turnId: e.turnId, index: e.index, answer: 'COBALT STRICT / external advisor disabled.', toolUses: [], stopReason: 'end_turn', usage: null }
-    const task = e.agentId === undefined ? undefined : await taskOfAgent($, e.agentId)
+    // Every reading below is quiet: a hook that fails before `next` is skipped,
+    // which for this one would send a request the policy exists to refuse.
+    const agentId = e.agentId
+    const task = agentId === undefined ? undefined : await quietly(() => taskOfAgent($, agentId))
     if (config.hasOrchestration && task?.cancellationRequested) {
       const text = 'SWARM / cancellation requested'
       yield { kind: 'text', index: 0, text }; yield { kind: 'stop', stopReason: 'end_turn', usage: null }
       return { turnId: e.turnId, index:e.index, answer:text, toolUses:[], stopReason:'end_turn', usage:null }
     }
-    if (task && config.hasOrchestration) { const at = await $.clock.now(); await changeSwarm($, held => heartbeat(held,task.id,at)) }
+    if (task && config.hasOrchestration) {
+      const id = task.id
+      await quiet(async () => { const at = await $.clock.now(); await changeSwarm($, held => heartbeat(held,id,at)) })
+    }
     // The tier is the policy's: Opus commands, Sonnet engineers, Haiku scouts.
     // The model id follows from it; the effort below is resolved separately, so
     // two agents side by side can run at different levels without a global move.
@@ -1998,7 +2070,8 @@ export const register: Register = (on, options) => {
       // An explicit level on the task is the commander's, and wins; otherwise
       // AUTO names one from the task and MANUAL honours the fixed tier level.
       const named = task !== undefined && task.requestedEffort !== 'AUTO' ? task.requestedEffort : null
-      const capability = capabilityOf(wanted.model, (await read($, effortKnownAtom)))
+      const known = await quietly(() => read($, effortKnownAtom))
+      const capability = capabilityOf(wanted.model, known ?? {})
       const manual = config.reasoningMode === 'MANUAL' && named === null
       // A subagent no task is known for yet, on an engine that takes the level
       // on the Agent call: its request already carries what it was launched
@@ -2067,9 +2140,28 @@ export const register: Register = (on, options) => {
     }
 
     return next(e)
+  }).catch(($, e, next) => {
+    // The row this handler was given is judged by the rule this hook holds, so
+    // an ordinary row is written and only the rows it would have refused are not.
+    if (next.called) return next(e)
+    const names = typeof e.value === 'string' ? [e.value] : Array.isArray(e.value) ? e.value : []
+    if (config.blocksFable && /model|advisor/i.test(e.key) && !/denied|blocked/i.test(e.key) && names.some(isFable)) return { deny: 'COBALT / the model-configuration guard failed, so the row was left as it was.' }
+    if (config.isStrict && /advisor/i.test(e.key) && e.value) return { deny: 'COBALT STRICT / the advisor guard failed, so the row was left as it was.' }
+
+    return next(e)
   })
 
-  on('command.run', { command: 'model' }, async ($, e, next) => (await guardModelCommand($, e.args)) ?? next(e))
+  on('command.run', { command: 'model' }, async ($, e, next) => {
+    const refused = await guardModelCommand($, e.args)
+    if (refused !== null) return refused
+
+    return next(e)
+  }).catch(($, e, next) => {
+    // Only a command line that names Fable is refused; anything else runs.
+    if (next.called || !config.blocksFable || !e.args.split(/[\s=,]+/).some(isFable)) return next(e)
+
+    return { text: `${BLOCK_LINE}. The model guard failed, so nothing was changed.` }
+  })
 
   on('command.run', { command: 'effort' }, async ($, e, next) => {
     // The person's own choice for the session, and all of it a plugin can see:
@@ -2082,6 +2174,9 @@ export const register: Register = (on, options) => {
     hostSignalsAt = null
 
     return ran
+  }).catch(($, e, next) => {
+    // It only notes what was typed: the command runs either way.
+    return next(e)
   })
 
   on('command.run', { command: 'advisor' }, async ($, e, next) => {
@@ -2093,6 +2188,14 @@ export const register: Register = (on, options) => {
     await quiet(() => probeAuth($, true))
 
     return ran
+  }).catch(($, e, next) => {
+    // The two refusals this hook makes, judged on the command it was given: a
+    // line that names Fable, and the strict preset's advisor change.
+    if (next.called) return next(e)
+    if (config.blocksFable && e.args.split(/[\s=,]+/).some(isFable)) return { text: `${BLOCK_LINE}. The advisor guard failed, so nothing was changed.` }
+    if (!config.isStrict || e.args.trim() === '' || /^(off|none|disable)$/i.test(e.args.trim())) return next(e)
+
+    return { text: 'COBALT STRICT / the advisor guard failed, so nothing was changed.' }
   })
 
   on('command.run', { command: 'login' }, async ($, e, next) => {
@@ -2100,6 +2203,9 @@ export const register: Register = (on, options) => {
     await quiet(() => probeAuth($, true))
 
     return ran
+  }).catch(($, e, next) => {
+    // It only re-reads the authentication: the command runs either way.
+    return next(e)
   })
 
   on('command.run', { command: 'logout' }, async ($, e, next) => {
@@ -2107,6 +2213,9 @@ export const register: Register = (on, options) => {
     await quiet(() => probeAuth($, true))
 
     return ran
+  }).catch(($, e, next) => {
+    // It only re-reads the authentication: the command runs either way.
+    return next(e)
   })
 
   on('classic.PostToolUse', async ($, e, next) => {
@@ -2150,6 +2259,10 @@ export const register: Register = (on, options) => {
     }
 
     return next(e)
+  }).catch(($, e, next) => {
+    // A reading of what the engine reported, not a gate: the tool call already
+    // ran, and nothing about it is undone here.
+    return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
@@ -2163,10 +2276,12 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('attribution.text', ($, e, next) =>
+  on('attribution.text', async ($, e, next) => {
     // the trailer and footer the engine would have Claude write into commits and PRs
-    config.hasAttributionGuard && (e.kind === 'commit' || e.kind === 'pr') ? { text: '' } : next(e),
-  )
+    if (config.hasAttributionGuard && (e.kind === 'commit' || e.kind === 'pr')) return { text: '' }
+
+    return next(e)
+  })
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
@@ -2178,8 +2293,8 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'cockpit' }, async ($, e) => {
     const [verb = '', value = ''] = e.args.trim().toLowerCase().split(/\s+/)
-    const savePrefs = async (next: Partial<Prefs>): Promise<Prefs> => {
-      const prefs = await update($, prefsAtom, old => ({ ...old, ...next }))
+    const savePrefs = async (patch: Partial<Prefs>): Promise<Prefs> => {
+      const prefs = await update($, prefsAtom, old => ({ ...old, ...patch }))
       await quiet(() => $.store.set('prefs', prefs))
 
       return prefs
@@ -2276,7 +2391,7 @@ export const register: Register = (on, options) => {
       default:
         return { text: HELP }
     }
-  })
+  }).catch(($, e, next) => next.called ? next(e) : { text: 'Cobalt: the cockpit command could not be read; nothing was changed.' })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (!isSupported || !config.hasHud || e.props.hasSurvey || (await read($, prefsAtom)).isHudHidden || e.props.maxRows < 1) {
@@ -2492,7 +2607,11 @@ export const register: Register = (on, options) => {
             if (cached?.signature !== signature) {
               cached = { signature, source: stripSvg(a, trackWidth * TRACK_W, now, isLight, motion) }
               agentSvgCache.set(a.id, cached)
-              if (agentSvgCache.size > 32) agentSvgCache.delete(agentSvgCache.keys().next().value!)
+              if (agentSvgCache.size > 32) {
+                // the first key is the oldest: removed by name, so no identifier
+                // called `next` sits inside a hook body, where it reads as a pass-through
+                for (const oldest of agentSvgCache.keys()) { agentSvgCache.delete(oldest); break }
+              }
             }
             return <Box key={`row-${a.id}`} marginLeft={layout.titleWidth ? layout.titleWidth + 3 : 0}><Svg key={`agent-${a.id}`} source={cached.source} alt={hasRole(a) ? roleStrip(a, trackWidth, now) : `${a.title} ${a.tool} ${state}`} width={trackWidth * TRACK_W} height={18} /></Box>
           }

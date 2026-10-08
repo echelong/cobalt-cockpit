@@ -1,4 +1,4 @@
-# Cobalt Cockpit v0.3.1 — Elastic Swarm + Adaptive Intelligence
+# Cobalt Cockpit v0.3.2 — Elastic Swarm + Adaptive Intelligence
 
 **Mission control for Claude Code.** Follow real task progress, coordinate bounded subagents, review verification gates, and replay what happened, without replacing Claude Code's native model and permission controls.
 
@@ -40,6 +40,7 @@ Opus remains **one main commander** and keeps the reasoning effort you select in
 - Main and subagent orchestration telemetry, subagent radar, observed model/effort and token usage.
 - Local Run Ledger, sanitized JSON export, bounded replay, and park/resume checkpoints.
 - Blast-radius protection, repository hygiene, optional sounds and hot reload persistence.
+- Fail-closed guards: a hook that cannot reach its decision refuses the action it guards rather than letting it run, and every such decision is judged against the event it was given.
 - Narrow-terminal and reduced-motion layouts; preserves the engine's image viewer.
 - Optional read-only NobodyWho telemetry and opt-in orchestration policy enforcement.
 
@@ -209,9 +210,19 @@ Sounds try PipeWire, PulseAudio, ALSA, ffplay, mpv, SoX, Canberra, macOS afplay,
 
 Run Ledger is local. Cockpit observes tool calls, paths, agent events, token/context telemetry, Git state and verification. In-session task state can contain user text; persisted checkpoints retain explicit goals and milestone labels. Hidden reasoning is never stored. Redaction is heuristic: review exports before sharing, and never export secrets. See [SECURITY.md](SECURITY.md).
 
+### What Cockpit runs, reads and sends
+
+Cockpit installs no launcher and downloads nothing. It runs local processes, with your privileges and without prompting, for four reasons: `realpath -m` canonicalizes a path a subagent claims as its own (orchestration only), `tail -c` reads the end of a telemetry ledger larger than 512 KiB, `git status --porcelain=v2` and `git rev-parse --show-toplevel` feed the HUD, and one of nine audio players plays the optional cues (`pw-play`, `paplay`, `aplay`, `ffplay`, `mpv`, `play`, `canberra-gtk-play`, `afplay`, then a terminal bell). Each is an argument array: no shell string is ever built from model or user text.
+
+It reads files: the decision-router ledger (read-only, optional, `localControl`), a file about to be written (a bounded replay snapshot), and Claude Code's settings. It reads environment variables **by name**: `CLAUDE_CODE_EFFORT_LEVEL`, `XDG_STATE_HOME`, `HOME`, `COBALT_REDUCED_MOTION`, and eight authentication variables — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_MANTLE` — whose values are reduced to set-or-not-set on the spot and never stored, logged, exported or sent. It writes nothing outside the host's plugin store, which holds up to eight bounded run ledgers, bounded replay bodies, checkpoints and two preferences.
+
+It makes no network request of its own: no fetch, no model call, no MCP call. Its two prompt hooks add text to the request Claude Code already sends — the discipline, safety and policy sections of the system prompt, and one line of task status — which is the only route by which anything Cockpit observed reaches a model. Every path above is listed with its call site in [docs/implementation-v0.3.2.md](docs/implementation-v0.3.2.md).
+
+The guards are not a sandbox: they use recognizable syntax and your confirmation. Keep Claude Code's permission controls enabled.
+
 ## Development
 
-Load the folder once with `claude --plugin-dir /path/to/cobalt-cockpit` to generate the host API declarations. TypeScript 5.4+ is needed for type checking; Python 3 runs the portability audit.
+Load the folder once with `claude --plugin-dir /path/to/cobalt-cockpit` to generate the host API declarations. TypeScript 5.4+ is needed for type checking; Python 3 runs the portability audit. The suite's default host version is 2.1.288, and the native-effort and directory-validation paths are exercised at 2.1.294.
 
 ```sh
 claude plugin validate --strict .
@@ -220,6 +231,7 @@ claude plugin validate --strict agents
 claude plugin test .
 tsc -p .
 python3 scripts/audit-public.py
+python3 scripts/make-icon.py    # re-render the listing icon from the HUD portrait
 ```
 
 All fixtures are synthetic. Test with an isolated HOME/config/state directory. Do not use a real telemetry ledger or private session capture in fixtures.
