@@ -74,7 +74,7 @@ assert market['plugins'][0]['source']=='./'
 assert m['repository']=='https://github.com/echelong/cobalt-cockpit'
 for key in ('orchestration','blockFable','subscriptionOnly','cobaltStrict'):
  assert m['userConfig'][key]['default'] is False, key
-for name in ('README.md','LICENSE','THIRD_PARTY_NOTICES','SECURITY.md','CHANGELOG.md','.gitignore'):
+for name in ('README.md','LICENSE','THIRD_PARTY_NOTICES','SECURITY.md','PRIVACY.md','CHANGELOG.md','.gitignore'):
  assert (root/name).is_file(), name
 notices=(root/'THIRD_PARTY_NOTICES').read_text()
 assert 'Copyright (c) 2026 Kirill Serditov' in notices
