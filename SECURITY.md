@@ -37,3 +37,14 @@ Command safety and repository hygiene use recognizable syntax and user confirmat
 ## Reporting a vulnerability
 
 Use GitHub's private vulnerability reporting for this repository if available. Otherwise contact the repository maintainer through their GitHub profile to arrange a private channel. Do not post secrets, private ledgers or exploit details in a public issue. Include affected version, a minimal synthetic reproduction and expected impact.
+
+## Optional capability companion
+
+The separately loaded [development companion](companions/README.md) defaults OFF and adds privileged loopback HTTP/CDP and external-process capabilities only when explicitly configured. Hindsight findings and Obscura page/console content are untrusted data, never instructions or verification authority. Memory retention requires explicit consent and reviewed verified summaries; secret filtering is heuristic and cannot replace review. Bank hashes isolate repository identity logically, not service authorization. No broad bank deletion, transcript ingestion, arbitrary browser JavaScript, cookie tools or unrestricted submissions are exposed.
+
+Browser execution requires a dedicated service with OS isolation and externally restricted egress. CDP interception/DNS preflight and fresh contexts supplement those controls; they do not sandbox V8 or fully contain popup/WebSocket/DNS races. Obscura's broad private-network flag also enables metadata access upstream and must only be lifted inside externally confined local tests. Existing personal profiles, host secrets, unrestricted mounts, stealth and automatic proxy setup are prohibited. Exact operator grants are required for bounded interactions; GET requests can still have effects.
+
+Custom tools retain conservative exclusive Cockpit ownership and a cross-session local operation lock. They explicitly query Claude Code's native permission check and proceed only
+on `allow`; `ask`/`deny` refuse before worker/config/service I/O. No permission
+check hook is installed. They never override permission decisions, spawn
+agents, rewrite model routing or pass verification gates. Missing services and timeouts produce explicit unavailable/unverified results. A retention timeout may leave an uncertain server-side write. Cleanup failure invalidates browser evidence. See [architecture](docs/capability-architecture.md) for limits and separate directory review requirements.

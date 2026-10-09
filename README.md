@@ -221,7 +221,7 @@ Cockpit installs no launcher and downloads nothing. It runs local processes, wit
 
 It reads files: the decision-router ledger (read-only, optional, `localControl`), a file about to be written (a bounded replay snapshot), and Claude Code's settings. It reads environment variables **by name**: `CLAUDE_CODE_EFFORT_LEVEL`, `XDG_STATE_HOME`, `HOME`, `COBALT_REDUCED_MOTION`, and eight authentication variables — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_MANTLE` — whose values are reduced to set-or-not-set on the spot and never stored, logged, exported or sent. It writes nothing outside the host's plugin store, which holds up to eight bounded run ledgers, bounded replay bodies, checkpoints and two preferences.
 
-It makes no network request of its own: no fetch, no model call, no MCP call. Its two prompt hooks add text to the request Claude Code already sends — the discipline, safety and policy sections of the system prompt, and one line of task status — which is the only route by which anything Cockpit observed reaches a model. Every path above is listed with its call site in [docs/implementation-v0.3.2.md](docs/implementation-v0.3.2.md).
+The base v0.3.2 runtime without the optional companion makes no network request of its own: no fetch, no model call, no MCP call. Its two prompt hooks add text to the request Claude Code already sends — the discipline, safety and policy sections of the system prompt, and one line of task status — which is the only route by which its observations reach a model. Every base-runtime path above is listed with its call site in [docs/implementation-v0.3.2.md](docs/implementation-v0.3.2.md). The enabled companion's separate network and inference behavior is described below and in PRIVACY.md.
 
 The guards are not a sandbox: they use recognizable syntax and your confirmation. Keep Claude Code's permission controls enabled.
 
@@ -244,3 +244,7 @@ All fixtures are synthetic. Test with an isolated HOME/config/state directory. D
 ## License
 
 MIT. Adapted work and required upstream MIT notices are preserved in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+
+## Optional memory and browser companion (development)
+
+The next feature release has an explicit, separately loaded [capability companion](companions/README.md) for Hindsight project memory and Obscura browser evidence. Both default OFF. The registered v0.3.2 runtime, model hierarchy, ownership rules and installed production plugin are unchanged. Setup is manual; no service, model or database is automatically installed or started. See [architecture and policy boundaries](docs/capability-architecture.md) and the delivery report for actual verification and limitations. This companion is not submitted to the Anthropic directory.

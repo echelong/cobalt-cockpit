@@ -1,0 +1,53 @@
+{
+  "date": "2026-10-09",
+  "hindsight": {
+    "kind": "real local CPU inference",
+    "version": "0.10.3",
+    "image_digest": "sha256:5b6ef2b892703f0e82c448786349c88db60f06d8c9190432b68af00ce6dc45e3",
+    "model": "qwen2.5:3b",
+    "paid_or_cloud_inference": false,
+    "retain_ms": 30478,
+    "retained_documents": 1,
+    "recalled_findings": 3,
+    "recall_ms": 65,
+    "delete_ms": 11,
+    "remaining_findings": 0,
+    "missing_service": "unavailable",
+    "recovery": "ready",
+    "separate_banks": true,
+    "runtime_removed": true,
+    "reflection_real_tested": false
+  },
+  "obscura": {
+    "kind": "real isolated namespace browser",
+    "version": "0.2.4",
+    "archive_sha256": "757e7b597ba5cdd53af9fc701e0a9b80f0a8d788f545d4f82ec9ad32db77f000",
+    "checks": [
+      "real_js_dom",
+      "png_screenshot",
+      "console_error",
+      "network_observed",
+      "foreign_request_blocked",
+      "metadata_refused",
+      "fresh_context_storage_isolation",
+      "unauthorized_action_refused",
+      "approved_click",
+      "timeout_not_verified",
+      "recovery"
+    ],
+    "png_bytes": 9046,
+    "refused_request_count": 1,
+    "foreign_server_hits": 0,
+    "screenshot_persisted": false,
+    "external_egress": false,
+    "processes_stopped": true
+  },
+  "claude_host": {
+    "version": "2.1.294",
+    "kind": "real disabled companion command bootstrap",
+    "command": "/capabilities",
+    "result": "COBALT / optional capability receipts; verification remains with commander",
+    "enabled_effect_permission_checks": "mocked tests",
+    "hook_order_checks": "actual guard source with mocked host"
+  }
+}

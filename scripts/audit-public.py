@@ -27,6 +27,9 @@ for p in sorted(root.rglob('*')):
  # `*`). They are not this repository's files and are not shipped: the release
  # commit carries none of them.
  if rel.parts[:2]==('.claude-plugin','types'): continue
+ # Same host-generated, gitignored declarations for the independently loaded
+ # companion. Its authored code/config remains fully audited below.
+ if rel.parts[:3]==('companions','.claude-plugin','types'): continue
  if p.is_symlink(): findings.append(f'{rel}: symbolic link'); continue
  if not p.is_file(): continue
  count+=1; total+=p.stat().st_size

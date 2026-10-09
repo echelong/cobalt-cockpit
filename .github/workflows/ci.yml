@@ -15,6 +15,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  adapters:
+    name: Offline optional adapters (no service installation)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Hindsight and bridge deterministic tests
+        run: python3 -m unittest discover -s companions/capabilities/tests -p 'test_*.py'
+      - name: Obscura deterministic tests (injected CDP client)
+        run: node --test companions/capabilities/tests/test-browser.mjs
+
   verify:
     name: Plugin tests, types, validation and audit
     runs-on: ubuntu-24.04
@@ -60,6 +76,7 @@ jobs:
           claude plugin validate --strict .claude-plugin/plugin.json
           claude plugin validate --strict .claude-plugin/marketplace.json
           claude plugin validate --strict agents
+          claude plugin validate --strict companions
 
       - name: Run offline plugin tests
         shell: bash
@@ -92,6 +109,7 @@ jobs:
             exit 1
           fi
           npm exec --yes --package=typescript@5.9.3 -- tsc -p .
+          npm exec --yes --package=typescript@5.9.3 -- tsc -p companions
 
       - name: Public portability and privacy audit
         shell: bash

@@ -1,5 +1,6 @@
 # Engine-generated declarations; generated on development loading.
 .claude-plugin/types/
+companions/.claude-plugin/types/
 node_modules/
 coverage/
 dist/
@@ -10,3 +11,5 @@ Thumbs.db
 .env
 .env.*
 .claude/
+__pycache__/
+*.pyc
