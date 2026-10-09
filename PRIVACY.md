@@ -1,6 +1,6 @@
 # Privacy
 
-This policy describes what Cobalt Cockpit v0.3.2 observes, what it keeps, where it keeps it, how long it stays, how to remove it, and what can reach a model. It is written from the plugin's source. Where the plugin gives no guarantee, this page says so rather than implying one. Last updated 2026-10-08.
+This policy describes what Cobalt Cockpit v0.4.0 observes, what it keeps, where it keeps it, how long it stays, how to remove it, and what can reach a model. It is written from the plugin's source. Where the plugin gives no guarantee, this page says so rather than implying one. Last updated 2026-10-08.
 
 [SECURITY.md](SECURITY.md) covers the guards, process access and vulnerability reporting. This page covers data.
 
@@ -8,7 +8,7 @@ This policy describes what Cobalt Cockpit v0.3.2 observes, what it keeps, where 
 
 - Cobalt Cockpit is a Claude Code mod that runs on your machine, inside Claude Code, with your user privileges.
 - It has no server, no account, no analytics and no telemetry backend of its own. Nobody operating Cobalt Cockpit receives anything from your sessions, because nothing is sent to them.
-- The base runtime without the optional companion makes no network request of its own: no HTTP fetch, no model call, no MCP call. Enabled companion behavior is documented separately below.
+- It makes no network request of its own: no HTTP fetch, no model call, no MCP call.
 - It keeps session state in Claude Code's memory and saves a bounded record of each session, the Run Ledger, to one local file that Claude Code manages.
 - Some of what it observes is added to the request Claude Code already sends to your model provider. That is the only route by which anything Cockpit observed leaves your machine, and it is listed below.
 - There is no command that erases the saved ledgers. Removing them is a manual step, described under [Deleting your data](#deleting-your-data).
@@ -137,15 +137,3 @@ Cockpit starts a small set of local programs (`git`, `realpath`, `tail`, and one
 This page changes with the plugin. A change to what is observed, kept or sent is recorded in [CHANGELOG.md](CHANGELOG.md) under the version that makes it.
 
 For a privacy question, open an issue in this repository. For anything that involves a secret or a private ledger, use the private reporting route in [SECURITY.md](SECURITY.md) and do not post the material publicly.
-
-## Explicit optional companion: memory and browser
-
-The base plugin's default disabled behavior remains as described above. Loading the [capability companion](companions/README.md) does not enable services: both host switches and private operator JSON switches default OFF. Disabled calls open no operator configuration, contact no service, read no Git identity and launch no worker.
-
-When enabled, the memory adapter reads canonical Git identity, HEAD and dirty-state metadata and sends explicitly supplied queries or reviewed technical summaries/provenance to the configured loopback Hindsight API. It does not read transcripts, hidden reasoning or source files. Hindsight persists admitted content in its own database/indexes and may perform independent generation, embedding, reranking and consolidation. Those providers are separate from Claude Code and must be explicitly configured; local inference avoids mandatory cloud/payment, but remote providers would receive the data if an operator configures them at the service. Disable Hindsight's LLM trace storage explicitly. DB/model/cache data belongs under `/mnt/mem2`; service backups/traces and deletion remain the operator's responsibility. The forget tool only deletes a repeated companion document ID in the current bank.
-
-Enabled browser tasks contact a dedicated loopback Obscura CDP endpoint and cause the browser service to request permitted website origins and execute their JavaScript. It sees rendered page text, DOM, console/network observations and optional screenshots. Dedicated fresh contexts do not inherit personal browser cookies. No cookie/storage import or arbitrary evaluation tool is exposed. Browser network control needs external egress isolation in addition to adapter interception. Exact localhost consent is independent of service endpoint configuration. Page text and console redaction are heuristic; avoid confidential pages unless explicitly authorized.
-
-The companion stores only bounded projected operation receipts (type, bank hash, count, duration, task, outcome, fallback/error code), never raw query/summary/page/image payloads. Base Run Ledger tool-call observation depends on plugin hook order; companion
-receipts cover capabilities independently. Explicit structured swarm results
-link capability evidence to the base run. Tool responses, including recalled text and explicitly requested ephemeral PNG bytes, can enter Claude Code's own session history; ephemeral means no companion screenshot archive. Use host session/store management for those records, and Hindsight service deletion/backup policy for memory data. No paid inference, runtime install, process start or production settings mutation is automatic. Opt-in integrations make network calls; default-disabled claims do not describe enabled service behavior.

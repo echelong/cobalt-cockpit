@@ -27,9 +27,6 @@ for p in sorted(root.rglob('*')):
  # `*`). They are not this repository's files and are not shipped: the release
  # commit carries none of them.
  if rel.parts[:2]==('.claude-plugin','types'): continue
- # Same host-generated, gitignored declarations for the independently loaded
- # companion. Its authored code/config remains fully audited below.
- if rel.parts[:3]==('companions','.claude-plugin','types'): continue
  if p.is_symlink(): findings.append(f'{rel}: symbolic link'); continue
  if not p.is_file(): continue
  count+=1; total+=p.stat().st_size
@@ -71,9 +68,13 @@ for p in sorted((root / 'hooks').glob('*.ts*')):
   # would be a second permission operation that nothing here needs.
   if re.search(r'\$\s*\.\s*tool\s*\.\s*check\b', line): findings.append(f'hooks/{p.name}:{n}: a permission query ($.tool.check) in the hooks module')
 m=json.loads((root/'.claude-plugin/plugin.json').read_text()); market=json.loads((root/'.claude-plugin/marketplace.json').read_text())
-assert m['version']==market['plugins'][0]['version']=='0.3.2'
+assert m['version']==market['plugins'][0]['version']=='0.4.0'
 assert m['name']==market['plugins'][0]['name']=='cobalt-cockpit'
 assert market['plugins'][0]['source']=='./'
+# This marketplace lists Cockpit and nothing else: the optional companion has its
+# own repository and its own marketplace, and none of its code lives here.
+assert len(market['plugins'])==1
+assert not (root/'companions').exists()
 assert m['repository']=='https://github.com/echelong/cobalt-cockpit'
 for key in ('orchestration','blockFable','subscriptionOnly','cobaltStrict'):
  assert m['userConfig'][key]['default'] is False, key

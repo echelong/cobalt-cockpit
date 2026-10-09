@@ -1,4 +1,4 @@
-# Cobalt Cockpit v0.3.2 — Elastic Swarm + Adaptive Intelligence
+# Cobalt Cockpit v0.4.0 — Elastic Swarm + Adaptive Intelligence
 
 **Mission control for Claude Code.** Follow real task progress, coordinate bounded subagents, review verification gates, and replay what happened, without replacing Claude Code's native model and permission controls.
 
@@ -46,6 +46,7 @@ Opus remains **one main commander** and keeps the reasoning effort you select in
 - Fail-closed guards: a hook that cannot reach its decision refuses the action it guards rather than letting it run, and every such decision is judged against the event it was given.
 - Narrow-terminal and reduced-motion layouts; preserves the engine's image viewer.
 - Optional read-only NobodyWho telemetry and opt-in orchestration policy enforcement.
+- Read-only helpers can deliver their reports: a bound helper may use the host's tool discovery and report hand-back without gaining any write, shell or delegation right, and each task records how its report arrived.
 
 ## Quick start
 
@@ -68,11 +69,14 @@ printf '%s\n' '{"orchestration":"true"}' | claude plugin configure cobalt-cockpi
 
 Restart Claude Code again after changing settings. Enabling orchestration activates model/admission and ownership policy; it does not enable Fable blocking unless you also opt into `blockFable` or `cobaltStrict`.
 
-**Updating an existing public-marketplace installation:**
+**Updating an existing public-marketplace installation** (v0.3.2 or earlier):
 
 ```sh
+claude plugin marketplace update cobalt-cockpit
 claude plugin update cobalt-cockpit@cobalt-cockpit
 ```
+
+Restart Claude Code and check `/cockpit version`. Your settings, preferences and saved Run Ledgers are kept; v0.4.0 adds no setting and changes no default.
 
 The marketplace name in this repository is `cobalt-cockpit`. Some existing private/local setups use a separately registered marketplace alias such as `cobalt`; for those, use the identity shown by `claude plugin list` rather than copying the public suffix.
 
@@ -221,7 +225,7 @@ Cockpit installs no launcher and downloads nothing. It runs local processes, wit
 
 It reads files: the decision-router ledger (read-only, optional, `localControl`), a file about to be written (a bounded replay snapshot), and Claude Code's settings. It reads environment variables **by name**: `CLAUDE_CODE_EFFORT_LEVEL`, `XDG_STATE_HOME`, `HOME`, `COBALT_REDUCED_MOTION`, and eight authentication variables — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_MANTLE` — whose values are reduced to set-or-not-set on the spot and never stored, logged, exported or sent. It writes nothing outside the host's plugin store, which holds up to eight bounded run ledgers, bounded replay bodies, checkpoints and two preferences.
 
-The base v0.3.2 runtime without the optional companion makes no network request of its own: no fetch, no model call, no MCP call. Its two prompt hooks add text to the request Claude Code already sends — the discipline, safety and policy sections of the system prompt, and one line of task status — which is the only route by which its observations reach a model. Every base-runtime path above is listed with its call site in [docs/implementation-v0.3.2.md](docs/implementation-v0.3.2.md). The enabled companion's separate network and inference behavior is described below and in PRIVACY.md.
+It makes no network request of its own: no fetch, no model call, no MCP call. Its two prompt hooks add text to the request Claude Code already sends — the discipline, safety and policy sections of the system prompt, and one line of task status — which is the only route by which anything Cockpit observed reaches a model. Every path above is listed with its call site in [docs/implementation-v0.3.2.md](docs/implementation-v0.3.2.md).
 
 The guards are not a sandbox: they use recognizable syntax and your confirmation. Keep Claude Code's permission controls enabled.
 
@@ -245,6 +249,8 @@ All fixtures are synthetic. Test with an isolated HOME/config/state directory. D
 
 MIT. Adapted work and required upstream MIT notices are preserved in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
 
-## Optional memory and browser companion (development)
+## Optional companion: memory and browser
 
-The next feature release has an explicit, separately loaded [capability companion](companions/README.md) for Hindsight project memory and Obscura browser evidence. Both default OFF. The registered v0.3.2 runtime, model hierarchy, ownership rules and installed production plugin are unchanged. Setup is manual; no service, model or database is automatically installed or started. See [architecture and policy boundaries](docs/capability-architecture.md) and the delivery report for actual verification and limitations. This companion is not submitted to the Anthropic directory.
+Cockpit is complete on its own: it needs no memory service, no browser, no database and no extra inference, and this repository contains none of that code.
+
+[`cobalt-capabilities`](https://github.com/echelong/cobalt-capabilities) is a separate plugin, in its own repository with its own releases, for people who want explicit project memory (through a Hindsight service they run) or bounded browser evidence (through an Obscura service they run) alongside Cockpit v0.4.0 or later. It is not installed with Cockpit, both of its capabilities are off until configured, and its privacy and security documentation is its own. Install instructions and limits are in that repository's README.

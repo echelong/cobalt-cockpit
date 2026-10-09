@@ -9,7 +9,7 @@
       "name": "cobalt-cockpit",
       "source": "./",
       "description": "A live mission-control layer for Claude Code with cyberpunk HUD, orchestration telemetry, dynamic task-aware reasoning effort, verification-gated progress, Run Ledger, replay, session parking, command safety, and optional local-control integration.",
-      "version": "0.3.2",
+      "version": "0.4.0",
       "license": "MIT",
       "repository": "https://github.com/echelong/cobalt-cockpit"
     }

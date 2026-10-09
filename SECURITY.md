@@ -30,6 +30,10 @@ A hook of Cockpit's that fails is not allowed to let an action through. The engi
 
 Cockpit has no hook on Claude Code's permission check (`tool.check`) and asks no permission decision of its own. Its guards run earlier, in `tool.call`, and only ever refuse a call or put a question to you; nothing in the plugin approves one, so your permission rules, your permission mode and the engine's own dialog decide every call that Cockpit lets through.
 
+## Helpers and their reports
+
+With orchestration on, a bound helper may use two host control tools whatever its ownership: tool discovery (`ToolSearch`) and the report hand-back to its parent (`SubagentHandback`). Neither has a resource effect. Discovery grants no right to run what it finds: every tool still passes its own ownership guard and Claude Code's permission check, so a read-only helper's write, shell command and delegation are refused exactly as before. A hand-back records only the calling helper's own report. How a report arrived (`reported`, `host_accepted`, `answer_observed`, `unavailable`) is recorded on the task and is never verification; only the commander verifies.
+
 ## Guard limitations
 
 Command safety and repository hygiene use recognizable syntax and user confirmation. They are not a sandbox or an exhaustive security boundary. Verification records observations and user/agent-reported evidence; it cannot guarantee code correctness. Keep Claude Code permission controls enabled.
@@ -37,14 +41,3 @@ Command safety and repository hygiene use recognizable syntax and user confirmat
 ## Reporting a vulnerability
 
 Use GitHub's private vulnerability reporting for this repository if available. Otherwise contact the repository maintainer through their GitHub profile to arrange a private channel. Do not post secrets, private ledgers or exploit details in a public issue. Include affected version, a minimal synthetic reproduction and expected impact.
-
-## Optional capability companion
-
-The separately loaded [development companion](companions/README.md) defaults OFF and adds privileged loopback HTTP/CDP and external-process capabilities only when explicitly configured. Hindsight findings and Obscura page/console content are untrusted data, never instructions or verification authority. Memory retention requires explicit consent and a short reviewed summary; it is stored as verified only when the Cockpit run ledger shows the named task commander-verified, and as an agent assertion otherwise. Secret filtering is heuristic and cannot replace review. Hindsight runs its own inference on retained summaries and queries, and derives further observations from them in the background; those carry no companion provenance and are reported as unverified. Bank hashes isolate repository identity logically, not service authorization. No broad bank deletion, transcript ingestion, arbitrary browser JavaScript, cookie tools or unrestricted submissions are exposed.
-
-Browser execution requires a dedicated service with OS isolation and externally restricted egress. CDP interception/DNS preflight and fresh contexts supplement those controls; they do not sandbox V8 or fully contain popup/WebSocket/DNS races. Obscura's broad private-network flag also enables metadata access upstream and must only be lifted inside externally confined local tests. Existing personal profiles, host secrets, unrestricted mounts, stealth and automatic proxy setup are prohibited. Exact operator grants are required for bounded interactions; GET requests can still have effects.
-
-Custom tools retain conservative exclusive Cockpit ownership and a cross-session local operation lock. They explicitly query Claude Code's native permission check and proceed only
-on `allow`; `ask`/`deny` refuse before worker/config/service I/O. No permission
-check hook is installed. They never override permission decisions, spawn
-agents, rewrite model routing or pass verification gates. Missing services and timeouts produce explicit unavailable/unverified results. A retention timeout may leave an uncertain server-side write. Cleanup failure invalidates browser evidence. See [architecture](docs/capability-architecture.md) for limits and separate directory review requirements.
