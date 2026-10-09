@@ -9,8 +9,16 @@ const MAX_IMAGE_BYTES = 512 * 1024;
 const MAX_OUTPUT_BYTES = 1800000;
 const OPERATIONS = new Set(['navigate', 'inspect', 'snapshot', 'console', 'network', 'screenshot', 'click', 'fill']);
 const sensitive = /(?:password|passwd|secret|token|api.?key|authorization|credential|session|cookie)/i;
+// The same credential shapes the memory adapter refuses; heuristic, not DLP.
+const SECRET_SHAPES = String.raw`-----BEGIN [A-Z ]*PRIVATE KEY|\b(?:sk-[A-Za-z0-9_-]{8,}|sk_(?:live|test)_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{12,}|gh[pousr]_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9_-]{8,}|AKIA[A-Z0-9]{16})|https?:\/\/[^\s\/@:]+:[^\s\/@]+@`;
+const secretShaped = new RegExp(SECRET_SHAPES);
 const redact = value => String(value ?? '').slice(0, TEXT_LIMIT)
-  .replace(/\b(?:sk-|gh[pousr]_)[A-Za-z0-9_-]{8,}/g, '[redacted]')
+  // Invisible formatting (Cf: bidi controls, zero-width characters, the
+  // byte-order mark, soft hyphen), the tag/annotation block, both
+  // variation-selector ranges and C0/C1 controls are stripped: they carry no
+  // legible content and can hide instructions or split a secret past a filter.
+  .replace(/\p{Cf}|[\u{E0000}-\u{E007F}]|[\u{FE00}-\u{FE0F}]|[\u{E0100}-\u{E01EF}]|[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, '')
+  .replace(new RegExp(SECRET_SHAPES, 'g'), '[redacted]')
   .replace(/\b(?:Bearer|Basic)\s+\S+/gi, '[redacted]')
   .replace(/((?:password|passwd|secret|token|api.?key|authorization|cookie)\s*[=:]\s*)[^\s,;]+/gi, '$1[redacted]');
 
@@ -35,12 +43,17 @@ export function isForbiddenAddress(address) {
   // Only ordinary global-unicast IPv6 is admitted. Translation/tunnel prefixes
   // are conservatively refused instead of trying to infer embedded endpoints.
   const normalized = new URL(`http://[${address}]/`).hostname.slice(1, -1).toLowerCase();
-  return !/^2[0-9a-f]{3}:/.test(normalized) || normalized.startsWith('2001:0:')
+  return !/^2[0-9a-f]{3}:/.test(normalized) || normalized.startsWith('2001:0:') || normalized.startsWith('2001::')
     || normalized.startsWith('2001:db8:') || normalized.startsWith('2002:');
 }
 
 const loopback = host => host === 'localhost' || host === '127.0.0.1' || host === '::1';
 const hostOf = url => url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+// Every loopback name and address is one host. An endpoint written
+// `ws://localhost:9222` and an allowlist entry written `http://127.0.0.1:9222`
+// are the same control socket, so a literal string compare would admit a page
+// that can reach the browser's own control endpoint.
+const sameHost = (a, b) => a === b || (loopback(a) && loopback(b));
 
 function validateConfig(config) {
   if (config.browser_isolation_confirmed !== true) throw new Error('OS and network isolation must be explicitly confirmed');
@@ -49,12 +62,34 @@ function validateConfig(config) {
     throw new Error('Obscura endpoint must be a credential-free loopback ws URL');
   if (!Array.isArray(config.browser_allowed_origins) || !config.browser_allowed_origins.length || config.browser_allowed_origins.length > 32)
     throw new Error('An exact browser origin allowlist is required');
+  const endpointHost = hostOf(endpoint), endpointPort = endpoint.port || '80';
+  // The memory service is unauthenticated and holds every repository's bank;
+  // a page on its origin would read around the adapter's bank scoping.
+  let memory = null;
+  try { memory = typeof config.hindsight_endpoint === 'string' ? new URL(config.hindsight_endpoint) : null; } catch { memory = null; }
   const origins = new Set(config.browser_allowed_origins.map(raw => {
     const url = new URL(raw);
     if (!['http:', 'https:'].includes(url.protocol) || raw !== url.origin || url.username || url.password)
       throw new Error('Browser allowlist entries must be exact HTTP(S) origins');
+    // A page on the CDP endpoint origin could reach the control socket itself.
+    if (sameHost(hostOf(url), endpointHost) && (url.port || (url.protocol === 'https:' ? '443' : '80')) === endpointPort)
+      throw new Error('Browser allowlist must not include the Obscura endpoint origin');
+    if (memory && sameHost(hostOf(url), hostOf(memory)) && (url.port || (url.protocol === 'https:' ? '443' : '80')) === (memory.port || '8888'))
+      throw new Error('Browser allowlist must not include the memory service origin');
     return url.origin;
   }));
+  const actions = config.browser_authorized_actions ?? [];
+  if (!Array.isArray(actions)) throw new Error('Browser action grants must be an array');
+  for (const grant of actions) {
+    // Every grant is bound to the exact origin it was authorized for; the
+    // worker compares it with the active page origin at execution time.
+    if (!grant || typeof grant !== 'object' || !['click', 'fill'].includes(grant.operation)
+      || typeof grant.task_id !== 'string' || typeof grant.selector !== 'string') throw new Error('Browser action grant must name task, click/fill operation and selector');
+    let origin;
+    try { origin = new URL(grant.origin); } catch { throw new Error('Browser action grant requires an exact origin'); }
+    if (!['http:', 'https:'].includes(origin.protocol) || grant.origin !== origin.origin || origin.username || origin.password)
+      throw new Error('Browser action grant origin must be an exact HTTP(S) origin');
+  }
   const timeout = config.browser_timeout_ms ?? 10000;
   if (!Number.isInteger(timeout) || timeout < 100 || timeout > 30000) throw new Error('Browser timeout must be 100–30000 ms');
   if (!['none', 'ephemeral'].includes(config.screenshot_retention ?? 'none')) throw new Error('Screenshot retention must be none or ephemeral');
@@ -65,6 +100,10 @@ async function permittedUrl(raw, config, origins, lookup) {
   const url = new URL(raw);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || !origins.has(url.origin)) return false;
   if ([...url.searchParams.keys()].some(key => sensitive.test(key))) return false;
+  // A credential-shaped string anywhere in the URL is refused, encoded or not.
+  let decoded = raw;
+  try { decoded = decodeURIComponent(raw); } catch { /* keep the raw form */ }
+  if (secretShaped.test(raw) || secretShaped.test(decoded)) return false;
   const host = hostOf(url);
   if (loopback(host)) return config.browser_allow_localhost === true;
   if (host.endsWith('.localhost') || host.endsWith('.local') || !host.includes('.') && !isIP(host)) return false;
@@ -72,36 +111,45 @@ async function permittedUrl(raw, config, origins, lookup) {
   return addresses.length > 0 && addresses.every(item => !isForbiddenAddress(item.address));
 }
 
-function authorized(config, taskId, step) {
+function granted(config, taskId, step, origin) {
   return Array.isArray(config.browser_authorized_actions) && config.browser_authorized_actions.some(grant =>
     grant.task_id === taskId && grant.operation === step.operation && grant.selector === step.selector
-    && (step.operation !== 'fill' || grant.value === step.value));
+    && (step.operation !== 'fill' || grant.value === step.value)
+    // Pre-flight passes no origin; execution requires the exact grant origin.
+    && (origin === undefined || grant.origin === origin));
 }
 
 /** Returned text is untrusted evidence, never instructions or a passed gate.
  * DNS preflight supplements Obscura's connect-time SSRF guard; it cannot pin DNS.
  * Operator isolation must enforce egress, especially for local-mode services.
  */
-export async function executeBrowser(config = {}, args = {}, { connect, lookup = dnsLookup } = {}) {
+export async function executeBrowser(config = {}, args = {}, { connect, lookup = dnsLookup, onStep } = {}) {
   config ??= {};
   args ??= {};
   if (config.browser_enabled !== true) return { status: 'disabled', executed: false, results: [] };
   const started = Date.now();
-  let browser, context, expired = false, timer, outcome;
+  let browser, context, expired = false, timer, outcome, stepInFlight = null, effectsPossible = false;
   const results = [], consoleMessages = [], network = [], blocked = [];
   const check = () => { if (expired) throw new Error('Browser task timed out'); };
+  // Progress telemetry names the step that is actually starting, never its
+  // content, and can never change the task's outcome.
+  const report = name => { try { onStep?.(name); } catch { /* telemetry only */ } };
   let settings;
   try {
     settings = validateConfig(config);
     if (typeof args.task_id !== 'string' || !/^[A-Za-z0-9_.-]{1,80}$/.test(args.task_id)) throw new Error('A bounded task_id is required');
     if (!Array.isArray(args.steps) || !args.steps.length || args.steps.length > MAX_STEPS) throw new Error('Browser task requires 1–12 steps');
-    for (const step of args.steps) {
+    // A lone `status` step is a readiness probe: it only checks that the
+    // configured control endpoint answers. It opens no context or page and
+    // navigates nowhere, so it cannot be combined with any other step.
+    const probe = args.steps.length === 1 && args.steps[0]?.operation === 'status';
+    if (!probe) for (const step of args.steps) {
       if (!step || !OPERATIONS.has(step.operation)) throw new Error('Unsupported browser operation');
       if (['click', 'fill'].includes(step.operation)) {
         if (typeof step.selector !== 'string' || step.selector.length > 256 || sensitive.test(step.selector)
-          || !authorized(config, args.task_id, step)) throw new Error('Browser interaction lacks an exact operator grant');
-        if (step.operation === 'fill' && (typeof step.value !== 'string' || step.value.length > 1000 || sensitive.test(step.value)))
-          throw new Error('Sensitive or oversized fill refused');
+          || !granted(config, args.task_id, step)) throw new Error('Browser interaction lacks an exact operator grant');
+        if (step.operation === 'fill' && (typeof step.value !== 'string' || !step.value.length || step.value.length > 1000 || sensitive.test(step.value)))
+          throw new Error('Sensitive, empty or oversized fill refused');
       }
       if (step.operation === 'screenshot' && config.screenshot_retention !== 'ephemeral') throw new Error('Screenshot requires ephemeral evidence consent');
       if (step.operation === 'navigate' && typeof step.url !== 'string') throw new Error('Navigation URL required');
@@ -111,15 +159,24 @@ export async function executeBrowser(config = {}, args = {}, { connect, lookup =
       for (const step of args.steps) if (step.operation === 'navigate' && !await permittedUrl(step.url, config, settings.origins, lookup))
         throw new Error('Navigation refused by browser policy');
       check();
+      if (probe) { stepInFlight = 'status'; report('status'); }
       if (!connect) {
         let puppeteer;
-        try { puppeteer = await import('puppeteer-core'); }
-        catch { throw new Error('Optional puppeteer-core dependency unavailable'); }
+        try {
+          // Only the dependency installed beside this worker is loaded; a
+          // same-named package in any parent directory is never picked up.
+          const beside = new URL('./node_modules/', import.meta.url).href;
+          const resolved = import.meta.resolve('puppeteer-core');
+          if (!resolved.startsWith(beside)) throw new Error('outside the worker directory');
+          puppeteer = await import(resolved);
+        } catch { throw new Error('Optional puppeteer-core dependency unavailable'); }
         connect = puppeteer.connect;
       }
       const connected = await connect({ browserWSEndpoint: settings.endpoint, protocolTimeout: settings.timeout });
       if (expired) { connected.disconnect(); check(); }
       browser = connected;
+      if (probe) return { status: 'ready', executed: true, task_id: args.task_id, verification_status: 'not_applicable',
+        operations_completed: ['status'], results: [], refused_request_count: 0, duration_ms: Date.now() - started };
       const created = await browser.createBrowserContext();
       if (expired) { await created.close(); check(); }
       context = created;
@@ -146,11 +203,35 @@ export async function executeBrowser(config = {}, args = {}, { connect, lookup =
         })().catch(() => { void request.abort('blockedbyclient').catch(() => {}); });
       });
       await page.setRequestInterception(true); check();
+      // The render engine can issue a redirect hop or a scripted navigation
+      // before the request policy sees it, so a page that ends anywhere off the
+      // allowlist is refused instead of reported as observed evidence.
+      const requireAllowlisted = () => {
+        const current = page.url();
+        // A fresh context has loaded nothing yet; there is no origin to check
+        // until the first navigate. `about:blank` is not evidence of anything.
+        if (current === 'about:blank') return;
+        const landed = new URL(current).origin;
+        if (!settings.origins.has(landed)) throw new Error('Active page origin is not allowlisted');
+      };
       for (const step of args.steps) {
         check();
+        // Re-checked before every step, not only after navigate and click: a
+        // redirect or scripted navigation that commits after the previous step
+        // returns could otherwise be read, snapshotted or screenshotted from an
+        // off-allowlist page and reported here as observed evidence.
+        requireAllowlisted();
+        stepInFlight = step.operation;
+        report(step.operation);
+        // Effects may outlive a later failure; record that a mutating step
+        // started before its outcome is known.
+        if (['navigate', 'click', 'fill'].includes(step.operation)) effectsPossible = true;
         let evidence;
         switch (step.operation) {
-          case 'navigate': await page.goto(step.url, { waitUntil: 'domcontentloaded', timeout: settings.timeout }); evidence = { url: safeUrl(page.url()) }; break;
+          case 'navigate':
+            await page.goto(step.url, { waitUntil: 'domcontentloaded', timeout: settings.timeout });
+            requireAllowlisted();
+            evidence = { url: safeUrl(page.url()) }; break;
           case 'inspect':
           case 'snapshot': {
             // Fixed code only. Never return passwords, form values, cookies,
@@ -171,10 +252,55 @@ export async function executeBrowser(config = {}, args = {}, { connect, lookup =
             if (image.length > MAX_IMAGE_BYTES || !image.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) throw new Error('Screenshot missing or oversized');
             evidence = { mime_type: 'image/png', bytes: image.length, base64: image.toString('base64'), retention: 'ephemeral' }; break;
           }
-          case 'click': await page.click(step.selector); evidence = { action: 'clicked' }; break;
-          case 'fill':
-            // Use maintained Puppeteer locator fill, not user-supplied JS.
-            await page.locator(step.selector).fill(step.value); evidence = { action: 'filled' }; break;
+          case 'click': {
+            if (!granted(config, args.task_id, step, new URL(page.url()).origin)) throw new Error('Click grant does not match the active origin');
+            await page.click(step.selector);
+            requireAllowlisted();
+            evidence = { action: 'clicked' }; break;
+          }
+          case 'fill': {
+            // Obscura 0.2.4 does not apply Puppeteer's locator.fill() protocol
+            // path: the input/change events fire but the value is never
+            // committed, so a naive fill would report success without effect.
+            // Fill through fixed code plus real keyboard input instead, then
+            // read the value back and refuse success unless it actually landed.
+            // Only a connected, enabled, editable text control can be written:
+            // a non-input, hidden, disabled, readonly, checkbox, radio or file
+            // target is refused before anything is cleared or typed.
+            if (!granted(config, args.task_id, step, new URL(page.url()).origin)) throw new Error('Fill grant does not match the active origin');
+            const target = await page.$(step.selector);
+            if (!target) throw new Error('Fill target not found');
+            const editable = await target.evaluate(element => {
+              const attribute = name => { try { return element.getAttribute(name); } catch { return null; } };
+              const tag = String(element.tagName ?? '');
+              if ((tag !== 'INPUT' && tag !== 'TEXTAREA') || element.isConnected === false) return false;
+              // Attribute and property are both checked: a rendering engine may
+              // implement only one of them, and a readonly field must never be
+              // written or programmatically cleared.
+              if (element.disabled === true || attribute('disabled') !== null) return false;
+              if (element.readOnly === true || attribute('readonly') !== null) return false;
+              if (tag === 'INPUT') {
+                const type = String(attribute('type') ?? element.type ?? 'text').toLowerCase();
+                if (['hidden', 'checkbox', 'radio', 'file', 'submit', 'button', 'reset', 'image'].includes(type)) return false;
+              }
+              return true;
+            });
+            if (editable !== true) throw new Error('Fill target is not an editable text control');
+            // Keystrokes go to whatever the document has focused, so focus is
+            // confirmed before typing: a CSS-hidden input passes the editable
+            // check, `focus()` silently fails, and type() would otherwise send
+            // the value into an unrelated element that then keeps it.
+            const focused = await target.evaluate(element => {
+              element.focus();
+              try { element.select(); } catch { element.value = ''; }
+              return document.activeElement === element;
+            });
+            if (focused !== true) throw new Error('Fill target could not take focus');
+            await target.type(step.value);
+            const applied = await target.evaluate((element, expected) => element.value === expected, step.value);
+            if (applied !== true) throw new Error('Fill did not apply');
+            evidence = { action: 'filled' }; break;
+          }
         }
         check();
         results.push({ operation: step.operation, evidence, trust: 'untrusted_reference' });
@@ -195,9 +321,15 @@ export async function executeBrowser(config = {}, args = {}, { connect, lookup =
     const code = message === 'Browser task timed out' ? 'browser_timeout'
       : message === 'Browser evidence output limit' ? 'browser_output_limit'
       : unavailable ? 'browser_unavailable' : 'browser_policy_or_execution_error';
+    // Failed evidence must still disclose effects that may already have
+    // happened, so the model can reconcile instead of retrying a
+    // non-idempotent step: completed operation names only, never their content.
     return outcome = { status: unavailable ? 'unavailable' : 'error',
       executed: false, task_id: /^[A-Za-z0-9_.-]{1,80}$/.test(args.task_id ?? '') ? args.task_id : undefined,
-      verification_status: 'not_verified', error: code, results: [], duration_ms: Date.now() - started };
+      verification_status: 'not_verified', error: code,
+      effects_possible: effectsPossible, steps_completed: results.length, step_in_flight: stepInFlight,
+      operations_completed: results.map(row => row.operation).slice(0, MAX_STEPS),
+      results: [], duration_ms: Date.now() - started };
   } finally {
     expired = true;
     clearTimeout(timer);
@@ -207,8 +339,15 @@ export async function executeBrowser(config = {}, args = {}, { connect, lookup =
         new Promise(resolve => { cleanupTimer = setTimeout(() => resolve(false), 1000); })]);
       clearTimeout(cleanupTimer);
       if (outcome) outcome.cleanup_confirmed = closed;
-      if (!closed && outcome) Object.assign(outcome, { status: 'error', executed: false,
-        error: 'browser_cleanup_failed', verification_status: 'not_verified', results: [] });
+      if (!closed && outcome) {
+        const completed = Array.isArray(outcome.results) ? outcome.results : [];
+        Object.assign(outcome, { status: 'error', executed: false,
+          error: 'browser_cleanup_failed', verification_status: 'not_verified',
+          effects_possible: outcome.effects_possible === true || completed.length > 0,
+          steps_completed: Math.max(Number(outcome.steps_completed ?? 0), completed.length),
+          operations_completed: Array.from(new Set([...(outcome.operations_completed ?? []), ...completed.map(row => row.operation)])).slice(0, MAX_STEPS),
+          results: [] });
+      }
     }
     if (browser) browser.disconnect();
   }
@@ -217,8 +356,16 @@ export async function executeBrowser(config = {}, args = {}, { connect, lookup =
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     let input = '';
-    for await (const chunk of process.stdin) { input += chunk; if (Buffer.byteLength(input) > 24576) throw new Error('Input exceeds 24 KiB'); }
+    // Config plus arguments must both fit: the bridge caps each source at 24 KiB.
+    for await (const chunk of process.stdin) { input += chunk; if (Buffer.byteLength(input) > 65536) throw new Error('Input exceeds 64 KiB'); }
     const { config, arguments: args } = JSON.parse(input);
-    process.stdout.write(`${JSON.stringify(await executeBrowser(config, args))}\n`);
-  } catch { process.stdout.write(`${JSON.stringify({ status: 'error', executed: false, error: 'browser_invalid_input', results: [] })}\n`); }
+    // One fixed-shape line per started step on stderr; the result stays alone on stdout.
+    // A reader that has gone away must not crash the task it was watching.
+    process.stderr.on('error', () => {});
+    const onStep = name => { process.stderr.write(`${JSON.stringify({ cobalt_step: name })}\n`); };
+    const report = `${JSON.stringify(await executeBrowser(config, args, { onStep }))}\n`;
+    // Exit once the report is flushed: a lingering socket must not hold the
+    // process past its result and turn a finished task into a timeout.
+    process.stdout.write(report, () => process.exit(0));
+  } catch { process.stdout.write(`${JSON.stringify({ status: 'error', executed: false, error: 'browser_invalid_input', results: [] })}\n`, () => process.exit(0)); }
 }

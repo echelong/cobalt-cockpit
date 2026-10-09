@@ -66,6 +66,97 @@ describe('swarm ownership through real host hooks', () => {
 })
 
 describe('swarm handoffs, end events and durable evidence', () => {
+  test('read-only helper discovers tools and delivers its report through native handback', options, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); on('session.id', () => ({ value: 'reader-session' })); await start($)
+    await assign($, 'reader'); const a = (await spawn($, 'reader')).agentId!
+    expect((await $.tool.call({ tool: 'ToolSearch', agentId: a, query: 'select:mcp__cobalt-cockpit__swarm' } as never)).deny).toBeUndefined()
+    await report($, { action: 'result', task_id: 'reader', agentId: a, conclusion: 'Finding with uncertainty', evidence: ['shared.ts:1'], unresolved: ['Needs commander review'] })
+    expect(task(held, 'reader').resultDelivery).toBe('reported')
+    expect((await $.tool.call({ tool: 'SubagentHandback', agentId: a, message: 'Finding with uncertainty' } as never)).deny).toBeUndefined()
+    expect(w.ran.filter(r => r['tool'] === 'SubagentHandback')).toHaveLength(1)
+    expect(task(held, 'reader').state).toBe('running')
+    await finish($, a)
+    expect(task(held, 'reader').state).toBe('completed')
+    expect(task(held, 'reader').resultDelivery).toBe('host_accepted')
+    expect(task(held, 'reader').verification).toBe('pending')
+    const status = await report($, { action: 'status', task_id: 'reader' })
+    expect(String(status.result)).toContain('Finding with uncertainty')
+    expect(String(status.result)).toContain('host_accepted')
+    // Persistence: the last value the plugin handed to `$.store.set` is a
+    // ledger that names the acknowledged report, and the timeline carries it.
+    const persisted = w.storeWrites.filter(x => x.key === `ledger:${current(held).sessionId}`).at(-1)?.value as Ledger
+    expect(persisted.swarm!.tasks.find(t => t.id === 'reader')?.resultDelivery).toBe('host_accepted')
+    expect(replayTimeline(persisted).some(s => s.title.startsWith('REPORT_ACKNOWLEDGED'))).toBe(true)
+  })
+  test('parallel read-only reports survive sibling failure and HUD counts observed endings', options, async ($, on) => {
+    world(on); const held = hostState(on, {}); await start($)
+    for (const id of ['one', 'two', 'failed']) await assign($, id)
+    const agents = await Promise.all(['one', 'two', 'failed'].map(id => spawn($, id)))
+    await Promise.all(agents.slice(0, 2).map((a, n) => $.tool.call({ tool: 'SubagentHandback', agentId: a.agentId!, message: `Report ${n}` } as never)))
+    await Promise.all(agents.map((a, n) => finish($, a.agentId!, n === 2 ? 'error' : 'answer')))
+    expect(task(held, 'one').result?.conclusion).toBe('Report 0')
+    expect(task(held, 'two').result?.conclusion).toBe('Report 1')
+    expect(task(held, 'failed').state).toBe('failed')
+    const status = JSON.parse(String((await report($, { action: 'status' })).result))
+    expect(status.completed).toBe(2)
+    const hud = await mountHud($, 'terminal', 120, true)
+    expect((await fieldRowsOf(hud)).join('\n')).toContain('2 done')
+    await hud.unmount()
+  })
+  test('handback and discovery do not authorize writes, shell, other tasks or unknown agents', options, async ($, on) => {
+    const w = world(on); await start($); await assign($, 'reader'); await assign($, 'sibling')
+    const a = (await spawn($, 'reader')).agentId!
+    expect((await edit($, a, '/work/shared.ts')).deny).toContain('read-only')
+    expect((await $.tool.call({ tool: 'Read', agentId: a, file_path: '/work/private.ts' } as never)).deny).toContain('outside owned')
+    expect((await $.tool.call({ tool: 'Bash', agentId: a, command: 'touch /work/shared.ts' } as never)).deny).toContain('read-only')
+    expect((await $.tool.call({ tool: 'SubagentHandback', agentId: 'unknown', message: 'claim' } as never)).deny).toContain('no bound ownership')
+    expect((await report($, { action: 'result', agentId: a, task_id: 'sibling', conclusion: 'spoof' })).isError).toBe(true)
+    expect(w.ran).toHaveLength(0)
+  })
+  test('native handback rejection is preserved and never recorded as delivered', options, async ($, on) => {
+    world(on, { failingTools: ['SubagentHandback'] }); const held = hostState(on, {}); await start($)
+    await assign($, 'reader'); const a = (await spawn($, 'reader')).agentId!
+    const r = await $.tool.call({ tool: 'SubagentHandback', agentId: a, message: 'Rejected report' } as never)
+    expect(r.isError).toBe(true)
+    expect(task(held, 'reader').resultDelivery).toBeUndefined()
+    expect(task(held, 'reader').result).toBeNull()
+  })
+  test('handback acknowledgement survives completion racing inside the native tool', options, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); await start($)
+    await assign($, 'fast'); const a = (await spawn($, 'fast')).agentId!
+    // The host completes the turn while the native handback tool is still running.
+    w.duringToolCall = async call => { if (call['tool'] === 'SubagentHandback') await finish($, a) }
+    await $.tool.call({ tool: 'SubagentHandback', agentId: a, message: 'Late acknowledgement' } as never)
+    expect(task(held, 'fast').state).toBe('completed')
+    expect(task(held, 'fast').resultDelivery).toBe('host_accepted')
+  })
+  test('interrupted helper preserves its submitted report and releases resources on observed stop', options, async ($, on) => {
+    world(on); const held = hostState(on, {}); await start($)
+    await assign($, 'interrupted'); const a = (await spawn($, 'interrupted')).agentId!
+    await report($, { action: 'result', task_id: 'interrupted', agentId: a, conclusion: 'Partial finding', evidence: ['shared.ts:2'] })
+    await finish($, a, 'aborted')
+    expect(task(held, 'interrupted').state).toBe('cancelled')
+    expect(task(held, 'interrupted').resultDelivery).toBe('reported')
+    expect(task(held, 'interrupted').result?.conclusion).toBe('Partial finding')
+    await assign($, 'recovery', ['/work/shared.ts'], 'write')
+    expect((await spawn($, 'recovery')).agentId).toBeDefined()
+  })
+  test('host completion without answer evidence is explicitly unavailable', options, async ($, on) => {
+    world(on); const held = hostState(on, {}); await start($)
+    await assign($, 'silent'); const a = (await spawn($, 'silent')).agentId!
+    // A completed turn whose answer carries no text: the host has no report to accept.
+    await $.turn.complete({ agentId: a, turnId: 'silent-turn', reason: 'answer', answer: '', durationMs: 20, isAborted: false } as never)
+    expect(task(held, 'silent').state).toBe('completed')
+    expect(task(held, 'silent').resultDelivery).toBe('unavailable')
+    expect(task(held, 'silent').verification).toBe('pending')
+  })
+  test('ordinary final response is observed separately from native handback', options, async ($, on) => {
+    world(on); const held = hostState(on, {}); await start($)
+    await assign($, 'final'); const a = (await spawn($, 'final')).agentId!
+    await finish($, a)
+    expect(task(held, 'final').resultDelivery).toBe('answer_observed')
+    expect(task(held, 'final').result?.conclusion).toBe('Observed bounded result')
+  })
   test('agents can hand off only their own work and commander alone verifies', options, async ($, on) => {
     world(on); const held = hostState(on, {}); await start($)
     await assign($, 'scout', ['/work/source.ts'], 'read', { tier: 'HAIKU', role: 'Scout' }); await assign($, 'sibling')

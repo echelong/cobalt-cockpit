@@ -1,6 +1,7 @@
 """One bounded operator invocation; no daemon, installer, inference or transcript access."""
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,36 @@ import sys
 
 MAX_INPUT = 24000
 MAX_OUTPUT = 2000000
+# Fixed lock location, never operator- or environment-selected: the per-user
+# runtime directory, or the shared temporary directory under the same
+# ownership checks where no runtime directory exists. LOCK_ROOT is a test seam.
+LOCK_ROOT = None
+
+
+def lock_roots():
+    return (LOCK_ROOT,) if LOCK_ROOT else (f"/run/user/{os.getuid()}", "/tmp")
+
+
+def load_adapter():
+    """Load the sibling memory adapter by its own path, not by module search."""
+    spec = importlib.util.spec_from_file_location("cobalt_hindsight", Path(__file__).with_name("hindsight.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+MEMORY_OPERATIONS = ("status", "recall", "retain", "reflect", "list", "forget")
+
+
+def report_step(name):
+    """One fixed-shape progress line on stderr when an operation really starts.
+
+    Names only, never arguments or content. The result stays alone on stdout,
+    and a closed or missing stderr never changes the operation's outcome.
+    """
+    try:
+        sys.stderr.write(json.dumps({"cobalt_step": name}) + "\n")
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def load_config(path):
@@ -48,15 +79,42 @@ def dispatch(request):
     # Never put endpoint strings, contents or credentials on disk.
     if 'lock_directory' in config:
         raise ValueError('lock_directory_not_configurable')
-    directory = Path(f"/mnt/mem2/cobalt-capabilities-{os.getuid()}/locks")
-    base = Path('/mnt/mem2').resolve(strict=True)
+    base = None
+    for candidate in lock_roots():
+        try:
+            resolved = Path(candidate).resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.is_dir():
+            base = resolved
+            break
+    if base is None:
+        # No usable location is a distinct, diagnosable condition rather than
+        # a generic malformed request.
+        raise ValueError("lock_storage_unavailable")
+    root = base / f"cobalt-capabilities-{os.getuid()}"
+    directory = root / "locks"
     if not directory.is_absolute() or '..' in directory.parts or not directory.resolve().is_relative_to(base):
-        raise ValueError("lock_directory_must_use_mem2")
+        raise ValueError("lock_directory_outside_fixed_root")
     if any(p.is_symlink() for p in [directory, *directory.parents] if p != base and p.is_relative_to(base)):
         raise ValueError("symlink_lock_directory")
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if directory.is_symlink() or directory.stat().st_uid != os.getuid() or directory.stat().st_mode & 0o077:
-        raise ValueError("private_lock_directory_required")
+    # Every level is created and verified private: parents=True would give an
+    # implicit intermediate directory the invoking umask instead of 0700. A
+    # directory an earlier version created wider is tightened, not trusted.
+    for level in (root, directory):
+        level.mkdir(mode=0o700, exist_ok=True)
+        if level.is_symlink():
+            raise ValueError("private_lock_directory_required")
+        info = level.stat()
+        if info.st_uid != os.getuid():
+            raise ValueError("private_lock_directory_required")
+        if info.st_mode & 0o077:
+            try:
+                os.chmod(level, 0o700)
+            except OSError:
+                raise ValueError("private_lock_directory_required") from None
+            if level.stat().st_mode & 0o077:
+                raise ValueError("private_lock_directory_required")
     # One lock across all endpoints/capabilities prevents independently configured
     # clients from widening the host's conservative ownership policy.
     digest = hashlib.sha256(b"cobalt-capabilities-exclusive").hexdigest()
@@ -70,19 +128,43 @@ def dispatch(request):
         except BlockingIOError:
             return {"capability": capability, "status": "error", "error": "resource_busy"}
         if capability == "memory":
-            from hindsight import Hindsight
-            return Hindsight(config, request.get("repo", "")).execute(request.get("operation", "status"), arguments)
+            Hindsight = load_adapter().Hindsight
+            operation = request.get("operation", "status")
+            # Reported only when the service request is actually issued: a
+            # refusal before any service I/O never shows as an operation.
+            started = (lambda: report_step(operation)) if operation in MEMORY_OPERATIONS else None
+            return Hindsight(config, request.get("repo", ""), on_request=started).execute(operation, arguments)
         worker = Path(__file__).with_name("browser.mjs")
         # A scrubbed child environment prevents implicit proxies/CDP credentials.
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "TMPDIR")}
         try:
-            result = subprocess.run(["node", str(worker)], input=json.dumps({"config": config, "arguments": arguments}),
-                                    capture_output=True, text=True, timeout=40, env=env, check=False)
-        except (OSError, subprocess.TimeoutExpired):
+            # The worker inherits stderr for its fixed-shape step lines; the
+            # host parses them strictly and discards everything else unread.
+            result = subprocess.run(["node", "--max-old-space-size=256", str(worker)], input=json.dumps({"config": config, "arguments": arguments}),
+                                    stdout=subprocess.PIPE, stderr=None, text=True, timeout=40, env=env, check=False)
+        except OSError:
+            # The worker never started, so nothing can have been clicked.
             return {"capability": capability, "status": "unavailable", "error": "worker_unavailable_or_timeout", "executed": False}
+        except subprocess.TimeoutExpired:
+            # A worker that outlived its budget did start: a navigation, click or
+            # fill may already have landed and only the report is missing, so
+            # this is failure with possible effects, not a clean refusal.
+            return {"capability": capability, "status": "unavailable", "error": "worker_unavailable_or_timeout",
+                    "executed": False, "effects_possible": True}
         if result.returncode or len(result.stdout) > MAX_OUTPUT:
-            return {"capability": capability, "status": "error", "error": "worker_failed", "executed": False}
-        return json.loads(result.stdout)
+            # Same reasoning: the process ran and its report is unusable.
+            return {"capability": capability, "status": "error", "error": "worker_failed",
+                    "executed": False, "effects_possible": True}
+        try:
+            report = json.loads(result.stdout)
+        except ValueError:
+            report = None
+        if not isinstance(report, dict):
+            # The worker ran to a clean exit and its report is unusable: the
+            # same failure with possible effects, never a clean refusal.
+            return {"capability": capability, "status": "error", "error": "worker_failed",
+                    "executed": False, "effects_possible": True}
+        return report
 
 
 def main():
@@ -94,8 +176,12 @@ def main():
         if not isinstance(request, dict):
             raise ValueError("invalid_request")
         result = dispatch(request)
+    except ValueError as error:
+        # Never disclose exception strings, endpoints or raw service bodies:
+        # only one locally diagnosable code is exported by name.
+        code = "lock_storage_unavailable" if str(error) == "lock_storage_unavailable" else "invalid_configuration_or_request"
+        result = {"status": "error", "error": code, "executed": False}
     except Exception:
-        # Never disclose exception strings, endpoints or raw service bodies.
         result = {"status": "error", "error": "invalid_configuration_or_request", "executed": False}
     print(json.dumps(result, ensure_ascii=True))
 

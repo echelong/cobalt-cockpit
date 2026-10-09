@@ -69,6 +69,12 @@ export type World = {
    * The plugin has no business with any of them, so a test asserts this stays empty.
    */
   outbound: string[]
+  /** Every value the plugin handed to `$.store.set`, in order: what it persisted
+   * beyond the session, so a test can read back a stored ledger. */
+  storeWrites: { key: string; value: unknown }[]
+  /** Runs inside the native tool call, before it answers: a host event racing a
+   * tool (a turn completing while its handback is still running). */
+  duringToolCall: ((call: Record<string, unknown>) => void | Promise<void>) | null
 }
 
 const MODEL_ALIAS: Record<string, string> = { sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5', haiku: 'claude-haiku-5-5' }
@@ -111,8 +117,19 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
     toasts: [],
     configured: [],
     outbound: [],
+    storeWrites: [],
+    duringToolCall: null,
     ...overrides,
   }
+  // A store write is the plugin's durable persistence. `mock.store` registers
+  // `store.set` itself, so this outermost wildcard observes every write before
+  // handing the event down to it. It records only `store.set` and passes all
+  // other events through untouched.
+  on('*', ($, e, next) => {
+    if (next.is('store.set', e)) w.storeWrites.push({ key: e.key, value: e.value })
+
+    return next(e)
+  })
   mock.store(on, stored)
   mock.env(on, { HOME: '/home/tester', ...w.env })
 
@@ -267,6 +284,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
   on('tool.call', async ($, e) => {
     const call = e as unknown as Record<string, unknown>
     w.ran.push(call)
+    if (w.duringToolCall !== null) await w.duringToolCall(call)
     if (e.tool === 'AskUserQuestion') {
       const question = String((call['questions'] as { question: string }[])[0]?.question ?? '')
       w.asked.push(question)

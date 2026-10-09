@@ -8,7 +8,7 @@
 // in variables (timers, the mounted waveform) is rebuilt as events arrive.
 // No bookkeeping in this file may fail a tool call: it runs under `quiet`.
 
-import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, overlaps, ownershipAllows, setAppliedEffort, setLaunchEffort } from './swarm'
+import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, acknowledgeHandback, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, overlaps, ownershipAllows, setAppliedEffort, setLaunchEffort } from './swarm'
 import type { Swarm, SwarmTask, ModelTier, Wave, Verification } from './swarm'
 import { textOf } from './ledger'
 import { atom, read, update } from 'claude-code'
@@ -210,6 +210,7 @@ const changeSwarm = async ($: EngineInterface, f: (s: Swarm) => Swarm): Promise<
 const finishObserved = (s: Swarm, id: string, reason: string, conclusion: string, at: number): Swarm => {
   const task = s.tasks.find(t=>t.id===id)
   if (!task) return s
+  s = { ...s, tasks: s.tasks.map(t => t.id === id ? { ...t, resultDelivery: t.resultDelivery ?? (conclusion.trim() && conclusion !== 'unknown' && conclusion !== 'Host reports stopped; result unavailable' ? 'answer_observed' as const : 'unavailable' as const) } : t) }
   const result = task.result ?? { conclusion, unresolved:['Structured result unavailable; commander verification pending'] }
   const state = task.cancellationRequested || ['aborted','cancelled'].includes(reason) ? 'cancelled' : ['answer','completed'].includes(reason) ? 'completed' : 'failed'
   try { return finishTask(s,id,state,result,at) } catch {
@@ -226,7 +227,7 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
     if (agent && (!task || task.agentId !== agent || !['result','escalate','status'].includes(action))) throw new Error('Only commander assigns, verifies, cancels or changes waves; agents report their own task only')
     if (action === 'status') {
       const selected = id ? s.tasks.filter(t=>t.id===id) : [...s.tasks.filter(t=>!['completed','failed','cancelled'].includes(t.state)), ...s.tasks.filter(t=>['completed','failed','cancelled'].includes(t.state)).slice(-8)].slice(0,32)
-      return { result: JSON.stringify({ ...summarizeSwarm(s), tasks: selected.map(t => ({ id:t.id, tier:t.tier, role:t.role, state:t.state, reason:t.reason, agent:t.agentId, effort:t.requestedEffort, launchEffort:t.launchEffort ?? null, appliedEffort:t.appliedEffort, effortReason:t.effortReason, result:t.result ? { conclusion:t.result.conclusion.slice(0,160), evidence:t.result.evidence.slice(0,3).map(x=>x.slice(0,160)), unresolved:t.result.unresolved.slice(0,3).map(x=>x.slice(0,160)) } : null, escalation:t.escalation ? { to:t.escalation.to, effort:t.escalation.effort ?? null, question:t.escalation.question.slice(0,160), risk:t.escalation.risk.slice(0,160) } : null, verification:t.verification })) }) }
+      return { result: JSON.stringify({ ...summarizeSwarm(s), tasks: selected.map(t => ({ id:t.id, tier:t.tier, role:t.role, state:t.state, reason:t.reason, agent:t.agentId, effort:t.requestedEffort, launchEffort:t.launchEffort ?? null, appliedEffort:t.appliedEffort, effortReason:t.effortReason, result:t.result ? { conclusion:t.result.conclusion.slice(0,160), evidence:t.result.evidence.slice(0,3).map(x=>x.slice(0,160)), unresolved:t.result.unresolved.slice(0,3).map(x=>x.slice(0,160)) } : null, escalation:t.escalation ? { to:t.escalation.to, effort:t.escalation.effort ?? null, question:t.escalation.question.slice(0,160), risk:t.escalation.risk.slice(0,160) } : null, verification:t.verification, resultDelivery:t.resultDelivery ?? 'unavailable' })) }) }
     }
     if (action === 'assign') {
       if (typeof e['objective'] !== 'string' || !e['objective'].trim()) throw new Error('Bounded objective required')
@@ -352,6 +353,10 @@ const guardSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
   const tool = String(e['tool'])
   if (tool === SWARM_TOOL_NAME || tool === TOOL) return null
   if (agent && !task) return 'SWARM / agent has no bound ownership; commander must assign before further tools'
+  // Host control has no resource effects. Discovery grants no execution rights:
+  // each discovered tool still passes its own ownership/native permission guard.
+  // Handback returns only this bound helper's report to its native parent.
+  if (tool === 'ToolSearch' || (agent && tool === 'SubagentHandback')) return null
   if (agent && (tool === 'Agent' || tool === 'Task')) return 'SWARM / only commander delegates; escalate instead'
   const write = ['Edit','Write','MultiEdit','NotebookEdit'].includes(tool)
   if (!agent && ['Agent','Task','TaskOutput','TaskStop','SendMessage'].includes(tool)) return null
@@ -1805,7 +1810,7 @@ export const register: Register = (on, options) => {
       return { deny: BLOCK_DENY }
     }
     if (!isSupported) return next(e)
-    const effect = config.hasOrchestration && !e.agentId && !['Read','Grep','Glob','WebFetch','WebSearch','Agent','Task','TaskOutput','TaskStop','SendMessage',TOOL,SWARM_TOOL_NAME].includes(String(e.tool)) && !(e.tool === 'Bash' && readOnlyShell(String(call['command'] ?? '')))
+    const effect = config.hasOrchestration && !e.agentId && !['Read','Grep','Glob','WebFetch','WebSearch','ToolSearch','Agent','Task','TaskOutput','TaskStop','SendMessage',TOOL,SWARM_TOOL_NAME].includes(String(e.tool)) && !(e.tool === 'Bash' && readOnlyShell(String(call['command'] ?? '')))
     if (effect && (spawning.size || commanderEffects.size)) return { deny:'SWARM / commander effect or agent admission in flight; serialize this operation' }
     const effectToken = Symbol(e.tool_use_id)
     if (effect) commanderEffects.add(effectToken)
@@ -1844,6 +1849,15 @@ export const register: Register = (on, options) => {
       if (isQuestion) await quiet(() => e.agentId ? editAgent($, e.agentId, a => ({ ...a, state: 'running', tool: 'Thinking' })) : update($, visualAtom, old => ({ ...old, waiting: Math.max(0, old.waiting - 1) })))
     }
     await ledgerToolEnd($, call, ran, beforeWrite)
+    // `SubagentHandback` is the native report channel a bounded helper uses to
+    // answer its parent; the host documents it on the Agent result (`handback`)
+    // but not in the tool-name union, so it is matched by value, never by name.
+    const handbackAgent: string | undefined = typeof e['agentId'] === 'string' ? e['agentId'] : undefined
+    if (config.hasOrchestration && handbackAgent !== undefined && (e.tool as string) === 'SubagentHandback' && !ran.deny && !ran.isError && typeof call['message'] === 'string') await quiet(async () => {
+      const at = await $.clock.now()
+      await changeSwarm($, s => acknowledgeHandback(s, handbackAgent, textOf(call['message']), at))
+      await persist($)
+    })
     if (e.agentId) await quiet(async () => { const a = (await read($, ledgerAtom)).agents.find(a => a.id === e.agentId); if (a) await editAgent($, e.agentId!, old => ({ ...old, toolCount: a.counts.tools })) })
     await quiet(() => noteEnd($, call, ran))
     // Close the field's entry with the call's real outcome, so the tape can show

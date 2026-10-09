@@ -132,9 +132,66 @@ class HindsightTests(unittest.TestCase):
         self.assertEqual(item["metadata"]["source_dirty"], "false")
         self.assertFalse(self.server.calls[-1][2]["async"])
 
-    def test_unverified_refused(self):
-        self.assertEqual(self.retain(verified=False)["status"], "error")
-        self.assertEqual(self.server.calls, [])
+    def test_asserted_retain_is_never_stored_as_verified(self):
+        result = self.retain(verified=False)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["verification_status"], "agent_asserted")
+        item = self.server.calls[-1][2]["items"][0]
+        self.assertEqual(item["metadata"]["verification_status"], "agent_asserted")
+        self.assertEqual(item["tags"], ["cockpit_agent_asserted"])
+        self.assertEqual(item["context"], "agent_asserted_cockpit_finding")
+        # Recalling an agent-asserted document never reports it as verified.
+        self.server.payload = {"results": [{"id": "m1", "text": "asserted finding", "metadata": dict(item["metadata"])}]}
+        memory = self.client.execute("recall", {"query": "recover"})["memories"][0]
+        self.assertEqual(memory["verification_status"], "source_reported_agent_asserted")
+        self.assertTrue(memory["untrusted"])
+        self.assertFalse(memory["authoritative"])
+
+    def test_observations_never_inherit_the_inference_budget(self):
+        seen = []
+        original = module.Hindsight._request
+
+        def spy(self, method, path, body=None, timeout_ms=None):
+            seen.append(timeout_ms)
+            return original(self, method, path, body, timeout_ms)
+
+        with patch.object(module.Hindsight, "_request", spy):
+            client = Hindsight({**self.config, "memory_timeout_ms": 300000}, self.repo)
+            self.server.payload = {"text": "synthesized explanation"}
+            self.assertEqual(client.execute("reflect", {"query": "x"})["status"], "ready")
+            self.server.payload = None
+            self.assertEqual(client.execute("status")["status"], "ready")
+            self.assertEqual(client.execute("list")["status"], "ready")
+            self.assertEqual(client.execute("recall", {"query": "x"})["status"], "ready")
+            self.assertEqual(self.retain()["status"], "ready")
+            # A smaller operator value is respected as the observation bound.
+            self.assertEqual(Hindsight({**self.config, "memory_timeout_ms": 800}, self.repo).execute("status")["status"], "ready")
+        self.assertEqual(seen, [None, 30000, 30000, 30000, None, 800])
+
+    def test_hostile_response_scan_is_bounded_and_linear(self):
+        # The scan covers the same bounded slice that is returned, so a hostile
+        # service cannot buy CPU time with a 4x larger field.
+        noisy = "http://" + "a:" * 30000
+        self.server.payload = {"results": [{"id": "m1", "text": noisy, "metadata": {"run_id": noisy}}]}
+        started = time.monotonic()
+        memory = self.client.execute("recall", {"query": "x"})["memories"][0]
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(len(memory["text"]), 4000)
+        self.assertEqual(len(memory["provenance"]["run_id"]), 512)
+
+    def test_invisible_formatting_is_removed(self):
+        hidden = "visible" + "\u200b\u202e\ufeff\U000e0041\u00ad"
+        self.server.payload = {"results": [{"id": "m1", "text": hidden}]}
+        memory = self.client.execute("recall", {"query": "x"})["memories"][0]
+        self.assertEqual(memory["text"], "visible")
+
+    def test_git_observation_environment_is_scrubbed(self):
+        with patch.dict("os.environ", {"LD_PRELOAD": "/tmp/injected", "HTTPS_PROXY": "http://proxy.invalid", "GIT_DIR": "/tmp/elsewhere"}):
+            env = module._git_env()
+        self.assertEqual(set(env) - {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"}, {"GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS"})
+        self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertNotIn("LD_PRELOAD", env)
+        self.assertNotIn("GIT_DIR", env)
 
     def test_explicit_consent_and_inference(self):
         for flag in ("memory_retention_consent", "memory_inference_configured"):
@@ -194,6 +251,16 @@ class HindsightTests(unittest.TestCase):
         self.assertEqual(self.retain()["status"], "ready")
         self.assertEqual(self.server.calls[-1][2]["items"][0]["metadata"]["source_dirty"], "true")
 
+    def test_missing_bank_reads_as_empty_not_an_opaque_refusal(self):
+        self.server.code = 404
+        recall = self.client.execute("recall", {"query": "x"})
+        self.assertEqual((recall["status"], recall["result_count"], recall["executed"]), ("ready", 0, True))
+        listing = self.client.execute("list")
+        self.assertEqual((listing["status"], listing["result_count"]), ("ready", 0))
+        # Other operations keep the strict error mapping.
+        self.assertEqual(self.client.execute("status")["status"], "error")
+        self.assertEqual(self.client.execute("retain", {"summary": "finding", "verified": True, "verification_reference": "fixture", "run_id": "run"})["status"], "error")
+
     def test_list_and_reflect_actual_schemas(self):
         self.assertEqual(self.client.execute("list")["result_count"], 0)
         self.server.payload = {"text": "Possible explanation", "based_on": {}}
@@ -220,6 +287,23 @@ class HindsightTests(unittest.TestCase):
         c = Hindsight({**self.config, "hindsight_endpoint": "http://127.0.0.1:1"}, self.repo)
         self.assertEqual(c.execute("status")["status"], "unavailable")
 
+    def test_timeout_bound_allows_slow_local_inference_and_refuses_the_rest(self):
+        # A CPU-only reflect measured ~207s against real Hindsight 0.10.3, so the
+        # operator ceiling permits long local inference within a fixed bound.
+        self.assertEqual(Hindsight({**self.config, "memory_timeout_ms": 300000}, self.repo).execute("status")["status"], "ready")
+        for bad in (99, 300001, True, "1000"):
+            refused = Hindsight({**self.config, "memory_timeout_ms": bad}, self.repo).execute("status")
+            self.assertEqual((refused["status"], refused["error"]), ("error", "operation_refused_or_invalid_response"))
+
+    def test_execution_is_claimed_only_when_the_operation_ran(self):
+        self.assertEqual(self.client.execute("status").get("executed"), True)
+        self.assertEqual(self.retain().get("executed"), True)
+        for endpoint in ("http://127.0.0.1:1",):
+            down = Hindsight({**self.config, "hindsight_endpoint": endpoint}, self.repo)
+            self.assertEqual(down.execute("status").get("executed"), False)
+        self.server.code = 500
+        self.assertEqual(self.client.execute("status").get("executed"), False)
+
     def test_uncertain_retain_exposes_scoped_id_for_reconciliation(self):
         self.server.delay = .2
         self.client = Hindsight({**self.config, "memory_timeout_ms": 100}, self.repo)
@@ -239,6 +323,78 @@ class HindsightTests(unittest.TestCase):
         self.assertEqual(self.client.execute("recall", {"query": "x"})["status"], "error")
         self.server.payload = {"text": "x" * (module.MAX_RESPONSE + 1)}
         self.assertEqual(self.client.execute("reflect", {"query": "x"})["status"], "error")
+
+
+    def test_request_start_is_reported_only_when_the_service_is_contacted(self):
+        started = []
+        client = Hindsight(self.config, self.repo, on_request=lambda: started.append(len(self.server.calls)))
+        self.assertEqual(client.execute("recall", {"query": "fixture"})["status"], "ready")
+        # Reported once, and before the service saw the request.
+        self.assertEqual(started, [0])
+        # A refusal before service I/O is never reported as a started operation.
+        for arguments in ({"summary": "ok"}, {"summary": "password=hunter2", "verification_reference": "r", "run_id": "r"}):
+            self.assertEqual(client.execute("retain", arguments)["status"], "error")
+        self.assertEqual(client.execute("forget", {"document_id": "other-bank-document", "confirm_document_id": "other-bank-document"})["status"], "error")
+        refused = Hindsight({**self.config, "memory_retention_consent": False}, self.repo, on_request=lambda: started.append("consent"))
+        self.assertEqual(refused.execute("retain", {"summary": "ok", "verification_reference": "r", "run_id": "r"})["status"], "error")
+        self.assertEqual(started, [0])
+        self.assertEqual(len(self.server.calls), 1)
+
+    def test_a_failing_progress_sink_cannot_change_the_operation(self):
+        def broken():
+            raise OSError("stderr closed")
+        self.assertEqual(Hindsight(self.config, self.repo, on_request=broken).execute("status")["status"], "ready")
+
+
+    def test_a_write_that_reached_the_service_and_was_not_confirmed_says_so(self):
+        slow = Hindsight({**self.config, "memory_timeout_ms": 100}, self.repo)
+        self.server.delay = .3
+        self.client = slow
+        retained = self.retain()
+        self.assertEqual((retained["status"], retained["executed"]), ("unavailable", False))
+        self.assertIs(retained.get("effects_possible"), True)
+        self.assertEqual(retained["outcome"], "unknown")
+        document = "cobalt-" + slow.bank_id[7:23] + "-" + "a" * 32
+        forgotten = Hindsight({**self.config, "memory_timeout_ms": 100}, self.repo).execute("forget", {"document_id": document, "confirm_document_id": document})
+        self.assertEqual((forgotten["status"], forgotten["executed"]), ("unavailable", False))
+        self.assertIs(forgotten.get("effects_possible"), True)
+        self.assertEqual(forgotten["outcome"], "unknown")
+        self.server.delay = 0
+        # An unusable answer after the request was sent is just as uncertain.
+        self.server.code = 500
+        self.assertIs(Hindsight(self.config, self.repo).execute("forget", {"document_id": document, "confirm_document_id": document}).get("effects_possible"), True)
+
+    def test_a_write_that_never_reached_the_service_claims_no_effect(self):
+        down = Hindsight({**self.config, "hindsight_endpoint": "http://127.0.0.1:1"}, self.repo)
+        document = "cobalt-" + down.bank_id[7:23] + "-" + "a" * 32
+        for result in (down.execute("retain", {"summary": "ok", "verification_reference": "r", "run_id": "r"}),
+                       down.execute("forget", {"document_id": document, "confirm_document_id": document}),
+                       self.client.execute("forget", {"document_id": "another-bank-document", "confirm_document_id": "another-bank-document"}),
+                       self.client.execute("retain", {"summary": "password=hunter2", "verification_reference": "r", "run_id": "r"})):
+            self.assertNotIn("effects_possible", result, result)
+        # The service saying the document does not exist is a known non-effect.
+        self.server.code = 404
+        missing = self.client.execute("forget", {"document_id": document, "confirm_document_id": document})
+        self.assertEqual(missing["status"], "error")
+        self.assertNotIn("effects_possible", missing)
+        # Reads are never writes, whatever happens to them.
+        self.server.code = 500
+        self.assertNotIn("effects_possible", self.client.execute("list"))
+
+    def test_git_observation_cannot_run_a_repository_configured_program(self):
+        marker = Path(self.temp.name) / "executed"
+        hook = Path(self.temp.name) / "monitor.sh"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+        self.git("config", "core.fsmonitor", str(hook))
+        self.assertEqual(self.retain()["status"], "ready")
+        self.assertEqual(self.client.execute("list")["status"], "ready")
+        self.assertFalse(marker.exists(), "a repository-configured fsmonitor program was executed")
+        with patch.object(module.subprocess, "run", wraps=subprocess.run) as run:
+            module._git(self.repo, "rev-parse", "HEAD")
+            module._worktree_dirty(self.repo)
+        for call in run.call_args_list:
+            self.assertEqual(tuple(call.args[0][:5]), ("git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"))
 
 
 if __name__ == "__main__":

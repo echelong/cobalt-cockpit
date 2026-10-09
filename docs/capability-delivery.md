@@ -2,8 +2,9 @@
 
 Development implementation for the next feature release. The public plugin
 version remains v0.3.2; the separate companion is provisionally 0.1.0.
-Both capabilities default OFF. No production installation, GitHub push, release
-tag or changed Anthropic directory submission has occurred.
+Both capabilities default OFF. This work is committed and pushed on `main`; no
+release tag was created and no changed Anthropic directory submission was made.
+No production installation or host settings change occurred.
 
 ## 1–2. Architecture and actual functionality
 
@@ -14,16 +15,36 @@ includes repository hash, HEAD, dirty status, run, timestamp, verification and
 source references. Recall is always untrusted/non-authoritative and includes
 age/commit/relevance indicators, never claimed factual confidence. Service
 failure falls back safely; ambiguous retention reports an unknown outcome and
-document ID for reconciliation. Reflection is implemented and mock-tested,
-but was not exercised against real inference.
+document ID for reconciliation. A retain is stored as `verified` only when the
+Cockpit run ledger shows the matching task commander-verified
+(`verification: pass`); every other retain is stored and recalled as
+`agent_asserted`. Reflection is implemented, mock-tested and exercised against
+real local inference (175 s, real generated text).
 
 Obscura uses its supported CDP interface through pinned puppeteer-core. Tasks
 create/close a fresh context, apply request policy, navigate and inspect real
 JS-rendered DOM, capture readable snapshots/console/network metadata and
-optionally ephemeral PNGs. Click/fill need exact private operator grants.
+optionally ephemeral PNGs. Click/fill need exact private operator grants bound
+to the task, operation, selector/value and exact origin; fills are refused
+unless the target is a connected, enabled, editable text control. A failed
+task discloses its completed operation names and possible effects instead of
+reporting a passed task.
 No arbitrary agent JavaScript, cookie/storage tools, credential submissions,
 POST forms, stealth or proxies. Execution returns structured untrusted evidence
 pending commander verification, never an automatic pass.
+
+Read-only completion is a first-class path. The native host control tools
+`ToolSearch` (deferred-tool discovery) and `SubagentHandback` (a helper's report
+to its native parent) carry no resource effects, so a bound read-only task, or a
+bounded writer, may use them without acquiring write permission; every tool they
+surface still passes its own ownership and native-permission guard, and
+delegation stays commander-only. A helper's own `swarm result` is recorded as
+`reported`, a native handback the host accepted as `host_accepted`, an ordinary
+observed final answer as `answer_observed`, and a host completion with no answer
+evidence as `unavailable`. That state is surfaced in `swarm status` and the Run
+Ledger, so a lost report is visible rather than silently absent. This replaces a
+defect where a read-only helper's guard refused both discovery and native
+handback, so its findings never reached the commander.
 
 The separate native Claude mod registers tools, calls a bounded broker by
 argument vector/stdin, checks native permission (`allow` only), and fences
@@ -70,10 +91,12 @@ of the exact tool is also required; enable switches never imply permission.
 
 Memory config: `memory_enabled`, numeric-loopback `hindsight_endpoint`,
 `memory_retention_consent`, `memory_inference_configured`,
-`memory_timeout_ms` (100–120000). Browser config: `browser_enabled`, loopback
+`memory_timeout_ms` (100–300000; local CPU reflection measured 175s in the
+real smoke; non-inference observations carry their own 30 s cap). Browser
+config: `browser_enabled`, loopback
 `obscura_endpoint`, exact `browser_allowed_origins`, independent
 `browser_allow_localhost`, `browser_isolation_confirmed`,
-`browser_timeout_ms` (100–30000), exact `browser_authorized_actions`,
+`browser_timeout_ms` (100–30000), origin-bound `browser_authorized_actions`,
 `screenshot_retention` (`none` or `ephemeral`). No credential inputs or automatic
 recall/transcript hooks. Explicit task-start recall is available to commander.
 Fixed per-UID operation locks live under `/mnt/mem2`; configurations cannot
@@ -113,35 +136,53 @@ run. No automatic gate pass, simulated browser result or inference progress.
 
 | Check | Observed result |
 |---|---|
-| Baseline plugin tests before edits | 987 passed,0failed |
-| Full final plugin suite | 995 passed,0failed (987existing+8new) |
-| Hindsight/bridge deterministic Python suite | 24 passed (20memory+4broker) |
-| Obscura deterministic Node suite | 25 passed; injected CDP client |
+| Full final plugin suite | 1028 passed, 0 failed (includes lifecycle, retain-corroboration, read-only result-delivery and bookkeeping tests) |
+| Read-only completion result-delivery regressions | 7 host-hook tests: discovery + native handback delivery, concurrent read-only reports with a failing sibling, no write consent from discovery, preserved native rejection, completion racing inside the handback tool, interrupted report retention, host completion with no answer evidence |
+| Hindsight/bridge deterministic Python suite | 43 passed, 0 failed |
+| Obscura deterministic Node suite | 39 passed, 0 failed; injected CDP client |
 | Root and companion TypeScript | Passed against generated Claude declarations |
-| Strict root/manifests/agents/companion validation | Passed on Claude2.1.294 |
-| Public audit | Passed,0portability/credential findings |
+| Strict root/manifests/agents/companion validation | Passed on Claude 2.1.295 |
+| Public audit | Passed, 0 portability/credential findings |
 | Git whitespace | Passed |
-| Real Claude host with both mods disabled | `/capabilities` succeeded, no inference/service install |
-| Real Hindsight0.10.3/local CPU Ollama | Retain/list/recall/forget/failure/recovery passed |
-| Real Obscura0.2.4 isolated namespace | JS/DOM/PNG/console/network/isolation/refusal/interaction/timeout/recovery passed |
+| Real Hindsight 0.10.3/local CPU Ollama | Status/retain(verified,confirmed)/list/recall/reflect/forget/failure/recovery passed |
+| Real Obscura 0.2.4 isolated namespace | JS/DOM/PNG/console/network/isolation/unauthorized+approved click/fill, readonly+hidden refusal, redirect-after-hop refusal, timeout/recovery passed |
+| Real Claude Code task with both companions enabled | Opus commander plus Haiku scout and Sonnet worker: memory status/recall(reflect 213,717 ms)/retain(listed as agent_asserted)/list/forget, browser fill observed with the test gate exiting 0, commander swarm verify pass and a ledger-corroborated verified retain; 0 permission denials (`host-run-3.json`) |
 
 The new source-guard tests run the actual two hook implementations in both
 orders with a mocked host, including admission/effect races and native deny/ask.
 They are deterministic tests, not an enabled Claude conversation smoke.
 
+The final commit re-ran the offline suites, both TypeScript projects, strict
+validation, the public audit and the Git whitespace check. The real
+Hindsight/Obscura service evidence and the real Claude host-task evidence below
+are from the runs recorded in this same working tree; they were not re-executed
+for the final commit because those disposable services were intentionally
+stopped and no companion service is started or installed without explicit
+authorization. Their deterministic, mock-backed counterparts were re-run and are
+green. No Claude model call was made for this commit.
+
 Real Hindsight: dedicated Podman storage/pg0 and isolated CPU-only
 Ollama qwen2.5:3b. First successful retain72,220ms; final retain30,478ms with
 CPU prompt cache, recall3 extracted findings65ms, own document deletion11ms,
-zero findings afterward. A verified disposable stale-lock failure/recovery
+zero findings afterward. The fixed-adapter run retained in 46,040 ms
+(verification_status verified, outcome confirmed), listed/recalled the stored
+finding (real reranker/semantic/keyword scores), generated a real reflect
+answer in 175,435 ms, deleted its own document in 16 ms, then listed zero
+findings. A verified disposable stale-lock failure/recovery
 fixture supplied the admitted summary. Missing endpoint reported unavailable
 and real endpoint recovery ready. No paid/cloud inference or production data.
 
 Real Obscura: pinned archive checksum matched upstream; bubblewrap fresh
 network namespace, read-only runtime/worker mounts, tmpfs and cleared environment.
-Real JS mutation and localStorage isolation, 9,046-byte PNG, console.error,
-network200, blocked foreign origin (server0hits), metadata refusal, unauthorized
-click refusal/granted click, deadline failure and fresh recovery all passed.
-Main integrator independently reran this smoke. No screenshot persisted.
+Real JS mutation and localStorage isolation, console.error, network200, blocked
+foreign page request (server 0 hits), metadata refusal, unauthorized click
+refusal/granted click, unauthorized fill refusal, fill-value mismatch refusal,
+approved fill mutating the real DOM, deadline failure and fresh recovery all
+passed. The hardened rerun added readonly and hidden fill refusal, refused a
+navigation that redirected off the allowlist after landing, and recorded that
+the redirect hop itself reached the non-allowlisted target once (documented
+residual; egress isolation is the containment), with a 9,736-byte PNG. No
+screenshot persisted.
 
 All created services stopped. Hindsight container/image/model/db in the
 dedicated store were removed; existing Ollama/Podman resources preserved.
@@ -155,7 +196,7 @@ The new independent Actions job uses Python stdlib and Node mocks without
 installing puppeteer/browser/database/models or contacting an integration
 service. Existing verify job keeps offline plugin tests and adds companion
 strict/type checks. Its relevant test/type/validation/audit commands passed
-locally. No GitHub run for this unpushed commit was triggered or claimed.
+locally. The CI run for the pushed commit is reported in the final delivery response.
 The existing main workflow [run37767849204](https://github.com/echelong/cobalt-cockpit/actions/runs/37767849204)
 was successful at baseline commit9fabc6692e85b507b96bfc9b618ca39ad667dea1.
 
@@ -169,22 +210,30 @@ unchanged publicly. Do not request portal revalidation automatically.
 
 ## 13–15. Limitations, rollout and Git
 
-Remaining limits: real reflection and fill were not exercised; general browser
-conformance/public-network containment are not established; this is Linux-only
-broker locking and loopback-only services without credential support. CPU
-retention needs an explicitly raised timeout and workload-specific validation.
-HUD activity is whole-tool/coarse rather than live per-CDP-step navigation/
-capture states. Companion receipts remain pending/unknown rather than copying
-commander verification or retaining durable image/evidence references, and
-old receipt store is not reloaded in a new session. Fine-grained HUD/ledger
-enhancements should precede a broad feature-release acceptance claim.
+Remaining limits: a navigation redirect hop can reach a non-allowlisted origin
+before the policy refuses the landing, and WebSocket handshakes are outside
+request interception; operator OS/egress isolation remains the containment.
+Neither local listener's identity is verified beyond loopback binding, so a
+multi-user host is not fully covered. General browser conformance and
+public-network containment are not established; this is Linux-only broker
+locking and loopback-only services without credential support. CPU retention
+and reflection need the configured long timeout and workload-specific
+validation. Companion receipts project observed/possible-effect state rather
+than copying commander verification; receipt writes merge with the store, but
+two concurrent sessions can still race between read and write.
 
-Independent security/privacy review used a separate Codex agent, not the
-requested Sonnet model. It identified permission/ownership/lock/data-boundary
-defects that were fixed; no remaining known source security blocker was found,
-conditional on passing final tests (now passed). Actual requested Claude-model
-review remains a rollout requirement if the owner requires that exact reviewer.
-The real service smokes do not establish a fully enabled Claude task end-to-end.
+Independent security/privacy/architecture review by Claude Sonnet 5.5 found no
+critical or high-severity defect and four medium findings (quadratic
+secret-scan backtracking on service-supplied text, self-asserted retain
+verification, hidden effects after a failed browser task, and a completed
+effect reported as refused), all fixed with focused tests; lower-severity and
+hardening findings were fixed or documented. A second Sonnet re-review checks
+the fixes for regressions. A real enabled Claude Code task with both
+companions ran end-to-end (evidence/host-run-3): the Sonnet worker's
+uncorroborated retain was stored as agent_asserted, its recall of an empty bank
+returned a ready empty list, its browser fill mutated the real fixture DOM, the
+commander's own test command exited 0, and the commander's retain was stored as
+verified only after it recorded the verifying task in the run ledger.
 
 Recommended rollout: private explicit companion install for one disposable
 repository; memory manual recall/retention only; then local frontend evidence
@@ -192,8 +241,8 @@ inside actual OS/egress isolation. Leave both off globally. Obtain directory
 review and owner publication approval before any public integration release.
 
 Work stayed on `main`, starting from clean9fabc6692e85b507b96bfc9b618ca39ad667dea1.
-Base manifests remain0.3.2. Changes are committed locally only after checks;
-the delivery response supplies the final commit hash and clean working-tree
-state. No branch/history rewrite, force-push, tag, production installation or
-GitHub publication. This delivers real optional adapter capabilities with the
+Base manifests remain0.3.2. Changes are committed only after checks; the final
+delivery response supplies the final commit hash, the CI run and the clean
+working-tree state. No branch/history rewrite, force-push, release tag,
+production installation or directory-submission change. This delivers real optional adapter capabilities with the
 documented remaining feature-release acceptance limits above.

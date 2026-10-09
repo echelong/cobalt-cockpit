@@ -371,6 +371,8 @@ export type SwarmTask = {
   id: string; parentTask: string | null; parentAgent: string | null; agentId: string | null; tier: ModelTier; role: string
   objective: string; scope: string; dependencies: string[]; owned: string[]; mode: 'read' | 'write'; state: TaskState
   cancellationRequested: boolean; wave: Wave; spawnReason: string; escalation: Handoff | null; result: SwarmResult | null; verification: Verification
+  /** Report observation, independent of host lifecycle and commander verification. Absent in older ledgers. */
+  resultDelivery?: 'reported' | 'host_accepted' | 'answer_observed' | 'unavailable'
   /** The effort the commander requested for this task: a level, or AUTO to choose from the task. */
   requestedEffort: EffortRequest; /** Why that effort (or the AUTO selection) was chosen. */ effortReason: string
   /** The level last applied to this task's live agent requests, where observable; null before any request. */ appliedEffort: string | null

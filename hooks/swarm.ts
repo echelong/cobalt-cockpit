@@ -166,7 +166,15 @@ export const releaseReservation = (s: Swarm, id: string, at: number, reason: str
 export const reportResult = (s: Swarm, id: string, result: Partial<SwarmResult>, at: number): Swarm => {
   const task = s.tasks.find(t => t.id === id)
   if (!task || terminal(task) || !occupied(task)) throw new Error('Result requires admitted active task')
-  return event(update(s, id, { result: compressResult(result) }), 'result', id, at, result.conclusion ?? '')
+  return event(update(s, id, { result: compressResult(result), resultDelivery: task.resultDelivery === 'host_accepted' ? 'host_accepted' : 'reported' }), 'result', id, at, result.conclusion ?? '')
+}
+/** Only after the native host acknowledges SubagentHandback. It may finish the
+ * turn before returning, so preserve the report even on a now-terminal task.
+ * No ownership, lifecycle or verification transition is implied. */
+export const acknowledgeHandback = (s: Swarm, agentId: string, message: string, at: number): Swarm => {
+  const task = s.tasks.find(t => t.agentId === agentId)
+  if (!task || !message.trim()) return s
+  return event(update(s, task.id, { resultDelivery: 'host_accepted', result: task.result ?? compressResult({ conclusion: message, unresolved: ['Native handback acknowledged; commander verification pending'] }) }), 'report_acknowledged', task.id, at, 'Native host accepted report')
 }
 /** A shell/global operation uses '*'; a read never widens a write claim. */
 export const ownershipAllows = (s: Swarm, id: string, path: string, mode: 'read' | 'write' = 'write'): boolean => {

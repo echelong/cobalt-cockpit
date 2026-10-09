@@ -60,18 +60,28 @@ without writing image files. Claude Code may retain tool responses in its own
 session history; ephemeral means no companion image archive, not no host
 history. Browser steps allow navigate, inspect, snapshot, console, network,
 screenshot, click and fill. No arbitrary JavaScript, storage or cookie tools.
+A task whose only step is `status` is a readiness probe: it checks that the
+configured control endpoint answers, opens no context or page, and cannot be
+combined with other steps.
 Click/fill require exact operator grants in the private file:
 
 ```json
-{"task_id":"fixture","operation":"click","selector":"#expand"}
+{"task_id":"fixture","operation":"click","selector":"#expand","origin":"https://example.org"}
 ```
 
 For fill also specify the exact `value`. Grants go in
-`browser_authorized_actions`; remove them after use. GET/HEAD requests only;
-POST and credential-bearing requests stay refused even with action grants.
-Navigation itself may have effects, so authorize permitted destinations with
-care. Purchases, destructive changes and submissions still require owner
-authorization; this companion supplies no unrestricted submission mechanism.
+`browser_authorized_actions`; remove them after use. Every grant names the
+exact origin it was authorized for and is checked against the active page
+origin at execution, so the same selector on another allowlisted site cannot
+reuse it. Fills are refused unless the target is a connected, enabled,
+editable text control; a hidden, disabled, readonly, checkbox/radio/file or
+non-input target is never cleared or typed. GET/HEAD requests only; POST and
+credential-bearing requests stay refused even with action grants. Navigation
+itself may have effects, so authorize permitted destinations with care. A
+navigation that lands off the allowlist is refused after landing (the render
+engine may issue a redirect hop before the policy sees it). Purchases,
+destructive changes and submissions still require owner authorization; this
+companion supplies no unrestricted submission mechanism.
 
 ## Tools, ownership and verification
 
@@ -79,8 +89,12 @@ authorization; this companion supplies no unrestricted submission mechanism.
 
 * `status`: observe configured service readiness and active bank.
 * `recall`: `query`; returns bounded untrusted references.
-* `retain`: `summary`, `verified:true`, `verification_reference`, `run_id`,
-  optional `source_references`; one short reviewed finding, never a source file.
+* `retain`: `summary`, `verification_reference`, `run_id`, optional
+  `verified:true`, optional `source_references`; one short reviewed finding,
+  never a source file. It is stored as verified only when the Cockpit run
+  ledger shows the matching `run_id` task commander-verified
+  (`verification: pass`); every other retain is stored and recalled as
+  `agent_asserted`, so an asserted boolean never becomes a verified record.
 * `reflect`: `query`; independent inference, untrusted reference output.
 * `list`: bounded bank inventory.
 * `forget`: `document_id` and identical `confirm_document_id`; deletes only
@@ -97,9 +111,10 @@ authorization; this companion supplies no unrestricted submission mechanism.
 ```
 
 Load Cockpit alongside the companion. Unknown Cockpit ownership state refuses
-enabled operations. An agent must hold an admitted running exclusive `write`
-task with `owned_resources:["*"]`; read-only or scoped writers cannot use these
-tools. Commander calls wait until all active agent ownership releases. A
+enabled operations; a malformed or versionless ledger is treated as unknown.
+An agent must hold an admitted running exclusive `write` task with
+`owned_resources:["*"]`; read-only or scoped writers cannot use these tools.
+Commander calls are refused while any active agent ownership is held. A
 process lock serializes effects across local sessions; no automatic retries,
 hidden loops or background inference pollers. The companion explicitly calls Claude Code's supported native permission check before enabled effects, because a custom
 tool handler answers before core tool execution. Only `allow` proceeds; `ask`
@@ -123,8 +138,42 @@ permissions, destinations or orchestration.
 The optional companion adds one static HUD line while either switch is on,
 with observed operation state and the active bank. With both switches off it
 returns the existing HUD unchanged, does no worker/config/service I/O, and
-shows no extra row. Readiness is never inferred from configuration alone.
-`/capabilities` shows bounded operation receipts (64 entries). Only projected
+shows no extra row. Readiness is never inferred from configuration alone, and
+the bank stays unset until this session observes a memory result.
+
+The line shows one label per capability, and every label is an observation:
+
+| Label | Shown when |
+|---|---|
+| `Disabled` | the capability's host switch is off |
+| `Unknown` | enabled, nothing observed yet in this session (also after a reload) |
+| `Starting` | the broker was started and has not yet reported an operation |
+| `Checking` | a `status` request reached the service / control endpoint |
+| `Recalling`, `Retaining`, `Reflecting`, `Listing`, `Forgetting` | that memory request was issued to the service |
+| `Navigating` | a `navigate` step started |
+| `Inspecting` | an `inspect` or `snapshot` step started |
+| `Capturing evidence` | a `console`, `network` or `screenshot` step started |
+| `Interacting` | a granted `click` or `fill` step started |
+| `Ready` | the last memory operation or readiness probe succeeded |
+| `Completed` | the last browser task was observed and its context closed |
+| `Unavailable` | the service or the worker runtime could not be reached, or timed out |
+| `Error` | the call was refused, failed or was interrupted |
+
+Operation labels come from the worker itself: the broker writes one
+fixed-shape line (`{"cobalt_step":"<name>"}`, names only) to its standard
+error when a request is actually issued or a browser step actually starts, and
+the host reads that stream. A call refused before any service I/O therefore
+never shows as an operation, and anything else on that pipe is discarded.
+An operation the user interrupts, or that outlives its budget, ends its worker
+and is recorded with error `interrupted` or `worker_unavailable_or_timeout`;
+when it could already have had an effect (a navigation, click, fill, retain or
+forget) the receipt says so instead of reading as a clean refusal. A receipt
+records whether the effect was observed (`executed`); a failed browser task
+whose earlier steps may already have had effects is marked "evidence invalid,
+effects possible" with the completed operation names, never presented as a
+passed task. `/capabilities` shows bounded operation receipts (64 entries),
+and each session's write merges with stored receipts so concurrent sessions
+and currently disabled capabilities keep their history. Only projected
 metadata persists in the companion's Claude plugin store. Base Run Ledger visibility depends on hook order: an outer companion handler
 answers before base `tool.call` telemetry. Companion receipts are the complete
 capability record in either order; report their evidence through `swarm result`

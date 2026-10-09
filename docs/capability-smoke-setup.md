@@ -45,7 +45,7 @@ Exact adapter config:
   "hindsight_endpoint": "http://127.0.0.1:18888",
   "memory_retention_consent": true,
   "memory_inference_configured": true,
-  "memory_timeout_ms": 120000
+  "memory_timeout_ms": 300000
 }
 ```
 
@@ -81,6 +81,34 @@ screenshots were ephemeral and not persisted. The test-created runtime/dependenc
 verification; downloading the pinned verified archive and installing the
 optional dependency again are prerequisites for replay. The isolated host
 bootstrap configuration was also removed.
+
+Second hardened reruns (2026-10-09, after the independent review):
+
+Hindsight rerun (`evidence/hindsight-smoke-2.json`, exit 0): status ready 4 ms;
+retain 46,040 ms with `verification_status: verified` and outcome confirmed;
+list 6 ms; recall with real reranker/semantic/keyword scores; reflect
+175,435 ms returning real generated text (`reflection_real_tested: true`);
+scoped forget 16 ms; list 0 after deletion; missing service unavailable 2 ms
+and real recovery ready 1 ms. Non-inference observations carried the new 30 s
+cap; reflection used the full configured budget.
+
+Obscura rerun, same bubblewrap recipe with the node runtime bound read-only:
+
+```
+--ro-bind <node-runtime-directory> /node \
+--setenv PATH /node/bin:/usr/bin:/bin
+```
+
+Checks (`evidence/browser-smoke-2.json`): real JS/DOM, 9,736-byte PNG,
+console.error, network200, blocked foreign page request (target 0 hits),
+metadata refusal, fresh-context localStorage, unauthorized action refused,
+approved click, unauthorized fill refused, fill value mismatch refused,
+approved fill mutating the real DOM, readonly and hidden fill refusal, a
+redirect off the allowlist refused after landing (`redirect_hop_hits: 1`),
+timeout not verified, fresh recovery. The redirect hop itself reached the
+non-allowlisted target once before refusal: that is a documented residual, and
+the operator's OS/egress isolation remains the containment. No screenshot was
+persisted.
 
 Obscura release archive SHA-256:
 `757e7b597ba5cdd53af9fc701e0a9b80f0a8d788f545d4f82ec9ad32db77f000`.

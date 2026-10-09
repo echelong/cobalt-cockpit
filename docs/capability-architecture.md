@@ -18,7 +18,14 @@ Six agent definitions select the existing Sonnet/Haiku pools. The main loop's
 effort remains operator-owned. Neither new service supplies models or agents.
 
 Native tool permission decisions remain with Claude Code: no `tool.check`
-hook is added. Since the custom handler answers before core execution, it
+hook is added. Bound helpers may call the two effect-free native control tools —
+`ToolSearch` for deferred-tool discovery and `SubagentHandback` for a helper's
+report to its native parent — without widening ownership; every tool discovery
+surfaces still passes its own ownership and native-permission guard, delegation
+stays commander-only, and a handback only records the helper's own report. A
+helper's report delivery is tracked on its task (`reported`, `host_accepted`,
+`answer_observed`, `unavailable`) so it is observable and is never treated as
+verification. Since the custom handler answers before core execution, it
 queries the supported native check explicitly and proceeds only on `allow`;
 `ask`/`deny` refuse before config, worker or service I/O. Existing custom effects under orchestration require
 exclusive wildcard writer ownership, and commander effects wait for active
@@ -39,6 +46,21 @@ store form the complete capability record. Base tool-call telemetry is
 load-order dependent when the companion answers first; structured results
 through the existing swarm/progress interfaces link evidence to the base run. Disabled calls skip
 the worker/config/service entirely. No mandatory dependency in the base plugin.
+
+HUD operation labels are observations, not inferences from the request. The
+broker and the browser worker write one fixed-shape line per started operation
+(`{"cobalt_step":"<name>"}`, an enumerated name and nothing else) to standard
+error: the memory adapter when a validated request is about to be issued to
+the service, the browser worker when a step begins. The host starts the broker
+with `$.process.spawn`, reads that stream and maps each known name to a label;
+every other byte on the pipe is discarded unread, and nothing from it is
+stored. A call refused before service I/O therefore shows `Starting` and then
+its result, never an operation.
+The same loop bounds the worker: at the host deadline or on the dispatch's
+abort signal (a user interrupt) it leaves the stream, which ends the child,
+and records `worker_unavailable_or_timeout` or `interrupted`. A worker that
+may already have changed something (navigate, click, fill, retain, forget)
+is then recorded with possible effects; a worker that never started is not.
 
 Companion placement is a runtime boundary, not an archive/scanner exclusion:
 a future root checkout submission would contain these files. Keep v0.3.2's
@@ -75,6 +97,14 @@ Deletion needs the exact companion document ID repeated, within current bank.
 The adapter never clears a bank. Timeout during retention has an uncertain
 remote outcome; no automatic retry or claim of successful retention follows.
 
+Hindsight consolidates retained documents in the background into derived
+observations. The real service returned these without a document ID or any of
+the companion's provenance, so the adapter reports them as `unverified` with
+unknown freshness and cannot delete them individually. In the real smoke they
+disappeared once their source documents were deleted (the bank listed empty);
+that is upstream behaviour, observed rather than guaranteed, so check the bank
+inventory after a deletion that matters.
+
 Hindsight requires Python >=3.11, PostgreSQL/pgvector or its development pg0,
 embedding/reranking and separately configured generation inference. The full
 image is large; API minimum documented RAM ~1.5 GiB, plus database and model
@@ -106,14 +136,24 @@ Obscura's [security boundary](https://github.com/h4ckf0r0day/obscura/blob/v0.2.4
 does not contain native V8 exploitation.
 
 Each bounded task creates a fresh browser context and closes it in finally;
-cleanup failure invalidates evidence. All planned URLs are preflighted before
-connecting. CDP interception checks subsequent requests/redirects/subresources
-against exact origins, DNS/address policy, GET/HEAD and absence of credential
-headers. Localhost needs separate consent; other private/linklocal/metadata
-addresses remain refused. External egress controls cover DNS rebinding,
-popup races, WebSockets and untrusted native execution; application checks
-alone do not guarantee containment. The upstream global private-network switch
-must never be described as localhost-only authorization.
+cleanup failure invalidates evidence without hiding effects that may already
+have happened. All planned URLs are preflighted before connecting. CDP
+interception checks subsequent requests and subresources against exact
+origins, DNS/address policy, GET/HEAD and absence of credential headers.
+Localhost needs separate consent; other private/linklocal/metadata addresses
+remain refused. The render engine can issue a navigation redirect hop before
+the request policy sees it: the real smoke recorded one request reaching a
+non-allowlisted redirect target, so a navigation that does not end on an
+allowlisted origin is refused after landing and external egress controls
+remain the containment for that hop. External egress controls also cover DNS
+rebinding, popup races, WebSocket handshakes (not covered by request
+interception) and untrusted native execution; application checks alone do not
+guarantee containment. The upstream global private-network switch must never
+be described as localhost-only authorization.
+
+A task whose only step is `status` is a readiness probe: it validates the
+whole configuration, connects to the control endpoint and disconnects, with no
+context, page or navigation. It is the only way the browser HUD shows `Ready`.
 
 Fixed DOM extraction, snapshot, console/network observation, PNG screenshot,
 and exactly granted click/fill return untrusted structured evidence. No
