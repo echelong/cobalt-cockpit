@@ -120,7 +120,7 @@ A `--plugin-dir` copy stops loading when you omit the flag next session.
 
 Set **`orchestration: true`** to enforce the Opus/Sonnet/Haiku policy, independent pool resource budgets, and explicit task ownership. Orchestration does not by itself block Fable outside routed work. **`blockFable` is a separate opt-in**. **`cobaltStrict`** is an optional stricter preset that also blocks Fable/external advisor selection and requires subscription-style authentication. These models must be available to your account; Cockpit cannot grant model access.
 
-The strict preset takes precedence over individual enforcement switches. NobodyWho remains optional and read-only: Cockpit observes its local receipts if configured; it does not install it or route requests to it.
+The strict preset takes precedence over individual enforcement switches. NobodyWho remains optional: Cockpit observes its local receipts if configured and does not install it. It sends the local router a request only in a session where you selected a router with `/cockpit router`.
 
 ### Elastic execution
 
@@ -193,7 +193,7 @@ Cockpit does not take part in Claude Code's permission check. It registers no ho
 - HUD and Ledger name the roles (MAIN, SCOUT, ENGINEER, ARCHITECT, LOCAL CONTROL), list each consultation with its ground, whether it returned, its decision and Sonnet's verification, and report host-reported tokens per tier. Requests without usage figures are counted as unreported; nothing is estimated. `/ledger` shows the host's `/cost` total where it keeps one.
 - Context: set Sonnet's compaction window natively (`/autocompact 400k`, stored as `modelSettings["claude-sonnet-5-5"].autoCompactWindow`). Cockpit does not compact or change settings. Subagents keep their own model defaults.
 
-`OPUS_LED` remains the default and behaves exactly as before. `cobaltStrict` turns orchestration on and adds safety restrictions; it never names a model, so strict mode with `SONNET_LED` keeps Sonnet as the main loop.
+`OPUS_LED` remains the default: Opus commands, as in 0.4.0, and nothing about models or admission changes unless you choose the other profile. What an upgrading user does see is listed in [docs/release-v0.5.0.md](docs/release-v0.5.0.md). `cobaltStrict` turns orchestration on and adds safety restrictions; it never names a model, so strict mode with `SONNET_LED` keeps Sonnet as the main loop.
 
 **Set up SONNET_LED** (keep your other options; CLI values are strings):
 
@@ -231,11 +231,11 @@ What a router may do is recommend one of five routes: handle it in the main sess
 - An accepted recommendation adds one advisory line to the task. A scout or worker it suggests still goes through assignment and admission.
 - If the router is down, slow, or its answer does not hold up, the deterministic policy decides and the fallback is recorded.
 
-A router is asked once, at the start of a task the rules do not settle, never per prompt, tool call or helper. The question is five fixed yes/no features of the task, each asked in both orders. A feature counts only when both orders agree, and the whole reading is discarded when fewer than four of five agree or more than three are affirmed. That is what makes the answer independent of option position: the local classifiers measurably follow position otherwise.
+A router is asked once per task, at its start, when the rules do not settle it; never for a tool call, a helper or an Opus admission. What counts as a task: with a plan in progress, the whole plan is one task and prompts inside it are not asked about. Without a plan, each prompt you submit (of 16 characters or more) is a task of its own, so each is asked about. The question is five fixed yes/no features of the task, each asked in both orders. A feature counts only when both orders agree, and the whole reading is discarded when fewer than four of five agree or more than three are affirmed. That is what makes the answer independent of option position: the local classifiers measurably follow position otherwise.
 
 Measured for v0.5.0 on 56 balanced synthetic tasks (details and limits in [docs/delivery-v0.5.0-router.md](docs/delivery-v0.5.0-router.md)): the rules alone classified 45; the router's reading alone was right for 49 with the local Qwen3 4B model and 51 with JEV, and 8 with the router's 0.6B tier-1 specialist, which is why NobodyWho mode uses the router's plain local provider. With the rules going first, as shipped, the outcome was right for 47 (NobodyWho) and 46 (JEV): most of what a router adds is "this is one for Opus", which it may only tell you. JEV answered in about 250 ms per request (p50 246 ms, p95 297 ms), not the 16 ms sometimes quoted.
 
-**JEV sends data off your machine.** In JEV mode the first 400 characters of a new task's prompt go to the TypeSafe API through your own decision router and key. Nothing else is sent, a prompt with credential-shaped text is withheld, and Cockpit never sees the key. JEV works only if your router allows it: either its own JEV switch is on, or you point Cockpit at a router configuration you made for this purpose:
+**JEV sends data off your machine.** In JEV mode the first 400 characters of the prompt that starts a task go to the TypeSafe API, in ten small requests, through your own decision router and key. Outside a plan that is each prompt you submit. Nothing else is sent, and Cockpit never sees the key. A prompt in which Cockpit recognises credential-shaped text (named values, URLs with passwords, known token prefixes, long unbroken runs, `.env` lines) is withheld; that is a list of patterns, not a guarantee, so do not paste secrets into a prompt in JEV mode. JEV works only if your router allows it: either its own JEV switch is on, or you point Cockpit at a router configuration you made for this purpose:
 
 ```sh
 # one time: a copy of your router config with JEV enabled, used by Cockpit's JEV mode only
@@ -244,13 +244,13 @@ python3 -c "import json,os;h=os.path.expanduser;c=json.load(open(h('~/.config/de
 printf '%s\n' '{"routerConfigDir":"~/.config/cobalt-cockpit/router-jev"}' | claude plugin configure cobalt-cockpit@cobalt-cockpit --values-stdin
 ```
 
-Your global router configuration is untouched, so nothing else on the machine reaches JEV. Without `routerConfigDir`, JEV mode reports `JEV · UNAVAILABLE (jev_disabled)` whenever the router's own switch is off.
+Your global router configuration is untouched, so nothing else on the machine reaches JEV. The directory must be your own: one inside the project you are working in is refused, so a repository can never choose where the router sends a request. Without `routerConfigDir`, JEV mode reports `JEV · UNAVAILABLE (jev_disabled)` whenever the router's own switch is off.
 
 ## NobodyWho integration
 
 This section is the read-only telemetry; the router you can select is described above. By default, Cockpit checks `$XDG_STATE_HOME/decision-router/ledger.jsonl`, or `$HOME/.local/state/decision-router/ledger.jsonl`. Set `ledgerPath` to override it; set `localControl` false to stop reading.
 
-Only `caller: "claude"` receipts arriving after startup are shown. Decision comes from an `ask` receipt; Pruning comes from a `prune` receipt. They stay separate. Missing, malformed or unavailable ledgers are silent; LOCAL CONTROL is omitted when nothing is observed. There is no fake activity, JEV integration, cloud fallback or dependency on local control. Raw prompts, hidden reasoning, receipt details and credential values are not copied into this adapter's telemetry.
+Only `caller: "claude"` receipts arriving after startup are shown. Decision comes from an `ask` receipt; Pruning comes from a `prune` receipt. They stay separate. Missing, malformed or unavailable ledgers are silent; LOCAL CONTROL is omitted when nothing is observed. This telemetry shows no fake activity, has no cloud fallback and does not depend on local control. (JEV is reachable only as the session router you may select, described above.) Raw prompts, hidden reasoning, receipt details and credential values are not copied into this adapter's telemetry.
 
 ## Configuration
 

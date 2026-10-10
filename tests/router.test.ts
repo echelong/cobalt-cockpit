@@ -78,6 +78,22 @@ describe('what a router is shown', () => {
     }
     expect(carriesCredential('Rotate the token store implementation and add tests')).toBe(false)
   })
+  test('the credential filter is broad by design: named values, URLs, known prefixes, long runs, a pasted .env', () => {
+    // Synthetic shapes only. Two are assembled from parts so that no line of this file is itself credential-shaped.
+    for (const secret of [
+      'SECRET_KEY=abc123xyz', 'PRIVATE_KEY=abcdefgh', 'SESSION_KEY=zzzzzzzz1', 'db-password = s3cretvalue', 'authToken="abc123def"', 'export FOO_TOKEN=x1y2z3a4',
+      'DATABASE_URL=postgres://u:p@h/db', 'connect to postgres://admin:hunter2@db.internal/app', 'redis://:pw123456@cache:6379', 'https://user:pw@host/path', 'curl -u user:pw https://x',
+      'key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY ok', 'ASIAIOSFODNN7EXAMPLE', `${'AK'}${'IA'}IOSFODNN7EXAMPLE`, 'sk-abcdefghijklmnop1234', 'sk-proj-abcdefghijklmnop1234', 'glpat-abcdefghijklmnopqrst',
+      'AIzaSyA-abcdefghijklmnopqrstuvwxyz012', 'npm_abcdefghijklmnopqrstuvwx', 'hf_abcdefghijklmnopqrstuvwx', `${'gh'}${'p_'}abcdefghijklmnopqrstuvwxyz0123456789`, 'https://hooks.slack.com/services/T000/B000/XXXX',
+      'the password is hunter2', '?token=abcdef', 'Authorization: Bearer abcdefghijkl', 'digest 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 here',
+    ]) expect([secret, carriesCredential(`Use this when you fix the uploader: ${secret}`)]).toEqual([secret, true])
+    // ordinary engineering prompts are not withheld
+    for (const plain of [
+      'Add a --verbose flag to the CLI that prints each processed file.', 'Fix the bug in src/components/settings/ThemeToggle.tsx and packages/app-server/src/handlers/user.ts',
+      'Make the password field validate length on blur', 'Document how secrets are loaded by the config module', 'Bump the version string to 1.4.2 in package.json.',
+      'Use https://example.com/docs/api as the reference for pagination', 'Rewrite the authentication flow to use rotating refresh tokens.',
+    ]) expect([plain, carriesCredential(plain)]).toEqual([plain, false])
+  })
   test('ten requests: five fixed yes/no features, each in both orders, nothing else', () => {
     const calls = callsFor('task: x')
     expect(calls).toHaveLength(10)
@@ -210,6 +226,11 @@ describe('what is recorded and shown', () => {
     expect(s).toMatchObject({ link: 'connected', asked: 1, accepted: 1 })
     expect(routerLabel(s)).toBe('JEV · CONNECTED')
     expect(routerLine(s)).toBe('JEV · CONNECTED · advisory · 1 asked · 1 accepted · 0 rejected · 0 fallback · last scout accepted 380ms')
+    // a withheld prompt sent nothing: it is a fallback, and says nothing about the provider
+    const withheld = decisionOf({ at: 6, mode: 'JEV', calls: 0, answers: [], wallMs: null, reading: { route: null, features: {}, agreed: 0, invalid: 'prompt withheld' }, rules: 'direct', verdict: null })
+    const after = withDecision(s, s.epoch, withheld)
+    expect(after).toMatchObject({ link: 'connected', asked: 1, fallbacks: 1, last: withheld })
+    expect(routerLabel(after)).toBe('JEV · CONNECTED')
     // a reading from before a switch is not this router's
     const later = switchRouter(s, 'NOBODYWHO')
     expect(withDecision(later, s.epoch, made())).toBe(later)
@@ -312,8 +333,10 @@ describe('the session router through the host', () => {
     const before = routerRuns(w).length
     const reply = await text(command($, 'router jev'))
     expect(reply).toContain('ROUTER / JEV · CONNECTED · jev-1.13.0')
-    expect(reply).toContain('the first 400 characters of your prompt are sent')
-    expect(reply).toContain('routerConfigDir')
+    expect(reply).toContain('its first 400 characters are sent to JEV in ten small requests')
+    expect(reply).toContain('Each prompt you submit outside a planned task counts as a new task')
+    expect(reply).toContain('with the router configuration at /home/op/.config/cobalt-cockpit/router-jev (routerConfigDir)')
+    expect(reply).toContain('not a guarantee')
     await prompt($, 'Show the build number in the footer of every page.')
     const jev = routerRuns(w).slice(before)
     expect(jev).toHaveLength(11)
@@ -476,5 +499,96 @@ describe('the session router through the host', () => {
     await command($, 'router jev'); await command($, 'router nobodywho')
     expect(w.storeWrites.filter(s => s.key === 'prefs' || JSON.stringify(s.value).includes('NOBODYWHO') && s.key !== 'ledger-index' && !s.key.startsWith('ledger:'))).toEqual([])
     expect(w.configured).toEqual([])
+  })
+})
+
+describe('the session router: review findings', () => {
+  test('outside a planned task every prompt is a task of its own, and is asked about', LED, async ($, on) => {
+    const w = world(on); const asked = scripted(w, { local: NWHO }); await start($)
+    await command($, 'router nobodywho')
+    await prompt($, ORDINARY)
+    await prompt($, 'Now do the same for the import dialog as well.')
+    await prompt($, 'go on')
+    // two prompts long enough to be tasks: two readings; the third names no task
+    expect(asked).toHaveLength(1 + 10 + 10)
+  })
+  test('a configuration directory inside the project is refused: a repository cannot choose where the router sends', { options: { orchestration: true, profile: 'SONNET_LED', routerConfigDir: '/work/example/.router' } }, async ($, on) => {
+    const w = world(on); scripted(w, { jev: { provider: 'jev', kind: 'disabled' } }); await start($)
+    const reply = await text(command($, 'router jev'))
+    expect(reply).toContain('routerConfigDir was NOT used because it is inside this project')
+    await prompt($, ORDINARY)
+    expect(routerRuns(w).length).toBeGreaterThan(1)
+    expect(routerRuns(w).every(r => r.env === undefined)).toBe(true)
+  })
+  for (const [dir, why] of [['/work/example', 'the project itself'], ['/work', 'a directory that contains the project']] as const) {
+    test(`a configuration directory that is ${why} is refused`, { options: { orchestration: true, profile: 'SONNET_LED', routerConfigDir: dir } }, async ($, on) => {
+      const w = world(on); scripted(w, { jev: JEV }); await start($)
+      expect(await text(command($, 'router jev'))).toContain('routerConfigDir was NOT used')
+      expect(routerRuns(w).every(r => r.env === undefined)).toBe(true)
+    })
+  }
+  test('a configuration directory with a parent segment is not an option at all', { options: { orchestration: true, profile: 'SONNET_LED', routerConfigDir: '/home/op/../../work/example/.router' } }, async ($, on) => {
+    const w = world(on); scripted(w, { jev: JEV }); await start($)
+    expect(await text(command($, 'router jev'))).toContain('no routerConfigDir is set')
+    expect(routerRuns(w).every(r => r.env === undefined)).toBe(true)
+  })
+  test('~ is resolved from HOME', { options: { orchestration: true, profile: 'SONNET_LED', routerConfigDir: '~/.config/cobalt-cockpit/router-jev' } }, async ($, on) => {
+    const w = world(on, { env: { HOME: '/home/op' } }); scripted(w, { jev: JEV }); await start($)
+    expect(await text(command($, 'router jev'))).toContain('with the router configuration at /home/op/.config/cobalt-cockpit/router-jev')
+    expect(routerRuns(w).at(-1)!.env).toEqual({ DECISION_ROUTER_CONFIG_DIR: '/home/op/.config/cobalt-cockpit/router-jev' })
+  })
+  test('without HOME a ~ directory is not used, and the reply does not claim it was', { options: { orchestration: true, profile: 'SONNET_LED', routerConfigDir: '~/.config/cobalt-cockpit/router-jev' } }, async ($, on) => {
+    const w = world(on, { env: { HOME: '' } }); scripted(w, { jev: JEV }); await start($)
+    const reply = await text(command($, 'router jev'))
+    expect(reply).toContain('routerConfigDir was NOT used because HOME is not set')
+    expect(routerRuns(w).every(r => r.env === undefined)).toBe(true)
+  })
+  test('only a command the person typed switches the router', LED, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); const asked = scripted(w, { jev: JEV }); await start($)
+    for (const kind of ['task-notification', 'scheduled-trigger']) {
+      const reply = String((await $.command.run({ command: 'cockpit', args: 'router jev', origin: { kind }, presentation: { isFullscreen: true, columns: 120 } } as never)).text)
+      expect(reply).toContain('switched only by a command you type')
+      expect(routerState(held).mode).toBe('OFF')
+    }
+    expect(asked).toHaveLength(0)
+    // it may still be read
+    expect(String((await $.command.run({ command: 'cockpit', args: 'router', origin: { kind: 'task-notification' }, presentation: { isFullscreen: true, columns: 120 } } as never)).text)).toContain('ROUTER / OFF')
+    expect(w.asked).toHaveLength(0)
+  })
+  test('after a switch to OFF mid-reading, nothing is kept and the next task asks nothing', LED, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); const asked = scripted(w, { local: NWHO }); await start($)
+    await command($, 'router nobodywho')
+    expect(asked).toHaveLength(1)
+    // the person switches off after the reading has begun and before its last look at the mode
+    let switched = false
+    w.duringRun = async argv => { if (argv[0] === 'decision' && !switched) { switched = true; await command($, 'router off') } }
+    await prompt($, ORDINARY)
+    // the requests that had started are answered into nothing: no decision, no advice, OFF
+    expect(routerState(held)).toMatchObject({ mode: 'OFF', last: null })
+    expect(ledger(held).routing ?? []).toHaveLength(0)
+    expect(w.submitted.at(-1)!.context.every(c => !c.includes('router'))).toBe(true)
+    // and the next task asks nothing at all
+    const n = asked.length
+    await prompt($, 'Rename the export helper and update both callers.')
+    expect(asked).toHaveLength(n)
+  })
+  test('a session that ends leaves no router selected for what follows', JEV_DIR, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); const asked = scripted(w, { jev: JEV }); await start($)
+    for (const reason of ['clear', 'other']) {
+      await command($, 'router jev')
+      expect(routerState(held).mode).toBe('JEV')
+      const n = asked.length
+      await $.session.end({ reason, sessionId: 's1', resume: { id: 's1' } } as never)
+      expect(routerState(held)).toMatchObject({ mode: 'OFF', last: null, link: 'unchecked' })
+      await prompt($, `${ORDINARY} after ${reason}`)
+      expect(asked).toHaveLength(n)
+    }
+  })
+  test('a withheld prompt does not make a connected provider look down', JEV_DIR, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); scripted(w, { jev: JEV }); await start($)
+    await command($, 'router jev')
+    await prompt($, 'Deploy to staging with DATABASE_URL=postgres://app:hunter2@db.internal/app and report back.')
+    expect(routerState(held)).toMatchObject({ link: 'connected', asked: 0, fallbacks: 1 })
+    expect(await text(command($, 'version'))).toContain('ROUTER / JEV · CONNECTED')
   })
 })

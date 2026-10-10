@@ -57,7 +57,9 @@ describe('consultation grounds', () => {
     expect(groundsAvailable(facts({ prompt: 'Run the release gate for v1.2' }))).toContain('release')
     expect(groundsAvailable(facts({ files: ['src/auth/session.ts'] }))).toContain('security')
     expect(groundsAvailable(facts({ files: ['a/x.ts', 'b/y.ts', 'c/z.ts'] }))).toContain('architecture')
-    expect(groundsAvailable(facts({ milestones: 5 }))).toContain('architecture')
+    // a long plan is the main loop's own word, not evidence: it raises no ground
+    expect(groundsAvailable(facts({ milestones: 12 }))).toEqual([])
+    expect(groundsAvailable(facts({ files: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'] }))).toContain('architecture')
     expect(groundsAvailable(facts({ prompt: 'Plan the database migration' }))).toContain('architecture')
   })
   test('a repeated failure counts only after the approach was meant to change', () => {
@@ -101,7 +103,7 @@ describe('evidence packet', () => {
 })
 
 describe('consultation admission', () => {
-  const base = { profile: 'SONNET_LED' as const, ground: 'architecture' as const, packet: packet(), facts: facts({ milestones: 6 }), consults: [], swarm: ledSwarm(), progressTask: 1 }
+  const base = { profile: 'SONNET_LED' as const, ground: 'architecture' as const, packet: packet(), facts: facts({ files: ['a/x.ts', 'b/y.ts', 'c/z.ts'] }), consults: [], swarm: ledSwarm(), progressTask: 1 }
   test('legacy profile and ordinary work are refused', () => {
     expect(consultVerdict({ ...base, profile: 'OPUS_LED' })).toMatchObject({ ok: false, reason: expect.stringContaining('LEGACY PROFILE') })
     expect(consultVerdict({ ...base, facts: facts() })).toMatchObject({ ok: false, reason: expect.stringContaining('ordinary work') })
@@ -460,5 +462,116 @@ describe('the architect reads its evidence and runs at High', () => {
     const spawned = await spawn($, `[task:${ledger(held).consults![0]!.id}] Opus asked consultation`)
     await step($, SONNET, { agentId: spawned.agentId })
     expect(w.efforts.at(-1)).toMatchObject({ model: OPUS_MODEL, effort: 'high', agentId: spawned.agentId })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The mandatory review is not the main loop's to waive. Each test is a way a
+// model could once have discharged it without an answer from Opus.
+// ---------------------------------------------------------------------------
+
+describe('a mandatory review cannot be waived by the main loop', () => {
+  const hold = async ($: Engine) => {
+    await progress($, { action: 'plan', milestones: FIVE })
+    for (const m of ['m1', 'm2', 'm3', 'm4']) await progress($, { action: 'complete', milestone: m })
+    for (const g of GATE_NAMES) await progress($, { action: 'gate', gate: g, state: 'na', evidence: 'fixture' })
+    return progress($, { action: 'complete', milestone: 'm5' })
+  }
+  test('planning again does not plan the review away, and the answer still reaches the new plan', LED, async ($, on) => {
+    world(on); const held = hostState(on, {}); await start($)
+    await prompt($, 'Please approve the release of v0.5.0 after checking everything')
+    expect(await hold($)).toContain('HELD')
+    // a fresh plan, not a re-plan: a new task number, the same obligation
+    const before = task(held).id
+    expect(await hold($)).toContain('HELD')
+    expect(task(held).id).toBe(before + 1)
+    expect(task(held).review).toEqual({ grounds: ['release'], consult: null, state: 'required' })
+    expect(task(held).percent).toBeLessThan(100)
+    // the consultation is admitted, answered, and the plan is replaced once more before it is judged
+    await call($, releasePacket)
+    const id = ledger(held).consults![0]!.id
+    const spawned = await spawn($, `[task:${id}] Opus release consultation`)
+    await finish($, spawned.agentId!)
+    expect(await hold($)).toContain('HELD')
+    expect(task(held).review).toMatchObject({ consult: id, state: 'admitted' })
+    await call($, { action: 'verify', task_id: id, state: 'pass', evidence: ['checked'] })
+    expect(task(held).review?.state).toBe('adjudicated')
+    await progress($, { action: 'complete', milestone: 'm5' })
+    expect(task(held).percent).toBe(100)
+  })
+  test('a verdict on a consultation Opus never answered is refused, pass or fail', LED, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); await start($)
+    await prompt($, 'Please approve the release of v0.5.0 after checking everything')
+    await hold($)
+    await call($, releasePacket)
+    const id = ledger(held).consults![0]!.id
+    for (const state of ['fail', 'pass']) expect(String((await call($, { action: 'verify', task_id: id, state, evidence: ['none'] })).result)).toContain('has not returned')
+    expect(task(held).review?.state).toBe('admitted')
+    // a result filed by the main loop itself is not an answer from Opus either
+    await call($, { action: 'result', task_id: id, conclusion: 'approved', evidence: ['self'] })
+    expect(String((await call($, { action: 'verify', task_id: id, state: 'fail', evidence: ['none'] })).result)).toContain('has not returned')
+    // nor is one still running
+    const spawned = await spawn($, `[task:${id}] Opus release consultation`)
+    expect(String((await call($, { action: 'verify', task_id: id, state: 'fail', evidence: ['none'] })).result)).toContain('has not returned')
+    expect(await progress($, { action: 'complete', milestone: 'm5' })).toContain('HELD')
+    expect(w.spawns.at(-1)?.['model']).toBe(OPUS_MODEL)
+    // once the architect has answered, either verdict adjudicates it
+    await finish($, spawned.agentId!)
+    await call($, { action: 'verify', task_id: id, state: 'fail', evidence: ['the advice was wrong: tests disagree'] })
+    expect(task(held).review?.state).toBe('adjudicated')
+  })
+  test('a consultation on another ground does not stand in for the one the review needs', LED, async ($, on) => {
+    world(on); const held = hostState(on, {}); await start($)
+    await prompt($, 'Please approve the release of v0.5.0, which includes the cache redesign')
+    await hold($)
+    expect(task(held).review).toEqual({ grounds: ['release'], consult: null, state: 'required' })
+    const reply = String((await call($, { action: 'consult', ground: 'architecture', objective: 'Cache', architecture: 'JSON store', locations: ['src/cache.ts'], alternatives: ['LRU', 'SQLite'], risk: 'stale reads', question: 'Which cache?' })).result)
+    expect(reply).toContain('OPUS ADMITTED')
+    expect(reply).not.toContain('mandatory')
+    const id = ledger(held).consults![0]!.id
+    const spawned = await spawn($, `[task:${id}] Opus architecture consultation`)
+    await finish($, spawned.agentId!)
+    await call($, { action: 'verify', task_id: id, state: 'pass', evidence: ['checked'] })
+    // the release review is untouched and still holds the task
+    expect(task(held).review).toEqual({ grounds: ['release'], consult: null, state: 'required' })
+    expect(await progress($, { action: 'complete', milestone: 'm5' })).toContain('HELD')
+    expect(task(held).percent).toBeLessThan(100)
+  })
+  test('no other agent can be adopted into a consultation', LED, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); await start($)
+    await prompt($, 'Please approve the release of v0.5.0 after checking everything')
+    await call($, releasePacket)
+    const id = ledger(held).consults![0]!.id
+    w.agents = [{ id: 'helper-9', description: 'scan', type: 'cobalt-cockpit:scout', status: 'running' }]
+    expect(String((await call($, { action: 'adopt', task_id: id, agent_id: 'helper-9' })).result)).toContain('cannot be adopted')
+    expect(ledger(held).swarm!.tasks.find(t => t.id === id)).toMatchObject({ agentId: null, state: 'queued' })
+  })
+  test('a long plan does not make Opus available: the architecture ground needs observed spread or the person\'s words', LED, async ($, on) => {
+    world(on); const held = hostState(on, {}); await start($)
+    await prompt($, 'Add a CSV option to the export button.')
+    await progress($, { action: 'plan', milestones: ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map(title => ({ title })) })
+    expect(String((await call($, { action: 'consult', ground: 'architecture', objective: 'CSV', architecture: 'x', locations: ['src/export.ts'], alternatives: ['a', 'b'], risk: 'none', question: 'ok?' })).result)).toContain('NOT ADMITTED')
+    expect(ledger(held).consults ?? []).toHaveLength(0)
+  })
+})
+
+describe('helpers that own everything keep what 0.4.0 gave them', () => {
+  test('an unassigned helper may still glob by absolute pattern; a scoped one is told how to ask', LEGACY, async ($, on) => {
+    world(on); const held = hostState(on, {}); await start($)
+    const free = await spawn($, 'look around', 'cobalt-cockpit:explorer')
+    expect((await as($, free.agentId!, 'Glob', { pattern: '/work/example/**/*.ts' })).deny).toBeUndefined()
+    expect((await as($, free.agentId!, 'Grep', { pattern: 'x', glob: '../*.ts' })).deny).toBeUndefined()
+    await call($, { action: 'assign', task_id: 'scoped', tier: 'SONNET', role: 'explorer', objective: 'scan src', owned_resources: ['/work/example/src'], mode: 'read' })
+    const scoped = await spawn($, '[task:scoped] scan', 'cobalt-cockpit:explorer')
+    expect((await as($, scoped.agentId!, 'Glob', { pattern: '/etc/*', path: '/work/example/src' })).deny).toBe('SWARM / read outside owned resources: give the directory as path and a pattern relative to it')
+    expect((await as($, scoped.agentId!, 'Glob', { pattern: '{/etc/passwd,x}', path: '/work/example/src' })).deny).toContain('read outside owned resources')
+    expect((await as($, scoped.agentId!, 'Glob', { pattern: '**/*.ts', path: '/work/example/src' })).deny).toBeUndefined()
+    expect(ledger(held).swarm!.tasks.find(t => t.agentId === free.agentId)!.owned).toEqual(['*'])
+  })
+  test('the architect agent called in the legacy profile is a read-only helper, not a writer', LEGACY, async ($, on) => {
+    world(on); const held = hostState(on, {}); await start($)
+    const a = await spawn($, 'review the design', 'cobalt-cockpit:architect')
+    expect(ledger(held).swarm!.tasks.find(t => t.agentId === a.agentId)).toMatchObject({ mode: 'read', tier: 'SONNET' })
+    expect((await as($, a.agentId!, 'Edit', { file_path: '/work/example/a.ts', old_string: 'a', new_string: 'b' })).deny).toBeDefined()
   })
 })

@@ -14,7 +14,7 @@ import { textOf } from './ledger'
 import { atom, read, update } from 'claude-code'
 import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL, OPUS_MODEL, isProfile, DEFAULT_PROFILE } from './model-policy'
 import type { SubagentTier, Profile } from './model-policy'
-import { addConsult, advanceReview, briefOf, consultVerdict, factsOf, isGround, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
+import { addConsult, advanceReview, briefOf, consultVerdict, factsOf, hasReturned, isGround, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
 import type { Consultation } from './consult'
 import { addDecision, adjudicate, adviceLine, answerOf, callsFor, carriesCredential, decisionOf, deterministicRoute, operatorNotice, readAnswers, routerArgv, routerLabel, routerLine, routerModeOf, routerStateOf, switchRouter, withDecision, AVAILABILITY_STATE, CALL_TIMEOUT_MS, EMPTY_ROUTER, PROVIDER, ROUTER_MODES } from './router'
 import type { ActiveMode, RouterAnswer, RouterMode, RouterPolicy, RouterState } from './router'
@@ -253,7 +253,7 @@ const serveConsult = async ($: EngineInterface, e: Record<string, unknown>, at: 
   const named = await Promise.all(readScopeOf(made.packet).map(p => canonicalResource($, p)))
   const owned = named.filter(p => p !== '*' && (p === root || p.startsWith(`${root}/`)))
   const outside = named.length - owned.length
-  // The router and the path lookups take time: another consultation may have been
+  // The path lookups take time: another consultation may have been
   // admitted meanwhile, so the bounds are checked again on the ledger as it is now.
   const fresh = await read($, ledgerAtom)
   const again = consultVerdict({ profile: config.hasOrchestration ? config.profile : 'OPUS_LED', ground, packet: made.packet, facts, consults: fresh.consults ?? [], swarm: swarmState(fresh), progressTask: task?.id ?? null })
@@ -262,7 +262,14 @@ const serveConsult = async ($: EngineInterface, e: Record<string, unknown>, at: 
   await changeSwarm($, held => submitTask(held, { id, tier: 'OPUS', role: ground === 'release' || ground === 'security' ? 'REVIEW' : 'ARCHITECT', objective: made.packet.decision, scope: `Opus consultation · ${ground}`, owned: owned.length ? owned : [root], mode: 'read', parentTask: null, effort: CONSULT_EFFORT, effortReason: `Opus consultation: ${CONSULT_EFFORT} by default`, spawnReason: `Opus admitted on ${ground}${verdict.isMandatory ? ' (mandatory)' : ''}` }, at).swarm)
   const c: Consultation = { id, ground, key: verdict.key, packet: made.packet, progressTask: task?.id ?? null, isMandatory: verdict.isMandatory, requestedAt: at }
   await mutateLedger($, l => ({ ...l, consults: addConsult(l.consults ?? [], c) }))
-  if (task !== null) await change($, t => t.id !== task.id ? t : { ...t, review: advanceReview(verdict.isMandatory ? requireReview(t, [ground]).review : t.review, id, 'admitted') })
+  // A review is advanced only by a consultation on one of the grounds that made
+  // it necessary: an easier consultation on another ground does not stand in for it.
+  if (task !== null) await change($, t => {
+    if (t.id !== task.id) return t
+    const held = verdict.isMandatory ? requireReview(t, [ground]) : t
+
+    return held.review?.grounds.includes(ground) ? { ...held, review: advanceReview(held.review, id, 'admitted') } : held
+  })
 
   const scope = `Read scope: ${owned.length ? `${owned.length} named file${owned.length === 1 ? '' : 's'}` : 'the project'}${outside ? `; ${outside} location${outside === 1 ? '' : 's'} not readable (outside the project, home-relative or not a plain path)` : ''}.`
 
@@ -294,6 +301,7 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
     else {
       if (!task) throw new Error('Unknown task')
       if (action === 'adopt') {
+        if (task.tier === 'OPUS') throw new Error('OPUS / a consultation runs only as the cobalt-cockpit:architect spawned for its [task:ID]; an existing agent cannot be adopted into it')
         const existingId = String(e['agent_id'] ?? '')
         const listed = await $.agent.list()
         if (!listed.some(a=>a.id===existingId && a.status==='running')) throw new Error('Adoption requires an observed running host agent')
@@ -310,10 +318,15 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
         await changeSwarm($, held => escalateTask(held,id,{ objective: task.objective, discoveries:list('discoveries'), evidence:list('evidence'), question:str('question'), risk:str('risk'), nextAction:str('next_action'), locations:list('locations'), to:e['to'] as ModelTier, effort: isEffortLevel(e['effort']) ? e['effort'] : null, effortReason: typeof e['effort_reason'] === 'string' ? str('effort_reason') : null },at))
       } else if (action === 'resolve') await changeSwarm($, held => resolveEscalation(held,id,{ conclusion:str('conclusion'),evidence:list('evidence'), changes:list('changes'), verification:list('verification'), unresolved:list('unresolved') },at))
       else if (action === 'cancel') await changeSwarm($, held => requestCancel(held,id,at))
-      else if (action === 'verify') { if (!['pending','pass','fail','unknown'].includes(String(e['state']))) throw new Error('Valid verification state required'); await changeSwarm($, held => verifyTask(held,id,e['state'] as Verification,at,list('evidence').join('; ')))
+      else if (action === 'verify') { if (!['pending','pass','fail','unknown'].includes(String(e['state']))) throw new Error('Valid verification state required')
+        // A consultation's advice can be judged, pass or fail, only once Opus has given it.
+        const isConsult = (await read($, ledgerAtom)).consults?.some(c => c.id === id) === true
+        if (isConsult && (e['state'] === 'pass' || e['state'] === 'fail') && !hasReturned(task)) throw new Error('OPUS / this consultation has not returned. Spawn cobalt-cockpit:architect with its [task:ID] and let it answer; a review is adjudicated only on an answer Opus gave')
+        await changeSwarm($, held => verifyTask(held,id,e['state'] as Verification,at,list('evidence').join('; ')))
         // The main session adjudicating a consultation's advice, pass or fail, is what a required review waits for.
         const consult = (await read($, ledgerAtom)).consults?.find(c => c.id === id)
-        if (consult && (e['state'] === 'pass' || e['state'] === 'fail')) await change($, t => t.id === consult.progressTask && t.review ? { ...t, review: advanceReview(t.review, id, 'adjudicated') } : t)
+        // bound by the consultation the review names, so a re-plan does not orphan it
+        if (consult && (e['state'] === 'pass' || e['state'] === 'fail')) await change($, t => t.review ? { ...t, review: advanceReview(t.review, id, 'adjudicated') } : t)
       }
       else throw new Error('Unknown swarm action')
     }
@@ -424,7 +437,7 @@ const guardSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
     const path = String(e['file_path'] ?? e['path'] ?? (tool !== 'Read' && cwd ? cwd : '*'))
     // A pattern reaches only below that path: one that is absolute, home-relative or climbs out is refused.
     const pattern = tool === 'Glob' ? e['pattern'] : tool === 'Grep' ? e['glob'] : undefined
-    if (typeof pattern === 'string' && /^[\/~]|(?:^|[\/\\{,])\.\.(?:[\/\\},]|$)/.test(pattern.trim())) return 'SWARM / read outside owned resources'
+    if (typeof pattern === 'string' && !task.owned.includes('*') && /(?:^|[{,])\s*[\/~]|(?:^|[\/\\{,])\.\.(?:[\/\\},]|$)/.test(pattern.trim())) return 'SWARM / read outside owned resources: give the directory as path and a pattern relative to it'
     if (!ownershipAllows(s,task.id,await canonicalResource($,path),'read')) return 'SWARM / read outside owned resources'
   }
   if (task && tool === 'Bash' && !task.owned.includes('*')) return 'SWARM / shell inspection requires declared wildcard read scope'
@@ -1139,28 +1152,62 @@ const refreshMeter = async ($: EngineInterface): Promise<void> => {
 
 const routerPolicy = (): RouterPolicy => ({ profile: config.profile, hasOrchestration: config.hasOrchestration, hasHaiku: config.maxHaiku !== 0, hasSonnet: config.maxSonnet !== 0 })
 
+let routerDirSeen: { option: string; cwd: string; dir: string | null; refused: string | null } | null = null
+
+/**
+ * The operator's router configuration directory for JEV mode, resolved, or why
+ * it is not used. It must be the operator's own: a directory inside the project
+ * is refused, because a repository must never be able to choose where the
+ * router sends a request or which key it presents. Cockpit only names the
+ * directory to the router's child process; it does not read or write it.
+ */
+const routerDir = async ($: EngineInterface): Promise<{ dir: string | null; refused: string | null }> => {
+  const option = config.routerConfigDir
+  if (option === '') return { dir: null, refused: null }
+  if (routerDirSeen !== null && routerDirSeen.option === option && routerDirSeen.cwd === cwd) return routerDirSeen
+  const judged = await (async (): Promise<{ dir: string | null; refused: string | null }> => {
+    let path = option
+    if (option.startsWith('~/')) {
+      const home = await $.env.get('HOME').catch(() => undefined)
+      if (home === undefined || !home.startsWith('/')) return { dir: null, refused: 'HOME is not set, so ~ could not be resolved' }
+      path = `${home.replace(/\/+$/, '')}${option.slice(1)}`
+    }
+    const real = await canonicalResource($, path)
+    const root = await canonicalResource($, cwd || '.')
+    if (real === '*' || real === '/') return { dir: null, refused: 'it could not be resolved to a directory' }
+    if (root === '*') return { dir: null, refused: 'the project root could not be resolved, so it could not be told apart from the project' }
+    if (real === root || real.startsWith(`${root}/`) || root.startsWith(`${real}/`)) return { dir: null, refused: 'it is inside this project (or contains it); a router configuration must be your own, outside any repository' }
+
+    return { dir: real, refused: null }
+  })()
+  routerDirSeen = { option, cwd, ...judged }
+
+  return judged
+}
+
+/** The environment of a router child: nothing, except the operator's directory in JEV mode. */
+const routerEnv = async ($: EngineInterface, mode: ActiveMode): Promise<Record<string, string> | undefined> => {
+  if (mode !== 'JEV') return undefined
+  const { dir } = await routerDir($)
+
+  return dir === null ? undefined : { DECISION_ROUTER_CONFIG_DIR: dir }
+}
+
 /**
  * Runs the router's own CLI once per body, at the same time, and reads each
  * answer. This is the only place a router process starts, and it starts only
- * for a mode the person selected. In JEV mode alone, and only when the operator
- * configured one, the child is pointed at the operator's router configuration
- * directory; nothing of it, and no credential, enters this process.
+ * for a mode the person selected. Every request is started before the first
+ * await, so nothing can come between the caller's last check and the start.
+ * No credential enters this process: the router reads its own key.
  */
-const askRouter = async ($: EngineInterface, mode: ActiveMode, bodies: readonly string[]): Promise<(RouterAnswer | null)[]> => {
-  let env: Record<string, string> | undefined
-  if (mode === 'JEV' && config.routerConfigDir !== '') {
-    const home = config.routerConfigDir.startsWith('~/') ? await $.env.get('HOME').catch(() => undefined) : ''
-    if (home !== undefined) env = { DECISION_ROUTER_CONFIG_DIR: config.routerConfigDir.startsWith('~/') ? `${home}${config.routerConfigDir.slice(1)}` : config.routerConfigDir }
-  }
-
-  return Promise.all(bodies.map(async body => {
+const askRouter = ($: EngineInterface, mode: ActiveMode, bodies: readonly string[], env: Record<string, string> | undefined): Promise<(RouterAnswer | null)[]> =>
+  Promise.all(bodies.map(async body => {
     try {
       const r = await $.process.run(routerArgv(mode, body), { timeoutMs: CALL_TIMEOUT_MS[mode], ...(env === undefined ? {} : { env }) })
 
       return r.exitCode === 0 && !r.isStdoutTruncated ? answerOf(r.stdout) : null
     } catch { return null }
   }))
-}
 
 /**
  * The router's reading of a new task, when one is selected and the rules have
@@ -1179,8 +1226,11 @@ const routeTask = async ($: EngineInterface, text: string, facts: Parameters<typ
   const state = routerStateOf(text)
   const calls = state === null ? [] : callsFor(state)
   if (state === null && !carriesCredential(text)) return null
+  const env = calls.length === 0 ? undefined : await routerEnv($, mode)
   const started = await $.clock.now()
-  const answers = calls.length === 0 ? [] : await askRouter($, mode, calls.map(c => c.body))
+  // the last look before anything is sent: a switch made meanwhile sends nothing
+  if ((await read($, routerAtom)).epoch !== held.epoch) return null
+  const answers = calls.length === 0 ? [] : await askRouter($, mode, calls.map(c => c.body), env)
   const at = await $.clock.now()
   const reading = calls.length === 0 ? { route: null, features: {}, agreed: 0, invalid: 'prompt withheld: credential-shaped text is never shown to a router' } : readAnswers(mode, calls, answers)
   const verdict = reading.route === null ? null : adjudicate(reading.route, facts, routerPolicy())
@@ -1201,8 +1251,11 @@ const selectRouter = async ($: EngineInterface, mode: RouterMode): Promise<strin
   if (mode === 'OFF') return 'ROUTER / OFF · deterministic policy only. No router is asked in this session.'
   // One fixed question that carries nothing of the session, so the mode's state is seen, not assumed.
   const probe = callsFor(AVAILABILITY_STATE)[0]!
+  const dir = mode === 'JEV' ? await routerDir($) : { dir: null, refused: null }
+  const env = await routerEnv($, mode)
   const started = await $.clock.now()
-  const [answer = null] = await askRouter($, mode, [probe.body])
+  if ((await read($, routerAtom)).epoch !== switched.epoch) return `ROUTER / ${routerLine(await read($, routerAtom))}`
+  const [answer = null] = await askRouter($, mode, [probe.body], env)
   const wall = (await $.clock.now()) - started
   const isUp = answer !== null && answer.provider === PROVIDER[mode] && answer.failure === null && answer.choice !== null
   const detail = isUp ? `${answer.model ?? PROVIDER[mode]} · ${wall}ms` : answer === null ? 'no answer' : answer.failure ?? `answered by ${answer.provider}`
@@ -1211,8 +1264,8 @@ const selectRouter = async ($: EngineInterface, mode: RouterMode): Promise<strin
   return [
     `ROUTER / ${routerLabel(now)}${isUp ? ` · ${detail}` : ''}`,
     mode === 'JEV'
-      ? `JEV is the TypeSafe API, reached through the local decision router${config.routerConfigDir === '' ? ' under its own JEV switch (no routerConfigDir is set)' : ' with the router configuration you set in routerConfigDir'}. For a new task the rules do not settle, the first 400 characters of your prompt are sent to it; nothing else is, and a prompt with credential-shaped text is withheld.`
-      : 'NobodyWho runs on this machine through the local decision router (its local provider only).',
+      ? `JEV is the TypeSafe API, reached through the local decision router${dir.dir !== null ? ` with the router configuration at ${dir.dir} (routerConfigDir)` : dir.refused !== null ? ` under its own JEV switch: routerConfigDir was NOT used because ${dir.refused}` : ' under its own JEV switch (no routerConfigDir is set)'}. Each prompt you submit outside a planned task counts as a new task: when the rules do not settle it, its first 400 characters are sent to JEV in ten small requests. Nothing else is sent, and a prompt in which credential-shaped text is recognised is withheld (a pattern list, not a guarantee: do not paste secrets).`
+      : 'NobodyWho is asked through the local decision router with its local provider only (--mode local); an answer from any other provider is discarded. Each prompt you submit outside a planned task counts as a new task and is asked about when the rules do not settle it.',
     'Advisory only: Cockpit\'s rules still decide admission, ownership, mandatory consultations and verification gates. This session only; a new session starts OFF.',
   ].join('\n')
 }
@@ -1759,7 +1812,7 @@ export const register: Register = (on, options) => {
     maxEffort: isEffortLevel(options['maxEffort']) ? options['maxEffort'] : DEFAULT_CEILING,
     modelEffort: parseModelEffort(options['modelEffort']),
     profile,
-    routerConfigDir: typeof options['routerConfigDir'] === 'string' && /^(?:\/|~\/)[^\0\n]{1,1024}$/.test(options['routerConfigDir'].trim()) ? options['routerConfigDir'].trim() : '',
+    routerConfigDir: typeof options['routerConfigDir'] === 'string' && /^(?:\/|~\/)[^\0\n]{1,1024}$/.test(options['routerConfigDir'].trim()) && !/(?:^|\/)\.\.(?:\/|$)/.test(options['routerConfigDir']) ? options['routerConfigDir'].trim() : '',
   }
 
   registerLedger(on)
@@ -1846,6 +1899,8 @@ export const register: Register = (on, options) => {
     foldTimer = null
     gitTimer?.cancel()
     gitTimer = null
+    // The router belongs to the session that chose it: whatever follows starts OFF.
+    await quiet(() => update($, routerAtom, held => held.mode === 'OFF' ? held : switchRouter(held, 'OFF')))
     if (e.reason === 'clear') {
       // a /clear ends the conversation the task belonged to
       await quiet(() => update($, taskAtom, () => null))
@@ -2154,7 +2209,7 @@ export const register: Register = (on, options) => {
         if (!assigned) {
           assignedId = `legacy-${e.tool_use_id}-${(await read($, orchestraAtom)).spawned}`.replace(/[^\w.-]/g,'-')
           const tier = tierOf(e.model) === 'HAIKU' || role === 'SCOUT' || role === 'UTILITY' ? 'HAIKU' : 'SONNET'
-          const state = await changeSwarm($, held => submitTask(held, { id: assignedId!, tier, role, objective: textOf(e.description || e.subagentType), mode: ['EXPLORER','RESEARCHER','REVIEWER','SCOUT','UTILITY'].includes(role) ? 'read' : 'write', owned:['*'], spawnReason:'Legacy Agent call; unknown scope conservatively exclusive' },at).swarm)
+          const state = await changeSwarm($, held => submitTask(held, { id: assignedId!, tier, role, objective: textOf(e.description || e.subagentType), mode: ['EXPLORER','RESEARCHER','REVIEWER','SCOUT','UTILITY','ARCHITECT'].includes(role) ? 'read' : 'write', owned:['*'], spawnReason:'Legacy Agent call; unknown scope conservatively exclusive' },at).swarm)
           assigned = state.tasks.find(t => t.id === assignedId)
           if (!assigned) return { deny: 'SWARM / duplicate work suppressed; inspect swarm status' }
         }
@@ -2531,9 +2586,12 @@ export const register: Register = (on, options) => {
       case 'router': {
         const held = await read($, routerAtom)
         let target = value === '' ? null : routerModeOf(value)
+        // Only the person switches a router: a command another plugin or a trigger ran may look, not choose.
+        const isPerson = e.origin.kind === 'composer' || e.origin.kind === 'bridge' || e.origin.kind === 'sdk'
+        if (target !== null && target !== held.mode && !isPerson) return { text: `ROUTER / ${routerLine(held)}\nCockpit: the router is switched only by a command you type; nothing was changed.` }
         if (value !== '' && target === null) return { text: `Cockpit: "${value}" is not a router. Use /cockpit router off | nobodywho | jev.\nROUTER / ${routerLine(held)}` }
         // no word given: the engine's own dialog, where there is someone to ask
-        if (target === null) target = await pickRouter($, held.mode)
+        if (target === null && isPerson) target = await pickRouter($, held.mode)
         if (target === null) return { text: `ROUTER / ${routerLine(held)}\nSwitch with /cockpit router off | nobodywho | jev. The choice lasts for this session; a new session starts OFF.` }
         if (target === held.mode) return { text: `ROUTER / ${routerLine(held)} (unchanged)` }
 

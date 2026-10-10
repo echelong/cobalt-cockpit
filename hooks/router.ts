@@ -112,10 +112,37 @@ export const AFFIRM_CAP = 3
 /** A prompt this short names no task to classify (`yes`, `go on`). */
 export const MIN_PROMPT = 16
 
-const CREDENTIAL = /-----BEGIN [A-Z ]*PRIVATE KEY|(?:api[_-]?key|access[_-]?(?:token|key)|token|password|passwd|secret|authorization)["']?\s*[=:]\s*["']?[^\s"']+|\bBearer\s+[A-Za-z0-9._~-]{8,}|\b(?:sk-ant-|sk-live-|sk_live_|sk_test_|ghp_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]+|\bAKIA[A-Z0-9]{16}\b|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/i
+// Text that looks like a credential. Deliberately broad: a prompt that matches is
+// not shown to any router, and withholding one that was harmless costs nothing
+// but a fallback. It is a list of shapes, not a proof: see PRIVACY.md.
+const CREDENTIAL_ANY_CASE = new RegExp([
+  '-----BEGIN [A-Z ]*PRIVATE KEY',
+  // a name that says secret, then a value: api_key=…, SECRET_KEY: …, db-password = …, authToken=…
+  '[A-Za-z0-9_.-]*(?:api[_-]?key|secret|token|passw(?:or)?d|passwd|pwd|credential|private[_-]?key|access[_-]?key|session[_-]?key|auth(?:orization)?)[A-Za-z0-9_.-]*["\']?\\s*[=:]\\s*["\']?[^\\s"\']{3,}',
+  // said in words
+  '\\b(?:password|passphrase|passcode|secret|token|api\\s+key)\\s+(?:is|was)\\s+\\S+',
+  // inside a URL, on a command line, or a webhook that is itself the secret
+  '\\b[a-z][a-z0-9+.-]*:\\/\\/[^\\s\\/@]*:[^\\s\\/@]+@',
+  '(?:^|\\s)(?:-u|--user)\\s+\\S+:\\S+',
+  'hooks\\.slack\\.com\\/services\\/',
+  '\\bBearer\\s+[A-Za-z0-9._~+\\/-]{8,}',
+  // well-known token prefixes
+  '\\b(?:sk-|sk_live_|sk_test_|rk_live_|pk_live_|ghp_|gho_|ghs_|ghu_|github_pat_|glpat-|xox[abeprs]-|npm_|hf_)[A-Za-z0-9_-]{8,}',
+  '\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+',
+  // a long unbroken run of letters and digits: a key or a digest, whatever it is called
+  '(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_=-]*[0-9])(?=[A-Za-z0-9+_=-]*[A-Za-z])[A-Za-z0-9+_=-]{32,}',
+].join('|'), 'i')
+const CREDENTIAL_EXACT_CASE = new RegExp([
+  // a line of a pasted .env: NAME=value
+  '\\b[A-Z][A-Z0-9_]{2,}=\\S{6,}',
+  '\\b(?:AKIA|ASIA)[A-Z0-9]{16}\\b',
+  '\\bAIza[A-Za-z0-9_-]{20,}',
+  // forty characters of mixed-case base64: the shape of a cloud secret key
+  '(?<![A-Za-z0-9+\\/])(?=[A-Za-z0-9+\\/]{40}(?![A-Za-z0-9+\\/]))(?=[A-Za-z0-9+\\/]*[a-z])(?=[A-Za-z0-9+\\/]*[A-Z])(?=[A-Za-z0-9+\\/]*[0-9])[A-Za-z0-9+\\/]{40}',
+].join('|'))
 
-/** Whether a prompt carries something credential-shaped; such a prompt is never shown to a router. */
-export const carriesCredential = (prompt: string): boolean => CREDENTIAL.test(prompt)
+/** Whether a prompt carries something credential-shaped, anywhere in it; such a prompt is not shown to a router. */
+export const carriesCredential = (prompt: string): boolean => CREDENTIAL_ANY_CASE.test(prompt) || CREDENTIAL_EXACT_CASE.test(prompt)
 
 /**
  * What a router is shown of a task: the person's prompt on one line, clipped.
@@ -146,8 +173,8 @@ export const AVAILABILITY_STATE = 'task: router availability check'
 export const PROVIDER: Record<ActiveMode, string> = { NOBODYWHO: 'nobodywho', JEV: 'jev' }
 /** The router's own mode flag: `local` is its local provider alone, `jev` its JEV provider alone. */
 const CLI_MODE: Record<ActiveMode, string> = { NOBODYWHO: 'local', JEV: 'jev' }
-/** One request may take this long before it is abandoned (the local model may have to load). */
-export const CALL_TIMEOUT_MS: Record<ActiveMode, number> = { NOBODYWHO: 8000, JEV: 4000 }
+/** One request may take this long before it is abandoned. The requests of a reading run together, so this is also the most a reading can delay a prompt. */
+export const CALL_TIMEOUT_MS: Record<ActiveMode, number> = { NOBODYWHO: 5000, JEV: 3000 }
 
 /** The argument array of one router request. Fixed words and one JSON body; no shell. */
 export const routerArgv = (mode: ActiveMode, body: string): string[] => ['decision', 'ask', '--caller', 'cockpit', '--mode', CLI_MODE[mode], '--json', body]
@@ -299,16 +326,26 @@ export const EMPTY_ROUTER: RouterState = { mode: DEFAULT_ROUTER, epoch: 0, link:
 /** The state after a switch: the new mode, a new epoch, and nothing carried over from the old provider. */
 export const switchRouter = (state: RouterState, mode: RouterMode): RouterState => ({ ...EMPTY_ROUTER, mode, epoch: state.epoch + 1 })
 
-/** The state after a decision made under `epoch`; unchanged when the router was switched meanwhile. */
-export const withDecision = (state: RouterState, epoch: number, d: RouterDecision): RouterState => state.epoch !== epoch || state.mode !== d.mode ? state : {
-  ...state,
-  link: d.answered > 0 && d.provider === PROVIDER[d.mode] && d.outcome !== 'fallback' ? 'connected' : d.answered === 0 || d.provider !== PROVIDER[d.mode] ? 'unavailable' : state.link,
-  detail: d.outcome === 'fallback' ? d.reason : state.detail,
-  asked: state.asked + 1,
-  accepted: state.accepted + (d.outcome === 'accepted' ? 1 : 0),
-  rejected: state.rejected + (d.outcome === 'rejected' ? 1 : 0),
-  fallbacks: state.fallbacks + (d.outcome === 'fallback' ? 1 : 0),
-  last: d,
+/**
+ * The state after a decision made under `epoch`; unchanged when the router was
+ * switched meanwhile. A decision in which nothing was sent (a withheld prompt)
+ * is counted as a fallback and says nothing about the provider.
+ */
+export const withDecision = (state: RouterState, epoch: number, d: RouterDecision): RouterState => {
+  if (state.epoch !== epoch || state.mode !== d.mode) return state
+  const tally = { fallbacks: state.fallbacks + (d.outcome === 'fallback' ? 1 : 0), last: d }
+  if (d.calls === 0) return { ...state, ...tally }
+  const isOwn = d.answered > 0 && d.provider === PROVIDER[d.mode]
+
+  return {
+    ...state,
+    ...tally,
+    link: isOwn && d.outcome !== 'fallback' ? 'connected' : !isOwn ? 'unavailable' : state.link,
+    detail: d.outcome === 'fallback' ? d.reason : state.detail,
+    asked: state.asked + 1,
+    accepted: state.accepted + (d.outcome === 'accepted' ? 1 : 0),
+    rejected: state.rejected + (d.outcome === 'rejected' ? 1 : 0),
+  }
 }
 
 const SITE: Record<ActiveMode, string> = { NOBODYWHO: 'LOCAL', JEV: 'TYPESAFE API' }

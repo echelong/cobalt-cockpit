@@ -34,8 +34,7 @@ export const MAX_CONSULTS = 32
 const TEXT_MAX = 1200
 const ITEM_MAX = 300
 const LIST_MAX = 12
-/** An architectural change at this size or spread may consult Opus. */
-export const ARCH_MILESTONES = 5
+/** An architectural change of this observed spread may consult Opus. A plan's length is the main loop's own word and is not counted. */
 export const ARCH_FILES = 5
 export const ARCH_DIRS = 3
 
@@ -88,7 +87,7 @@ const dirsOf = (files: readonly string[]): number => new Set(files.map(f => f.re
 /** The grounds on which Opus may be consulted now. Empty for ordinary work. */
 export const groundsAvailable = (facts: ConsultFacts): ConsultGround[] => {
   const out: ConsultGround[] = []
-  const large = facts.milestones >= ARCH_MILESTONES || facts.files.length >= ARCH_FILES || dirsOf(facts.files) >= ARCH_DIRS
+  const large = facts.files.length >= ARCH_FILES || dirsOf(facts.files) >= ARCH_DIRS
   if (large || affirmed(facts.prompt, MENTIONS_ARCH)) out.push('architecture')
   if (facts.files.some(f => SENSITIVE_PATH.test(f)) || affirmed(facts.prompt, MENTIONS_SECURITY)) out.push('security')
   if (facts.errorStreak >= FAILURE_STREAK) out.push('repeated-failure')
@@ -173,6 +172,13 @@ export const statusOf = (task: SwarmTask | undefined): ConsultStatus => {
 
   return task.state === 'cancelled' ? 'cancelled' : 'failed'
 }
+
+/**
+ * Whether a consultation was really answered: its task was bound to the
+ * architect the admission hook spawned for it, and the host observed that agent
+ * finish. A result or a verdict filed without that is not an answer from Opus.
+ */
+export const hasReturned = (task: SwarmTask | undefined): boolean => task !== undefined && task.tier === 'OPUS' && task.state === 'completed' && task.agentId !== null && task.endedAt !== null
 
 const taskOf = (swarm: Swarm, id: string): SwarmTask | undefined => swarm.tasks.find(t => t.id === id)
 

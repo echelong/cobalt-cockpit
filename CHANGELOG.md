@@ -7,10 +7,17 @@ The session router:
 - New `/cockpit router`: each session chooses `off` (the default in every new session), `nobodywho` (the local decision router, local provider only) or `jev` (the same router's TypeSafe JEV provider). The choice is session state and is never saved. One router is active at a time, and a switch discards what the previous one said.
 - A router recommends one of five routes for a new task: handle it directly, scout with Haiku, delegate to Sonnet, consider a higher effort, or consider an Opus consultation. It starts, admits and approves nothing. The rules go first: when they settle the route no router is asked, and a recommendation for Opus is refused unless a consultation ground already holds, in which case you are shown a notice instead.
 - Position-independent questions. The local classifier's first-option bias was traced to the router's seeded shuffle, which never reorders a two-option list, combined with early stopping. Cockpit now asks five fixed yes/no features, each in both orders, and discards a reading when fewer than four agree or more than three are affirmed.
-- JEV is external: the first 400 characters of a new task's prompt go to the TypeSafe API through your own decision router and key, which Cockpit never reads. A prompt with credential-shaped text is withheld. New option `routerConfigDir` (empty by default) names a router configuration you created for this mode; it reaches the router's child process in JEV mode only.
+- JEV is external: the first 400 characters of a new task's prompt go to the TypeSafe API through your own decision router and key, which Cockpit never reads. A prompt in which credential-shaped text is recognised is withheld (a broad pattern list, not a guarantee). New option `routerConfigDir` (empty by default) names a router configuration you created for this mode; it reaches the router's child process in JEV mode only.
 - Each decision is a bounded ledger record: provider, model, receipts, both latencies, the recommendation, and whether the rules accepted it. Router figures are never counted as model usage.
 - Removed before release: the `localAdvice` option and the router call at Opus admission. Admission is by the rules alone.
-- Measurements, limits and the live acceptance are in [docs/delivery-v0.5.0-router.md](docs/delivery-v0.5.0-router.md). Suite: 1049 → 1079.
+- Measurements, limits and the live acceptance are in [docs/delivery-v0.5.0-router.md](docs/delivery-v0.5.0-router.md).
+
+Found by independent review before release, and fixed:
+
+- A mandatory Opus review could be discharged without an answer from Opus: by planning again, by a verdict on a consultation that never ran, by a consultation on a different ground, or by adopting another agent into it. A new plan now inherits the review, a verdict is accepted only once the architect has run and finished, only a consultation on one of the review's own grounds advances it, and adoption is refused for Opus tasks.
+- The architecture ground no longer holds on the length of the main session's own plan, only on the files the host observed or the person's words.
+- The Glob and Grep pattern refusal added for scoped helpers no longer applies to a helper that owns everything, as in 0.4.0.
+- Suite: 1049 → 1098. What an upgrading user sees is in [docs/release-v0.5.0.md](docs/release-v0.5.0.md).
 
 Release hardening:
 
@@ -21,7 +28,7 @@ Release hardening:
 
 The Sonnet-led profile:
 
-- New `profile` option. `OPUS_LED` (the default) is 0.4.0's behaviour, unchanged. `SONNET_LED` means: Sonnet builds, Haiku scouts, Opus reviews. The main loop is requested on Sonnet 5.5 at the user's own effort, and Opus 5.5 runs only as an admitted, read-only `cobalt-cockpit:architect` consultation.
+- New `profile` option. `OPUS_LED` (the default) keeps 0.4.0's models and admission. `SONNET_LED` means: Sonnet builds, Haiku scouts, Opus reviews. The main loop is requested on Sonnet 5.5 at the user's own effort, and Opus 5.5 runs only as an admitted, read-only `cobalt-cockpit:architect` consultation.
 - Opus admission (`swarm action consult`): a ground that must hold on evidence (architecture, security, repeated failure, explicit request, release approval) and a bounded evidence packet. One Opus at a time; an unchanged problem is consulted once; one retry; three per task. Routes around it (an unassigned Opus or architect spawn, an OPUS assignment) are refused.
 - Mandatory consultations: an explicit request for Opus, a release approval, or a change to security-sensitive files holds the task below 100% until the consultation returns and the main session verifies its advice.
 - HUD and Ledger: role labels (MAIN, SCOUT, ENGINEER, ARCHITECT, LOCAL CONTROL), consultation records (ground, decision, verification, receipt), host-reported usage per tier, and the host's cost total. Nothing is estimated.

@@ -96,17 +96,17 @@ The automatic gain is small, and deliberately so. Most of what the routers add i
 
 **How JEV mode reaches it.** The router has no per-request way to enable JEV. It does read its configuration directory from `DECISION_ROUTER_CONFIG_DIR`. The operator creates one directory holding a copy of the router configuration with JEV enabled and names it in the new `routerConfigDir` option. Cockpit passes that variable to the router's child process, and only for requests made while the session's router is JEV. Cockpit never creates, reads or edits router configuration, and the key never enters the plugin's process. Without `routerConfigDir`, JEV mode runs under the router's own switch and reports `UNAVAILABLE (jev_disabled)` when that is off. The global switch stays off, so no other caller on the machine can reach JEV.
 
-**Measured.** 672 evaluation requests and 25 live ones through the approved configuration, all answered by `jev-1.13.0`, with no error and no timeout. A further 11 live requests without that configuration were refused by the router's own switch, as intended.
+**Measured.** 672 evaluation requests and 50 live ones (two rounds of 25) through the approved configuration, all answered by `jev-1.13.0`, with no error and no timeout. A further 22 live requests without that configuration were refused by the router's own switch, as intended.
 
 | | p50 | p95 | max |
 | --- | --- | --- | --- |
 | One request, as the router reports it (network included) | 246 ms | 297 ms | 536 ms |
 | One request, wall time of the CLI process | 325 ms | 379 ms | |
-| One reading (ten requests at once), by the session's clock, live | 418 to 510 ms | | |
+| One reading (ten requests at once), by the session's clock, live | 418 to 681 ms (four readings) | | |
 
 The 16 ms figure sometimes quoted for JEV was not observed: a request took about fifteen times that from this machine. Each request reported about 380 input tokens and 40 output tokens of JEV usage; a reading is ten.
 
-**Privacy boundary.** JEV is an external service. In JEV mode the request carries the first 400 characters of the prompt that starts a task and one fixed question. It carries no file content, no path Cockpit observed, no history and no credential, and a prompt containing credential-shaped text is not sent at all (recorded as a fallback with no receipt). The selection reply states this boundary each time JEV is chosen.
+**Privacy boundary.** JEV is an external service. In JEV mode the request carries the first 400 characters of the prompt that starts a task and one fixed question. It carries no file content, no path Cockpit observed and no history. A prompt in which credential-shaped text is recognised anywhere is not sent at all, and is recorded as a fallback with no receipt. The filter is a broad list of shapes (named values, URLs carrying a password, known token prefixes, `.env` lines, long unbroken runs, "the password is …"), not a guarantee. Outside a planned task every prompt is a task of its own, so in JEV mode each such prompt's first 400 characters are sent. The selection reply states this boundary each time JEV is chosen.
 
 ## Authority boundaries
 
@@ -121,7 +121,7 @@ A router's recommendation is judged by `adjudicate` against the rules. Accepting
 | Spawn agents | A scout or worker it suggests still passes `assign` and the Agent admission hook |
 | Override gates | It reads and writes no gate |
 
-It is asked once, at the start of a task the rules do not settle. It is not asked for a prompt inside a task in progress, a tool call, a helper, or an Opus admission.
+It is asked once per task, at its start, when the rules do not settle it. A plan in progress is one task, and prompts inside it are not asked about. Without a plan, each prompt of 16 characters or more is its own task and is asked about. It is never asked for a tool call, a helper, or an Opus admission.
 
 ## Evidence
 
@@ -133,30 +133,53 @@ Tested in every direction (OFF to NobodyWho, NobodyWho to JEV, JEV to OFF, OFF t
 
 ## Live acceptance (isolated)
 
-Claude Code 2.1.296, one Cockpit per session (the working tree, loaded inline, with the installed copy disabled for that process only), `cobaltStrict: true`, `profile: SONNET_LED`, Sonnet at medium. Router receipts are attributed by the session's working directory in the router's own ledger.
+Run on the final code, after the review fixes. Claude Code 2.1.296, one Cockpit per session (the working tree, loaded inline, with the installed copy disabled for that process only), `cobaltStrict: true`, `profile: SONNET_LED`, Sonnet at medium. Router receipts are attributed by the session's working directory in the router's own ledger.
 
 | Session | Observed |
 | --- | --- |
 | OFF, ordinary task | 0 router receipts; nothing router-related in the model's context; main `claude-sonnet-5-5` |
-| NobodyWho | 11 receipts, all `local` / `nobodywho` (Qwen3 4B); reading 1,145 ms; "scout" accepted and given to the model as one line |
-| JEV with `routerConfigDir` | 11 receipts, all `jev` / `jev-1.13.0`; reading 510 ms; "delegate" accepted |
+| NobodyWho | 11 receipts, all `local` / `nobodywho` (Qwen3 4B); reading 1,084 ms; "scout" accepted and given to the model as one line |
+| JEV with `routerConfigDir` (given as `~/…`) | 11 receipts, all `jev` / `jev-1.13.0`; reading 445 ms; "delegate" accepted |
 | JEV without `routerConfigDir` | 11 requests refused by the router's own switch (`jev_disabled`); `JEV · UNAVAILABLE`; fallback recorded; the task completed under deterministic policy |
 | All five switches | Label correct after each; only the four availability requests ran; none after OFF |
 | JEV and a mandatory consultation | Router not asked about the task; architect `claude-opus-5-5` at `high`, verified `pass`; main stayed on Sonnet |
 | JEV reads "security", no ground | Refused by the rules; operator notice shown; no Opus ran; nothing added to the model's context |
+| OFF, delegated work | Scout `claude-haiku-5-5` at low and worker `claude-sonnet-5-5` at low, both reports delivered; 0 router receipts |
 
 ## Overhead
 
 - **OFF:** none. No process, no request, no added text.
 - **Context:** no tool schema is added. One sentence of the system prompt changed (about 40 tokens net). An accepted recommendation adds one line of about 45 tokens to the prompt that starts the task.
-- **Time, per new task the rules do not settle:** about 1.1 s with NobodyWho (ten concurrent local requests; about 2.0 s if issued one after another), about 0.4 to 0.5 s with JEV. Selecting a provider costs one request (0.3 to 0.5 s; 1.85 s when the local model had to load).
+- **Time, per task the rules do not settle:** about 1.1 s with NobodyWho (ten concurrent local requests; about 2.0 s if issued one after another), about 0.4 to 0.5 s with JEV, and never more than the per-request timeout (5 s local, 3 s JEV). Outside a plan that is per prompt. Selecting a provider costs one request (0.3 to 0.5 s; 1.85 s when the local model had to load).
 - **JEV usage:** ten small requests per reading.
 
 ## Tests
 
-`tests/router.test.ts`: 36 tests. Pure: modes and parsing; the baseline routes; what a router is shown, including clipping, non-tasks and credential withholding; the ten requests; answer parsing; position-following, yes-to-everything, wrong-provider, no-receipt and failed readings; every adjudication rule; records, labels and the ledger section. Through the real host hooks with a scripted router: OFF asks nothing; each mode's argument array and environment; the configuration directory reaching JEV calls only; the router's own refusal; the rules settling a task without a request; a router unable to cause Opus, lift a hold or start a helper; unreliable providers discarded; a credential prompt withheld; all switches; a reading dropped after a switch; the main model and effort unmoved; no re-routing inside a task; the dialog; the pane; nothing stored.
+`tests/router.test.ts`: 48 tests. Pure: modes and parsing; the baseline routes; what a router is shown, including clipping, non-tasks and credential withholding; the ten requests; answer parsing; position-following, yes-to-everything, wrong-provider, no-receipt and failed readings; every adjudication rule; records, labels and the ledger section. Through the real host hooks with a scripted router: OFF asks nothing; each mode's argument array and environment; the configuration directory reaching JEV calls only; the router's own refusal; the rules settling a task without a request; a router unable to cause Opus, lift a hold or start a helper; unreliable providers discarded; a credential prompt withheld; all switches; a reading dropped after a switch; the main model and effort unmoved; no re-routing inside a task; the dialog; the pane; nothing stored.
 
-Six mutations each fail at least one test: the configuration directory given to non-JEV calls; the stale-reading check removed; Opus accepted without a ground; the rules-first short-circuit removed; the agreement floor at zero; the credential withhold removed.
+Nine mutations each fail at least one test: the configuration directory given to non-JEV calls; the stale-reading check removed; Opus accepted without a ground; the rules-first short-circuit removed; the agreement floor at zero; the credential withhold removed; a configuration directory inside the project accepted; a non-person command allowed to switch; the reset at session end removed.
+
+## Independent review
+
+Two independent Sonnet reviewers read the candidate before release: one the router commit, one the complete v0.5.0 change set against v0.4.0. Neither found an authority bypass or an injection path in the router: its arguments are fixed words and one JSON body, every field read from the router's output is whitelisted, the advisory line is fixed text, and nothing connects a recommendation to admission, the review hold, a model, an effort, ownership or a spawn.
+
+Findings on the router, all fixed:
+
+| Severity | Finding | Fix |
+| --- | --- | --- |
+| High | Outside a plan every prompt is a new task, so every prompt was asked about, while the documents said "never inside a task" | Behaviour kept (it is Cockpit's own definition of a task) and stated exactly in the README, PRIVACY.md and the selection reply; a test pins it |
+| High | The credential filter missed connection strings, several token prefixes, `SECRET_KEY=` style names and prose, while the documents said no credential is sent | Filter broadened to those shapes and tested on 26 of them; the documents now call it a pattern list, not a guarantee |
+| Medium | A withheld prompt marked the provider unavailable | A decision that sent nothing leaves the link state alone |
+| Medium | The router survived `/clear` | Reset at every session end |
+| Medium | README lines still said Cockpit never routes to NobodyWho and has no JEV integration; PRIVACY.md named v0.4.0 | Corrected |
+| Low | A reading could start just after a switch | The mode is checked again immediately before the requests start, and all ten start before the next await |
+| Low | No bound on a reading's delay beyond the per-request timeout | Timeouts cut to 5 s (local) and 3 s (JEV); the requests run together, so that is the bound |
+| Low | `routerConfigDir` accepted any directory; with `~` and no HOME the reply still claimed it was used | A directory inside the project, containing it, with a `..` segment or unresolvable is refused, and the reply says what was actually used |
+| Low | Any origin could run the command | Only a command the person typed switches the router |
+
+Findings on the rest of v0.5.0 that this release also fixes (details in the changelog): a mandatory Opus review could be discharged without an answer from Opus in four ways; the architecture ground could be raised by the main session's own plan length; and the Glob pattern refusal applied to helpers that own everything, which 0.4.0 allowed. Each has a test that fails when its fix is removed.
+
+Left as it is, and why: consult admission is check-then-act across awaits, so two simultaneous requests could both be admitted, but the spawn budget still allows one running Opus. A file literally named with a leading `~` now counts as a wildcard. Whether an edit made through a shell command to a security-sensitive file raises the security ground depends on the shell-diff reader, which this release does not change.
 
 ## Limits
 

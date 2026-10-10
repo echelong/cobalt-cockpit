@@ -546,6 +546,10 @@ export const applyAction = (task: Task, input: ProgressInput, now: number, sha: 
               ...newTask(task.id + 1, goal ?? task.lastPrompt, now, sha),
               lastPrompt: task.lastPrompt,
               hasInstructionFileRequest: task.hasInstructionFileRequest,
+              // A review the person or the files made necessary is not planned away:
+              // it follows the work into the next plan until Opus has answered it.
+              ...(task.review === undefined ? {} : { review: task.review }),
+              ...(task.promptGrounds === undefined ? {} : { promptGrounds: task.promptGrounds }),
             }
           : task
 
