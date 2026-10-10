@@ -28,6 +28,10 @@ export type World = {
   /** What `git status --porcelain=v2 --branch` prints; null: not a repository. */
   gitStatus: string | null
   players: Record<string, PlayerBehavior>
+  /** A program that answers with this stdout (exit 0), by name; checked before `players`. */
+  outputs: Record<string, (argv: readonly string[]) => string>
+  /** The tools the plugin registered, as it registered them. */
+  registered: Record<string, unknown>[]
   usage: { percent?: number; tokens?: number; window: number }
   files: Record<string, string>
   /** Commands that exit non-zero. */
@@ -97,6 +101,8 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
     blits: 0,
     gitStatus: CLEAN_REPO,
     players: { 'pw-play': 'ok' },
+    outputs: {},
+    registered: [],
     usage: { percent: 39, tokens: 78_000, window: 200_000 },
     files: {},
     failing: null,
@@ -200,7 +206,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
     return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage } as never
   })
   on('session.cwd', () => ({ value: '/work/example' }))
-  on('tool.register', ($, e) => ({ value: { tool: `mcp__${PLUGIN}__${e.name}` } }))
+  on('tool.register', ($, e) => { w.registered.push({ ...e }); return { value: { tool: `mcp__${PLUGIN}__${e.name}` } } })
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('ui.log', ($, e) => {
     if (e.to === 'transcript') w.transcript.push(e.text)
@@ -244,6 +250,8 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
 
       return e.argv.includes('rev-parse') ? ran(0, '/work/example\n') : ran(0, w.gitStatus)
     }
+    const output = w.outputs[program]
+    if (output !== undefined) return ran(0, output(e.argv))
     const behavior = w.players[program] ?? 'missing'
     if (behavior === 'missing') throw new Error(`spawn ${program} ENOENT`)
     if (behavior === 'hangs') throw new Error(`${program} was still running at the timeout`)

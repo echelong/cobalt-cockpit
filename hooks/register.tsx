@@ -14,7 +14,7 @@ import { textOf } from './ledger'
 import { atom, read, update } from 'claude-code'
 import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL, OPUS_MODEL, isProfile, DEFAULT_PROFILE } from './model-policy'
 import type { SubagentTier, Profile } from './model-policy'
-import { addConsult, adviceOf, adviceRequest, advanceReview, briefOf, consultVerdict, factsOf, isGround, mandatoryGrounds, packetOf, promptGroundsOf, requireReview, GROUNDS } from './consult'
+import { addConsult, adviceOf, adviceRequest, advanceReview, briefOf, consultVerdict, factsOf, isGround, mandatoryGrounds, orderChecked, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
 import type { Consultation, LocalAdvice } from './consult'
 import {
   DEFAULT_CEILING,
@@ -52,7 +52,7 @@ import {
   namesInstructionFile,
 } from './hygiene'
 import type { Attribution } from './hygiene'
-import { applyAction, newTask, noteFailure, oneLine, setGate, settle, summaryOf, touchFile } from './model'
+import { applyAction, newTask, noteFailure, oneLine, progressNudge, setGate, settle, summaryOf, touchFile } from './model'
 import type { Cue, ProgressInput } from './model'
 import { basename, parseShell, unwrap } from './shell'
 import { COLORS, fit, heading, hudRows, paneRows, visualStateOf } from './view'
@@ -200,7 +200,8 @@ const SWARM_TOOL = {
 } as const
 // Canonicalize both assignment and use. Unknown aliases conservatively lock all.
 const canonicalResource = async ($: EngineInterface, path: string): Promise<string> => {
-  if (!path || /[*?\[\]{}]/.test(path)) return '*'
+  // `~` is the engine's to expand, not a directory under cwd: it is unknown, so everything.
+  if (!path || /[*?\[\]{}]/.test(path) || path.startsWith('~')) return '*'
   try {
     const r = await $.process.run(['realpath','-m','--', path.startsWith('/') ? path : `${cwd}/${path}`], { timeoutMs: 2000 })
     return r.exitCode === 0 && !r.isStdoutTruncated ? normalizeOwned(r.stdout.trim()) : '*'
@@ -242,25 +243,47 @@ const serveConsult = async ($: EngineInterface, e: Record<string, unknown>, at: 
     await quiet(() => mutateLedger($, l => warn(l, `${verdict.reason.split('.')[0]} (${ground})`)))
     throw new Error(verdict.reason)
   }
+  // The architect reads the files the packet names (line references dropped),
+  // inside the project only; a packet that names none reads the project, never `*`.
+  const root = await canonicalResource($, cwd || '.')
+  if (root === '*') throw new Error('OPUS / the project root could not be resolved, so no read scope can be given; nothing was admitted')
   let advice: LocalAdvice | null = null
   let adviceNote: string | null = null
+  // Admission is already decided above, by the rules. Advice is sought only
+  // when it could say something (not for a mandatory consultation), and kept
+  // only when it survives the choices being swapped.
   if (!config.hasLocalAdvice) adviceNote = 'local advice off'
+  else if (verdict.isMandatory) adviceNote = 'mandatory: no advice sought'
   else {
     try {
-      const r = await $.process.run(['decision', 'ask', '--caller', 'cockpit', '--json', adviceRequest(ground, made.packet, facts)], { timeoutMs: 20_000 })
-      advice = r.exitCode === 0 ? adviceOf(r.stdout) : null
-      if (advice === null) adviceNote = r.exitCode === 0 ? 'no receipt in router output' : `router exited ${r.exitCode}`
-    } catch { adviceNote = 'router unavailable' }
+      const ask = async (swapped: boolean) => {
+        const r = await $.process.run(['decision', 'ask', '--caller', 'cockpit', '--json', adviceRequest(ground, made.packet, facts, swapped)], { timeoutMs: 20_000 })
+        if (r.exitCode !== 0) throw new Error(`router exited ${r.exitCode}`)
+        return adviceOf(r.stdout)
+      }
+      const checked = orderChecked(await ask(false), await ask(true))
+      if ('advice' in checked) advice = checked.advice
+      else adviceNote = checked.note
+    } catch (error) { adviceNote = error instanceof Error && error.message.startsWith('router exited') ? error.message : 'router unavailable' }
   }
-  const id = `opus-${consults.length + 1}-${verdict.key.slice(0, 6)}`
-  const owned = await Promise.all(made.packet.files.map(p => canonicalResource($, p)))
-  await changeSwarm($, held => submitTask(held, { id, tier: 'OPUS', role: ground === 'release' || ground === 'security' ? 'REVIEW' : 'ARCHITECT', objective: made.packet.decision, scope: `Opus consultation · ${ground}`, owned: owned.length ? owned : ['*'], mode: 'read', parentTask: null, spawnReason: `Opus admitted on ${ground}${verdict.isMandatory ? ' (mandatory)' : ''}` }, at).swarm)
+  const named = await Promise.all(readScopeOf(made.packet).map(p => canonicalResource($, p)))
+  const owned = named.filter(p => p !== '*' && (p === root || p.startsWith(`${root}/`)))
+  const outside = named.length - owned.length
+  // The router and the path lookups take time: another consultation may have been
+  // admitted meanwhile, so the bounds are checked again on the ledger as it is now.
+  const fresh = await read($, ledgerAtom)
+  const again = consultVerdict({ profile: config.hasOrchestration ? config.profile : 'OPUS_LED', ground, packet: made.packet, facts, consults: fresh.consults ?? [], swarm: swarmState(fresh), progressTask: task?.id ?? null })
+  if (!again.ok) throw new Error(again.reason)
+  const id = `opus-${(fresh.consults ?? []).length + 1}-${verdict.key.slice(0, 6)}`
+  await changeSwarm($, held => submitTask(held, { id, tier: 'OPUS', role: ground === 'release' || ground === 'security' ? 'REVIEW' : 'ARCHITECT', objective: made.packet.decision, scope: `Opus consultation · ${ground}`, owned: owned.length ? owned : [root], mode: 'read', parentTask: null, effort: CONSULT_EFFORT, effortReason: `Opus consultation: ${CONSULT_EFFORT} by default`, spawnReason: `Opus admitted on ${ground}${verdict.isMandatory ? ' (mandatory)' : ''}` }, at).swarm)
   const c: Consultation = { id, ground, key: verdict.key, packet: made.packet, progressTask: task?.id ?? null, isMandatory: verdict.isMandatory, requestedAt: at, advice, adviceNote }
   await mutateLedger($, l => ({ ...l, consults: addConsult(l.consults ?? [], c) }))
   if (task !== null) await change($, t => t.id !== task.id ? t : { ...t, review: advanceReview(verdict.isMandatory ? requireReview(t, [ground]).review : t.review, id, 'admitted') })
-  const local = advice === null ? `NobodyWho: no advice (${adviceNote}).` : `NobodyWho advised ${advice.abstain ? 'abstain' : advice.choice ?? 'nothing'} (receipt ${advice.requestId.slice(0, 12)}, tier ${advice.tier ?? '?'}); advisory only.`
+  const local = advice === null ? `NobodyWho: no advice (${adviceNote}).` : `NobodyWho, order-checked: ${advice.choice} (receipts ${advice.requestId.slice(0, 12)}, ${advice.checkRequestId?.slice(0, 12) ?? '?'}); advisory only, admission was decided by the rules.`
 
-  return `OPUS ADMITTED / ${id} · ${ground}${verdict.isMandatory ? ' · mandatory for this task' : ''}. ${local}\nSpawn Agent with subagent_type "cobalt-cockpit:architect", description "[task:${id}] Opus ${ground} consultation", and exactly this brief as the prompt:\n\n${briefOf(c)}\n\nIts answer is advice until you verify it. Then record swarm action "verify" for ${id}: pass when the advice checks out, fail when it does not, with evidence either way.`
+  const scope = `Read scope: ${owned.length ? `${owned.length} named file${owned.length === 1 ? '' : 's'}` : 'the project'}${outside ? `; ${outside} location${outside === 1 ? '' : 's'} not readable (outside the project, home-relative or not a plain path)` : ''}.`
+
+  return `OPUS ADMITTED / ${id} · ${ground}${verdict.isMandatory ? ' · mandatory for this task' : ''}. ${local} ${scope}\nSpawn Agent with subagent_type "cobalt-cockpit:architect", description "[task:${id}] Opus ${ground} consultation", and exactly this brief as the prompt:\n\n${briefOf(c)}\n\nIts answer is advice until you verify it. Then record swarm action "verify" for ${id}: pass when the advice checks out, fail when it does not, with evidence either way.`
 }
 const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promise<{ result: string; isError?: boolean }> => {
   try {
@@ -414,7 +437,11 @@ const guardSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
   const readTool = ['Read','Grep','Glob','WebFetch','WebSearch'].includes(tool) || (tool === 'Bash' && readOnlyShell(String(e['command'] ?? '')))
   if (task && task.mode === 'read' && !readTool) return 'SWARM / read-only tasks may use inspection tools only; shell/custom effects require commander investigation'
   if (task && ['Read','Grep','Glob'].includes(tool)) {
-    const path = String(e['file_path'] ?? e['path'] ?? '*')
+    // Grep and Glob without a path search the working directory: that is the claim checked, not everything.
+    const path = String(e['file_path'] ?? e['path'] ?? (tool !== 'Read' && cwd ? cwd : '*'))
+    // A pattern reaches only below that path: one that is absolute, home-relative or climbs out is refused.
+    const pattern = tool === 'Glob' ? e['pattern'] : tool === 'Grep' ? e['glob'] : undefined
+    if (typeof pattern === 'string' && /^[\/~]|(?:^|[\/\\{,])\.\.(?:[\/\\},]|$)/.test(pattern.trim())) return 'SWARM / read outside owned resources'
     if (!ownershipAllows(s,task.id,await canonicalResource($,path),'read')) return 'SWARM / read outside owned resources'
   }
   if (task && tool === 'Bash' && !task.owned.includes('*')) return 'SWARM / shell inspection requires declared wildcard read scope'
@@ -438,7 +465,7 @@ const PROGRESS_TOOL = {
     'Reports real task progress to the Cobalt Cockpit HUD the user watches. ' +
     'action "plan": define the milestones of a substantial task before editing (3-7, in order, each with a phase; kind "coding" or "readonly"; replan true only to refine the current plan). ' +
     '"start" / "complete" / "fail" / "block" / "unblock": move one milestone (by id such as m2, or title); give "note" for fail and block. ' +
-    '"gate": report a verification gate (CODE, TEST, TYPE, BUILD, SECURITY, GIT) as pass, fail, na or pending with one line of "evidence". ' +
+    '"gate": report a verification gate (CODE, TEST, TYPE, BUILD, SECURITY, GIT) as pass, fail, na or pending with one line of "evidence"; or several at once in "gates". ' +
     '"status": read the current state. ' +
     'Progress is completed milestones over all milestones; 100% needs every milestone complete and every required gate pass or na. Never complete a milestone that is not finished.',
   inputSchema: {
@@ -464,6 +491,7 @@ const PROGRESS_TOOL = {
       gate: { type: 'string', enum: ['CODE', 'TEST', 'TYPE', 'BUILD', 'SECURITY', 'GIT'] },
       state: { type: 'string', enum: ['pass', 'fail', 'na', 'pending'] },
       evidence: { type: 'string', description: 'gate: the command run and its outcome, or why the gate does not apply' },
+      gates: { type: 'array', description: 'gate: several gates in one call; all are recorded or none', items: { type: 'object', properties: { gate: { type: 'string', enum: ['CODE', 'TEST', 'TYPE', 'BUILD', 'SECURITY', 'GIT'] }, state: { type: 'string', enum: ['pass', 'fail', 'na', 'pending'] }, evidence: { type: 'string' } }, required: ['gate', 'state'] } },
       note: { type: 'string', description: 'why a milestone failed or is blocked, or a remark on its completion' },
     },
     required: ['action'],
@@ -478,7 +506,7 @@ For a substantial coding task (more than a trivial edit):
 1. Inspect before editing, then call ${TOOL} with action "plan": 3-7 milestones in order, each with a phase (typically Inspect, Implement, Test, Fix, Verify).
 2. Call "start" as you begin a milestone and "complete" only when it is really finished. Use "fail" or "block" with a note when it is not. Never complete a milestone to move the bar.
 3. After implementing, run the relevant tests and checks, fix what fails, and verify the final state of the repository.
-4. Report each verification gate with action "gate" (CODE, TEST, TYPE, BUILD, SECURITY, GIT): pass or fail with the command and its outcome as evidence, or na with the reason it does not apply. Test, type-check, build, lint and audit commands run through Bash are recorded automatically from their exit status; when that status is masked (output piped to another command, a background run) report the result yourself.
+4. Report each verification gate with action "gate" (CODE, TEST, TYPE, BUILD, SECURITY, GIT; several in one call with "gates"): pass or fail with the command and its outcome as evidence, or na with the reason it does not apply. Test, type-check, build, lint and audit commands run through Bash are recorded automatically from their exit status; when that status is masked (output piped to another command, a background run) report the result yourself.
 5. The task reads 100% and DONE only when every milestone is complete and every required gate is pass or na. If something cannot be verified, leave it UNVERIFIED and tell the user exactly what was not verified. If you are stuck, use "block" and state the blocker plainly. The end of a turn is not the end of the task.
 
 For questions, explanations and other read-only work, skip the tool (or plan with kind "readonly") and do not run tests the work does not call for.`
@@ -598,7 +626,7 @@ const capabilityOf = (model: string, known: Readonly<Record<string, readonly Eff
 
 // Set by register(); the rest is rebuilt as events arrive after a reload.
 // Nothing a drawing depends on lives here: that is all in `$.state`.
-let config: Config = { hasHud: true, isAnimated: true, hasSounds: true, hasGuard: true, hasAttributionGuard: true, volume: 0.6, hasLocalControl: true, ledgerPath: '', blocksFable: false, isStrict: false, hasOrchestration: false, maxSubagents: 16, maxSonnet: 'AUTO', maxHaiku: 'AUTO', isSubscriptionOnly: false, reasoningMode: 'AUTO', maxEffort: DEFAULT_CEILING, modelEffort: {}, profile: DEFAULT_PROFILE, hasLocalAdvice: true }
+let config: Config = { hasHud: true, isAnimated: true, hasSounds: true, hasGuard: true, hasAttributionGuard: true, volume: 0.6, hasLocalControl: true, ledgerPath: '', blocksFable: false, isStrict: false, hasOrchestration: false, maxSubagents: 16, maxSonnet: 'AUTO', maxHaiku: 'AUTO', isSubscriptionOnly: false, reasoningMode: 'AUTO', maxEffort: DEFAULT_CEILING, modelEffort: {}, profile: DEFAULT_PROFILE, hasLocalAdvice: false }
 let isSupported = true
 /** True once the engine is known to take `effort` on an Agent call. */
 let hasNativeEffort = false
@@ -1650,7 +1678,7 @@ export const register: Register = (on, options) => {
     maxEffort: isEffortLevel(options['maxEffort']) ? options['maxEffort'] : DEFAULT_CEILING,
     modelEffort: parseModelEffort(options['modelEffort']),
     profile,
-    hasLocalAdvice: options['localAdvice'] !== false,
+    hasLocalAdvice: options['localAdvice'] === true,
   }
 
   registerLedger(on)
@@ -1666,6 +1694,9 @@ export const register: Register = (on, options) => {
     })
     if (!isSupported) return next(e)
 
+    // Left to the host's deferral. Listing it in the prompt (isDeferred: false)
+    // was measured in v0.5.0: 768 more prompt tokens on every request and no more
+    // progress reporting. What moved reporting is the one observed reminder below.
     await quiet(() => $.tool.register(PROGRESS_TOOL))
     await quiet(() => $.tool.register(SWARM_TOOL))
     await quiet(() =>
@@ -1938,6 +1969,13 @@ export const register: Register = (on, options) => {
       const finished = await $.clock.now()
       const failed = String((ran as { decision?: string } | undefined)?.decision ?? '') === 'deny'
       await quiet(() => update($, eventsAtom, log => closeOf(log, e.tool_use_id as string, failed, finished)))
+    }
+    // A task that is plainly under way with no plan is reminded once, beside the
+    // edit that showed it (the host's own observation, not the model's word).
+    if (e.agentId === undefined && ['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(e.tool) && 'result' in ran && ran.isError === undefined && ran.deny === undefined) {
+      let note: string | null = null
+      await quiet(() => update($, taskAtom, t => { const nudged = t === null ? null : progressNudge(t, TOOL); if (nudged === null) return t; note = nudged.note; return nudged.task }))
+      if (note !== null) return { ...ran, context: [...(ran.context ?? []), note] }
     }
     // A failure that has repeated is said once, beside the result it repeated
     // on. Every other call returns exactly what the engine answered.

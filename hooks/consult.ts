@@ -116,6 +116,21 @@ const clip = (text: unknown, max: number): string => {
 }
 const clipList = (items: unknown): string[] => (Array.isArray(items) ? items : []).map(i => clip(i, ITEM_MAX)).filter(Boolean).slice(0, LIST_MAX)
 
+/**
+ * The file a packet location names. A location is evidence for the brief and
+ * may carry a line reference (`src/a.ts:8`, `src/a.ts:8-12`, `src/a.ts:8:3`,
+ * `src/a.ts#L8-L12`); the architect's read scope is the file itself, so the
+ * reference is dropped here and kept, verbatim, in the brief.
+ */
+export const locationPath = (location: string): string =>
+  location.trim().replace(/#L\d+(?:-L?\d+)?$/, '').replace(/:\d+(?:[-:]\d+){0,2}$/, '')
+
+/** Where a consultation may read: each named file once, in order. */
+export const readScopeOf = (p: EvidencePacket): string[] => [...new Set(p.files.map(locationPath).filter(Boolean))]
+
+/** An admitted consultation asks for this level unless the operator's ceiling or the engine holds it lower. */
+export const CONSULT_EFFORT = 'high' as const
+
 /** A packet held to its bounds, or the first thing missing from it. */
 export const packetOf = (ground: ConsultGround, raw: Partial<Record<keyof EvidencePacket, unknown>>): { packet: EvidencePacket } | { error: string } => {
   const packet: EvidencePacket = {
@@ -244,13 +259,38 @@ export const briefOf = (c: Consultation): string => {
   ].join('\n')
 }
 
-/** The local router question for a consultation. The packet stays local: the router is on this machine. */
-export const adviceRequest = (ground: ConsultGround, p: EvidencePacket, facts: ConsultFacts): string => JSON.stringify({
+const ADVICE_CHOICES = { consult_opus: 'Consult Opus once with the evidence packet', sonnet_continues: 'Sonnet continues and verifies alone' } as const
+
+/**
+ * The local router question for a consultation. The packet stays local: the
+ * router is on this machine. `swapped` lists the choices in the other order:
+ * the local classifier measurably favours a position (see
+ * docs/delivery-v0.5.0-hardening.md), so a question is asked both ways.
+ */
+export const adviceRequest = (ground: ConsultGround, p: EvidencePacket, facts: ConsultFacts, swapped = false): string => JSON.stringify({
   state: clip(`ground=${ground}; files=${facts.files.length}; milestones=${facts.milestones}; failure_streak=${facts.errorStreak}; objective=${p.objective}; risk=${p.risk}`, 600),
   question: 'Does this problem genuinely need an Opus architect or reviewer, or can the Sonnet main session complete it alone?',
-  choices: { consult_opus: 'Consult Opus once with the evidence packet', sonnet_continues: 'Sonnet continues and verifies alone' },
+  choices: swapped ? { sonnet_continues: ADVICE_CHOICES.sonnet_continues, consult_opus: ADVICE_CHOICES.consult_opus } : ADVICE_CHOICES,
   allow_abstain: true,
 })
+
+/**
+ * Advice that survives having its choices swapped, or why it does not. Both
+ * answers need a receipt and must name the same offered choice; an abstention,
+ * a choice not offered or a change of mind under reordering is position, not
+ * judgement, and is discarded with its receipts named.
+ */
+export const orderChecked = (first: LocalAdvice | null, swapped: LocalAdvice | null): { advice: LocalAdvice } | { note: string } => {
+  if (first === null || swapped === null) return { note: first === null && swapped === null ? 'no receipt in router output' : 'one of the two order-checked answers had no receipt' }
+  const receipts = `receipts ${first.requestId.slice(0, 12)}, ${swapped.requestId.slice(0, 12)}`
+  if (first.requestId === swapped.requestId) return { note: `one receipt for both orders (${receipts}); not order-checked` }
+  if (first.abstain || swapped.abstain) return { note: `abstained (${receipts})` }
+  const offered = (c: string | null) => c !== null && Object.hasOwn(ADVICE_CHOICES, c)
+  if (!offered(first.choice) || !offered(swapped.choice)) return { note: `answered outside the offered choices (${receipts})` }
+  if (first.choice !== swapped.choice) return { note: `order-sensitive: ${first.choice} first, ${swapped.choice} with the choices swapped (${receipts}); discarded` }
+
+  return { advice: { ...first, checkRequestId: swapped.requestId } }
+}
 
 /** NobodyWho's advice from `decision ask` output, only when it carries a real receipt id. */
 export const adviceOf = (stdout: string): LocalAdvice | null => {

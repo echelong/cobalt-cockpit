@@ -4,7 +4,7 @@
 // what was refused, and what the task model let finish.
 
 import { describe, expect, test } from 'claude-code/testing'
-import { adviceOf, consultVerdict, groundsAvailable, mandatoryGrounds, packetOf, problemKey, promptGroundsOf, requireReview, statusOf, FAILURE_STREAK, MAX_PER_TASK } from '../hooks/consult'
+import { adviceOf, adviceRequest, consultVerdict, groundsAvailable, locationPath, mandatoryGrounds, orderChecked, packetOf, problemKey, promptGroundsOf, readScopeOf, requireReview, statusOf, CONSULT_EFFORT, FAILURE_STREAK, MAX_PER_TASK } from '../hooks/consult'
 import type { ConsultFacts } from '../hooks/consult'
 import { desiredRequest, mainModel, policyMismatch, OPUS_MODEL } from '../hooks/model-policy'
 import { applyAction, newTask, percentOf, settle } from '../hooks/model'
@@ -87,6 +87,13 @@ describe('evidence packet', () => {
     expect('packet' in made && made.packet.objective.length).toBe(1200)
     expect('packet' in made && made.packet.files.length).toBe(12)
   })
+  test('a location names its file: line references are dropped for the read scope, kept in the packet', () => {
+    for (const [loc, path] of [['src/stats.js:8-12', 'src/stats.js'], ['src/stats.js:8', 'src/stats.js'], ['src/stats.js:8:3', 'src/stats.js'], ['src/a.ts#L8-L12', 'src/a.ts'], ['src/a.ts#L8', 'src/a.ts'], ['src/a.ts:8-12:3', 'src/a.ts'], [' /abs/b.ts:1-2 ', '/abs/b.ts'], ['src/dir', 'src/dir'], ['src/v1:2/x.ts', 'src/v1:2/x.ts']] as const) expect(locationPath(loc)).toBe(path)
+    const p = packet({ files: ['src/stats.js:8-12', 'src/stats.js:40', 'src/util.ts#L3-L9'] })
+    expect(readScopeOf(p)).toEqual(['src/stats.js', 'src/util.ts'])
+    expect(p.files).toContain('src/stats.js:8-12')
+    expect(CONSULT_EFFORT).toBe('high')
+  })
   test('the key ignores spacing and order but not new evidence', () => {
     expect(problemKey('architecture', packet())).toBe(problemKey('architecture', packet({ objective: '  choose   the CACHE layer ', alternatives: ['SQLite', 'LRU in memory'] })))
     expect(problemKey('architecture', packet())).not.toBe(problemKey('architecture', packet({ failures: ['new failure'] })))
@@ -139,6 +146,24 @@ describe('consultation admission', () => {
     expect(adviceOf(JSON.stringify({ decision: { choice: 'consult_opus' } }))).toBeNull()
     expect(adviceOf('not json')).toBeNull()
     expect(adviceOf(JSON.stringify({ request_id: 'abcdef123456', decision: { abstain: true, choice: 'x' } }))?.choice).toBeNull()
+  })
+  test('the router is asked both ways round; only advice that survives the swap is kept', () => {
+    const p = packet()
+    const asked = JSON.parse(adviceRequest('architecture', p, facts()))
+    const swapped = JSON.parse(adviceRequest('architecture', p, facts(), true))
+    expect(Object.keys(asked.choices)).toEqual(['consult_opus', 'sonnet_continues'])
+    expect(Object.keys(swapped.choices)).toEqual(['sonnet_continues', 'consult_opus'])
+    expect({ ...swapped, choices: null }).toEqual({ ...asked, choices: null })
+    const a = (requestId: string, choice: string | null, abstain = false) => ({ requestId, choice, abstain, tier: null, latencyMs: 300, provider: 'nobodywho' })
+    // a position-following classifier: the first option both times
+    expect(orderChecked(a('aaaaaaaa1', 'consult_opus'), a('bbbbbbbb2', 'sonnet_continues'))).toEqual({ note: 'order-sensitive: consult_opus first, sonnet_continues with the choices swapped (receipts aaaaaaaa1, bbbbbbbb2); discarded' })
+    expect(orderChecked(a('aaaaaaaa1', 'sonnet_continues'), a('bbbbbbbb2', 'sonnet_continues'))).toEqual({ advice: { ...a('aaaaaaaa1', 'sonnet_continues'), checkRequestId: 'bbbbbbbb2' } })
+    expect(orderChecked(a('aaaaaaaa1', null, true), a('bbbbbbbb2', 'consult_opus'))).toEqual({ note: 'abstained (receipts aaaaaaaa1, bbbbbbbb2)' })
+    expect(orderChecked(a('aaaaaaaa1', 'option_a'), a('bbbbbbbb2', 'option_a'))).toEqual({ note: 'answered outside the offered choices (receipts aaaaaaaa1, bbbbbbbb2)' })
+    expect(orderChecked(null, a('bbbbbbbb2', 'consult_opus'))).toEqual({ note: 'one of the two order-checked answers had no receipt' })
+    expect(orderChecked(null, null)).toEqual({ note: 'no receipt in router output' })
+    // one receipt for both orders is a cached answer, not a second judgement
+    expect(orderChecked(a('aaaaaaaa1', 'consult_opus'), a('aaaaaaaa1', 'consult_opus'))).toEqual({ note: 'one receipt for both orders (receipts aaaaaaaa1, aaaaaaaa1); not order-checked' })
   })
 })
 
@@ -222,6 +247,19 @@ const spawn = ($: Engine, description: string, subagentType = 'cobalt-cockpit:ar
 const finish = ($: Engine, agentId: string) => $.turn.complete({ agentId, turnId: `turn-${agentId}`, reason: 'answer', answer: 'DECISION: ship', durationMs: 20, isAborted: false } as never)
 const ledger = (held: ReturnType<typeof hostState>) => held.get('run-ledger')!.value as Ledger
 const task = (held: ReturnType<typeof hostState>) => held.get('task')!.value as Task
+const ADVICE = { options: { orchestration: true, profile: 'SONNET_LED', localAdvice: true } }
+const archPacket = { action: 'consult', ground: 'architecture', objective: 'Choose the cache layer', architecture: 'Single process; JSON store', locations: ['src/cache.ts:10-40', 'src/store.ts'], alternatives: ['LRU in memory', 'SQLite'], risk: 'Stale reads under concurrency', question: 'Which cache design?' }
+/** A local router that answers `choices` in turn, each with a receipt; or, `positional`, whatever is listed first. */
+const router = (w: ReturnType<typeof world>, choices: string[], positional = false) => {
+  const asked: { choices: Record<string, string> }[] = []
+  w.outputs['decision'] = argv => {
+    const body = JSON.parse(String(argv.at(-1)))
+    asked.push(body)
+    const choice = positional ? Object.keys(body.choices)[0] : choices[asked.length - 1]
+    return JSON.stringify({ request_id: `rcpt${asked.length}`.padEnd(16, 'f'), mode: 'local-first', follow: choice, decision: { provider: 'nobodywho', choice, abstain: false, latency_ms: 300 } })
+  }
+  return asked
+}
 const releasePacket = { action: 'consult', ground: 'release', objective: 'Release v0.5.0', architecture: 'Plugin hooks', locations: ['hooks/consult.ts'], risk: 'Broken admission in production', question: 'Approve the release?' }
 
 describe('SONNET_LED through the host', () => {
@@ -270,8 +308,9 @@ describe('SONNET_LED through the host', () => {
 
     const reply = String((await call($, releasePacket)).result)
     expect(reply).toContain('OPUS ADMITTED')
-    expect(reply).toContain('NobodyWho: no advice (router unavailable)')
-    expect(w.runs.some(argv => argv[0] === 'decision' && argv.includes('cockpit'))).toBe(true)
+    // local advice is off by default: the rules decide and no router is asked
+    expect(reply).toContain('NobodyWho: no advice (local advice off)')
+    expect(w.runs.some(argv => argv[0] === 'decision')).toBe(false)
     const id = ledger(held).consults![0]!.id
     expect(task(held).review?.state).toBe('admitted')
     expect(String((await call($, releasePacket)).result)).toContain('OCCUPIED')
@@ -297,11 +336,39 @@ describe('SONNET_LED through the host', () => {
     await $.tool.call({ tool: 'Edit', file_path: '/work/example/hooks/guard.ts', old_string: 'a', new_string: 'b', tool_use_id: 'e1' } as never)
     expect(task(held).review?.grounds).toContain('security')
   })
-  test('a router that answers without a receipt is not reported as a decision', LED, async ($, on) => {
+  test('a router that answers without a receipt is not reported as a decision', ADVICE, async ($, on) => {
     const w = world(on); const held = hostState(on, {}); w.players['decision'] = 'ok'; await start($)
-    await prompt($, 'Please approve the release')
-    expect(String((await call($, releasePacket)).result)).toContain('no receipt in router output')
+    await prompt($, 'Redesign the cache architecture across the modules')
+    expect(String((await call($, archPacket)).result)).toContain('no receipt in router output')
     expect(ledger(held).consults![0]!.advice).toBeNull()
+  })
+  test('a position-following router is discarded with both receipts; the rules still admit', ADVICE, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); const asked = router(w, [], true); await start($)
+    await prompt($, 'Redesign the cache architecture across the modules')
+    const reply = String((await call($, archPacket)).result)
+    expect(reply).toContain('OPUS ADMITTED')
+    expect(reply).toContain('order-sensitive: consult_opus first, sonnet_continues with the choices swapped (receipts rcpt1fffffff, rcpt2fffffff); discarded')
+    expect(asked.map(a => Object.keys(a.choices)[0])).toEqual(['consult_opus', 'sonnet_continues'])
+    expect(ledger(held).consults![0]!.advice).toBeNull()
+    expect(w.runs.filter(argv => argv[0] === 'decision').every(argv => !argv.includes('--mode'))).toBe(true)
+  })
+  test('advice that survives the swap is shown as advisory, and cannot refuse an admitted consultation', ADVICE, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); router(w, ['sonnet_continues', 'sonnet_continues']); await start($)
+    await prompt($, 'Redesign the cache architecture across the modules')
+    const reply = String((await call($, archPacket)).result)
+    expect(reply).toContain('OPUS ADMITTED')
+    expect(reply).toContain('NobodyWho, order-checked: sonnet_continues (receipts rcpt1fffffff, rcpt2fffffff); advisory only, admission was decided by the rules.')
+    expect(ledger(held).consults![0]!.advice).toMatchObject({ choice: 'sonnet_continues', requestId: 'rcpt1fffffffffff', checkRequestId: 'rcpt2fffffffffff' })
+  })
+  test('advice can never admit what the rules refuse, and is not sought for a mandatory consultation', ADVICE, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); const asked = router(w, ['consult_opus', 'consult_opus']); await start($)
+    await prompt($, 'Fix the typo in the README')
+    expect(String((await call($, { ...archPacket, objective: 'typo' })).result)).toContain('NOT ADMITTED')
+    expect(asked).toHaveLength(0)
+    expect(ledger(held).consults ?? []).toHaveLength(0)
+    await prompt($, 'Please approve the release of v0.5.0')
+    expect(String((await call($, releasePacket)).result)).toContain('NobodyWho: no advice (mandatory: no advice sought)')
+    expect(asked).toHaveLength(0)
   })
   // The profile picks the main model; strict mode adds safety, not a model.
   // [options, the session's model, the model the main request reaches the engine on]
@@ -350,5 +417,120 @@ describe('SONNET_LED through the host', () => {
     for (const id of ['a', 'b', 'c', 'd', 'e']) results.push(await spawn($, `[task:${id}] work`, id < 'c' ? 'cobalt-cockpit:worker' : 'cobalt-cockpit:scout'))
     expect(results.filter(r => r.agentId)).toHaveLength(4)
     expect(results.at(-1)?.deny).toBeDefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The architect's read scope and effort, through the host. The Agent call goes
+// first (where the native level is set), then its spawn, then the architect's
+// own tool calls, as the engine runs them.
+// ---------------------------------------------------------------------------
+
+const NATIVE = { version: '2.1.294' }
+const architect = async ($: Engine, w: ReturnType<typeof world>, id: string) => {
+  const tool_use_id = `arch-${++seq}`
+  const description = `[task:${id}] Opus consultation`
+  await $.tool.call({ tool: 'Agent', tool_use_id, description, prompt: 'brief', subagent_type: 'cobalt-cockpit:architect' } as never)
+  const sent = w.ran.find(c => c['tool_use_id'] === tool_use_id)!
+  const spawned = await $.agent.spawn({ prompt: 'brief', description, subagentType: 'cobalt-cockpit:architect', tool_use_id, parentModel: SONNET, provider: { plugin: 'cobalt-cockpit', tier: 'user' }, background: true, fork: false } as never)
+  return { sent, agentId: spawned.agentId! }
+}
+const asks = { action: 'consult', ground: 'asked', objective: 'Correct the mean', architecture: 'Pure stats helpers', risk: 'Wrong averages in reports', question: 'Is the mean wrong, and how should it be fixed?' }
+const as = ($: Engine, agentId: string, tool: string, input: Record<string, unknown>) => $.tool.call({ tool, agentId, tool_use_id: `u-${++seq}`, ...input } as never)
+
+describe('the architect reads its evidence and runs at High', () => {
+  test('line-numbered locations across files are readable; everything else is refused; the handback is delivered', { ...LED, options: { ...LED.options } }, async ($, on) => {
+    const w = world(on, NATIVE); const held = hostState(on, {}); await start($)
+    await prompt($, 'Ask Opus to review the stats mean')
+    const reply = String((await call($, { ...asks, locations: ['src/stats.js:8-12', 'src/stats.js:40', 'lib/util.ts#L3-L9', '/etc/passwd:1'] })).result)
+    expect(reply).toContain('OPUS ADMITTED')
+    expect(reply).toContain('Read scope: 2 named files; 1 location not readable (outside the project, home-relative or not a plain path)')
+    expect(reply).toContain('src/stats.js:8-12')
+    const c = ledger(held).consults![0]!
+    const t = ledger(held).swarm!.tasks.find(x => x.id === c.id)!
+    expect(t.owned).toEqual(['/work/example/lib/util.ts', '/work/example/src/stats.js'])
+    expect(t).toMatchObject({ mode: 'read', tier: 'OPUS', requestedEffort: 'high' })
+
+    const { sent, agentId } = await architect($, w, c.id)
+    expect(sent['effort']).toBe('high')
+    expect(w.spawns.at(-1)?.['model']).toBe(OPUS_MODEL)
+    for (const file_path of ['/work/example/src/stats.js', '/work/example/lib/util.ts']) expect((await as($, agentId, 'Read', { file_path })).deny).toBeUndefined()
+    expect((await as($, agentId, 'Grep', { pattern: 'mean', path: '/work/example/src/stats.js' })).deny).toBeUndefined()
+    for (const file_path of ['/work/example/src/secret.ts', '/etc/passwd', '/work/example/src/stats.js.bak', '/work/example/src/stats.js:8-12']) expect((await as($, agentId, 'Read', { file_path })).deny).toContain('read outside owned resources')
+    expect((await as($, agentId, 'Grep', { pattern: 'x' })).deny).toContain('read outside owned resources')
+    expect((await as($, agentId, 'Edit', { file_path: '/work/example/src/stats.js', old_string: 'a', new_string: 'b' })).deny).toBeDefined()
+    expect((await as($, agentId, 'Bash', { command: 'cat /work/example/src/stats.js' })).deny).toBeDefined()
+    expect((await as($, agentId, 'Agent', { description: 'more', prompt: 'x' })).deny).toBeDefined()
+    expect((await as($, agentId, 'SubagentHandback', { message: 'DECISION: divide by n, not n-1 (src/stats.js:10)' })).deny).toBeUndefined()
+    expect(w.ran.filter(r => r['tool'] === 'SubagentHandback')).toHaveLength(1)
+    expect(w.ran.some(r => r['tool'] === 'Edit' || r['tool'] === 'Bash')).toBe(false)
+
+    // the engine applied High: observed, and no fallback said
+    await step($, OPUS_MODEL, { agentId, effort: 'high' })
+    expect(w.efforts.at(-1)).toEqual({ model: OPUS_MODEL, effort: 'high', agentId })
+    expect(ledger(held).swarm!.tasks.find(x => x.id === c.id)).toMatchObject({ launchEffort: 'high', appliedEffort: 'high' })
+    expect(ledger(held).warnings.filter(x => x.includes('EFFORT FALLBACK'))).toEqual([])
+    // the main loop keeps the person's level throughout
+    await step($, SONNET, { effort: 'medium' })
+    expect(w.efforts.at(-1)).toEqual({ model: SONNET, effort: 'medium' })
+  })
+  test('a consultation that names no file reads the project, never everything', LED, async ($, on) => {
+    const w = world(on, NATIVE); const held = hostState(on, {}); await start($)
+    await prompt($, 'Please approve the release of v0.5.0')
+    expect(String((await call($, releasePacket)).result)).toContain('Read scope: 1 named file')
+    await prompt($, 'Ask Opus to review the stats mean')
+    const reply = String((await call($, asks)).result)
+    // occupied by the first: admit the second only after it ends
+    expect(reply).toContain('OCCUPIED')
+    const first = ledger(held).consults![0]!
+    const { agentId } = await architect($, w, first.id)
+    expect((await as($, agentId, 'Read', { file_path: '/work/example/hooks/consult.ts' })).deny).toBeUndefined()
+    await finish($, agentId)
+    await call($, { action: 'verify', task_id: first.id, state: 'pass', evidence: ['checked'] })
+    const second = String((await call($, asks)).result)
+    expect(second).toContain('Read scope: the project')
+    const c = ledger(held).consults!.at(-1)!
+    expect(ledger(held).swarm!.tasks.find(x => x.id === c.id)!.owned).toEqual(['/work/example'])
+    const b = await architect($, w, c.id)
+    expect((await as($, b.agentId, 'Grep', { pattern: 'mean' })).deny).toBeUndefined()
+    expect((await as($, b.agentId, 'Glob', { pattern: '**/*.ts' })).deny).toBeUndefined()
+    expect((await as($, b.agentId, 'Read', { file_path: '/work/example/src/stats.js' })).deny).toBeUndefined()
+    for (const file_path of ['/etc/hosts', '/home/someone/.ssh/id_ed25519', '/work/example-other/a.ts', '~/.ssh/id_rsa', '~']) expect((await as($, b.agentId, 'Read', { file_path })).deny).toContain('read outside owned resources')
+    // a pattern cannot reach where the path may not: absolute, home-relative or climbing out
+    for (const pattern of ['/etc/*', '/home/someone/.ssh/*', '~/.ssh/*', '../**/*.ts', 'src/../../*', '{src,..}/*']) expect((await as($, b.agentId, 'Glob', { pattern })).deny).toContain('read outside owned resources')
+    for (const glob of ['/etc/*', '../*.ts']) expect((await as($, b.agentId, 'Grep', { pattern: 'x', glob })).deny).toContain('read outside owned resources')
+    expect((await as($, b.agentId, 'Grep', { pattern: 'x', path: '~' })).deny).toContain('read outside owned resources')
+    for (const pattern of ['src/**/*.ts', '**/..config.ts', '*.md']) expect((await as($, b.agentId, 'Glob', { pattern })).deny).toBeUndefined()
+    expect((await as($, b.agentId, 'Grep', { pattern: 'x', glob: '*.ts' })).deny).toBeUndefined()
+  })
+  test('an engine that applies less than High is reported as what it applied, not as High', LED, async ($, on) => {
+    const w = world(on, NATIVE); const held = hostState(on, {}); await start($)
+    await prompt($, 'Ask Opus to review the stats mean')
+    await call($, { ...asks, locations: ['src/stats.js:8'] })
+    const c = ledger(held).consults![0]!
+    const { sent, agentId } = await architect($, w, c.id)
+    expect(sent['effort']).toBe('high')
+    await step($, OPUS_MODEL, { agentId, effort: 'medium' })
+    expect(ledger(held).swarm!.tasks.find(x => x.id === c.id)).toMatchObject({ requestedEffort: 'high', launchEffort: 'high', appliedEffort: 'medium' })
+    expect(ledger(held).warnings).toContain('EFFORT FALLBACK / engine applied medium; requested high')
+  })
+  test('the operator ceiling holds the consultation below High and says so; workers keep their own levels', { options: { orchestration: true, profile: 'SONNET_LED', maxEffort: 'medium' } }, async ($, on) => {
+    const w = world(on, NATIVE); const held = hostState(on, {}); await start($)
+    await prompt($, 'Ask Opus to review the stats mean')
+    await call($, { ...asks, locations: ['src/stats.js:8'] })
+    const c = ledger(held).consults![0]!
+    expect((await architect($, w, c.id)).sent['effort']).toBe('medium')
+    await call($, { action: 'assign', task_id: 'scan', tier: 'HAIKU', role: 'scout', objective: 'list files', owned_resources: ['/work/example/src'], mode: 'read', effort: 'low' })
+    const tool_use_id = `scan-${++seq}`
+    await $.tool.call({ tool: 'Agent', tool_use_id, description: '[task:scan] list', prompt: 'x', subagent_type: 'cobalt-cockpit:scout' } as never)
+    expect(w.ran.find(r => r['tool_use_id'] === tool_use_id)!['effort']).toBe('low')
+  })
+  test('without native effort the request itself is set to High', LED, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); await start($)
+    await prompt($, 'Ask Opus to review the stats mean')
+    await call($, { ...asks, locations: ['src/stats.js:8'] })
+    const spawned = await spawn($, `[task:${ledger(held).consults![0]!.id}] Opus asked consultation`)
+    await step($, SONNET, { agentId: spawned.agentId })
+    expect(w.efforts.at(-1)).toMatchObject({ model: OPUS_MODEL, effort: 'high', agentId: spawned.agentId })
   })
 })

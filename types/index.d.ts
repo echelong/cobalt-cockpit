@@ -136,6 +136,8 @@ export type Task = {
   review?: ReviewRequirement
   /** Consultation grounds the person's full prompts raised in this task (SONNET_LED). */
   promptGrounds?: ConsultGround[]
+  /** Set once the main loop was reminded that this edited task has no progress plan. */
+  progressNudged?: boolean
 }
 
 /** Which model leads the main loop when orchestration is enforced. */
@@ -156,7 +158,8 @@ export type EvidencePacket = {
 }
 
 /** NobodyWho's advice on a consultation, only from a real router receipt. */
-export type LocalAdvice = { requestId: string; choice: string | null; abstain: boolean; tier: number | null; latencyMs: number | null; provider: string }
+/** `checkRequestId`: the receipt of the same question with the choices swapped; advice is kept only when both agree. */
+export type LocalAdvice = { requestId: string; choice: string | null; abstain: boolean; tier: number | null; latencyMs: number | null; provider: string; checkRequestId?: string }
 
 /**
  * One Opus consultation. Its lifecycle (running, returned, failed) and the main

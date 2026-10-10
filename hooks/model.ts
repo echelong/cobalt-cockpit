@@ -456,6 +456,24 @@ export const touchFile = (task: Task, path: string, added: number, removed: numb
   return { ...task, files }
 }
 
+/** Distinct files the main loop edits before a task without a plan is reminded of one. */
+export const NUDGE_FILES = 2
+
+/**
+ * One reminder, from what the host observed: the main loop has edited
+ * NUDGE_FILES distinct files and declared no milestones. It is said once per
+ * task and moves nothing: no milestone, gate or percentage comes from it. A
+ * single-file fix never sees it.
+ */
+export const progressNudge = (task: Task, tool: string): { task: Task; note: string } | null => {
+  if (task.milestones.length > 0 || task.progressNudged === true || task.files.length < NUDGE_FILES) return null
+
+  return {
+    task: { ...task, progressNudged: true },
+    note: `Cobalt Cockpit: ${task.files.length} files edited and no progress plan, so the user's HUD shows no milestones for this task. Call ${tool} with action "plan" now (3-7 milestones, the work done so far included), then start and complete them and report the verification gates.`,
+  }
+}
+
 export const noteFailure = (task: Task, at: number, text: string): Task => ({
   ...task,
   failures: withFailure(task.failures, at, text),
@@ -498,6 +516,8 @@ export type ProgressInput = {
   replan?: unknown
   milestone?: unknown
   gate?: unknown
+  /** gate: several gates in one call, each `{ gate, state, evidence }`; all apply or none does. */
+  gates?: unknown
   state?: unknown
   evidence?: unknown
   note?: unknown
@@ -546,6 +566,17 @@ export const applyAction = (task: Task, input: ProgressInput, now: number, sha: 
     case 'unblock':
       return unblock(task, now)
     case 'gate': {
+      if (Array.isArray(input.gates) && input.gates.length > 0) {
+        let held = task
+        for (const one of input.gates.slice(0, GATES.length)) {
+          const row = (one !== null && typeof one === 'object' ? one : {}) as ProgressInput
+          const out = applyAction(held, { action: 'gate', gate: row.gate, state: row.state, evidence: row.evidence }, now, sha)
+          if (out.error !== undefined) return { task, error: `${String(row.gate)}: ${out.error}; no gate was recorded` }
+          held = out.task
+        }
+
+        return { task: held }
+      }
       if (!isGateName(input.gate)) return { task, error: `"gate" must be one of ${GATES.join(', ')}` }
       const state = input.state as GateState
       if (!REPORTABLE.includes(state)) return { task, error: '"state" must be pass, fail, na or pending' }
