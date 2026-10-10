@@ -21,7 +21,7 @@
 //     a failed consultation is retried at most once; three per task.
 
 import { redactSecrets, secretText } from './secrets'
-import type { ConsultGround, Consultation, EvidencePacket, Profile, ReviewRequirement, Swarm, SwarmTask, Task } from '../types'
+import type { ConsultGround, Consultation, EvidencePacket, Profile, ReleaseRecord, ReviewRequirement, Swarm, SwarmTask, Task } from '../types'
 export type { ConsultGround, Consultation, EvidencePacket, ReviewRequirement } from '../types'
 
 export const GROUNDS: readonly ConsultGround[] = ['architecture', 'security', 'repeated-failure', 'asked', 'release']
@@ -29,6 +29,18 @@ export const MANDATORY: readonly ConsultGround[] = ['asked', 'release', 'securit
 /** The same failure this many times in a row: failed, was told to change approach, failed again. */
 export const FAILURE_STREAK = 3
 export const MAX_PER_TASK = 3
+/**
+ * The budget, in three separate parts. DISCRETIONARY consultations (every ground but release) are three per
+ * task and MAX_DISCRETIONARY_LEDGER per ledger, so resetting the task does not give more. RELEASE consultations
+ * are not counted in either: each is tied to one full commit id, one may return per commit, and at most
+ * MAX_RELEASE_ATTEMPTS are admitted for it (the first and one retry after an attempt that did not return),
+ * with MAX_RELEASE_SESSION in one ledger. The per-commit record also lives in the store across sessions.
+ */
+export const MAX_DISCRETIONARY_LEDGER = 12
+export const MAX_RELEASE_ATTEMPTS = 2
+export const MAX_RELEASE_SESSION = 6
+export const MAX_RELEASE_RECORDS = 32
+export const isCandidate = (value: unknown): value is string => typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value)
 /** Attempts of one unchanged problem: the first and one retry after a failed or cancelled run. */
 export const MAX_ATTEMPTS_PER_KEY = 2
 export const MAX_CONSULTS = 32
@@ -194,6 +206,10 @@ export type ConsultRequest = {
   consults: readonly Consultation[]
   swarm: Swarm
   progressTask: number | null
+  /** A release consultation's commit: the full id of HEAD of a clean working tree, or null where it could not be established. */
+  candidate?: string | null
+  /** The store's release records, across sessions. */
+  history?: readonly ReleaseRecord[]
 }
 
 /**
@@ -211,18 +227,57 @@ export const consultVerdict = (r: ConsultRequest): { ok: true; key: string; isMa
   }
   const live = r.consults.find(c => ['admitted', 'running'].includes(statusOf(taskOf(r.swarm, c.id))))
   if (live) return { ok: false, reason: `OPUS / OCCUPIED. Consultation ${live.id} is still open; one Opus specialist at a time. Spawn it, wait for it, or cancel it.` }
+  if (r.ground === 'release') return releaseVerdict(r, mandatoryGrounds(r.facts).includes('release'))
   const key = problemKey(r.ground, r.packet)
   const same = r.consults.filter(c => c.key === key)
   const answered = same.find(c => statusOf(taskOf(r.swarm, c.id)) === 'returned')
   if (answered) return { ok: false, reason: `OPUS / DUPLICATE. This unchanged problem was already consulted (${answered.id}). Act on its decision, or change the evidence (new failures, a different approach) before asking again.` }
   if (same.length >= MAX_ATTEMPTS_PER_KEY) return { ok: false, reason: `OPUS / RETRY BUDGET. This problem has had ${same.length} consultations that did not return; continue in Sonnet or block with the reason.` }
-  if (r.progressTask !== null && r.consults.filter(c => c.progressTask === r.progressTask).length >= MAX_PER_TASK) return { ok: false, reason: `OPUS / TASK BUDGET. This task has had ${MAX_PER_TASK} consultations; continue in Sonnet or block with the reason.` }
+  const discretionary = r.consults.filter(c => c.ground !== 'release')
+  if (discretionary.length >= MAX_DISCRETIONARY_LEDGER) return { ok: false, reason: `OPUS / LEDGER BUDGET. This session has had ${discretionary.length} discretionary consultations in all; a task reset does not give more. Continue in Sonnet or block with the reason.` }
+  if (r.progressTask !== null && discretionary.filter(c => c.progressTask === r.progressTask).length >= MAX_PER_TASK) return { ok: false, reason: `OPUS / TASK BUDGET. This task has had ${MAX_PER_TASK} consultations; continue in Sonnet or block with the reason.` }
 
   return { ok: true, key, isMandatory: mandatoryGrounds(r.facts).includes(r.ground) }
 }
 
-/** Adds a consultation record, keeping the newest MAX_CONSULTS. */
-export const addConsult = (consults: readonly Consultation[], c: Consultation): Consultation[] => [...consults.filter(old => old.id !== c.id), c].slice(-MAX_CONSULTS)
+/**
+ * A release consultation: tied to the full commit id it reviews, and bounded apart from the discretionary
+ * budget. An unidentifiable candidate is refused, never approved. Approval of one commit says nothing of
+ * another, and a commit that returned is not reviewed again.
+ */
+const releaseVerdict = (r: ConsultRequest, isMandatory: boolean): { ok: true; key: string; isMandatory: boolean } | { ok: false; reason: string } => {
+  if (!isCandidate(r.candidate)) return { ok: false, reason: 'OPUS / CANDIDATE UNKNOWN. A release review is tied to one full commit id of a clean working tree, and none could be established (no repository, no commit, uncommitted changes, or git did not answer). Commit the candidate, then ask again. Nothing was started.' }
+  const sha = r.candidate
+  const mine = r.consults.filter(c => c.ground === 'release' && c.candidate === sha)
+  const kept = (r.history ?? []).filter(h => h.candidate === sha)
+  const answered = mine.find(c => statusOf(taskOf(r.swarm, c.id)) === 'returned') ?? kept.find(h => h.returned)
+  if (answered) return { ok: false, reason: `OPUS / DUPLICATE. Commit ${sha.slice(0, 12)} was already reviewed (${answered.id}). Act on its decision; a changed commit is a new candidate.` }
+  const attempts = new Set([...mine.map(c => c.id), ...kept.map(h => h.id)]).size
+  if (attempts >= MAX_RELEASE_ATTEMPTS) return { ok: false, reason: `OPUS / RELEASE RETRY BUDGET. Commit ${sha.slice(0, 12)} has had ${attempts} release consultations that did not return; block with the reason.` }
+  const inSession = r.consults.filter(c => c.ground === 'release').length
+  if (inSession >= MAX_RELEASE_SESSION) return { ok: false, reason: `OPUS / RELEASE ALLOWANCE. This session has had ${inSession} release consultations; block with the reason.` }
+  const text = `release\u0000${sha}`
+  let hash = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193) >>> 0
+
+  return { ok: true, key: hash.toString(16).padStart(8, '0'), isMandatory }
+}
+
+/**
+ * Adds a consultation record, keeping the newest MAX_CONSULTS. Release records are kept ahead of the rest
+ * (up to MAX_RELEASE_RECORDS), so a crowd of ordinary consultations cannot push a release record out.
+ */
+export const addConsult = (consults: readonly Consultation[], c: Consultation): Consultation[] => {
+  const all = [...consults.filter(old => old.id !== c.id), c]
+  const release = all.filter(x => x.ground === 'release').slice(-MAX_RELEASE_RECORDS)
+  const rest = all.filter(x => x.ground !== 'release').slice(-Math.max(0, MAX_CONSULTS - release.length))
+  const keep = new Set([...release, ...rest])
+
+  return all.filter(x => keep.has(x))
+}
+
+/** The store's release records after one more consultation, or after one returned. */
+export const withRelease = (history: readonly ReleaseRecord[], record: ReleaseRecord): ReleaseRecord[] => [...history.filter(h => h.id !== record.id), record].slice(-MAX_RELEASE_RECORDS)
 
 /**
  * The task with the review it now requires. Grounds only accumulate within a
@@ -257,6 +312,7 @@ export const briefOf = (c: Consultation): string => {
   return [
     `[task:${c.id}] Opus consultation · ground ${c.ground}${c.isMandatory ? ' · mandatory' : ''}`,
     '',
+    ...(c.candidate === undefined ? [] : [`CANDIDATE COMMIT\n  ${c.candidate} (a clean working tree at exactly this commit; review this commit, not a branch or a later one)`]),
     `OBJECTIVE\n  ${p.objective}`,
     `CURRENT ARCHITECTURE\n  ${p.architecture || '(not stated)'}`,
     `RELEVANT FILES\n${list(p.files)}`,

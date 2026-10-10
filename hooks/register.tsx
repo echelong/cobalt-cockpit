@@ -15,8 +15,9 @@ import { atom, read, update } from 'claude-code'
 import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL, OPUS_MODEL, isProfile, DEFAULT_PROFILE } from './model-policy'
 import type { SubagentTier, Profile } from './model-policy'
 import { discoveryRows, guidanceFor, markGuided, needsAlignment, unpin, withDiscovery } from './discovery'
-import { addConsult, advanceReview, briefOf, consultVerdict, factsOf, hasReturned, isGround, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
+import { addConsult, advanceReview, briefOf, consultVerdict, factsOf, hasReturned, isCandidate, isGround, withRelease, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
 import type { Consultation } from './consult'
+import type { ReleaseRecord } from '../types'
 import { addDecision, adjudicate, adviceLine, answerOf, callsFor, carriesCredential, decisionOf, deterministicRoute, operatorNotice, readAnswers, routerArgv, routerLabel, routerLine, routerModeOf, routerStateOf, switchRouter, withDecision, AVAILABILITY_STATE, CALL_TIMEOUT_MS, EMPTY_ROUTER, PROVIDER, ROUTER_MODES } from './router'
 import type { ActiveMode, RouterAnswer, RouterMode, RouterPolicy, RouterState } from './router'
 import {
@@ -230,12 +231,96 @@ const finishObserved = (s: Swarm, id: string, reason: string, conclusion: string
   }
 }
 /**
+ * The commit a release review is for: the full id of HEAD, and only when the working tree is clean (every
+ * untracked file and submodule counted, whatever the user's git configuration says), because a review of a
+ * commit says nothing of changes that are not in it. `dirty` is a real difference; `unknown` is git failing.
+ */
+type Candidate = { sha: string } | { sha: null; why: 'dirty' | 'unknown' }
+const candidateOf = async ($: EngineInterface): Promise<Candidate> => {
+  try {
+    const run = (argv: string[]) => $.process.run(['git', '--no-optional-locks', ...argv], { timeoutMs: GIT_TIMEOUT_MS })
+    const head = await run(['rev-parse', '--verify', 'HEAD'])
+    if (head.exitCode !== 0 || head.isStdoutTruncated) return { sha: null, why: 'unknown' }
+    const status = await run(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'])
+    if (status.exitCode !== 0 || status.isStdoutTruncated) return { sha: null, why: 'unknown' }
+    if (status.stdout.trim() !== '') return { sha: null, why: 'dirty' }
+    const sha = head.stdout.trim()
+
+    return isCandidate(sha) ? { sha } : { sha: null, why: 'unknown' }
+  } catch {
+    return { sha: null, why: 'unknown' }
+  }
+}
+const releaseRecords = (held: unknown): ReleaseRecord[] => (Array.isArray(held) ? held.filter((h): h is ReleaseRecord => h !== null && typeof h === 'object' && isCandidate((h as ReleaseRecord).candidate) && typeof (h as ReleaseRecord).id === 'string' && typeof (h as ReleaseRecord).returned === 'boolean' && typeof (h as ReleaseRecord).at === 'number') : [])
+/** The store's release records. Strict: a store that cannot be read, or holds something else, fails a release request closed. */
+const releaseHistory = async ($: EngineInterface): Promise<ReleaseRecord[]> => {
+  const held = await $.store.get('release-reviews')
+  if (held !== undefined && !Array.isArray(held)) throw new Error('OPUS / RELEASE RECORD UNREADABLE. The stored record of release reviews is not usable, so the allowance cannot be established. Nothing was started.')
+
+  return releaseRecords(held)
+}
+/** The same, for housekeeping: what can be read. */
+const releaseHistorySoft = async ($: EngineInterface): Promise<ReleaseRecord[]> => releaseRecords(await $.store.get('release-reviews').catch(() => undefined))
+/** A release consultation the host saw return is recorded as returned where a restart cannot lose it, whether or not it has been verified yet. */
+const syncRelease = async ($: EngineInterface): Promise<void> => {
+  const ledger = await read($, ledgerAtom)
+  const mine = (ledger.consults ?? []).filter(c => c.ground === 'release' && c.candidate !== undefined)
+  if (mine.length === 0) return
+  const swarm = swarmState(ledger)
+  const history = await releaseHistorySoft($)
+  for (const c of mine) {
+    const record = history.find(h => h.id === c.id && h.candidate === c.candidate)
+    if (record?.returned === true || !hasReturned(swarm.tasks.find(t => t.id === c.id))) continue
+    await quiet(() => $.store.set('release-reviews', withRelease(history, { candidate: c.candidate!, id: c.id, at: record?.at ?? c.requestedAt, returned: true })))
+  }
+}
+/**
+ * A release approval stands only for the commit it was given for, on a clean tree: a change takes it back (and
+ * the same commit, clean again, gives it back, because that review really returned). An approval with no
+ * commit behind it, or a git that does not answer, is never the reason to keep or to restore one.
+ */
+const reconcileRelease = async ($: EngineInterface): Promise<void> => {
+  const task = await read($, taskAtom)
+  const review = task?.review
+  if (review === undefined || !review.grounds.includes('release')) return
+  if (review.state === 'adjudicated' && review.candidate === undefined) {
+    await update($, taskAtom, t => (t?.review?.state === 'adjudicated' && t.review.candidate === undefined ? settle({ ...t, review: { grounds: t.review.grounds, consult: null, state: 'required' } }).task : t))
+
+    return
+  }
+  if (review.state === 'adjudicated' && review.candidate !== undefined) {
+    const now = await candidateOf($)
+    if (now.sha === review.candidate || (now.sha === null && now.why === 'unknown')) return
+    await update($, taskAtom, t => (t?.review?.state === 'adjudicated' && t.review.candidate === review.candidate ? settle({ ...t, review: { grounds: t.review.grounds, consult: null, state: 'required', lapsed: { candidate: review.candidate, consult: t.review.consult } } }).task : t))
+
+    return
+  }
+  if (review.state === 'required' && review.lapsed !== undefined) {
+    const lapsed = review.lapsed
+    const now = await candidateOf($)
+    if (now.sha !== lapsed.candidate || lapsed.consult === null) return
+    const ledger = await read($, ledgerAtom)
+    const returned = hasReturned(swarmState(ledger).tasks.find(x => x.id === lapsed.consult)) || (await releaseHistorySoft($)).some(h => h.id === lapsed.consult && h.candidate === lapsed.candidate && h.returned)
+    if (!returned) return
+    await update($, taskAtom, t => (t?.review?.state === 'required' && t.review.lapsed?.candidate === lapsed.candidate ? settle({ ...t, review: { grounds: t.review.grounds, consult: lapsed.consult, state: 'adjudicated', candidate: lapsed.candidate } }).task : t))
+  }
+}
+
+/**
  * One Opus consultation requested by the main session (SONNET_LED). The ground
  * and packet are checked by `consultVerdict` alone; no router is asked. Admission
  * reserves nothing yet: the OPUS swarm task it submits is admitted again, with
  * ownership and budget, when the architect's Agent call arrives.
  */
-const serveConsult = async ($: EngineInterface, e: Record<string, unknown>, at: number): Promise<string> => {
+let consulting: Promise<unknown> = Promise.resolve()
+/** One consultation request at a time: two cannot both pass the bounds before either is recorded. */
+const serveConsult = ($: EngineInterface, e: Record<string, unknown>, at: number): Promise<string> => {
+  const run = consulting.then(() => serveConsultNow($, e, at), () => serveConsultNow($, e, at))
+  consulting = run.catch(() => undefined)
+
+  return run
+}
+const serveConsultNow = async ($: EngineInterface, e: Record<string, unknown>, at: number): Promise<string> => {
   const ground = e['ground']
   if (!isGround(ground)) throw new Error(`Valid ground required: ${GROUNDS.join(', ')}`)
   const made = packetOf(ground, { objective: e['objective'], architecture: e['architecture'], files: e['locations'], alternatives: e['alternatives'], failures: e['failures'], risk: e['risk'], decision: e['question'] })
@@ -244,7 +329,10 @@ const serveConsult = async ($: EngineInterface, e: Record<string, unknown>, at: 
   const facts = factsOf(task, (await read($, orchestraAtom)).errorStreak, task?.promptGrounds ?? [])
   const ledger = await read($, ledgerAtom)
   const consults = ledger.consults ?? []
-  const verdict = consultVerdict({ profile: config.hasOrchestration ? config.profile : 'OPUS_LED', ground, packet: made.packet, facts, consults, swarm: swarmState(ledger), progressTask: task?.id ?? null })
+  if (ground === 'release') await syncRelease($)
+  const candidate = ground === 'release' ? (await candidateOf($)).sha : null
+  const history = ground === 'release' ? await releaseHistory($) : []
+  const verdict = consultVerdict({ profile: config.hasOrchestration ? config.profile : 'OPUS_LED', ground, packet: made.packet, facts, consults, swarm: swarmState(ledger), progressTask: task?.id ?? null, candidate, history })
   if (!verdict.ok) {
     await quiet(() => mutateLedger($, l => warn(l, `${verdict.reason.split('.')[0]} (${ground})`)))
     throw new Error(verdict.reason)
@@ -259,19 +347,32 @@ const serveConsult = async ($: EngineInterface, e: Record<string, unknown>, at: 
   // The path lookups take time: another consultation may have been
   // admitted meanwhile, so the bounds are checked again on the ledger as it is now.
   const fresh = await read($, ledgerAtom)
-  const again = consultVerdict({ profile: config.hasOrchestration ? config.profile : 'OPUS_LED', ground, packet: made.packet, facts, consults: fresh.consults ?? [], swarm: swarmState(fresh), progressTask: task?.id ?? null })
+  // the candidate is read again as well: it is the commit the review is for, and it must still be the one
+  const nowCandidate = ground === 'release' ? (await candidateOf($)).sha : null
+  const fresher = ground === 'release' ? await releaseHistory($) : []
+  const again = consultVerdict({ profile: config.hasOrchestration ? config.profile : 'OPUS_LED', ground, packet: made.packet, facts, consults: fresh.consults ?? [], swarm: swarmState(fresh), progressTask: task?.id ?? null, candidate: nowCandidate, history: fresher })
   if (!again.ok) throw new Error(again.reason)
-  const id = `opus-${(fresh.consults ?? []).length + 1}-${verdict.key.slice(0, 6)}`
+  if (nowCandidate !== candidate) throw new Error('OPUS / CANDIDATE CHANGED. The commit moved or the working tree changed while the consultation was being admitted; nothing was started. Ask again for the commit you mean.')
+  const counter = (list: readonly { id: string }[]) => Math.max(0, ...list.map(x => Number(/^opus-(\d+)-/.exec(x.id)?.[1] ?? 0)))
+  // unique across the ledger and the store, so a restart cannot reuse the id of an attempt already spent
+  const id = `opus-${Math.max(counter(fresh.consults ?? []), counter(fresher)) + 1}-${verdict.key.slice(0, 6)}`
+  // the record that bounds a release review is written first, and a write that fails admits nothing
+  if (ground === 'release' && nowCandidate !== null) await $.store.set('release-reviews', withRelease(fresher, { candidate: nowCandidate, id, at, returned: false }))
   await changeSwarm($, held => submitTask(held, { id, tier: 'OPUS', role: ground === 'release' || ground === 'security' ? 'REVIEW' : 'ARCHITECT', objective: made.packet.decision, scope: `Opus consultation · ${ground}`, owned: owned.length ? owned : [root], mode: 'read', parentTask: null, effort: CONSULT_EFFORT, effortReason: `Opus consultation: ${CONSULT_EFFORT} by default`, spawnReason: `Opus admitted on ${ground}${verdict.isMandatory ? ' (mandatory)' : ''}` }, at).swarm)
-  const c: Consultation = { id, ground, key: verdict.key, packet: made.packet, progressTask: task?.id ?? null, isMandatory: verdict.isMandatory, requestedAt: at }
+  const c: Consultation = { id, ground, key: verdict.key, packet: made.packet, progressTask: task?.id ?? null, isMandatory: verdict.isMandatory, requestedAt: at, ...(ground === 'release' && candidate !== null ? { candidate } : {}) }
   await mutateLedger($, l => ({ ...l, consults: addConsult(l.consults ?? [], c) }))
   // A review is advanced only by a consultation on one of the grounds that made
   // it necessary: an easier consultation on another ground does not stand in for it.
   if (task !== null) await change($, t => {
     if (t.id !== task.id) return t
-    const held = verdict.isMandatory ? requireReview(t, [ground]) : t
+    let held = verdict.isMandatory ? requireReview(t, [ground]) : t
+    // an approval given for another commit is not carried to this one
+    if (ground === 'release' && held.review?.state === 'adjudicated' && held.review.candidate !== candidate) held = { ...held, review: { grounds: held.review.grounds, consult: null, state: 'required' } }
+    const admitted = held.review?.grounds.includes(ground) ? advanceReview(held.review, id, 'admitted') : undefined
+    if (admitted === undefined) return held
+    const { lapsed: _gone, ...clean } = admitted
 
-    return held.review?.grounds.includes(ground) ? { ...held, review: advanceReview(held.review, id, 'admitted') } : held
+    return { ...held, review: ground === 'release' && candidate !== null ? { ...clean, candidate } : clean }
   })
 
   const scope = `Read scope: ${owned.length ? `${owned.length} named file${owned.length === 1 ? '' : 's'}` : 'the project'}${outside ? `; ${outside} location${outside === 1 ? '' : 's'} not readable (outside the project, home-relative or not a plain path)` : ''}.`
@@ -330,6 +431,8 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
         const consult = (await read($, ledgerAtom)).consults?.find(c => c.id === id)
         // bound by the consultation the review names, so a re-plan does not orphan it
         if (consult && (e['state'] === 'pass' || e['state'] === 'fail')) await change($, t => t.review ? { ...t, review: advanceReview(t.review, id, 'adjudicated') } : t)
+        // a release consultation that really returned is recorded as such where a restart cannot lose it
+        await quiet(() => syncRelease($))
       }
       else throw new Error('Unknown swarm action')
     }
@@ -1493,6 +1596,8 @@ const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: 
   const now = await $.clock.now()
   const sha = (await read($, gitAtom))?.sha ?? null
   await quiet(() => reconcileTree($))
+  await quiet(() => syncRelease($))
+  await quiet(() => reconcileRelease($))
   // the tree an accepted goal check is about, taken before the answer is recorded
   const before = e.action === 'align' || e.action === 'gate' || (e.action as string) === 'gates' ? await read($, taskAtom) : null
   const goalChecked = before !== null && needsAlignment(before)
@@ -1650,7 +1755,7 @@ const noteEnd = async (
     )
   }
   // Whatever else a tool did to the project, a goal check made for another tree is stale.
-  if (ran.deny === undefined && e.tool !== TOOL) await quiet(() => reconcileTree($))
+  if (ran.deny === undefined && e.tool !== TOOL) { await quiet(() => reconcileTree($)); await quiet(() => reconcileRelease($)) }
   scheduleGit($)
   void refreshMeter($)
 }

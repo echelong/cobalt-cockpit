@@ -33,6 +33,8 @@ export type World = {
   tree: Record<string, string>
   /** HEAD: a commit moves it and leaves `tree` alone. */
   head: string
+  /** Whether `git status --porcelain` reports changes (a release candidate must be clean). */
+  uncommitted: boolean
   players: Record<string, PlayerBehavior>
   /** A program that answers with this stdout (exit 0), by name; checked before `players`. */
   outputs: Record<string, (argv: readonly string[]) => string>
@@ -110,7 +112,8 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
     blits: 0,
     gitStatus: CLEAN_REPO,
     tree: {},
-    head: 'abc1234abc1234',
+    head: 'a'.repeat(40),
+    uncommitted: false,
     players: { 'pw-play': 'ok' },
     outputs: {},
     registered: [],
@@ -266,6 +269,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
       const git = sub[0] === '-C' ? sub.slice(2) : sub
       if (git[0] === 'rev-parse') return ran(0, git.includes('--verify') ? `${w.head}\n` : '/work/example\n')
       if (git[0] === 'diff') return ran(0, git.includes('--diff-filter=D') ? '' : Object.keys(w.tree).join('\0') + (Object.keys(w.tree).length ? '\0' : ''))
+      if (git[0] === 'status' && git.includes('--porcelain')) return ran(0, w.uncommitted ? ' M src/api.js\n' : '')
       if (git[0] === 'ls-files') return ran(0, '')
       if (git[0] === 'hash-object') return ran(0, git.slice(git.indexOf('--') + 1).map(path => `h${[...(w.tree[path] ?? '')].reduce((n, c) => (n * 31 + c.charCodeAt(0)) >>> 0, 7)}`).join('\n') + '\n')
 

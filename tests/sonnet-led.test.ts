@@ -111,7 +111,7 @@ describe('consultation admission', () => {
   })
   test('a holding ground is admitted, mandatory only where its ground is', () => {
     expect(consultVerdict(base)).toMatchObject({ ok: true, isMandatory: false })
-    expect(consultVerdict({ ...base, ground: 'release', facts: facts({ prompt: 'approve the release' }) })).toMatchObject({ ok: true, isMandatory: true })
+    expect(consultVerdict({ ...base, ground: 'release', facts: facts({ prompt: 'approve the release' }), candidate: 'a'.repeat(40) })).toMatchObject({ ok: true, isMandatory: true })
   })
   test('one live Opus; an unchanged problem once; bounded retries and task budget', () => {
     const c1 = consult('c1', packet())

@@ -230,7 +230,13 @@ export type Consultation = {
   /** Whether the ground made this consultation mandatory for the task. */
   isMandatory: boolean
   requestedAt: number
+  /** A release consultation: the full commit id of the clean working tree it was admitted for. */
+  candidate?: string
+  /** A release approval withdrawn because the commit or tree moved: restored if the same commit is clean again. */
+  lapsed?: { candidate: string; consult: string | null }
 }
+/** One release consultation as the store keeps it across sessions: bounded, so a restart cannot erase it or reset its budget. */
+export type ReleaseRecord = { candidate: string; id: string; at: number; returned: boolean }
 
 export type ReviewRequirement = {
   grounds: ConsultGround[]
@@ -238,6 +244,8 @@ export type ReviewRequirement = {
   consult: string | null
   /** required → admitted → returned → adjudicated (main session verified the advice, pass or fail). */
   state: 'required' | 'admitted' | 'returned' | 'adjudicated'
+  /** A release review: the commit it approved. A different commit, or a changed working tree, takes it back. */
+  candidate?: string
 }
 
 export type ActivityKind =
