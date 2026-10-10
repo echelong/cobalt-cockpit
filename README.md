@@ -1,4 +1,4 @@
-# Cobalt Cockpit v0.4.0 — Elastic Swarm + Adaptive Intelligence
+# Cobalt Cockpit v0.5.0 — Elastic Swarm + Adaptive Intelligence
 
 **Mission control for Claude Code.** Follow real task progress, coordinate bounded subagents, review verification gates, and replay what happened, without replacing Claude Code's native model and permission controls.
 
@@ -46,6 +46,7 @@ Opus remains **one main commander** and keeps the reasoning effort you select in
 - Fail-closed guards: a hook that cannot reach its decision refuses the action it guards rather than letting it run, and every such decision is judged against the event it was given.
 - Narrow-terminal and reduced-motion layouts; preserves the engine's image viewer.
 - Optional read-only NobodyWho telemetry and opt-in orchestration policy enforcement.
+- Optional Sonnet-led profile (`profile: SONNET_LED`): Sonnet 5.5 is the main model at your effort, and Opus 5.5 runs at High only as an admitted, read-only architect consultation. `OPUS_LED` stays the default.
 - Read-only helpers can deliver their reports: a bound helper may use the host's tool discovery and report hand-back without gaining any write, shell or delegation right, and each task records how its report arrived.
 
 ## Quick start
@@ -69,14 +70,14 @@ printf '%s\n' '{"orchestration":"true"}' | claude plugin configure cobalt-cockpi
 
 Restart Claude Code again after changing settings. Enabling orchestration activates model/admission and ownership policy; it does not enable Fable blocking unless you also opt into `blockFable` or `cobaltStrict`.
 
-**Updating an existing public-marketplace installation** (v0.3.2 or earlier):
+**Updating an existing public-marketplace installation:**
 
 ```sh
 claude plugin marketplace update cobalt-cockpit
 claude plugin update cobalt-cockpit@cobalt-cockpit
 ```
 
-Restart Claude Code and check `/cockpit version`. Your settings, preferences and saved Run Ledgers are kept; v0.4.0 adds no setting and changes no default.
+Restart Claude Code and check `/cockpit version`. Your settings, preferences and saved Run Ledgers are kept. v0.5.0 keeps `OPUS_LED` as the default profile, so the main model does not change unless you choose `SONNET_LED` (below). Its one changed default is `localAdvice`, now false.
 
 The marketplace name in this repository is `cobalt-cockpit`. Some existing private/local setups use a separately registered marketplace alias such as `cobalt`; for those, use the identity shown by `claude plugin list` rather than copying the public suffix.
 
@@ -186,11 +187,27 @@ Cockpit does not take part in Claude Code's permission check. It registers no ho
 - Opus 5.5 is never the main loop and never a background model. The main session requests it with `swarm action consult`: a ground (`architecture`, `security`, `repeated-failure`, `asked`, `release`) and a concise evidence packet (objective, architecture, files, alternatives, failures, risk, decision). Cockpit admits it only where the ground holds on evidence: a large or spread change, or architecture named in the prompt; security-sensitive files or a security prompt; the same failure three times in a row; an explicit request for Opus; a release approval. One Opus at a time, an unchanged problem consulted once, one retry after a failed run, three per task. The admitted consultation runs as `cobalt-cockpit:architect` (read-only, Opus, high effort) and returns a structured decision; Sonnet implements and verifies it.
 - Opus cannot be reached around this: an unassigned Agent call naming Opus or the architect, an `assign` of tier OPUS, or the architect on a Sonnet task is refused.
 - Mandatory consultations: an explicit request for Opus, a release approval, or a change to security-sensitive files (auth, secrets, credentials, permissions, policy, guards, `.env`, keys) holds the task below 100% until a consultation has returned and the main session has verified its advice with `swarm action verify` (pass or fail, with evidence). Review findings are advice until verified.
-- NobodyWho advises: with `localAdvice` on, each consultation request asks the local router (`decision ask --caller cockpit`). Its answer is recorded beside the consultation only with a real receipt id, and never decides admission. Unavailable advice degrades to deterministic admission.
+- NobodyWho advice is off by default (`localAdvice`). Measured for v0.5.0, the local classifier followed option position, not content, so deterministic admission decides. When turned on, the local router (`decision ask --caller cockpit`) is asked only after the rules admit a non-mandatory consultation, twice with the choices swapped. Its answer is kept only when both receipts agree, and it never decides admission.
 - HUD and Ledger name the roles (MAIN, SCOUT, ENGINEER, ARCHITECT, LOCAL CONTROL), list each consultation with its ground, whether it returned, its decision and Sonnet's verification, and report host-reported tokens per tier. Requests without usage figures are counted as unreported; nothing is estimated. `/ledger` shows the host's `/cost` total where it keeps one.
 - Context: set Sonnet's compaction window natively (`/autocompact 400k`, stored as `modelSettings["claude-sonnet-5-5"].autoCompactWindow`). Cockpit does not compact or change settings. Subagents keep their own model defaults.
 
-`OPUS_LED` remains the default and behaves exactly as before. Migration and rollback are in [docs/implementation-v0.5-sonnet-led.md](docs/implementation-v0.5-sonnet-led.md).
+`OPUS_LED` remains the default and behaves exactly as before. `cobaltStrict` turns orchestration on and adds safety restrictions; it never names a model, so strict mode with `SONNET_LED` keeps Sonnet as the main loop.
+
+**Set up SONNET_LED** (keep your other options; CLI values are strings):
+
+```sh
+printf '%s\n' '{"orchestration":"true","profile":"SONNET_LED"}' | claude plugin configure cobalt-cockpit@cobalt-cockpit --values-stdin
+```
+
+Then choose the main effort yourself (`/effort medium` is recommended), optionally `/autocompact 400k` while on Sonnet, and restart Claude Code. `/cockpit version` shows `PROFILE / SONNET_LED · main claude-sonnet-5-5 · Opus on admission`.
+
+**Roll back** to the previous behaviour by setting `profile` to `OPUS_LED` (or removing it) and restarting:
+
+```sh
+printf '%s\n' '{"profile":"OPUS_LED"}' | claude plugin configure cobalt-cockpit@cobalt-cockpit --values-stdin
+```
+
+Run Ledgers and preferences stay readable in both directions. Design, measurements and the v0.5.0 corrections are in [docs/implementation-v0.5-sonnet-led.md](docs/implementation-v0.5-sonnet-led.md) and [docs/delivery-v0.5.0-hardening.md](docs/delivery-v0.5.0-hardening.md).
 
 ## NobodyWho integration
 
@@ -224,7 +241,7 @@ Restart Claude Code after changing configuration. To enable just Fable blocking 
 | `reasoningMode` | `AUTO`; `MANUAL` honours fixed per-tier levels for subagents; the main loop's effort stays yours |
 | `maxEffort` | `max`; lower ceilings cap every subagent request and are recorded |
 | `profile` | `OPUS_LED` (legacy: Opus main loop); `SONNET_LED` runs the main loop on Sonnet and consults Opus on admission |
-| `localAdvice` | true; `SONNET_LED` only: ask the local NobodyWho router for advisory input on a consultation |
+| `localAdvice` | false; `SONNET_LED` only: ask the local NobodyWho router, both ways round, for advisory input on an admitted non-mandatory consultation |
 
 ## Compatibility
 
@@ -238,7 +255,7 @@ Run Ledger is local. Cockpit observes tool calls, paths, agent events, token/con
 
 ### What Cockpit runs, reads and sends
 
-Cockpit installs no launcher and downloads nothing. It runs local processes, with your privileges and without prompting, for five reasons: `realpath -m` canonicalizes a path a subagent claims as its own (orchestration only), `tail -c` reads the end of a telemetry ledger larger than 512 KiB, `git status --porcelain=v2` and `git rev-parse --show-toplevel` feed the HUD, one of nine audio players plays the optional cues (`pw-play`, `paplay`, `aplay`, `ffplay`, `mpv`, `play`, `canberra-gtk-play`, `afplay`, then a terminal bell), and in the `SONNET_LED` profile with `localAdvice` on, `decision ask --caller cockpit` asks the local NobodyWho router for advice when an Opus consultation is requested. Each is an argument array: no shell string is ever built from model or user text.
+Cockpit installs no launcher and downloads nothing. It runs local processes, with your privileges and without prompting, for five reasons: `realpath -m` canonicalizes a path a subagent claims as its own (orchestration only), `tail -c` reads the end of a telemetry ledger larger than 512 KiB, `git status --porcelain=v2` and `git rev-parse --show-toplevel` feed the HUD, one of nine audio players plays the optional cues (`pw-play`, `paplay`, `aplay`, `ffplay`, `mpv`, `play`, `canberra-gtk-play`, `afplay`, then a terminal bell), and in the `SONNET_LED` profile with `localAdvice` on (off by default), `decision ask --caller cockpit --json <question>` asks the local NobodyWho router, twice, for advice on an admitted Opus consultation; the question is the consultation's ground, counts, objective and risk, and the router runs on this machine. Each is an argument array: no shell string is ever built from model or user text.
 
 It reads files: the decision-router ledger (read-only, optional, `localControl`), a file about to be written (a bounded replay snapshot), and Claude Code's settings. It reads environment variables **by name**: `CLAUDE_CODE_EFFORT_LEVEL`, `XDG_STATE_HOME`, `HOME`, `COBALT_REDUCED_MOTION`, and eight authentication variables — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_MANTLE` — whose values are reduced to set-or-not-set on the spot and never stored, logged, exported or sent. It writes nothing outside the host's plugin store, which holds up to eight bounded run ledgers, bounded replay bodies, checkpoints and two preferences.
 

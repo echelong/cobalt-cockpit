@@ -68,7 +68,7 @@ for p in sorted((root / 'hooks').glob('*.ts*')):
   # would be a second permission operation that nothing here needs.
   if re.search(r'\$\s*\.\s*tool\s*\.\s*check\b', line): findings.append(f'hooks/{p.name}:{n}: a permission query ($.tool.check) in the hooks module')
 m=json.loads((root/'.claude-plugin/plugin.json').read_text()); market=json.loads((root/'.claude-plugin/marketplace.json').read_text())
-assert m['version']==market['plugins'][0]['version']=='0.4.0'
+assert m['version']==market['plugins'][0]['version']=='0.5.0'
 assert m['name']==market['plugins'][0]['name']=='cobalt-cockpit'
 assert market['plugins'][0]['source']=='./'
 # This marketplace lists Cockpit and nothing else: the optional companion has its

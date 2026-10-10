@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased — v0.5.0 release hardening
+## 0.5.0 — Sonnet-led profile
+
+Release hardening:
 
 - Fixed: the Opus architect could not read the files it was consulted about. A location written `path:line` became its owned resource verbatim. Line references are now dropped from the read scope, which is confined to project files. A consultation that names no file reads the project, not everything as before. A Glob or Grep pattern that is absolute, home-relative or climbs out is refused, and so is a `~` path.
 - Fixed: admitted Opus consultations ran at Medium. They now request High, under the operator ceiling. The engine's applied level is recorded, and any difference is reported as a fallback. The main loop's effort is untouched.
@@ -8,7 +10,7 @@
 - NobodyWho: `localAdvice` is now off by default. Measured on 288 local calls, the classifier followed option position, not content. When on, it is asked only after the rules admit a non-mandatory consultation, both ways round, and kept only when both receipts agree. It never decides admission.
 - Suite: 1023 → 1049. Root causes, measurements, the security review and the isolated live acceptance are in [docs/delivery-v0.5.0-hardening.md](docs/delivery-v0.5.0-hardening.md).
 
-## Unreleased — Sonnet-led profile
+The Sonnet-led profile:
 
 - New `profile` option. `OPUS_LED` (the default) is 0.4.0's behaviour, unchanged. `SONNET_LED` means: Sonnet builds, Haiku scouts, Opus reviews, NobodyWho advises. The main loop is requested on Sonnet 5.5 at the user's own effort, and Opus 5.5 runs only as an admitted, read-only `cobalt-cockpit:architect` consultation.
 - Opus admission (`swarm action consult`): a ground that must hold on evidence (architecture, security, repeated failure, explicit request, release approval) and a bounded evidence packet. One Opus at a time; an unchanged problem is consulted once; one retry; three per task. Routes around it (an unassigned Opus or architect spawn, an OPUS assignment) are refused.
