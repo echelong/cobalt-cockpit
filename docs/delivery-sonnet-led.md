@@ -82,6 +82,50 @@ Limits of this measurement: one run per cell, one fixture, no repeated-failure, 
 - Delegation lesson from this milestone: a scoped writer cannot read files outside its owned resources, so a worker briefed to depend on types in an unowned file stopped without writing anything. Briefs must include those types, or ownership must list them as read resources.
 - No user-level configuration was changed. To use the profile, set it yourself (see migration).
 
+## Model-policy P1 investigation
+
+Report: an ordinary session showed `MODEL POLICY / requested claude-sonnet-5-5 · medium; constrained to claude-opus-5-5 · effort unspecified`.
+
+**Root cause.** That session loaded exactly one Cockpit, the installed production 0.4.0. 0.4.0 has no `profile` option. With `cobaltStrict: true` its `turn.step` hook rewrites every main-loop request to `MAIN_MODEL` (Opus). The host recorded it: every assistant message in that session came from `claude-opus-5-5` while the selected model was `sonnet`, and 0.4.0's own ledger holds the warning above. The rewrite carries the host's Sonnet level (`medium`) onto the Opus request. The development code was not loaded in that session.
+
+**Precedence (development code, unchanged; now pinned by tests).** The profile names the main model. `cobaltStrict` turns orchestration on and adds safety restrictions (Fable block, subscription-only, no external advisor). It names no model.
+
+| Options | Main model |
+| --- | --- |
+| `orchestration` or `cobaltStrict`, `profile` absent or `OPUS_LED` | Opus 5.5 |
+| `orchestration` or `cobaltStrict` (or both), `profile: SONNET_LED` | Sonnet 5.5, at the host's effort |
+| neither on (any `profile`) | the host's own choice, untouched |
+
+An admitted consultation runs as a separate `cobalt-cockpit:architect` agent on Opus. The main loop's requests stay on Sonnet while it runs.
+
+**Test isolation.** The earlier six-run benchmark loaded the development plugin with `--plugin-dir` beside the enabled production plugin, so two Cockpit policy hooks were active in those runs. A clean test session disables the installed copy for that process only:
+
+```
+claude -p … --plugin-dir <repo> \
+  --settings '{"enabledPlugins":{"cobalt-cockpit@cobalt-cockpit":false},"pluginConfigs":{"cobalt-cockpit@inline":{"options":{"cobaltStrict":true,"profile":"SONNET_LED"}}}}'
+```
+
+The `init` event then lists a single `cobalt-cockpit@inline`. User settings are not modified.
+
+**Live matrix** (Claude Code 2.1.296, one development Cockpit per session, model read from each assistant message the host streamed):
+
+| # | Options | Session model / effort | Main ran on | Opus | Policy warning |
+| --- | --- | --- | --- | --- | --- |
+| 1 | strict, OPUS_LED | sonnet / default | Opus | main | yes (legacy, expected) |
+| 2 | strict, SONNET_LED | sonnet / default | Sonnet medium | none | none |
+| 3 | orchestration, strict off, SONNET_LED | sonnet / default | Sonnet medium | none | none |
+| 4 | strict, SONNET_LED | sonnet / `--effort medium` | Sonnet medium | none | none |
+| 4c | strict, SONNET_LED | sonnet / `--effort high` | Sonnet high | none | none |
+| 4b | strict, SONNET_LED | opus / default | Sonnet | none | yes (moved to Sonnet) |
+| 5 | strict, SONNET_LED, "Ask Opus to review…" | sonnet / medium | Sonnet (10 msgs) | 1 architect agent (4 msgs) | none |
+| 6 | strict, SONNET_LED, ordinary coding | sonnet / medium | Sonnet | none | none |
+| 7 | resume run 1 under SONNET_LED, then OPUS_LED | sonnet | Sonnet, then Opus | — | — |
+| 8 | orchestration off | opus / sonnet | Opus / Sonnet (native) | — | none |
+
+Deterministic tests: nine precedence cases through the real `turn.step` hook, plus one that holds the main loop on Sonnet at the host's effort while an admitted architect runs. A mutation that makes strict mode force `OPUS_LED` fails four of them.
+
+Remaining for release hardening, found in these runs: a consultation location written `path:line` becomes the architect's owned resource verbatim, so the architect could not read the file (run 5, where Sonnet verified the advice independently); the architect ran at `medium`, not `high`; and in run 6 Sonnet still made no progress calls, because the progress tool is registered as deferred.
+
 ## Migration and rollback
 
 Migration: keep orchestration on, set `profile` to `SONNET_LED`, choose `/effort` (medium recommended), optionally run `/autocompact 400k` while on Sonnet (already set on this machine), and restart. Rollback: set `profile` back to `OPUS_LED`, or remove it, and restart. Details and data compatibility are in [implementation-v0.5-sonnet-led.md](implementation-v0.5-sonnet-led.md).

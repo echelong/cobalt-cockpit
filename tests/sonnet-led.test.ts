@@ -303,6 +303,46 @@ describe('SONNET_LED through the host', () => {
     expect(String((await call($, releasePacket)).result)).toContain('no receipt in router output')
     expect(ledger(held).consults![0]!.advice).toBeNull()
   })
+  // The profile picks the main model; strict mode adds safety, not a model.
+  // [options, the session's model, the model the main request reaches the engine on]
+  {
+    const cases: [Record<string, string | boolean>, string, string][] = [
+      [{ cobaltStrict: true }, SONNET, OPUS_MODEL],
+      [{ cobaltStrict: true, profile: 'OPUS_LED' }, SONNET, OPUS_MODEL],
+      [{ cobaltStrict: true, profile: 'SONNET_LED' }, SONNET, SONNET],
+      [{ cobaltStrict: true, profile: 'SONNET_LED' }, OPUS_MODEL, SONNET],
+      [{ orchestration: true, profile: 'SONNET_LED' }, SONNET, SONNET],
+      [{ orchestration: true, cobaltStrict: true, profile: 'SONNET_LED' }, SONNET, SONNET],
+      // a profile is not in force without orchestration: the host's own choice stands
+      [{ profile: 'SONNET_LED' }, OPUS_MODEL, OPUS_MODEL],
+      [{ profile: 'SONNET_LED' }, SONNET, SONNET],
+      [{}, OPUS_MODEL, OPUS_MODEL],
+    ]
+    for (const [options, session, reached] of cases) {
+      test(`precedence: ${JSON.stringify(options)} on ${session} runs main on ${reached}`, { options }, async ($, on) => {
+        const w = world(on); const held = hostState(on, {}); await start($)
+        await step($, session, { effort: 'medium' })
+        expect(w.efforts.at(-1)).toEqual({ model: reached, effort: 'medium' })
+        expect((ledger(held).warnings ?? []).some(x => x.startsWith('MODEL POLICY'))).toBe(session !== reached)
+      })
+    }
+  }
+  test('the main loop keeps the host effort and stays on Sonnet while an Opus consultation runs', { options: { cobaltStrict: true, profile: 'SONNET_LED' } }, async ($, on) => {
+    const w = world(on); const held = hostState(on, {}); await start($)
+    for (const effort of ['low', 'medium', 'high', undefined]) {
+      await step($, SONNET, effort === undefined ? {} : { effort })
+      expect(w.efforts.at(-1)).toEqual({ model: SONNET, ...(effort === undefined ? {} : { effort }) })
+    }
+    await prompt($, 'Please approve the release of v0.5.0')
+    await call($, releasePacket)
+    const spawned = await spawn($, `[task:${ledger(held).consults![0]!.id}] Opus release consultation`)
+    await step($, OPUS_MODEL, { agentId: spawned.agentId, effort: 'high' })
+    expect(w.efforts.at(-1)).toMatchObject({ model: OPUS_MODEL, agentId: spawned.agentId })
+    // the main loop's next request, with the architect still running
+    await step($, SONNET, { effort: 'medium' })
+    expect(w.efforts.at(-1)).toEqual({ model: SONNET, effort: 'medium' })
+    expect(ledger(held).warnings.filter(x => x.startsWith('MODEL POLICY'))).toEqual([])
+  })
   test('the budget is four helpers', LED, async ($, on) => {
     world(on); await start($)
     for (const id of ['a', 'b', 'c', 'd', 'e']) await call($, { action: 'assign', task_id: id, tier: id < 'c' ? 'SONNET' : 'HAIKU', role: 'w', objective: id, owned_resources: [`/work/example/${id}.ts`], mode: 'read' })
