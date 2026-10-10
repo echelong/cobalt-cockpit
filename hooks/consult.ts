@@ -21,7 +21,7 @@
 //     a failed consultation is retried at most once; three per task.
 
 import { redactSecrets, secretText } from './secrets'
-import type { ConsultGround, Consultation, EvidencePacket, Profile, ReleaseRecord, ReviewRequirement, Swarm, SwarmTask, Task } from '../types'
+import type { ClearedGround, ConsultGround, Consultation, EvidencePacket, Profile, ReleaseOutcome, ReleaseRecord, ReviewRequirement, Swarm, SwarmTask, Task } from '../types'
 export type { ConsultGround, Consultation, EvidencePacket, ReviewRequirement } from '../types'
 
 export const GROUNDS: readonly ConsultGround[] = ['architecture', 'security', 'repeated-failure', 'asked', 'release']
@@ -177,14 +177,28 @@ export const problemKey = (ground: ConsultGround, p: EvidencePacket): string => 
   return hash.toString(16).padStart(8, '0')
 }
 
-export type ConsultStatus = 'admitted' | 'running' | 'returned' | 'failed' | 'cancelled'
+/**
+ * The terminal states of a consultation, read one way everywhere:
+ *   admitted / running  open: nothing can be admitted beside it.
+ *   returned            the host saw the architect finish (`hasReturned`); only this is an answer from Opus.
+ *   failed              the run failed, or was marked complete with no architect seen to finish: a spent attempt.
+ *   cancelled           withdrawn before it answered: a spent attempt.
+ *   escalated           the architect handed the problem on instead of answering: a spent attempt, never an answer
+ *                       and never an approval.
+ * Past `returned` there are three more facts, kept apart: VERIFIED (the main session judged the advice, pass or
+ * fail), the RECOMMENDATION (GO or NO-GO, read off the architect's own DECISION line) and the owner's approval to
+ * publish, which Cockpit never records. Only a returned, verified pass with a GO for the exact clean commit clears a
+ * release ground.
+ */
+export type ConsultStatus = 'admitted' | 'running' | 'returned' | 'failed' | 'cancelled' | 'escalated'
 
 /** A consultation's lifecycle, read off the swarm task it ran as. */
 export const statusOf = (task: SwarmTask | undefined): ConsultStatus => {
   if (task === undefined) return 'cancelled'
   if (task.state === 'queued' || task.state === 'blocked' || task.state === 'reserved') return 'admitted'
   if (task.state === 'running' || task.state === 'stalled') return 'running'
-  if (task.state === 'completed' || task.state === 'escalated') return 'returned'
+  if (task.state === 'completed') return hasReturned(task) ? 'returned' : 'failed'
+  if (task.state === 'escalated') return 'escalated'
 
   return task.state === 'cancelled' ? 'cancelled' : 'failed'
 }
@@ -251,7 +265,7 @@ const releaseVerdict = (r: ConsultRequest, isMandatory: boolean): { ok: true; ke
   const mine = r.consults.filter(c => c.ground === 'release' && c.candidate === sha)
   const kept = (r.history ?? []).filter(h => h.candidate === sha)
   const answered = mine.find(c => statusOf(taskOf(r.swarm, c.id)) === 'returned') ?? kept.find(h => h.returned)
-  if (answered) return { ok: false, reason: `OPUS / DUPLICATE. Commit ${sha.slice(0, 12)} was already reviewed (${answered.id}). Act on its decision; a changed commit is a new candidate.` }
+  if (answered) return { ok: false, reason: `OPUS / DUPLICATE. Commit ${sha.slice(0, 12)} was already reviewed (${answered.id}); no second consultation is started. A verified GO for this exact commit is applied to this task by itself; a NO-GO, or a review not yet verified, is not an approval. A changed commit is a new candidate.` }
   const attempts = new Set([...mine.map(c => c.id), ...kept.map(h => h.id)]).size
   if (attempts >= MAX_RELEASE_ATTEMPTS) return { ok: false, reason: `OPUS / RELEASE RETRY BUDGET. Commit ${sha.slice(0, 12)} has had ${attempts} release consultations that did not return; block with the reason.` }
   const inSession = r.consults.filter(c => c.ground === 'release').length
@@ -276,8 +290,92 @@ export const addConsult = (consults: readonly Consultation[], c: Consultation): 
   return all.filter(x => keep.has(x))
 }
 
-/** The store's release records after one more consultation, or after one returned. */
-export const withRelease = (history: readonly ReleaseRecord[], record: ReleaseRecord): ReleaseRecord[] => [...history.filter(h => h.id !== record.id), record].slice(-MAX_RELEASE_RECORDS)
+/**
+ * The store's release records after one more consultation or one more fact about it. Merged by id: a record keeps
+ * the commit and time it was first written with, `returned` never goes back to false, and a later write that knows
+ * less (no verdict yet) cannot erase what an earlier one recorded.
+ */
+export const withRelease = (history: readonly ReleaseRecord[], record: ReleaseRecord): ReleaseRecord[] => {
+  const old = history.find(h => h.id === record.id)
+  const merged: ReleaseRecord = old === undefined ? record : { candidate: old.candidate, id: old.id, at: old.at, returned: old.returned || record.returned, ...((record.verified ?? old.verified) === undefined ? {} : { verified: record.verified ?? old.verified }), ...((record.outcome ?? old.outcome) === undefined ? {} : { outcome: record.outcome ?? old.outcome }) } as ReleaseRecord
+
+  return [...history.filter(h => h.id !== record.id), merged].slice(-MAX_RELEASE_RECORDS)
+}
+
+/**
+ * The architect's release recommendation: exactly one `DECISION:` line, saying GO or NO-GO and nothing else it could
+ * be mistaken for. Missing, repeated, hedged or unreadable is undefined, and undefined never approves.
+ */
+export const releaseDecision = (answer: unknown): ReleaseOutcome | undefined => {
+  if (typeof answer !== 'string') return undefined
+  const lines = answer.split(/\r?\n/).filter(l => /^[\s>*_#-]*DECISION[\s*_]*:/i.test(l))
+  if (lines.length !== 1) return undefined
+  const verdict = /^[\s>*_#-]*DECISION[\s*_]*:[\s*_]*(NO[-\s]?GO|GO)(?![\w-])/i.exec(lines[0]!)?.[1]
+  if (verdict === undefined) return undefined
+
+  return /^no/i.test(verdict) ? 'no-go' : 'go'
+}
+
+/**
+ * The stored review that can stand for a commit in a later task: it returned, its advice was verified as a pass,
+ * and its recommendation is GO. A NO-GO for the same commit outranks any GO. Nothing else is eligible: not a review
+ * that has only returned, not a failed or pending verification, not a record from before outcomes were kept.
+ */
+export const releaseEligible = (history: readonly ReleaseRecord[], sha: string): ReleaseRecord | undefined => {
+  const mine = history.filter(h => h.candidate === sha && h.returned && h.verified === 'pass')
+  if (mine.some(h => h.outcome === 'no-go')) return undefined
+
+  return mine.filter(h => h.outcome === 'go').at(-1)
+}
+
+/**
+ * The review after the main session judged one consultation's advice. The only place a ground is cleared, and only by
+ * a consultation of that very ground. A release ground is cleared only by a verified pass whose recommendation is GO
+ * for the commit the consultation was admitted for, while that commit is still the clean one (`now`); every other
+ * outcome leaves it uncleared. The review is adjudicated when all of its grounds are cleared.
+ */
+export const clearReview = (review: ReviewRequirement | undefined, c: Consultation, state: 'pass' | 'fail', outcome: ReleaseOutcome | undefined, now: string | null): ReviewRequirement | undefined => {
+  if (review === undefined || !review.grounds.includes(c.ground)) return review
+  const mine = review.consult === c.id
+  const entry: ClearedGround | undefined = c.ground !== 'release'
+    ? { ground: c.ground, consult: c.id }
+    : state === 'pass' && outcome === 'go' && c.candidate !== undefined && c.candidate === now ? { ground: 'release', consult: c.id, candidate: c.candidate } : undefined
+  if (entry === undefined) return mine ? { ...review, consult: null, state: review.state === 'admitted' ? 'required' : review.state } : review
+  const cleared = [...(review.cleared ?? []).filter(x => x.ground !== c.ground), entry]
+  const base: ReviewRequirement = { ...review, cleared, ...(entry.candidate === undefined ? {} : { candidate: entry.candidate }) }
+  if (review.grounds.every(g => cleared.some(x => x.ground === g))) return { ...base, consult: c.id, state: 'adjudicated' }
+
+  return { ...base, consult: mine ? null : review.consult, state: mine || review.state === 'adjudicated' ? 'required' : review.state }
+}
+
+/** What git says about the working tree: a clean commit, a real difference, or no answer. */
+export type GitCandidate = { sha: string } | { sha: null; why: 'dirty' | 'unknown' }
+
+/**
+ * A review's release ground against what git now says. Cleared for a commit that has moved or a tree that has changed:
+ * withdrawn. Not cleared, and git names the clean commit of an eligible stored review: cleared again, marked reused.
+ * Git not answering is neither: a held approval is kept (nothing shows it moved), none is granted or restored, and the
+ * stored records are never touched. An approval with no commit behind it (stored before v0.5.1) does not stand.
+ */
+export const revalidateRelease = (review: ReviewRequirement, now: GitCandidate, history: readonly ReleaseRecord[]): ReviewRequirement => {
+  if (!review.grounds.includes('release')) return review
+  const held = review.cleared?.find(x => x.ground === 'release')
+  const open = review.state !== 'adjudicated'
+  const { candidate: _gone, ...rest } = review
+  if (held === undefined && review.state === 'adjudicated') return { ...rest, cleared: (review.cleared ?? []).filter(x => x.ground !== 'release'), consult: null, state: 'required' }
+  if (held !== undefined) {
+    if (now.sha === held.candidate || (now.sha === null && now.why === 'unknown')) return review
+
+    return { ...rest, cleared: (review.cleared ?? []).filter(x => x.ground !== 'release'), consult: open ? review.consult : null, state: open ? review.state : 'required' }
+  }
+  if (now.sha === null) return review
+  const record = releaseEligible(history, now.sha)
+  if (record === undefined) return review
+  const cleared = [...(review.cleared ?? []), { ground: 'release' as const, consult: record.id, candidate: now.sha, reused: true as const }]
+  const base: ReviewRequirement = { ...review, cleared, candidate: now.sha }
+
+  return review.grounds.every(g => cleared.some(x => x.ground === g)) ? { ...base, consult: record.id, state: 'adjudicated' } : base
+}
 
 /**
  * The task with the review it now requires. Grounds only accumulate within a
@@ -298,7 +396,14 @@ export const requireReview = (task: Task, grounds: readonly ConsultGround[]): Ta
 /** The review moved on by what happened to its consultation. */
 export const advanceReview = (review: ReviewRequirement | undefined, consultId: string, step: 'admitted' | 'returned' | 'adjudicated'): ReviewRequirement | undefined => {
   if (review === undefined) return undefined
-  if (step === 'admitted') return review.state === 'adjudicated' ? review : { ...review, consult: consultId, state: 'admitted' }
+  if (step === 'admitted') {
+    if (review.state === 'adjudicated') return review
+    // a commit is carried only by a cleared release ground, never by an attempt: nothing stale rides along
+    const { candidate: _stale, ...rest } = review
+    const held = review.cleared?.find(x => x.ground === 'release')?.candidate
+
+    return { ...rest, ...(held === undefined ? {} : { candidate: held }), consult: consultId, state: 'admitted' }
+  }
   if (review.consult !== consultId) return review
 
   return { ...review, state: step }
@@ -322,6 +427,7 @@ export const briefOf = (c: Consultation): string => {
     `DECISION REQUESTED\n  ${p.decision}`,
     '',
     'Answer with: DECISION (one line), RATIONALE, PLAN or FINDINGS (ordered, path:line where it applies), RISKS, and VERIFICATION (the checks Sonnet must run to confirm it). Do not implement; Sonnet implements and verifies.',
+    ...(c.ground === 'release' ? ['', 'The DECISION line is read by machine: write exactly one line, "DECISION: GO" or "DECISION: NO-GO", and no other line that starts with DECISION. GO only if no critical or high finding remains. State which files you could and could not read.'] : []),
   ].join('\n')
 }
 

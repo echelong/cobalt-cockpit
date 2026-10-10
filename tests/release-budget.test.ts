@@ -133,7 +133,7 @@ const SWARM = 'mcp__cobalt-cockpit__swarm'
 const call = ($: Engine, input: Record<string, unknown>) => $.tool.call({ tool: SWARM, ...input } as never)
 let seq = 0
 const spawn = ($: Engine, description: string) => $.agent.spawn({ prompt: 'brief', description, subagentType: 'cobalt-cockpit:architect', tool_use_id: `sp-${++seq}`, parentModel: SONNET, provider: { plugin: 'cobalt-cockpit', tier: 'user' }, background: true, fork: false } as never)
-const finish = ($: Engine, agentId: string) => $.turn.complete({ agentId, turnId: `turn-${agentId}`, reason: 'answer', answer: 'DECISION: ship', durationMs: 20, isAborted: false } as never)
+const finish = ($: Engine, agentId: string) => $.turn.complete({ agentId, turnId: `turn-${agentId}`, reason: 'answer', answer: 'DECISION: GO', durationMs: 20, isAborted: false } as never)
 const ledger = (held: ReturnType<typeof hostState>) => held.get('run-ledger')!.value as Ledger
 const task = (held: ReturnType<typeof hostState>) => held.get('task')!.value as Task
 const releasePacket = { action: 'consult', ground: 'release', objective: 'Release v0.5.1', architecture: 'Plugin hooks', locations: ['hooks/consult.ts'], risk: 'Broken admission', question: 'Approve the release?' }
@@ -153,12 +153,14 @@ describe('a release review through the host', () => {
     expect(reply).toContain(`CANDIDATE COMMIT\n  ${A}`)
     const id = ledger(held).consults![0]!.id
     expect(ledger(held).consults![0]!.candidate).toBe(A)
-    expect(task(held).review).toMatchObject({ state: 'admitted', candidate: A })
+    // an attempt carries no commit onto the review: only a cleared release ground does
+    expect(task(held).review).toMatchObject({ state: 'admitted' })
+    expect(task(held).review?.candidate).toBeUndefined()
     expect(w.storeWrites.some(x => x.key === 'release-reviews')).toBe(true)
     const spawned = await spawn($, `[task:${id}] Opus release consultation`)
     await finish($, spawned.agentId!)
-    await call($, { action: 'verify', task_id: id, state: 'pass', evidence: ['checked'] })
-    expect(task(held).review?.state).toBe('adjudicated')
+    await call($, { action: 'verify', task_id: id, state: 'pass', release_outcome: 'go', evidence: ['checked'] })
+    expect(task(held).review).toMatchObject({ state: 'adjudicated', candidate: A })
     expect(String((await call($, releasePacket)).result)).toContain('DUPLICATE')
     // the approval stands while the commit and the tree are unchanged ...
     expect(await progress($, { action: 'complete', milestone: 'm5' })).toStartWith('DONE 100%')
@@ -230,19 +232,20 @@ describe('a release review through the host', () => {
     const w = world(on); const held = hostState(on, {}); await releaseTask($)
     await call($, releasePacket)
     const id = await approve($, held)
-    await call($, { action: 'verify', task_id: id, state: 'pass', evidence: ['checked'] })
+    await call($, { action: 'verify', task_id: id, state: 'pass', release_outcome: 'go', evidence: ['checked'] })
     expect(task(held).review).toMatchObject({ state: 'adjudicated', candidate: A })
     w.head = B
     const second = String((await call($, releasePacket)).result)
     expect(second).toContain('OPUS ADMITTED')
-    expect(task(held).review).toMatchObject({ state: 'admitted', candidate: B })
+    expect(task(held).review).toMatchObject({ state: 'admitted' })
+    expect(task(held).review?.candidate).toBeUndefined()
     expect(task(held).review?.consult).not.toBe(id)
   })
   test('uncommitted changes withdraw an approval, an unanswering git does not, and the same clean commit gives it back', LED, async ($, on) => {
     const w = world(on); const held = hostState(on, {}); await releaseTask($)
     await call($, releasePacket)
     const id = await approve($, held)
-    await call($, { action: 'verify', task_id: id, state: 'pass', evidence: ['checked'] })
+    await call($, { action: 'verify', task_id: id, state: 'pass', release_outcome: 'go', evidence: ['checked'] })
     const saved = w.gitStatus
     w.gitStatus = null
     await progress($, { action: 'status' })
@@ -250,7 +253,7 @@ describe('a release review through the host', () => {
     w.gitStatus = saved
     w.uncommitted = true
     await progress($, { action: 'status' })
-    expect(task(held).review).toMatchObject({ state: 'required', lapsed: { candidate: A, consult: id } })
+    expect(task(held).review).toMatchObject({ state: 'required' })
     expect(task(held).percent).toBeLessThan(100)
     w.uncommitted = false
     await progress($, { action: 'status' })
@@ -261,7 +264,8 @@ describe('a release review through the host', () => {
     const t = task(held)
     held.get('task')!.value = { ...t, review: { grounds: ['release'], consult: 'opus-1-old', state: 'adjudicated' } }
     await progress($, { action: 'status' })
-    expect(task(held).review).toEqual({ grounds: ['release'], consult: null, state: 'required' })
+    expect(task(held).review).toMatchObject({ grounds: ['release'], consult: null, state: 'required' })
+    expect(task(held).review?.cleared ?? []).toEqual([])
   })
   test('an unreadable release record fails closed', LED, async ($, on) => {
     world(on, {}, { 'release-reviews': 'garbage' }); const held = hostState(on, {}); await releaseTask($)

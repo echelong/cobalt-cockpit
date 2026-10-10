@@ -582,6 +582,15 @@ export type ProgressInput = {
   /** decide: one decision record. align: the original-goal check. */
   decision?: unknown
   alignment?: unknown
+  /** The flat spellings `foldAliases` folds into `decision` (decide) and `alignment` (align). */
+  problem?: unknown
+  chosen?: unknown
+  alternatives?: unknown
+  tradeoffs?: unknown
+  status?: unknown
+  id?: unknown
+  missing?: unknown
+  assumptions?: unknown
 }
 
 const optionalText = (value: unknown): string | null =>

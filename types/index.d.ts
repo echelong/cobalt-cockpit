@@ -232,19 +232,29 @@ export type Consultation = {
   requestedAt: number
   /** A release consultation: the full commit id of the clean working tree it was admitted for. */
   candidate?: string
-  /** A release approval withdrawn because the commit or tree moved: restored if the same commit is clean again. */
-  lapsed?: { candidate: string; consult: string | null }
 }
-/** One release consultation as the store keeps it across sessions: bounded, so a restart cannot erase it or reset its budget. */
-export type ReleaseRecord = { candidate: string; id: string; at: number; returned: boolean }
+/** The architect's release recommendation, read off its own DECISION line. */
+export type ReleaseOutcome = 'go' | 'no-go'
+/**
+ * One release consultation as the store keeps it across sessions: bounded, so a restart cannot erase it or reset its budget.
+ * Four separate facts: `returned` (the host saw the architect finish), `verified` (the main session judged its advice),
+ * `outcome` (the recommendation, set only with a verified pass) and, apart from all of them, the owner's approval to
+ * publish, which is never recorded here.
+ */
+export type ReleaseRecord = { candidate: string; id: string; at: number; returned: boolean; verified?: 'pass' | 'fail'; outcome?: ReleaseOutcome }
+
+/** One ground of a review, cleared by a consultation of that ground. A release ground carries its commit; `reused` marks a review taken from another task or session. */
+export type ClearedGround = { ground: ConsultGround; consult: string; candidate?: string; reused?: true }
 
 export type ReviewRequirement = {
   grounds: ConsultGround[]
   /** The consultation that answers it, once admitted. */
   consult: string | null
-  /** required → admitted → returned → adjudicated (main session verified the advice, pass or fail). */
+  /** required → admitted → returned → adjudicated (every ground cleared). */
   state: 'required' | 'admitted' | 'returned' | 'adjudicated'
-  /** A release review: the commit it approved. A different commit, or a changed working tree, takes it back. */
+  /** The grounds already cleared, each by a consultation of its own ground; the review is adjudicated when all of `grounds` are. Absent on a review stored before v0.5.1. */
+  cleared?: ClearedGround[]
+  /** A release review: the commit its cleared release ground stands for. A different commit, or a changed working tree, takes it back. */
   candidate?: string
 }
 
@@ -515,7 +525,7 @@ export type ToolEntry = { id: string; runId: Value<string>; turnId: Value<string
 export type Reading = { at: number; turnId: Value<string>; tokens: Value<number>; window: Value<number>; percent: Value<number> }
 export type Request = { id: string; runId: Value<string>; turnId: string; agentId: Value<string>; requestedModel: Value<string>; requestedEffort: Value<string>; model: Value<string>; effort: Value<string>; effectiveEffort: Value<string>; input: Value<number>; output: Value<number>; cacheRead: Value<number>; cacheWrite: Value<number> }
 export type Checkpoint = { at: number; goal: string; phase: string; completed: string[]; remaining: string[]; latest: string; gates: Record<string, string>; branch: string; startingSha: string; currentSha: string; repo: string; dirty: Value<number>; blockers: string[]; backgroundAgents: string[] }
-export type Ledger = { schema: 1 | 2; observedCompletions?: { agentId: string; reason: string; conclusion: string; at: number }[]; swarm?: Swarm; sessionId: string; currentRun: Value<string>; turns: Record<string, string>; runs: Run[]; agents: LedgerAgent[]; tools: ToolEntry[]; requests: Request[]; usage: Reading[]; receipts: NwhoEvent[]; warnings: string[]; replay: ReplayStep[]; checkpoint: Checkpoint | null; /** Opus consultations (SONNET_LED); absent in older ledgers. */ consults?: Consultation[]; /** The session router's decisions, newest last; absent until one is made. */ routing?: RouterDecision[]; /** v0.5.1 decision records, newest last; absent in v0.5.0 ledgers. */ decisions?: DecisionRecord[]; /** v0.5.1: why each task got its discovery level; absent in v0.5.0 ledgers. */ discoveries?: DiscoveryEntry[] }
+export type Ledger = { schema: 1 | 2; observedCompletions?: { agentId: string; reason: string; conclusion: string; at: number; decision?: ReleaseOutcome }[]; swarm?: Swarm; sessionId: string; currentRun: Value<string>; turns: Record<string, string>; runs: Run[]; agents: LedgerAgent[]; tools: ToolEntry[]; requests: Request[]; usage: Reading[]; receipts: NwhoEvent[]; warnings: string[]; replay: ReplayStep[]; checkpoint: Checkpoint | null; /** Opus consultations (SONNET_LED); absent in older ledgers. */ consults?: Consultation[]; /** The session router's decisions, newest last; absent until one is made. */ routing?: RouterDecision[]; /** v0.5.1 decision records, newest last; absent in v0.5.0 ledgers. */ decisions?: DecisionRecord[]; /** v0.5.1: why each task got its discovery level; absent in v0.5.0 ledgers. */ discoveries?: DiscoveryEntry[] }
 export type ReplayStep = { id: string; runId: string; turnId: string; agentId: string; file: string; kind: 'Edit' | 'Write'; at: number; before: string; after: string; scope: 'fragment' | 'file'; omitted: boolean }
 export type Cursor = { offset: number; size: number; seen: string[]; primed: boolean }
 

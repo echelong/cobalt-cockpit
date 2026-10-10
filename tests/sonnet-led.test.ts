@@ -221,7 +221,7 @@ const step = async ($: Engine, model: string, over: Record<string, unknown> = {}
 }
 let seq = 0
 const spawn = ($: Engine, description: string, subagentType = 'cobalt-cockpit:architect', model?: string) => $.agent.spawn({ prompt: 'brief', description, subagentType, tool_use_id: `sp-${++seq}`, parentModel: SONNET, provider: { plugin: 'cobalt-cockpit', tier: 'user' }, background: true, fork: false, ...(model ? { model } : {}) } as never)
-const finish = ($: Engine, agentId: string) => $.turn.complete({ agentId, turnId: `turn-${agentId}`, reason: 'answer', answer: 'DECISION: ship', durationMs: 20, isAborted: false } as never)
+const finish = ($: Engine, agentId: string) => $.turn.complete({ agentId, turnId: `turn-${agentId}`, reason: 'answer', answer: 'DECISION: GO', durationMs: 20, isAborted: false } as never)
 const ledger = (held: ReturnType<typeof hostState>) => held.get('run-ledger')!.value as Ledger
 const task = (held: ReturnType<typeof hostState>) => held.get('task')!.value as Task
 const releasePacket = { action: 'consult', ground: 'release', objective: 'Release v0.5.0', architecture: 'Plugin hooks', locations: ['hooks/consult.ts'], risk: 'Broken admission in production', question: 'Approve the release?' }
@@ -288,7 +288,7 @@ describe('SONNET_LED through the host', () => {
     expect(String((await call($, releasePacket)).result)).toContain('DUPLICATE')
     expect(task(held).percent).toBeLessThan(100)
 
-    await call($, { action: 'verify', task_id: id, state: 'pass', evidence: ['Re-ran tests: 1000 pass'] })
+    await call($, { action: 'verify', task_id: id, state: 'pass', release_outcome: 'go', evidence: ['Re-ran tests: 1000 pass'] })
     expect(task(held).review?.state).toBe('adjudicated')
     await progress($, { action: 'complete', milestone: 'm5' })
     expect(task(held).percent).toBe(100)
@@ -494,7 +494,7 @@ describe('a mandatory review cannot be waived by the main loop', () => {
     await finish($, spawned.agentId!)
     expect(await hold($)).toContain('HELD')
     expect(task(held).review).toMatchObject({ consult: id, state: 'admitted' })
-    await call($, { action: 'verify', task_id: id, state: 'pass', evidence: ['checked'] })
+    await call($, { action: 'verify', task_id: id, state: 'pass', release_outcome: 'go', evidence: ['checked'] })
     expect(task(held).review?.state).toBe('adjudicated')
     await progress($, { action: 'complete', milestone: 'm5' })
     expect(task(held).percent).toBe(100)
@@ -515,10 +515,11 @@ describe('a mandatory review cannot be waived by the main loop', () => {
     expect(String((await call($, { action: 'verify', task_id: id, state: 'fail', evidence: ['none'] })).result)).toContain('has not returned')
     expect(await progress($, { action: 'complete', milestone: 'm5' })).toContain('HELD')
     expect(w.spawns.at(-1)?.['model']).toBe(OPUS_MODEL)
-    // once the architect has answered, either verdict adjudicates it
+    // once the architect has answered, the verdict is accepted; advice judged wrong is not an approval, so the review is required again
     await finish($, spawned.agentId!)
     await call($, { action: 'verify', task_id: id, state: 'fail', evidence: ['the advice was wrong: tests disagree'] })
-    expect(task(held).review?.state).toBe('adjudicated')
+    expect(task(held).review).toMatchObject({ state: 'required', consult: null })
+    expect(task(held).review?.cleared ?? []).toEqual([])
   })
   test('a consultation on another ground does not stand in for the one the review needs', LED, async ($, on) => {
     world(on); const held = hostState(on, {}); await start($)

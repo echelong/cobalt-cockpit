@@ -15,9 +15,9 @@ import { atom, read, update } from 'claude-code'
 import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL, OPUS_MODEL, isProfile, DEFAULT_PROFILE } from './model-policy'
 import type { SubagentTier, Profile } from './model-policy'
 import { discoveryRows, guidanceFor, markGuided, needsAlignment, unpin, withDiscovery } from './discovery'
-import { addConsult, advanceReview, briefOf, consultVerdict, factsOf, hasReturned, isCandidate, isGround, withRelease, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
+import { addConsult, advanceReview, briefOf, clearReview, consultVerdict, factsOf, hasReturned, isCandidate, isGround, releaseDecision, revalidateRelease, withRelease, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
 import type { Consultation } from './consult'
-import type { ReleaseRecord } from '../types'
+import type { ReleaseOutcome, ReleaseRecord } from '../types'
 import { addDecision, adjudicate, adviceLine, answerOf, callsFor, carriesCredential, decisionOf, deterministicRoute, operatorNotice, readAnswers, routerArgv, routerLabel, routerLine, routerModeOf, routerStateOf, switchRouter, withDecision, AVAILABILITY_STATE, CALL_TIMEOUT_MS, EMPTY_ROUTER, PROVIDER, ROUTER_MODES } from './router'
 import type { ActiveMode, RouterAnswer, RouterMode, RouterPolicy, RouterState } from './router'
 import {
@@ -202,7 +202,7 @@ const SWARM_TOOL = {
     dependencies: { type: 'array', items: { type: 'string' } }, owned_resources: { type: 'array', items: { type: 'string' } }, mode: { type: 'string', enum: ['read','write'] },
     parent_task: { type: 'string' }, spawn_reason: { type: 'string' }, wave: { type: 'string', enum: ['RECONNAISSANCE','ENGINEERING','REVIEW','INTEGRATION','VERIFICATION'] },
     conclusion: { type: 'string' }, evidence: { type: 'array', items: { type: 'string' } }, changes: { type: 'array', items: { type: 'string' } }, verification: { type: 'array', items: { type: 'string' } }, unresolved: { type: 'array', items: { type: 'string' } }, confidence: { type: 'string' },
-    to: { type: 'string', enum: ['SONNET','OPUS'] }, discoveries: { type: 'array', items: { type: 'string' } }, question: { type: 'string' }, risk: { type: 'string' }, next_action: { type: 'string' }, locations: { type: 'array', items: { type: 'string' } }, state: { type: 'string', enum: ['pending','pass','fail','unknown'] },
+    to: { type: 'string', enum: ['SONNET','OPUS'] }, discoveries: { type: 'array', items: { type: 'string' } }, question: { type: 'string' }, risk: { type: 'string' }, next_action: { type: 'string' }, locations: { type: 'array', items: { type: 'string' } }, state: { type: 'string', enum: ['pending','pass','fail','unknown'] }, release_outcome: { type: 'string', enum: ['go','no-go'], description: 'verify (a release consultation, state pass): your confirmation of the architect\'s own DECISION line; it cannot be more favourable than that line' },
     effort: { type: 'string', enum: ['AUTO','low','medium','high','xhigh','max'], description: 'assign/escalate: the reasoning level this task deserves, or AUTO to choose from the task' }, effort_reason: { type: 'string', description: 'assign/escalate: why that level was chosen' },
   }, required: ['action'] },
 } as const
@@ -251,7 +251,11 @@ const candidateOf = async ($: EngineInterface): Promise<Candidate> => {
     return { sha: null, why: 'unknown' }
   }
 }
-const releaseRecords = (held: unknown): ReleaseRecord[] => (Array.isArray(held) ? held.filter((h): h is ReleaseRecord => h !== null && typeof h === 'object' && isCandidate((h as ReleaseRecord).candidate) && typeof (h as ReleaseRecord).id === 'string' && typeof (h as ReleaseRecord).returned === 'boolean' && typeof (h as ReleaseRecord).at === 'number') : [])
+const releaseRecords = (held: unknown): ReleaseRecord[] => (Array.isArray(held) ? held.filter((h): h is ReleaseRecord => h !== null && typeof h === 'object' && isCandidate((h as ReleaseRecord).candidate) && typeof (h as ReleaseRecord).id === 'string' && typeof (h as ReleaseRecord).returned === 'boolean' && typeof (h as ReleaseRecord).at === 'number').map(h => {
+  // a verdict is kept only in its two known forms; anything else reads as no verdict, which never approves
+  const { verified, outcome, ...rest } = h
+  return { ...rest, ...(verified === 'pass' || verified === 'fail' ? { verified } : {}), ...(outcome === 'go' || outcome === 'no-go' ? { outcome } : {}) }
+}) : [])
 /** The store's release records. Strict: a store that cannot be read, or holds something else, fails a release request closed. */
 const releaseHistory = async ($: EngineInterface): Promise<ReleaseRecord[]> => {
   const held = await $.store.get('release-reviews')
@@ -261,49 +265,57 @@ const releaseHistory = async ($: EngineInterface): Promise<ReleaseRecord[]> => {
 }
 /** The same, for housekeeping: what can be read. */
 const releaseHistorySoft = async ($: EngineInterface): Promise<ReleaseRecord[]> => releaseRecords(await $.store.get('release-reviews').catch(() => undefined))
+/**
+ * Every write of the release records goes through here, one at a time inside this process: the list is read again
+ * inside the queue, changed, written, and read back, and a record that did not come back as written fails the
+ * operation (so an admission that depends on it admits nothing). LIMIT: the store offers get and set only, with no
+ * compare-and-set, so two Cockpit processes sharing one store can still overwrite each other between the read and the
+ * write. The read-back catches a write that is already gone, not one that is lost a moment later; the merge by id and
+ * the read-again keep what a second process wrote earlier. A release admission is the one place that cannot be left
+ * ambiguous, and it fails closed on any mismatch.
+ */
+let releaseQueue: Promise<unknown> = Promise.resolve()
+const mutateRelease = ($: EngineInterface, f: (held: ReleaseRecord[]) => ReleaseRecord[]): Promise<ReleaseRecord[]> => {
+  const run = releaseQueue.then(async () => {
+    const held = await releaseHistory($)
+    const written = f(held)
+    if (JSON.stringify(written) === JSON.stringify(held)) return held
+    await $.store.set('release-reviews', written)
+    const back = releaseRecords(await $.store.get('release-reviews'))
+    const lost = written.find(n => { const b = back.find(x => x.id === n.id); return b === undefined || b.candidate !== n.candidate || b.returned !== n.returned || b.verified !== n.verified || b.outcome !== n.outcome })
+    if (lost !== undefined) throw new Error(`OPUS / RELEASE RECORD NOT PERSISTED. The record of release consultation ${lost.id} did not read back as written, so nothing that depends on it was started.`)
+
+    return written
+  })
+  releaseQueue = run.catch(() => undefined)
+
+  return run
+}
 /** A release consultation the host saw return is recorded as returned where a restart cannot lose it, whether or not it has been verified yet. */
 const syncRelease = async ($: EngineInterface): Promise<void> => {
   const ledger = await read($, ledgerAtom)
-  const mine = (ledger.consults ?? []).filter(c => c.ground === 'release' && c.candidate !== undefined)
-  if (mine.length === 0) return
   const swarm = swarmState(ledger)
-  const history = await releaseHistorySoft($)
-  for (const c of mine) {
-    const record = history.find(h => h.id === c.id && h.candidate === c.candidate)
-    if (record?.returned === true || !hasReturned(swarm.tasks.find(t => t.id === c.id))) continue
-    await quiet(() => $.store.set('release-reviews', withRelease(history, { candidate: c.candidate!, id: c.id, at: record?.at ?? c.requestedAt, returned: true })))
-  }
+  const back = (ledger.consults ?? []).filter(c => c.ground === 'release' && c.candidate !== undefined && hasReturned(swarm.tasks.find(t => t.id === c.id)))
+  if (back.length === 0) return
+  await mutateRelease($, held => back.reduce((all, c) => (all.some(h => h.id === c.id && h.returned) ? all : withRelease(all, { candidate: c.candidate!, id: c.id, at: c.requestedAt, returned: true })), held))
 }
 /**
- * A release approval stands only for the commit it was given for, on a clean tree: a change takes it back (and
- * the same commit, clean again, gives it back, because that review really returned). An approval with no
- * commit behind it, or a git that does not answer, is never the reason to keep or to restore one.
+ * A release approval stands only for the commit it was given for, on a clean tree: a change takes it back, and the
+ * same commit, clean again, gives it back from the stored record of a verified GO (`revalidateRelease`). A git that
+ * does not answer grants nothing and restores nothing; an approval already held is kept, since nothing shows it moved,
+ * and the stored records are never touched.
  */
 const reconcileRelease = async ($: EngineInterface): Promise<void> => {
   const task = await read($, taskAtom)
   const review = task?.review
   if (review === undefined || !review.grounds.includes('release')) return
-  if (review.state === 'adjudicated' && review.candidate === undefined) {
-    await update($, taskAtom, t => (t?.review?.state === 'adjudicated' && t.review.candidate === undefined ? settle({ ...t, review: { grounds: t.review.grounds, consult: null, state: 'required' } }).task : t))
-
-    return
-  }
-  if (review.state === 'adjudicated' && review.candidate !== undefined) {
-    const now = await candidateOf($)
-    if (now.sha === review.candidate || (now.sha === null && now.why === 'unknown')) return
-    await update($, taskAtom, t => (t?.review?.state === 'adjudicated' && t.review.candidate === review.candidate ? settle({ ...t, review: { grounds: t.review.grounds, consult: null, state: 'required', lapsed: { candidate: review.candidate, consult: t.review.consult } } }).task : t))
-
-    return
-  }
-  if (review.state === 'required' && review.lapsed !== undefined) {
-    const lapsed = review.lapsed
-    const now = await candidateOf($)
-    if (now.sha !== lapsed.candidate || lapsed.consult === null) return
-    const ledger = await read($, ledgerAtom)
-    const returned = hasReturned(swarmState(ledger).tasks.find(x => x.id === lapsed.consult)) || (await releaseHistorySoft($)).some(h => h.id === lapsed.consult && h.candidate === lapsed.candidate && h.returned)
-    if (!returned) return
-    await update($, taskAtom, t => (t?.review?.state === 'required' && t.review.lapsed?.candidate === lapsed.candidate ? settle({ ...t, review: { grounds: t.review.grounds, consult: lapsed.consult, state: 'adjudicated', candidate: lapsed.candidate } }).task : t))
-  }
+  const history = await releaseHistorySoft($)
+  // nothing held and nothing stored that could stand for a commit: git need not be asked
+  if (review.cleared?.some(x => x.ground === 'release') !== true && review.state !== 'adjudicated' && !history.some(h => h.returned && h.verified === 'pass' && h.outcome === 'go')) return
+  const revalidated = revalidateRelease(review, await candidateOf($), history)
+  if (revalidated === review) return
+  const was = JSON.stringify(review)
+  await update($, taskAtom, t => (t?.review !== undefined && JSON.stringify(t.review) === was ? settle({ ...t, review: revalidated }).task : t))
 }
 
 /**
@@ -329,7 +341,11 @@ const serveConsultNow = async ($: EngineInterface, e: Record<string, unknown>, a
   const facts = factsOf(task, (await read($, orchestraAtom)).errorStreak, task?.promptGrounds ?? [])
   const ledger = await read($, ledgerAtom)
   const consults = ledger.consults ?? []
-  if (ground === 'release') await syncRelease($)
+  if (ground === 'release') {
+    await syncRelease($)
+    // a verified GO already held for this exact clean commit is applied to this task before the duplicate is refused
+    await quiet(() => reconcileRelease($))
+  }
   const candidate = ground === 'release' ? (await candidateOf($)).sha : null
   const history = ground === 'release' ? await releaseHistory($) : []
   const verdict = consultVerdict({ profile: config.hasOrchestration ? config.profile : 'OPUS_LED', ground, packet: made.packet, facts, consults, swarm: swarmState(ledger), progressTask: task?.id ?? null, candidate, history })
@@ -357,7 +373,7 @@ const serveConsultNow = async ($: EngineInterface, e: Record<string, unknown>, a
   // unique across the ledger and the store, so a restart cannot reuse the id of an attempt already spent
   const id = `opus-${Math.max(counter(fresh.consults ?? []), counter(fresher)) + 1}-${verdict.key.slice(0, 6)}`
   // the record that bounds a release review is written first, and a write that fails admits nothing
-  if (ground === 'release' && nowCandidate !== null) await $.store.set('release-reviews', withRelease(fresher, { candidate: nowCandidate, id, at, returned: false }))
+  if (ground === 'release' && nowCandidate !== null) await mutateRelease($, held => withRelease(held, { candidate: nowCandidate, id, at, returned: false }))
   await changeSwarm($, held => submitTask(held, { id, tier: 'OPUS', role: ground === 'release' || ground === 'security' ? 'REVIEW' : 'ARCHITECT', objective: made.packet.decision, scope: `Opus consultation · ${ground}`, owned: owned.length ? owned : [root], mode: 'read', parentTask: null, effort: CONSULT_EFFORT, effortReason: `Opus consultation: ${CONSULT_EFFORT} by default`, spawnReason: `Opus admitted on ${ground}${verdict.isMandatory ? ' (mandatory)' : ''}` }, at).swarm)
   const c: Consultation = { id, ground, key: verdict.key, packet: made.packet, progressTask: task?.id ?? null, isMandatory: verdict.isMandatory, requestedAt: at, ...(ground === 'release' && candidate !== null ? { candidate } : {}) }
   await mutateLedger($, l => ({ ...l, consults: addConsult(l.consults ?? [], c) }))
@@ -365,14 +381,12 @@ const serveConsultNow = async ($: EngineInterface, e: Record<string, unknown>, a
   // it necessary: an easier consultation on another ground does not stand in for it.
   if (task !== null) await change($, t => {
     if (t.id !== task.id) return t
-    let held = verdict.isMandatory ? requireReview(t, [ground]) : t
-    // an approval given for another commit is not carried to this one
-    if (ground === 'release' && held.review?.state === 'adjudicated' && held.review.candidate !== candidate) held = { ...held, review: { grounds: held.review.grounds, consult: null, state: 'required' } }
+    const held = verdict.isMandatory ? requireReview(t, [ground]) : t
+    // an approval given for another commit was withdrawn above (`reconcileRelease`); an attempt carries no commit
+    // onto the review, only a cleared release ground does (`advanceReview`, `clearReview`)
     const admitted = held.review?.grounds.includes(ground) ? advanceReview(held.review, id, 'admitted') : undefined
-    if (admitted === undefined) return held
-    const { lapsed: _gone, ...clean } = admitted
 
-    return { ...held, review: ground === 'release' && candidate !== null ? { ...clean, candidate } : clean }
+    return admitted === undefined ? held : { ...held, review: admitted }
   })
 
   const scope = `Read scope: ${owned.length ? `${owned.length} named file${owned.length === 1 ? '' : 's'}` : 'the project'}${outside ? `; ${outside} location${outside === 1 ? '' : 's'} not readable (outside the project, home-relative or not a plain path)` : ''}.`
@@ -424,13 +438,29 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
       else if (action === 'cancel') await changeSwarm($, held => requestCancel(held,id,at))
       else if (action === 'verify') { if (!['pending','pass','fail','unknown'].includes(String(e['state']))) throw new Error('Valid verification state required')
         // A consultation's advice can be judged, pass or fail, only once Opus has given it.
-        const isConsult = (await read($, ledgerAtom)).consults?.some(c => c.id === id) === true
-        if (isConsult && (e['state'] === 'pass' || e['state'] === 'fail') && !hasReturned(task)) throw new Error('OPUS / this consultation has not returned. Spawn cobalt-cockpit:architect with its [task:ID] and let it answer; a review is adjudicated only on an answer Opus gave')
-        await changeSwarm($, held => verifyTask(held,id,e['state'] as Verification,at,list('evidence').join('; ')))
-        // The main session adjudicating a consultation's advice, pass or fail, is what a required review waits for.
         const consult = (await read($, ledgerAtom)).consults?.find(c => c.id === id)
-        // bound by the consultation the review names, so a re-plan does not orphan it
-        if (consult && (e['state'] === 'pass' || e['state'] === 'fail')) await change($, t => t.review ? { ...t, review: advanceReview(t.review, id, 'adjudicated') } : t)
+        const judged = e['state'] === 'pass' || e['state'] === 'fail'
+        if (consult && judged && !hasReturned(task)) throw new Error('OPUS / this consultation has not returned. Spawn cobalt-cockpit:architect with its [task:ID] and let it answer; a review is adjudicated only on an answer Opus gave')
+        // A release ground is cleared by a recommendation, not by the advice being sound. The recommendation is the
+        // architect's own DECISION line; `release_outcome` is the main session confirming it, and can only be as
+        // strict or stricter. A missing, repeated, hedged or contradicted one records and clears nothing.
+        let outcome: ReleaseOutcome | undefined
+        if (consult?.ground === 'release' && e['state'] === 'pass') {
+          const said = task.agentId === null ? undefined : (await read($, ledgerAtom)).observedCompletions?.find(c => c.agentId === task.agentId)?.decision
+          if (said === undefined) throw new Error('OPUS / RELEASE DECISION UNREADABLE. The architect\'s returned answer does not carry exactly one line "DECISION: GO" or "DECISION: NO-GO", so no release recommendation can be read from it. Nothing was recorded. Verify it with state "fail", or ask again on a changed commit.')
+          const asked = e['release_outcome']
+          if (asked !== 'go' && asked !== 'no-go') throw new Error('OPUS / release_outcome required: "go" or "no-go", confirming the architect\'s DECISION line. A verified pass alone approves nothing. Nothing was recorded.')
+          if (asked === 'go' && said === 'no-go') throw new Error('OPUS / the architect\'s DECISION is NO-GO; a GO cannot be declared over it. Verify with release_outcome "no-go". Nothing was recorded.')
+          outcome = asked === 'go' && said === 'go' ? 'go' : 'no-go'
+        }
+        // the record a later task or a restart relies on is written first; a write that does not read back stops here
+        if (consult?.ground === 'release' && consult.candidate !== undefined && judged) await mutateRelease($, held => withRelease(held, { candidate: consult.candidate!, id, at: consult.requestedAt, returned: true, verified: e['state'] as 'pass' | 'fail', ...(outcome === undefined ? {} : { outcome }) }))
+        await changeSwarm($, held => verifyTask(held,id,e['state'] as Verification,at,list('evidence').join('; ')))
+        // The main session judging a consultation's advice clears the one ground that consultation was asked on, and no other.
+        if (consult && judged) {
+          const now = consult.ground === 'release' ? (await candidateOf($)).sha : null
+          await change($, t => t.review ? { ...t, review: clearReview(t.review, consult, e['state'] as 'pass' | 'fail', outcome, now) } : t)
+        }
         // a release consultation that really returned is recorded as such where a restart cannot lose it
         await quiet(() => syncRelease($))
       }
@@ -1936,7 +1966,9 @@ export const ledgerTurnComplete = async ($: EngineInterface, e: { turnId: string
     await mutateLedger($, l => {
       const ended = finishTurn(l,e,at)
       if (!e.agentId) return ended
-      const completed = [...(ended.observedCompletions ?? []).filter(c=>c.agentId!==e.agentId), { agentId:e.agentId,reason:e.reason,conclusion:textOf(e.answer),at }].slice(-128)
+      // the stored conclusion is one folded, shortened line; the DECISION line is read from the answer as given
+      const decision = releaseDecision(e.answer)
+      const completed = [...(ended.observedCompletions ?? []).filter(c=>c.agentId!==e.agentId), { agentId:e.agentId,reason:e.reason,conclusion:textOf(e.answer),at,...(decision === undefined ? {} : { decision }) }].slice(-128)
       const task = swarmState(ended).tasks.find(t=>t.agentId===e.agentId)
       return { ...ended, observedCompletions:completed, swarm:task ? finishObserved(swarmState(ended),task.id,e.reason,textOf(e.answer),at) : swarmState(ended) }
     })
