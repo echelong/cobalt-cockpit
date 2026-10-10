@@ -303,8 +303,10 @@ export const planTask = (task: Task, input: PlanInput, now: number): Outcome => 
     blocker: isReplan ? task.blocker : null,
     updatedAt: now,
   }
+  // A goal check made before or across a plan checked a different plan: it starts over.
+  const { alignment: _stale, ...unchecked } = planned
 
-  return { task: withDiscovery(planned, null) }
+  return { task: withDiscovery(unchecked, null) }
 }
 
 export const startMilestone = (task: Task, ref: unknown, now: number): Outcome => {
@@ -371,6 +373,7 @@ export const failMilestone = (task: Task, ref: unknown, note: string | null, now
       milestones: replaceMilestone(task, failed),
       failures: withFailure(task.failures, now, `${found.title} failed${note ? `: ${note}` : ''}`),
       updatedAt: now,
+      ...(task.alignment === undefined ? {} : { alignment: invalidateAlignment(task, 'milestone failed').alignment! }),
     },
   }
 }
@@ -575,7 +578,8 @@ export const applyAction = (task: Task, input: ProgressInput, now: number, sha: 
               ...(task.review === undefined ? {} : { review: task.review }),
               ...(task.promptGrounds === undefined ? {} : { promptGrounds: task.promptGrounds }),
               // The operator's pinned level outlives the task; any other is read again from the new one.
-              ...(task.discovery?.source === 'operator' ? { discovery: { ...task.discovery, objective: null, criteria: [], unknowns: [], risks: [], guided: task.discovery.guided } } : {}),
+              // The level the evidence reached is a floor for the next plan: a restart cannot lower it. The rest starts over.
+              ...(task.discovery === undefined ? {} : { discovery: { ...task.discovery, objective: null, criteria: [], unknowns: [], risks: [] } }),
             }
           : task
 

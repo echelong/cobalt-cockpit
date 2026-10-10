@@ -271,6 +271,53 @@ describe('original-goal verification', () => {
   })
 })
 
+describe('bypasses found in review', () => {
+  const evidence = { action: 'align', alignment: { state: 'ALIGNED', demonstrated: [{ id: 'e1', evidence: 'looked fine' }] } }
+  test('ALIGNED cannot be recorded before there is a plan, and a plan or replan starts the check over', () => {
+    const early = applyAction(stage('Add booking cancellation to the API and the UI'), evidence, 5, null)
+    expect(early.error).toContain('no plan exists yet')
+    const checked = drive(finished(standard()), [aligned])
+    expect(checked.alignment!.state).toBe('ALIGNED')
+    const replanned = drive(checked, [{ action: 'plan', replan: true, milestones: [...FIVE, { title: 'Extra' }] }])
+    expect(replanned.alignment).toBeUndefined()
+    expect(isAlignmentSatisfied(replanned)).toBe(false)
+  })
+  test('a plan restart cannot lower the level the evidence reached', () => {
+    const risky = drive(stage('Add booking cancellation to the API and the UI'), [{ action: 'discover', level: 'DEEP' }, PLAN])
+    expect(risky.discovery!.level).toBe('DEEP')
+    const restarted = drive(risky, [{ action: 'plan', milestones: FIVE }])
+    expect(restarted.id).toBe(2)
+    expect(restarted.discovery!.level).toBe('DEEP')
+    expect(restarted.discovery!.criteria).toEqual([])
+  })
+  test('a read-only plan that goes on to edit files still needs the goal check', () => {
+    const task = drive(stage('Add booking cancellation to the API and the UI'), [{ action: 'plan', kind: 'readonly', milestones: FIVE }])
+    const edited = settle(touchFile(task, 'src/bookings.ts', 5, 0)).task
+    expect(needsAlignment(edited)).toBe(true)
+    const done = drive(edited, [...[1, 2, 3, 4, 5].map(n => ({ action: 'complete', milestone: `m${n}` }))])
+    expect(done.status).not.toBe('done')
+  })
+  test('a question or a trivial-looking noun does not hide a request to build something', () => {
+    for (const p of ['How should retries work? Implement backoff in the client', 'Implement comment threading for posts', 'Add a colour picker to settings']) expect(level(p)).toBe('STANDARD')
+    for (const p of ['Fix typo in README', 'Change the font size of the heading', 'How should retries work?']) expect(level(p)).toBe('LIGHT')
+  })
+  test('a new open unknown, or a milestone that fails after the check, takes it back', () => {
+    const checked = drive(finished(standard()), [aligned])
+    expect(discover(checked, { unknowns: [{ text: 'Late question' }] }, 40).task.alignment!.state).toBe('PENDING')
+    expect(applyAction(checked, { action: 'fail', milestone: 'm2', note: 'broke' }, 41, null).task.alignment!.state).toBe('PENDING')
+  })
+  test('a task stored by v0.5.0 keeps its percent and status when it is only read', () => {
+    const { discovery: _d, ...legacy } = finished(standard())
+    const out = applyAction(legacy as Task, { action: 'status' }, 5, null)
+    expect(out.task.discovery).toBeUndefined()
+    expect(settle(out.task).task.percent).toBe(80)
+  })
+  test('the evidence id is a short plain token, never free text', () => {
+    const out = align(finished(standard()), { alignment: { state: 'PARTIAL', demonstrated: [{ id: secret, evidence: 'x' }] } }, 5, [])
+    expect(JSON.stringify(out.task)).not.toContain(secret)
+  })
+})
+
 describe('presentation', () => {
   test('a narrow terminal gets short rows and the same facts', () => {
     const task = drive(standard(), [{ action: 'discover', goal: 'Implement booking cancellation for every booking source', unknowns: [{ text: 'Is a partial refund allowed when the booking has several guests?' }, { text: 'Second' }] }])

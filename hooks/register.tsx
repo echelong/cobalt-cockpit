@@ -14,7 +14,7 @@ import { textOf } from './ledger'
 import { atom, read, update } from 'claude-code'
 import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL, OPUS_MODEL, isProfile, DEFAULT_PROFILE } from './model-policy'
 import type { SubagentTier, Profile } from './model-policy'
-import { discoveryRows, guidanceFor, markGuided, unpin, withDiscovery } from './discovery'
+import { discoveryRows, guidanceFor, invalidateAlignment, markGuided, unpin, withDiscovery } from './discovery'
 import { addConsult, advanceReview, briefOf, consultVerdict, factsOf, hasReturned, isGround, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
 import type { Consultation } from './consult'
 import { addDecision, adjudicate, adviceLine, answerOf, callsFor, carriesCredential, decisionOf, deterministicRoute, operatorNotice, readAnswers, routerArgv, routerLabel, routerLine, routerModeOf, routerStateOf, switchRouter, withDecision, AVAILABILITY_STATE, CALL_TIMEOUT_MS, EMPTY_ROUTER, PROVIDER, ROUTER_MODES } from './router'
@@ -1429,7 +1429,9 @@ const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: 
       return old
     }
     // The person's pin and the evidence of the plan are applied before the task is settled, so the goal check counts toward DONE.
-    const settled = settle(withDiscovery(outcome.task, pin))
+    // A task stored by v0.5.0 (milestones, no discovery) keeps the rules it began under, unless this call starts a new one.
+    const isLegacy = old !== null && old.milestones.length > 0 && old.discovery === undefined && e.action !== 'plan'
+    const settled = settle(isLegacy ? outcome.task : withDiscovery(outcome.task, pin))
     cues = settled.cues
     reply = [outcome.note, summaryOf(settled.task)].filter(Boolean).join(' ')
 
@@ -1479,7 +1481,14 @@ const noteEnd = async (
   e: { tool: string; tool_use_id: string; agentId?: string } & Record<string, unknown>,
   ran: { deny?: string | undefined; isError?: boolean | undefined; result?: unknown },
 ) => {
-  if (e.agentId !== undefined) return
+  if (e.agentId !== undefined) {
+    // A helper's edit never moves the task, but it does make an earlier goal check stale.
+    const made = (ran.deny === undefined && ran.isError !== true ? ran.result : null) as Record<string, unknown> | null
+    const wrote = made !== null && made['staged'] !== true && (e.tool === 'Edit' || e.tool === 'Write' || (e.tool === 'Bash' && Array.isArray((made['bashEditDiff'] as { files?: unknown } | undefined)?.files)))
+    if (wrote) await quiet(() => change($, task => invalidateAlignment(task, 'a helper changed files')))
+
+    return
+  }
   const result = (ran.deny === undefined && ran.isError !== true ? ran.result : null) as Record<string, unknown> | null
   const edits: { path: string; added: number; removed: number }[] = []
   if ((e.tool === 'Edit' || e.tool === 'Write') && result !== null && result['staged'] !== true) {
@@ -1959,6 +1968,7 @@ export const register: Register = (on, options) => {
       let guidance: string | null = null
       // Discovery is read from the full prompt (the stored one is clipped) and only ever goes up; guidance is said once per level.
       const discovered = (t: Task): Task => {
+        if (t.milestones.length > 0 && t.discovery === undefined) return t
         const d = withDiscovery(t, pin, { prompt: e.text, files: t.files.map(f => f.path), milestones: t.milestones.length, grounds: [...new Set([...(t.promptGrounds ?? []), ...promptGroundsOf(e.text)])] })
         guidance = guidanceFor(d)
 
@@ -2625,7 +2635,7 @@ export const register: Register = (on, options) => {
         const task = await read($, taskAtom)
         const pin = await read($, discoveryPinAtom)
 
-        return { text: [...discoveryRows(task, columns ?? 72), `PIN / ${pin ?? 'none (rules decide)'}${value === '' ? ' · /cockpit discovery light | standard | deep | auto (this session only; gates and consultations are unchanged)' : ''}`].join('\n') }
+        return { text: [...discoveryRows(task, columns ?? 72), `PIN / ${pin ?? 'none (rules decide)'}${value === '' ? ' · /cockpit discovery light | standard | deep | auto (this session only; LIGHT also waives the goal check; gates and consultations are unchanged)' : ''}`].join('\n') }
       }
       case 'router': {
         const held = await read($, routerAtom)

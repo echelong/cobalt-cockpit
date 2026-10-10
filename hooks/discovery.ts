@@ -39,6 +39,7 @@ const DEEP_RE = /\b(migrat\w*|schema|auth(?:entication|orization|n|z)?|oauth|pas
 const TRIVIAL_RE = /\b(typo|spelling|rename|label|wording|copy|colou?r|css|padding|margin|font|comment|one[- ]line|whitespace|indent\w*|bump)\b/i
 const BROAD_RE = /\b(all|every|each|across|throughout|multiple|several|everywhere|feature|refactor\w*|support|integrat\w*)\b/i
 const QUESTION_RE = /^\s*(?:what|why|how|where|which|who|when|explain|describe|show|list|summari[sz]e|is there|does|do you)\b/i
+const BUILD_RE = /\b(implement\w*|add|build|create|introduce|develop|enable|port|integrat\w*|migrat\w*)\b/i
 const ACTION_RE = /\b(implement\w*|add|build|create|fix\w*|debug\w*|refactor\w*|migrat\w*|change|update|support|integrat\w*|write|remove|delete|replace|convert|port|extend|improve|optimi[sz]e|rename|make|re-?design\w*|restructure|overhaul|develop|wire|introduce|enable|handle)\b/i
 
 export const FILES_STANDARD = 3
@@ -64,8 +65,9 @@ export const classify = (facts: DiscoveryFacts): { level: DiscoveryLevel; reason
   if (DEEP_RE.test(facts.prompt)) raise('DEEP', 'high-risk-term')
   if (level !== 'DEEP') {
     const words = facts.prompt.trim().split(/\s+/).filter(Boolean).length
-    if (QUESTION_RE.test(facts.prompt)) reasons.push('question')
-    else if (TRIVIAL_RE.test(facts.prompt) && words <= 25 && !BROAD_RE.test(facts.prompt)) reasons.push('trivial-shape')
+    // a question or a trivial-looking noun keeps a task LIGHT only when nothing in it asks for something to be built
+    if (QUESTION_RE.test(facts.prompt) && !BUILD_RE.test(facts.prompt)) reasons.push('question')
+    else if (TRIVIAL_RE.test(facts.prompt) && !BUILD_RE.test(facts.prompt) && words <= 25 && !BROAD_RE.test(facts.prompt)) reasons.push('trivial-shape')
     else if (ACTION_RE.test(facts.prompt)) raise('STANDARD', 'change-request')
     else reasons.push('no-change-requested')
   }
@@ -168,8 +170,8 @@ export const discover = (task: Task, input: DiscoverInput, now: number): Change 
   const risks = [...new Set([...d.risks, ...list(input.risks, MAX_RISKS, 40)])].slice(0, MAX_RISKS)
   const next: Task = { ...task, discovery: { ...d, criteria, unknowns, risks }, updatedAt: now }
   // A criterion added after alignment was claimed is one it did not check.
-  const added = criteria.length > base.criteria.length
-  const settled = added ? invalidateAlignment(next, 'criteria changed') : next
+  const reopened = unknowns.filter(u => u.state === 'open').length > base.unknowns.filter(u => u.state === 'open').length
+  const settled = criteria.length > base.criteria.length || reopened ? invalidateAlignment(next, 'criteria or unknowns changed') : next
 
   return { task: settled }
 }
@@ -227,7 +229,8 @@ export const decide = (task: Task, input: DecideInput, now: number): Change => {
 export const ALIGNMENT_STATES: readonly AlignmentState[] = ['ALIGNED', 'PARTIAL', 'BLOCKED', 'UNKNOWN']
 
 /** A coding task above LIGHT is not done until its result was checked against the request. */
-export const needsAlignment = (task: Task): boolean => task.kind === 'coding' && task.discovery !== undefined && task.discovery.level !== 'LIGHT'
+// a plan declared read-only that went on to edit files is coding work for this purpose
+export const needsAlignment = (task: Task): boolean => (task.kind === 'coding' || task.files.length > 0) && task.discovery !== undefined && task.discovery.level !== 'LIGHT'
 
 export const isAlignmentSatisfied = (task: Task): boolean => !needsAlignment(task) || task.alignment?.state === 'ALIGNED'
 
@@ -255,13 +258,14 @@ export const align = (task: Task, input: AlignInput, now: number, open: readonly
     const row = (one !== null && typeof one === 'object' ? one : {}) as Record<string, unknown>
     const evidence = clip(row['evidence'], 160)
     if (!evidence) return { task, error: 'each "demonstrated" entry needs "evidence": the check that showed it. Nothing was recorded' }
-    demonstrated.push({ id: typeof row['id'] === 'string' && row['id'].trim() ? row['id'].trim().slice(0, 8) : `e${demonstrated.length + 1}`, evidence })
+    demonstrated.push({ id: typeof row['id'] === 'string' && /^[A-Za-z0-9]{1,8}$/.test(row['id'].trim()) ? row['id'].trim() : `e${demonstrated.length + 1}`, evidence })
   }
   const missing = list(raw['missing'], MAX_CRITERIA, 120)
   const assumptions = list(raw['assumptions'], MAX_CRITERIA, 120)
   const note = clip(raw['note'], 160)
   if (state === 'ALIGNED') {
     const problems: string[] = []
+    if (task.milestones.length === 0) problems.push('no plan exists yet, so nothing was built to check')
     const criteria = task.discovery?.criteria ?? []
     if (criteria.length === 0 && demonstrated.length === 0) problems.push('no demonstrated acceptance evidence')
     for (const c of criteria) if (!demonstrated.some(d => d.id === c.id)) problems.push(`criterion ${c.id} has no evidence`)
