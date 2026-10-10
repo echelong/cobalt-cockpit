@@ -1,0 +1,9 @@
+# Synthetic test fixtures in commits that are already public history (reviewed
+# 2026-10-10: documentation placeholders and made-up shapes, no live credential).
+# Each line is one exact finding: commit:file:rule:line. Nothing broader is allowed.
+20089937e9024b0bdea70d26d030e8077ce81eea:tests/cockpit.test.ts:curl-auth-header:716
+796171e55b83165a4716184397a9985025536a0f:companions/capabilities/tests/test-browser.mjs:generic-api-key:430
+bd85c0983704cd7a8b36b55d14d77313faf1a456:tests/router.test.ts:generic-api-key:388
+bd85c0983704cd7a8b36b55d14d77313faf1a456:tests/router.test.ts:generic-api-key:75
+e00e9d950cb05a8e9a0a53885c925570ba4635f6:tests/router.test.ts:curl-auth-user:85
+e00e9d950cb05a8e9a0a53885c925570ba4635f6:tests/router.test.ts:gitlab-pat:86

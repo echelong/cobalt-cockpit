@@ -20,6 +20,7 @@
 //   - BOUNDS. One live Opus at a time; an unchanged problem is consulted once;
 //     a failed consultation is retried at most once; three per task.
 
+import { redactSecrets, secretText } from './secrets'
 import type { ConsultGround, Consultation, EvidencePacket, Profile, ReviewRequirement, Swarm, SwarmTask, Task } from '../types'
 export type { ConsultGround, Consultation, EvidencePacket, ReviewRequirement } from '../types'
 
@@ -109,10 +110,12 @@ export const mandatoryGrounds = (facts: ConsultFacts): ConsultGround[] => {
 }
 
 const clip = (text: unknown, max: number): string => {
-  const line = typeof text === 'string' ? text.replace(/[ \t]+/g, ' ').trim() : ''
+  const line = typeof text === 'string' ? redactSecrets(text).replace(/[ \t]+/g, ' ').trim() : ''
 
   return line.length > max ? `${line.slice(0, max - 1)}…` : line
 }
+// A location is a path the architect reads; it is refused, never rewritten, when it is credential-shaped.
+const plain = (text: unknown, max: number): string => { const line = typeof text === 'string' ? text.replace(/[ \t]+/g, ' ').trim() : ''; return line.length > max ? line.slice(0, max) : line }
 const clipList = (items: unknown): string[] => (Array.isArray(items) ? items : []).map(i => clip(i, ITEM_MAX)).filter(Boolean).slice(0, LIST_MAX)
 
 /**
@@ -135,12 +138,13 @@ export const packetOf = (ground: ConsultGround, raw: Partial<Record<keyof Eviden
   const packet: EvidencePacket = {
     objective: clip(raw.objective, TEXT_MAX),
     architecture: clip(raw.architecture, TEXT_MAX),
-    files: clipList(raw.files),
+    files: (Array.isArray(raw.files) ? raw.files : []).map(i => plain(i, ITEM_MAX)).filter(Boolean).slice(0, LIST_MAX),
     alternatives: clipList(raw.alternatives),
     failures: clipList(raw.failures),
     risk: clip(raw.risk, TEXT_MAX),
     decision: clip(raw.decision, TEXT_MAX),
   }
+  if (packet.files.some(f => secretText(locationPath(f)))) return { error: 'locations must be file paths: one looks like a credential' }
   if (!packet.objective) return { error: 'objective required: what the work is for' }
   if (!packet.decision) return { error: 'question required: the precise decision Opus is asked for' }
   if (!packet.risk) return { error: 'risk required: what goes wrong if the decision is wrong' }

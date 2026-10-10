@@ -41,3 +41,16 @@ Command safety and repository hygiene use recognizable syntax and user confirmat
 ## Reporting a vulnerability
 
 Use GitHub's private vulnerability reporting for this repository if available. Otherwise contact the repository maintainer through their GitHub profile to arrange a private channel. Do not post secrets, private ledgers or exploit details in a public issue. Include affected version, a minimal synthetic reproduction and expected impact.
+
+## Secret scanning
+
+Every pull request and push to `main` runs the `Secret scan` workflow (Gitleaks, version and checksum pinned, read-only token, actions pinned to a commit). It scans all reachable history and the working tree and prints only rule, file, line and commit, never a value. Maintainers should mark its `Gitleaks` job as a required status check in the branch protection for `main`.
+
+To run the same check locally (Linux x86-64; the script downloads the pinned release and verifies its SHA-256):
+
+```sh
+scripts/scan-secrets.sh          # reports go to a private temp directory (a private temporary directory by default, mode 0600): do not publish them
+python3 scripts/audit-public.py  # portability and credential-shape audit, including AWS AKIA/ASIA key IDs
+```
+
+`.gitleaksignore` lists exact fingerprints of reviewed synthetic fixtures in already-public history; nothing wider is excluded. Test fixtures that look like credentials are assembled from parts at run time. If a scan reports a real credential, revoke it at the provider first: deleting the line does not invalidate it.

@@ -4,7 +4,10 @@ from pathlib import Path
 import json, re, struct, sys
 root = Path(__file__).resolve().parents[1]
 private = re.compile(r'/home/' + ''.join(map(chr, [114,105,111])) + r'\b|\b' + ''.join(map(chr, [114,105,111])) + r'\b|\b(?:' + '|'.join([''.join(map(chr,x)) for x in ([67,76,73,78,67,72],[69,110,101,114,98,105,100],[78,97,100,100,111])]) + r')\b', re.I)
-credential = re.compile(r'\b(?:sk-ant-|sk_live_|ghp_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{24,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\bAKIA[A-Z0-9]{16}\b')
+# Credential shapes. AWS key IDs are AKIA (long-term) and ASIA (temporary session
+# credentials) among the other documented prefixes. Test fixtures build these at
+# run time from parts, so no complete scanner-triggering value sits in a source file.
+credential = re.compile(r'\b(?:sk-ant-|sk_live_|rk_live_|ghp_|gho_|ghs_|ghu_|ghr_|github_pat_|glpat-|xox[baprs]-)[A-Za-z0-9_-]{24,}|\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}|-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----|\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ABIA|ACCA)[A-Z0-9]{16}\b|\bAIza[0-9A-Za-z_-]{35}\b')
 # A directory scanner refuses a source file that carries an invisible format
 # character, however harmless it is: it cannot be reviewed, and it can hide a
 # different name under a look-alike one. Tab, newline and carriage return are

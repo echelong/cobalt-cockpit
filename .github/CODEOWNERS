@@ -1,0 +1,4 @@
+# Changes to the secret scan itself need an owner review.
+/.github/ @echelong
+/scripts/scan-secrets.sh @echelong
+/.gitleaksignore @echelong

@@ -1223,7 +1223,7 @@ const routeTask = async ($: EngineInterface, text: string, facts: Parameters<typ
   if (mandatoryGrounds(facts).length > 0) return null
   const rules = deterministicRoute(facts)
   if (rules.route !== 'direct') return null
-  const state = routerStateOf(text)
+  const state = routerStateOf(text, mode)
   const calls = state === null ? [] : callsFor(state)
   if (state === null && !carriesCredential(text)) return null
   const env = calls.length === 0 ? undefined : await routerEnv($, mode)

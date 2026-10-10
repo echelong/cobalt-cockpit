@@ -17,6 +17,7 @@
 // the one process call lives in register.tsx.
 
 import { affirmed, groundsAvailable, mandatoryGrounds } from './consult'
+import { carriesCredential } from './secrets'
 import type { ConsultFacts } from './consult'
 import type { ActiveMode, ConsultGround, Route, RouterDecision, RouterMode, RouterState } from '../types'
 export type { ActiveMode, Route, RouterDecision, RouterMode, RouterState } from '../types'
@@ -112,47 +113,42 @@ export const AFFIRM_CAP = 3
 /** A prompt this short names no task to classify (`yes`, `go on`). */
 export const MIN_PROMPT = 16
 
-// Text that looks like a credential. Deliberately broad: a prompt that matches is
-// not shown to any router, and withholding one that was harmless costs nothing
-// but a fallback. It is a list of shapes, not a proof: see PRIVACY.md.
-const CREDENTIAL_ANY_CASE = new RegExp([
-  '-----BEGIN [A-Z ]*PRIVATE KEY',
-  // a name that says secret, then a value: api_key=…, SECRET_KEY: …, db-password = …, authToken=…
-  '[A-Za-z0-9_.-]*(?:api[_-]?key|secret|token|passw(?:or)?d|passwd|pwd|credential|private[_-]?key|access[_-]?key|session[_-]?key|auth(?:orization)?)[A-Za-z0-9_.-]*["\']?\\s*[=:]\\s*["\']?[^\\s"\']{3,}',
-  // said in words
-  '\\b(?:password|passphrase|passcode|secret|token|api\\s+key)\\s+(?:is|was)\\s+\\S+',
-  // inside a URL, on a command line, or a webhook that is itself the secret
-  '\\b[a-z][a-z0-9+.-]*:\\/\\/[^\\s\\/@]*:[^\\s\\/@]+@',
-  '(?:^|\\s)(?:-u|--user)\\s+\\S+:\\S+',
-  'hooks\\.slack\\.com\\/services\\/',
-  '\\bBearer\\s+[A-Za-z0-9._~+\\/-]{8,}',
-  // well-known token prefixes
-  '\\b(?:sk-|sk_live_|sk_test_|rk_live_|pk_live_|ghp_|gho_|ghs_|ghu_|github_pat_|glpat-|xox[abeprs]-|npm_|hf_)[A-Za-z0-9_-]{8,}',
-  '\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+',
-  // a long unbroken run of letters and digits: a key or a digest, whatever it is called
-  '(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_=-]*[0-9])(?=[A-Za-z0-9+_=-]*[A-Za-z])[A-Za-z0-9+_=-]{32,}',
-].join('|'), 'i')
-const CREDENTIAL_EXACT_CASE = new RegExp([
-  // a line of a pasted .env: NAME=value
-  '\\b[A-Z][A-Z0-9_]{2,}=\\S{6,}',
-  '\\b(?:AKIA|ASIA)[A-Z0-9]{16}\\b',
-  '\\bAIza[A-Za-z0-9_-]{20,}',
-  // forty characters of mixed-case base64: the shape of a cloud secret key
-  '(?<![A-Za-z0-9+\\/])(?=[A-Za-z0-9+\\/]{40}(?![A-Za-z0-9+\\/]))(?=[A-Za-z0-9+\\/]*[a-z])(?=[A-Za-z0-9+\\/]*[A-Z])(?=[A-Za-z0-9+\\/]*[0-9])[A-Za-z0-9+\\/]{40}',
-].join('|'))
-
-/** Whether a prompt carries something credential-shaped, anywhere in it; such a prompt is not shown to a router. */
-export const carriesCredential = (prompt: string): boolean => CREDENTIAL_ANY_CASE.test(prompt) || CREDENTIAL_EXACT_CASE.test(prompt)
+// Credential shapes live in ./secrets: a prompt that matches is not shown to any
+// router, and withholding one that was harmless costs nothing but a fallback.
+export { carriesCredential }
 
 /**
- * What a router is shown of a task: the person's prompt on one line, clipped.
- * Nothing else leaves: no file content, no path Cockpit observed, no history.
- * Null when the prompt names no task or carries something credential-shaped,
- * in which case no router is asked at all.
+ * The only words of a prompt that may leave the machine for JEV: a fixed
+ * engineering vocabulary, each matched whole. Nothing else is copied, so a name,
+ * path, secret or sentence cannot be carried out by construction.
  */
-export const routerStateOf = (prompt: string): string | null => {
+export const JEV_VOCABULARY = [
+  'architecture', 'design', 'refactor', 'migrate', 'migration', 'module', 'modules', 'interface', 'schema', 'api', 'rewrite', 'restructure',
+  'debug', 'bug', 'crash', 'race', 'concurrency', 'deadlock', 'intermittent', 'flaky', 'regression', 'leak', 'performance', 'timeout',
+  'search', 'find', 'inventory', 'audit', 'survey', 'across', 'every', 'all', 'files', 'codebase', 'repository',
+  'parallel', 'independent', 'separate', 'multiple', 'each',
+  'implement', 'add', 'fix', 'test', 'tests', 'docs', 'rename', 'typo', 'lint', 'build', 'deploy', 'update', 'remove', 'review', 'security',
+] as const
+const VOCABULARY = new Set<string>(JEV_VOCABULARY)
+
+/** Whole vocabulary words of a prompt, in first-seen order, each once. */
+export const featuresOf = (prompt: string): string[] => [...new Set(prompt.toLowerCase().match(/[a-z]+/g)?.filter(w => VOCABULARY.has(w)))]
+
+/**
+ * What a router is shown of a task. A local router sees the person's prompt on
+ * one line, clipped; JEV, which leaves the machine, sees vocabulary words and a
+ * size bucket only. Nothing else leaves: no file content, no path Cockpit
+ * observed, no history. Null when the prompt names no task or carries something
+ * credential-shaped, in which case no router is asked at all.
+ */
+export const routerStateOf = (prompt: string, mode: ActiveMode): string | null => {
   const line = prompt.replace(/\s+/g, ' ').trim()
   if (line.length < MIN_PROMPT || line.startsWith('/') || carriesCredential(prompt)) return null
+  if (mode === 'JEV') {
+    const words = featuresOf(line)
+
+    return words.length === 0 ? null : `task keywords: ${words.slice(0, 12).join(', ')}; size: ${line.length < 120 ? 'short' : line.length < 400 ? 'medium' : 'long'}`
+  }
 
   return `task: ${line.length > TASK_MAX ? `${line.slice(0, TASK_MAX - 1)}…` : line}`
 }

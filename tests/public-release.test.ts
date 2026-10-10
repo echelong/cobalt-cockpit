@@ -2,6 +2,9 @@ import { describe, expect, test } from 'claude-code/testing'
 import { command, hostState, mountHud, mountPane, planAndComplete, progress, prompt, rowsOf, start, world, bash , type World } from './world'
 import { emptyLedger, exportJSON } from '../hooks/ledger'
 import { replayStep, secretText } from '../hooks/replay'
+import { carriesCredential, redactSecrets } from '../hooks/secrets'
+import { emptySwarm, finishTask, submitTask } from '../hooks/swarm'
+import { packetOf, readScopeOf } from '../hooks/consult'
 import type { Ledger, ReplayStep } from '../types'
 
 const request = async ($: Parameters<typeof start>[0], model: string, agentId?: string) => {
@@ -87,4 +90,56 @@ describe('public privacy boundaries', () => {
       expect(step.omitted).toBe(true); expect(step.before).toBe(''); expect(step.file).toBe('unknown')
     })
   }
+})
+
+describe('credential shapes shared by every store and outgoing text', () => {
+  const join = (...parts: string[]): string => parts.join('')
+  test('AWS temporary (ASIA) and long-term (AKIA) key IDs are recognised everywhere', () => {
+    for (const id of [join('AS', 'IA', 'QWERTY0123456789'), join('AK', 'IA', 'QWERTY0123456789')]) {
+      expect(secretText(`id ${id}`)).toBe(true)
+      expect(carriesCredential(`id ${id}`)).toBe(true)
+      expect(redactSecrets(`id ${id} ok`)).toBe('id [redacted] ok')
+    }
+  })
+  test('redaction keeps the useful state around a secret', () => {
+    const out = redactSecrets(`Fix the uploader, api_key=${join('sk-', 'live-', 'abcdefgh12345678')} is in the log; sha 0123456789abcdef0123456789abcdef01234567`)
+    expect(out).toBe('Fix the uploader, [redacted] is in the log; sha 0123456789abcdef0123456789abcdef01234567')
+  })
+  test('a task, its events and its handback never keep a credential shape', () => {
+    const key = join('AS', 'IA', 'QWERTY0123456789')
+    const { swarm } = submitTask(emptySwarm(), { id: 'a', tier: 'HAIKU', role: 'scout', objective: `Inventory files; password: hunter2hunter2 and ${key}`, spawnReason: `needs ${key}` }, 1)
+    const done = finishTask(swarm, 'a', 'failed', { conclusion: `saw Bearer abcdefghijklmnop and ${key}`, evidence: [`token=abcdef12345`] }, 2)
+    expect(JSON.stringify(done)).not.toMatch(/hunter2|QWERTY|abcdefghijklmnop|abcdef12345/)
+    expect(JSON.stringify(done)).toContain('Inventory files')
+  })
+  test('a consultation packet is redacted before it is kept', () => {
+    const key = join('AS', 'IA', 'QWERTY0123456789')
+    const out = packetOf('architecture', { objective: `design ${key}`, decision: 'which?', risk: 'r', files: ['hooks/a.ts'], alternatives: ['x'] })
+    expect('packet' in out && JSON.stringify(out.packet)).not.toContain('QWERTY')
+  })
+})
+
+describe('credential filter hardening', () => {
+  const join = (...parts: string[]): string => parts.join('')
+  test('a private key is redacted through its END line, body included', () => {
+    const body = Array.from({ length: 6 }, (_, n) => join('MIIEvQIBADAN', 'BgkqhkiG9w0BAQEFAASC').repeat(2) + n).join('\n')
+    const out = redactSecrets(`before ${join('-----BEGIN ', 'PRIVATE KEY-----')}\n${body}\n${join('-----END ', 'PRIVATE KEY-----')} after`)
+    expect(out).toBe('before [redacted] after')
+    expect(redactSecrets(`${join('-----BEGIN RSA ', 'PRIVATE KEY-----')}\n${body}`)).toBe('[redacted]')
+  })
+  test('file locations with a line number are kept, never redacted, and never reach ownership as [redacted]', () => {
+    const out = packetOf('security', { objective: 'review', decision: 'ok?', risk: 'r', files: ['hooks/auth.ts:120', 'tests/token-store.ts:12:3', 'src/password-reset.ts:42'] })
+    if (!('packet' in out)) throw new Error(out.error)
+    expect(readScopeOf(out.packet)).toEqual(['hooks/auth.ts', 'tests/token-store.ts', 'src/password-reset.ts'])
+    expect(redactSecrets('Fix auth: login fails in hooks/auth.ts:120')).toBe('Fix auth: login fails in hooks/auth.ts:120')
+    expect('error' in packetOf('security', { objective: 'a', decision: 'b', risk: 'c', files: [`src/${join('api', '_key', '=abc', 'def123456')}`] })).toBe(true)
+  })
+  test('hostile long input is bounded and fast', () => {
+    for (const text of ['x://' + ':'.repeat(200_000), 'a-'.repeat(100_000), 'token'.repeat(40_000), 'eyJ-'.repeat(50_000), 'A'.repeat(200_000)]) {
+      const started = performance.now()
+      redactSecrets(text); carriesCredential(text); secretText(text)
+      expect(performance.now() - started).toBeLessThan(250)
+    }
+    expect(carriesCredential('word '.repeat(10_000))).toBe(true)
+  })
 })

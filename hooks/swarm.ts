@@ -5,6 +5,7 @@
 import type { EffortLevel, ModelTier, Wave, TaskState, Verification, SwarmResult, Handoff, SwarmTask, SwarmEvent, SwarmConfig, Swarm, TaskInput } from '../types'
 export type { ModelTier, Wave, TaskState, Verification, SwarmResult, Handoff, SwarmTask, SwarmEvent, SwarmConfig, Swarm, TaskInput } from '../types'
 import { BASE_EFFORT, effortEscalation, isEffortLevel } from './effort'
+import { redactSecrets } from './secrets'
 export const DEFAULT_SWARM_CONFIG: SwarmConfig = { sonnet: 'AUTO', haiku: 'AUTO', total: 'AUTO', opus: 0, maxTasks: 512, maxEvents: 256, stallMs: 300_000 }
 /** SONNET_LED's conservative budget: four helpers in all, two Sonnet, two Haiku and one Opus within them. */
 export const SONNET_LED_SWARM: Partial<SwarmConfig> = { total: 4, sonnet: 2, haiku: 2, opus: 1 }
@@ -33,7 +34,7 @@ const terminal = (t: SwarmTask): boolean => ['completed', 'failed', 'cancelled']
 const occupied = (t: SwarmTask): boolean => t.endedAt === null && (t.state === 'reserved' || t.state === 'running' || (!terminal(t) && (t.agentId !== null || (t.state === 'stalled' && t.startedAt !== null))))
 const active = (s: Swarm): SwarmTask[] => s.tasks.filter(occupied)
 const event = (s: Swarm, kind: string, id: string | null, at: number, detail: string): Swarm => {
-  const item: SwarmEvent = { seq: s.sequence + 1, at, kind, taskId: id, agentId: s.tasks.find(t => t.id === id)?.agentId ?? null, wave: s.wave, detail: detail.slice(0, 1500) }
+  const item: SwarmEvent = { seq: s.sequence + 1, at, kind, taskId: id, agentId: s.tasks.find(t => t.id === id)?.agentId ?? null, wave: s.wave, detail: redactSecrets(detail).slice(0, 1500) }
   const all = [...s.events, item]; const dropped = Math.max(0, all.length - s.config.maxEvents)
   return { ...s, sequence: item.seq, events: all.slice(-s.config.maxEvents), droppedEvents: s.droppedEvents + dropped }
 }
@@ -46,7 +47,9 @@ const cycle = (s: Swarm, input: TaskInput): boolean => {
   const walk = (id: string, visited: Set<string>): boolean => { if (id === input.id) return true; if (visited.has(id)) return false; visited.add(id); return (s.tasks.find(t => t.id === id)?.dependencies ?? []).some(dep => walk(dep, visited)) }
   return (input.dependencies ?? []).some(dep => walk(dep, new Set()))
 }
-export const submitTask = (s: Swarm, input: TaskInput, at: number): { swarm: Swarm; task: SwarmTask; duplicate: boolean } => {
+export const submitTask = (s: Swarm, raw: TaskInput, at: number): { swarm: Swarm; task: SwarmTask; duplicate: boolean } => {
+  // free text is filtered before it is compared or kept
+  const input: TaskInput = { ...raw, role: redactSecrets(raw.role), objective: redactSecrets(raw.objective), ...(raw.scope === undefined ? {} : { scope: redactSecrets(raw.scope) }), ...(raw.spawnReason === undefined ? {} : { spawnReason: redactSecrets(raw.spawnReason) }), ...(raw.effortReason === undefined ? {} : { effortReason: redactSecrets(raw.effortReason) }) }
   const owned = [...new Set((input.owned?.length ? input.owned : ['*']).map(normalizeOwned))].sort()
   const same = s.tasks.find(t => t.id === input.id || (!terminal(t) && t.tier === input.tier && t.mode === (input.mode ?? 'read') && t.objective.trim() === input.objective.trim() && t.scope === (input.scope ?? '') && t.wave === (input.wave ?? s.wave) && t.parentTask === (input.parentTask ?? null) && JSON.stringify([...t.dependencies].sort()) === JSON.stringify([...(input.dependencies ?? [])].sort()) && JSON.stringify(t.owned) === JSON.stringify(owned)))
   if (same) return { swarm: event({ ...s, requested: s.requested + 1 }, 'duplicate', same.id, at, input.id), task: same, duplicate: true }
@@ -96,7 +99,7 @@ export const bindAgent = (s: Swarm, id: string, agentId: string, at: number, kin
   if ((!t || (t.state !== 'reserved' && !(t.state === 'stalled' && t.startedAt !== null && t.agentId === null))) || (t.tier === 'OPUS' && (s.config.opus ?? 0) === 0) || !agentId || s.tasks.some(t => t.agentId === agentId)) throw new Error('Agent binding requires a unique observed agent and reserved subagent task')
   return event({ ...update(s, id, { agentId, state: 'running', lastActivityAt: at }), actual: s.actual + 1 }, kind, id, at, `${t.tier} ${t.role}${kind === 'adopt' ? ' · observed existing host agent; no new spawn' : ''}`)
 }
-const text = (s: string): string => s.slice(0, 1500)
+const text = (s: string): string => redactSecrets(s).slice(0, 1500)
 const list = (s: readonly string[]): string[] => s.slice(0, 12).map(text)
 export const compressResult = (r: Partial<SwarmResult>): SwarmResult => ({ conclusion: text(r.conclusion ?? ''), evidence: list(r.evidence ?? []), changes: list(r.changes ?? []), verification: list(r.verification ?? []), unresolved: list(r.unresolved ?? []), confidence: r.confidence === undefined || r.confidence === null ? null : text(r.confidence), escalation: r.escalation === undefined || r.escalation === null ? null : text(r.escalation), rawRef: r.rawRef === undefined || r.rawRef === null ? null : text(r.rawRef) })
 export const finishTask = (s: Swarm, id: string, state: 'completed' | 'failed' | 'cancelled', result: Partial<SwarmResult> | null, at: number): Swarm => {

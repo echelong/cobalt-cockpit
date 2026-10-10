@@ -66,15 +66,18 @@ describe('the deterministic baseline', () => {
   })
 })
 
+// Synthetic credentials are built at run time from parts, so no source line is itself credential-shaped.
+const join = (...parts: string[]): string => parts.join('')
+
 describe('what a router is shown', () => {
   test('the prompt on one line, clipped; nothing for a non-task; never a credential', () => {
-    expect(routerStateOf('Add a retry\n  to the uploader and test it.')).toBe('task: Add a retry to the uploader and test it.')
-    const long = routerStateOf(`Refactor ${'x'.repeat(900)}`)!
+    expect(routerStateOf('Add a retry\n  to the uploader and test it.', 'NOBODYWHO')).toBe('task: Add a retry to the uploader and test it.')
+    const long = routerStateOf(`Refactor ${'x'.repeat(900)}`, 'NOBODYWHO')!
     expect(long.length).toBe('task: '.length + TASK_MAX)
-    for (const none of ['yes', 'go on', '/cockpit router jev', '   ']) expect(routerStateOf(none)).toBeNull()
-    for (const secret of ['Use api_key=sk-live-abcdefgh12345678 to call the billing service please', 'Deploy with password: hunter2hunter2 on the staging box', 'Set Authorization: Bearer abcdefghijklmnop for the client']) {
+    for (const none of ['yes', 'go on', '/cockpit router jev', '   ']) expect(routerStateOf(none, 'NOBODYWHO')).toBeNull()
+    for (const secret of [`Use api_key=${join('sk-', 'live-', 'abcdefgh12345678')} to call the billing service please`, 'Deploy with password: hunter2hunter2 on the staging box', 'Set Authorization: Bearer abcdefghijklmnop for the client']) {
       expect(carriesCredential(secret)).toBe(true)
-      expect(routerStateOf(secret)).toBeNull()
+      expect(routerStateOf(secret, 'NOBODYWHO')).toBeNull()
     }
     expect(carriesCredential('Rotate the token store implementation and add tests')).toBe(false)
   })
@@ -82,10 +85,10 @@ describe('what a router is shown', () => {
     // Synthetic shapes only. Two are assembled from parts so that no line of this file is itself credential-shaped.
     for (const secret of [
       'SECRET_KEY=abc123xyz', 'PRIVATE_KEY=abcdefgh', 'SESSION_KEY=zzzzzzzz1', 'db-password = s3cretvalue', 'authToken="abc123def"', 'export FOO_TOKEN=x1y2z3a4',
-      'DATABASE_URL=postgres://u:p@h/db', 'connect to postgres://admin:hunter2@db.internal/app', 'redis://:pw123456@cache:6379', 'https://user:pw@host/path', 'curl -u user:pw https://x',
-      'key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY ok', 'ASIAIOSFODNN7EXAMPLE', `${'AK'}${'IA'}IOSFODNN7EXAMPLE`, 'sk-abcdefghijklmnop1234', 'sk-proj-abcdefghijklmnop1234', 'glpat-abcdefghijklmnopqrst',
+      'DATABASE_URL=postgres://u:p@h/db', 'connect to postgres://admin:hunter2@db.internal/app', 'redis://:pw123456@cache:6379', 'https://user:pw@host/path', join('curl ', '-u user', ':pw https://x'),
+      join('key wJalr', 'XUtn', 'FEMI/K7MD', 'ENG/bPxR', 'fiCYEX', 'AMPLEKEY ok'), join('AS', 'IA', 'IOSFODNN7', 'EXAMPLE'), join('AK', 'IA', 'IOSFODNN7', 'EXAMPLE'), join('AS', 'IA', 'QWERTY0123456789'), join('sk', '-abcdefghijklmnop1234'), join('sk', '-proj-abcdefghijklmnop1234'), join('glpat', '-abcdefghijklmnopqrst'),
       'AIzaSyA-abcdefghijklmnopqrstuvwxyz012', 'npm_abcdefghijklmnopqrstuvwx', 'hf_abcdefghijklmnopqrstuvwx', `${'gh'}${'p_'}abcdefghijklmnopqrstuvwxyz0123456789`, 'https://hooks.slack.com/services/T000/B000/XXXX',
-      'the password is hunter2', '?token=abcdef', 'Authorization: Bearer abcdefghijkl', 'digest 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 here',
+      'the password is hunter2', '?token=abcdef', 'Authorization: Bearer abcdefghijkl', join('digest 9f86d081884c7d65', '9a2feaa0c55ad015a3bf4f1b2b0b822c', 'd15d6c15b0f00a08 here'),
     ]) expect([secret, carriesCredential(`Use this when you fix the uploader: ${secret}`)]).toEqual([secret, true])
     // ordinary engineering prompts are not withheld
     for (const plain of [
@@ -408,7 +411,7 @@ describe('the session router through the host', () => {
   test('a prompt with a credential in it is never shown to a router, and that is recorded without a receipt', LED, async ($, on) => {
     const w = world(on); const held = hostState(on, {}); const asked = scripted(w, { jev: JEV }); await start($)
     await command($, 'router jev')
-    await prompt($, 'Call the billing service with api_key=sk-live-abcdefgh12345678 and store the result.')
+    await prompt($, `Call the billing service with api_key=${join('sk-', 'live-', 'abcdefgh12345678')} and store the result.`)
     expect(asked).toHaveLength(1)
     expect(ledger(held).routing!.at(-1)).toMatchObject({ calls: 0, answered: 0, receipts: [], outcome: 'fallback', reason: expect.stringContaining('prompt withheld') })
     expect(JSON.stringify(ledger(held).routing)).not.toContain('sk-live')
@@ -590,5 +593,24 @@ describe('the session router: review findings', () => {
     await prompt($, 'Deploy to staging with DATABASE_URL=postgres://app:hunter2@db.internal/app and report back.')
     expect(routerState(held)).toMatchObject({ link: 'connected', asked: 0, fallbacks: 1 })
     expect(await text(command($, 'version'))).toContain('ROUTER / JEV · CONNECTED')
+  })
+})
+
+describe('what JEV is shown', () => {
+  test('vocabulary words and a size bucket only: no name, path, sentence or number leaves', () => {
+    const prompt = 'Debug the intermittent race in /srv/acme-billing/src/payments.ts for Dana Whitfield, ticket 48211, then add tests'
+    const state = routerStateOf(prompt, 'JEV')!
+    expect(state).toBe('task keywords: debug, intermittent, race, add, tests; size: short')
+    for (const leaked of ['acme', 'billing', 'payments', 'Dana', 'Whitfield', '48211', '/srv']) expect(state).not.toContain(leaked)
+    expect(routerStateOf(prompt, 'NOBODYWHO')).toContain('acme-billing')
+  })
+  test('a prompt with no vocabulary word, or a credential anywhere, asks nobody', () => {
+    expect(routerStateOf('Please make the thing nicer for everyone today', 'JEV')).toBeNull()
+    expect(routerStateOf(`Fix the build with ${join('AS', 'IA', 'QWERTY0123456789')} in it`, 'JEV')).toBeNull()
+  })
+  test('every request JEV is sent carries only the keyword state', () => {
+    const state = routerStateOf('Refactor the module interface across every file in the codebase', 'JEV')!
+    for (const call of callsFor(state)) expect(JSON.parse(call.body).state).toBe(state)
+    expect(state.length).toBeLessThan(120)
   })
 })

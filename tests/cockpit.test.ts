@@ -713,7 +713,7 @@ describe('the Activity Field, through the plugin', () => {
     const w = world(on)
     await start($)
     await $.turn.start({ text: 'x', turnId: 't1' })
-    await $.tool.call({ tool: 'Bash', command: 'curl -H "Authorization: Bearer sk-live-SECRET" https://api.example.com' } as never)
+    await $.tool.call({ tool: 'Bash', command: `curl -H "${['Authori', 'zation'].join('')}: ${['Bea', 'rer'].join('')} ${['sk-', 'live-SECRET'].join('')}" https://api.example.com` } as never)
     const field = (await fieldRowsOf(await mountHud($, 'terminal', 120, true))).join('\n')
     expect(field).toContain('BASH')
     expect(field).not.toContain('SECRET')
