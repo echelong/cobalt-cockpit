@@ -434,6 +434,8 @@ declare module 'claude-code' {
       'effort-known': Record<string, readonly EffortLevel[]>
       /** The session's router and what it has done; never stored beyond the session. */
       router: RouterState
+      /** The operator's discovery level pin; this session only. */
+      'discovery-pin': DiscoveryLevel | null
     }
   }
 }
