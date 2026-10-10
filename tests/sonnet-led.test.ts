@@ -264,7 +264,7 @@ describe('SONNET_LED through the host', () => {
     const w = world(on); const held = hostState(on, {}); await start($)
     await prompt($, 'Please approve the release of v0.5.0 after checking everything')
     await progress($, { action: 'plan', milestones: FIVE })
-    expect(task(held).review).toEqual({ grounds: ['release'], consult: null, state: 'required' })
+    expect(task(held).review).toMatchObject({ grounds: ['release'], consult: null, state: 'required' })
     for (const m of ['m1', 'm2', 'm3', 'm4']) await progress($, { action: 'complete', milestone: m })
     for (const g of GATE_NAMES) await progress($, { action: 'gate', gate: g, state: 'na', evidence: 'fixture' })
     expect(await progress($, { action: 'complete', milestone: 'm5' })).toContain('HELD')
@@ -485,7 +485,7 @@ describe('a mandatory review cannot be waived by the main loop', () => {
     const before = task(held).id
     expect(await hold($)).toContain('HELD')
     expect(task(held).id).toBe(before + 1)
-    expect(task(held).review).toEqual({ grounds: ['release'], consult: null, state: 'required' })
+    expect(task(held).review).toMatchObject({ grounds: ['release'], consult: null, state: 'required' })
     expect(task(held).percent).toBeLessThan(100)
     // the consultation is admitted, answered, and the plan is replaced once more before it is judged
     await call($, releasePacket)
@@ -525,7 +525,7 @@ describe('a mandatory review cannot be waived by the main loop', () => {
     world(on); const held = hostState(on, {}); await start($)
     await prompt($, 'Please approve the release of v0.5.0, which includes the cache redesign')
     await hold($)
-    expect(task(held).review).toEqual({ grounds: ['release'], consult: null, state: 'required' })
+    expect(task(held).review).toMatchObject({ grounds: ['release'], consult: null, state: 'required' })
     const reply = String((await call($, { action: 'consult', ground: 'architecture', objective: 'Cache', architecture: 'JSON store', locations: ['src/cache.ts'], alternatives: ['LRU', 'SQLite'], risk: 'stale reads', question: 'Which cache?' })).result)
     expect(reply).toContain('OPUS ADMITTED')
     expect(reply).not.toContain('mandatory')
@@ -534,7 +534,7 @@ describe('a mandatory review cannot be waived by the main loop', () => {
     await finish($, spawned.agentId!)
     await call($, { action: 'verify', task_id: id, state: 'pass', evidence: ['checked'] })
     // the release review is untouched and still holds the task
-    expect(task(held).review).toEqual({ grounds: ['release'], consult: null, state: 'required' })
+    expect(task(held).review).toMatchObject({ grounds: ['release'], consult: null, state: 'required' })
     expect(await progress($, { action: 'complete', milestone: 'm5' })).toContain('HELD')
     expect(task(held).percent).toBeLessThan(100)
   })

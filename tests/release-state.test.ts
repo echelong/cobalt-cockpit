@@ -16,8 +16,8 @@ const LED = { options: { orchestration: true, profile: 'SONNET_LED' } }
 const A = 'a'.repeat(40)
 const B = 'b'.repeat(40)
 const SWARM = 'mcp__cobalt-cockpit__swarm'
-const GO = 'DECISION: GO — the candidate may be released.\nRATIONALE: nothing blocking.'
-const NO_GO = 'DECISION: NO-GO — a high defect remains.\nFINDINGS: H1 at hooks/consult.ts:1.'
+const GO = 'RATIONALE: nothing blocking.\nDECISION: GO\nFINDINGS: none above medium.'
+const NO_GO = 'RATIONALE: a high defect remains.\nDECISION: NO-GO\nFINDINGS: H1 at hooks/consult.ts:1.'
 const call = ($: Engine, input: Record<string, unknown>) => $.tool.call({ tool: SWARM, ...input } as never)
 let seq = 0
 const spawn = ($: Engine, description: string) => $.agent.spawn({ prompt: 'brief', description, subagentType: 'cobalt-cockpit:architect', tool_use_id: `rs-${++seq}`, parentModel: SONNET, provider: { plugin: 'cobalt-cockpit', tier: 'user' }, background: true, fork: false } as never)
@@ -67,8 +67,9 @@ describe('the architect’s recommendation is read, not declared', () => {
   test('releaseDecision reads exactly one DECISION line, and fails closed on anything else', () => {
     expect(releaseDecision(GO)).toBe('go')
     expect(releaseDecision(NO_GO)).toBe('no-go')
-    expect(releaseDecision('decision: go')).toBe('go')
-    for (const bad of [undefined, '', 'GO', 'The release looks fine.', 'DECISION: maybe', 'DECISION: GO\nDECISION: NO-GO', 'DECISION: NOT GO']) expect(releaseDecision(bad)).toBeUndefined()
+    expect(releaseDecision('DECISION: GO')).toBe('go')
+    expect(releaseDecision('  DECISION: NO-GO  \r\nmore')).toBe('no-go')
+    for (const bad of [undefined, '', 'GO', 'The release looks fine.', 'DECISION: maybe', 'DECISION: GO\nDECISION: NO-GO', 'DECISION: NOT GO', 'decision: go']) expect(releaseDecision(bad)).toBeUndefined()
   })
   test('a GO the main session declares over an architect NO-GO is refused and clears nothing', LED, async ($, on) => {
     const w = world(on); const held = hostState(on, {}); await releaseTask($)

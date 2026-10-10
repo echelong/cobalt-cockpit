@@ -185,7 +185,7 @@ describe('a release review through the host', () => {
     expect(String((await call($, releasePacket)).result)).toContain('CANDIDATE UNKNOWN')
     expect(ledger(held).consults ?? []).toHaveLength(0)
     expect(w.spawns).toHaveLength(0)
-    expect(task(held).review).toEqual({ grounds: ['release'], consult: null, state: 'required' })
+    expect(task(held).review).toMatchObject({ grounds: ['release'], consult: null, state: 'required' })
     expect(task(held).percent).toBeLessThan(100)
   })
   test('a restart (a new world on the same store) still sees the review of that commit', LED, async ($, on) => {

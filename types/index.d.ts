@@ -244,7 +244,7 @@ export type ReleaseOutcome = 'go' | 'no-go'
 export type ReleaseRecord = { candidate: string; id: string; at: number; returned: boolean; verified?: 'pass' | 'fail'; outcome?: ReleaseOutcome }
 
 /** One ground of a review, cleared by a consultation of that ground. A release ground carries its commit; `reused` marks a review taken from another task or session. */
-export type ClearedGround = { ground: ConsultGround; consult: string; candidate?: string; reused?: true }
+export type ClearedGround = { ground: ConsultGround; consult: string; candidate?: string; reused?: true; /** `release`: an explicit request for Opus (`asked`) fulfilled by the release consultation that cleared the release ground on the same review. */ via?: 'release' }
 
 export type ReviewRequirement = {
   grounds: ConsultGround[]
@@ -256,6 +256,8 @@ export type ReviewRequirement = {
   cleared?: ClearedGround[]
   /** A release review: the commit its cleared release ground stands for. A different commit, or a changed working tree, takes it back. */
   candidate?: string
+  /** The prompt (`promptOrigin`) that first raised each ground; absent on a review stored before this was kept, which therefore never matches. */
+  raised?: Partial<Record<ConsultGround, string>>
 }
 
 export type ActivityKind =
@@ -525,7 +527,7 @@ export type ToolEntry = { id: string; runId: Value<string>; turnId: Value<string
 export type Reading = { at: number; turnId: Value<string>; tokens: Value<number>; window: Value<number>; percent: Value<number> }
 export type Request = { id: string; runId: Value<string>; turnId: string; agentId: Value<string>; requestedModel: Value<string>; requestedEffort: Value<string>; model: Value<string>; effort: Value<string>; effectiveEffort: Value<string>; input: Value<number>; output: Value<number>; cacheRead: Value<number>; cacheWrite: Value<number> }
 export type Checkpoint = { at: number; goal: string; phase: string; completed: string[]; remaining: string[]; latest: string; gates: Record<string, string>; branch: string; startingSha: string; currentSha: string; repo: string; dirty: Value<number>; blockers: string[]; backgroundAgents: string[] }
-export type Ledger = { schema: 1 | 2; observedCompletions?: { agentId: string; reason: string; conclusion: string; at: number; decision?: ReleaseOutcome }[]; swarm?: Swarm; sessionId: string; currentRun: Value<string>; turns: Record<string, string>; runs: Run[]; agents: LedgerAgent[]; tools: ToolEntry[]; requests: Request[]; usage: Reading[]; receipts: NwhoEvent[]; warnings: string[]; replay: ReplayStep[]; checkpoint: Checkpoint | null; /** Opus consultations (SONNET_LED); absent in older ledgers. */ consults?: Consultation[]; /** The session router's decisions, newest last; absent until one is made. */ routing?: RouterDecision[]; /** v0.5.1 decision records, newest last; absent in v0.5.0 ledgers. */ decisions?: DecisionRecord[]; /** v0.5.1: why each task got its discovery level; absent in v0.5.0 ledgers. */ discoveries?: DiscoveryEntry[] }
+export type Ledger = { schema: 1 | 2; observedCompletions?: { agentId: string; reason: string; conclusion: string; at: number; decision?: ReleaseOutcome; /** Later turns of an architect that had already returned: separate information, never the approved answer. */ later?: { at: number; reason: string; conclusion: string; decision?: ReleaseOutcome }[] }[]; swarm?: Swarm; sessionId: string; currentRun: Value<string>; turns: Record<string, string>; runs: Run[]; agents: LedgerAgent[]; tools: ToolEntry[]; requests: Request[]; usage: Reading[]; receipts: NwhoEvent[]; warnings: string[]; replay: ReplayStep[]; checkpoint: Checkpoint | null; /** Opus consultations (SONNET_LED); absent in older ledgers. */ consults?: Consultation[]; /** The session router's decisions, newest last; absent until one is made. */ routing?: RouterDecision[]; /** v0.5.1 decision records, newest last; absent in v0.5.0 ledgers. */ decisions?: DecisionRecord[]; /** v0.5.1: why each task got its discovery level; absent in v0.5.0 ledgers. */ discoveries?: DiscoveryEntry[] }
 export type ReplayStep = { id: string; runId: string; turnId: string; agentId: string; file: string; kind: 'Edit' | 'Write'; at: number; before: string; after: string; scope: 'fragment' | 'file'; omitted: boolean }
 export type Cursor = { offset: number; size: number; seen: string[]; primed: boolean }
 

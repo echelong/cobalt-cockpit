@@ -297,23 +297,28 @@ export const addConsult = (consults: readonly Consultation[], c: Consultation): 
  */
 export const withRelease = (history: readonly ReleaseRecord[], record: ReleaseRecord): ReleaseRecord[] => {
   const old = history.find(h => h.id === record.id)
-  const merged: ReleaseRecord = old === undefined ? record : { candidate: old.candidate, id: old.id, at: old.at, returned: old.returned || record.returned, ...((record.verified ?? old.verified) === undefined ? {} : { verified: record.verified ?? old.verified }), ...((record.outcome ?? old.outcome) === undefined ? {} : { outcome: record.outcome ?? old.outcome }) } as ReleaseRecord
+  // once a recommendation is recorded it is final: a later write cannot turn a NO-GO into a GO, or change the verification it was recorded with
+  const final = old?.outcome !== undefined
+  const verified = final ? old.verified : record.verified ?? old?.verified
+  const outcome = final ? old.outcome : record.outcome ?? old?.outcome
+  const merged: ReleaseRecord = old === undefined ? record : { candidate: old.candidate, id: old.id, at: old.at, returned: old.returned || record.returned, ...(verified === undefined ? {} : { verified }), ...(outcome === undefined ? {} : { outcome }) } as ReleaseRecord
 
   return [...history.filter(h => h.id !== record.id), merged].slice(-MAX_RELEASE_RECORDS)
 }
 
 /**
- * The architect's release recommendation: exactly one `DECISION:` line, saying GO or NO-GO and nothing else it could
- * be mistaken for. Missing, repeated, hedged or unreadable is undefined, and undefined never approves.
+ * The architect's release recommendation. Exactly one line in the whole answer may mention `DECISION:` at all (at the
+ * start of a line or anywhere in one), and that line must be, character for character apart from surrounding blanks,
+ * `DECISION: GO` or `DECISION: NO-GO`. Missing, repeated, conflicting, hedged ("GO/NO-GO", "GO maybe", "GO unless"),
+ * truncated, differently cased or decorated is undefined, and undefined never approves.
  */
 export const releaseDecision = (answer: unknown): ReleaseOutcome | undefined => {
   if (typeof answer !== 'string') return undefined
-  const lines = answer.split(/\r?\n/).filter(l => /^[\s>*_#-]*DECISION[\s*_]*:/i.test(l))
+  const lines = answer.split(/\r?\n/).filter(l => /DECISION[\s*_`]*:/i.test(l))
   if (lines.length !== 1) return undefined
-  const verdict = /^[\s>*_#-]*DECISION[\s*_]*:[\s*_]*(NO[-\s]?GO|GO)(?![\w-])/i.exec(lines[0]!)?.[1]
-  if (verdict === undefined) return undefined
+  const said = /^[ \t]*DECISION: (GO|NO-GO)[ \t]*$/.exec(lines[0]!)?.[1]
 
-  return /^no/i.test(verdict) ? 'no-go' : 'go'
+  return said === 'GO' ? 'go' : said === 'NO-GO' ? 'no-go' : undefined
 }
 
 /**
@@ -341,11 +346,29 @@ export const clearReview = (review: ReviewRequirement | undefined, c: Consultati
     ? { ground: c.ground, consult: c.id }
     : state === 'pass' && outcome === 'go' && c.candidate !== undefined && c.candidate === now ? { ground: 'release', consult: c.id, candidate: c.candidate } : undefined
   if (entry === undefined) return mine ? { ...review, consult: null, state: review.state === 'admitted' ? 'required' : review.state } : review
-  const cleared = [...(review.cleared ?? []).filter(x => x.ground !== c.ground), entry]
+  const extra = entry.ground === 'release' && fulfilsAsked(review, c) ? [{ ground: 'asked' as const, consult: c.id, via: 'release' as const }] : []
+  const cleared = [...(review.cleared ?? []).filter(x => x.ground !== c.ground && !extra.some(y => y.ground === x.ground)), entry, ...extra]
   const base: ReviewRequirement = { ...review, cleared, ...(entry.candidate === undefined ? {} : { candidate: entry.candidate }) }
   if (review.grounds.every(g => cleared.some(x => x.ground === g))) return { ...base, consult: c.id, state: 'adjudicated' }
 
   return { ...base, consult: mine ? null : review.consult, state: mine || review.state === 'adjudicated' ? 'required' : review.state }
+}
+
+/**
+ * Whether a release consultation that is clearing the release ground also fulfils the explicit request for Opus
+ * (`asked`) on the same review. Only when every one of these holds, and never by guess: the review requires both; both
+ * were raised by the very same prompt (their recorded origins are equal, so a legacy review with no origin, or an
+ * `asked` raised by another prompt, never matches); the consultation is the one admitted for this review, was mandatory
+ * and named the files it reviewed. It clears no other ground (security, architecture, repeated-failure) and rewrites
+ * no old record.
+ */
+export const fulfilsAsked = (review: ReviewRequirement, c: Consultation): boolean => {
+  if (c.ground !== 'release' || !review.grounds.includes('asked') || !review.grounds.includes('release')) return false
+  if (review.cleared?.some(x => x.ground === 'asked')) return false
+  const asked = review.raised?.asked
+  const release = review.raised?.release
+
+  return asked !== undefined && asked === release && review.consult === c.id && c.isMandatory && c.packet.files.length > 0
 }
 
 /** What git says about the working tree: a clean commit, a real difference, or no answer. */
@@ -362,11 +385,12 @@ export const revalidateRelease = (review: ReviewRequirement, now: GitCandidate, 
   const held = review.cleared?.find(x => x.ground === 'release')
   const open = review.state !== 'adjudicated'
   const { candidate: _gone, ...rest } = review
-  if (held === undefined && review.state === 'adjudicated') return { ...rest, cleared: (review.cleared ?? []).filter(x => x.ground !== 'release'), consult: null, state: 'required' }
+  const withoutRelease = (list: readonly ClearedGround[] | undefined): ClearedGround[] => (list ?? []).filter(x => x.ground !== 'release' && x.via !== 'release')
+  if (held === undefined && review.state === 'adjudicated') return { ...rest, cleared: withoutRelease(review.cleared), consult: null, state: 'required' }
   if (held !== undefined) {
     if (now.sha === held.candidate || (now.sha === null && now.why === 'unknown')) return review
 
-    return { ...rest, cleared: (review.cleared ?? []).filter(x => x.ground !== 'release'), consult: open ? review.consult : null, state: open ? review.state : 'required' }
+    return { ...rest, cleared: withoutRelease(review.cleared), consult: open ? review.consult : null, state: open ? review.state : 'required' }
   }
   if (now.sha === null) return review
   const record = releaseEligible(history, now.sha)
@@ -382,15 +406,27 @@ export const revalidateRelease = (review: ReviewRequirement, now: GitCandidate, 
  * task; a ground kind that appears after the review was adjudicated reopens
  * it, because that review never saw the change that raised it.
  */
-export const requireReview = (task: Task, grounds: readonly ConsultGround[]): Task => {
+export const requireReview = (task: Task, grounds: readonly ConsultGround[], origin?: string): Task => {
   if (grounds.length === 0) return task
   const had = task.review
   const merged = [...new Set([...(had?.grounds ?? []), ...grounds])]
-  if (had === undefined) return { ...task, review: { grounds: merged, consult: null, state: 'required' } }
-  const isNew = merged.length > had.grounds.length
-  if (!isNew) return task
+  // the prompt that first raised a ground is remembered with it; a ground that was already required keeps its own origin
+  const added = merged.filter(g => !(had?.grounds ?? []).includes(g))
+  const raised = { ...(had?.raised ?? {}), ...(origin === undefined ? {} : Object.fromEntries(added.map(g => [g, origin]))) }
+  const stamp = Object.keys(raised).length === 0 ? {} : { raised }
+  if (had === undefined) return { ...task, review: { grounds: merged, consult: null, state: 'required', ...stamp } }
+  if (added.length === 0) return task
 
-  return { ...task, review: had.state === 'adjudicated' ? { grounds: merged, consult: null, state: 'required' } : { ...had, grounds: merged } }
+  return { ...task, review: had.state === 'adjudicated' ? { grounds: merged, consult: null, state: 'required', ...stamp } : { ...had, grounds: merged, ...stamp } }
+}
+
+/** A short stable key for the full text of a prompt: the origin of the grounds it raised. */
+export const promptOrigin = (text: string): string => {
+  let hash = 0x811c9dc5
+  const norm = text.toLowerCase().replace(/\s+/g, ' ').trim()
+  for (let i = 0; i < norm.length; i++) hash = Math.imul(hash ^ norm.charCodeAt(i), 0x01000193) >>> 0
+
+  return `${norm.length.toString(16)}-${hash.toString(16).padStart(8, '0')}`
 }
 
 /** The review moved on by what happened to its consultation. */

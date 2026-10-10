@@ -355,6 +355,8 @@ python3 scripts/audit-public.py
 python3 scripts/make-icon.py    # re-render the listing icon from the HUD portrait
 ```
 
+To develop under Auto mode, launch with `scripts/dev-launch.sh`, which loads an out-of-tree snapshot of the plugin and refuses to start if the snapshot is empty or overlaps the repository. An empty `--plugin-dir` resolves to the working directory and makes Claude Code protect the repository from Auto-mode edits. Root cause, preflight and the release acceptance procedure: [docs/development-auto-mode.md](docs/development-auto-mode.md).
+
 All fixtures are synthetic. Test with an isolated HOME/config/state directory. Do not use a real telemetry ledger or private session capture in fixtures.
 
 ## License

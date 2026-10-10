@@ -15,7 +15,7 @@ import { atom, read, update } from 'claude-code'
 import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL, OPUS_MODEL, isProfile, DEFAULT_PROFILE } from './model-policy'
 import type { SubagentTier, Profile } from './model-policy'
 import { discoveryRows, guidanceFor, markGuided, needsAlignment, unpin, withDiscovery } from './discovery'
-import { addConsult, advanceReview, briefOf, clearReview, consultVerdict, factsOf, hasReturned, isCandidate, isGround, releaseDecision, revalidateRelease, withRelease, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
+import { addConsult, advanceReview, briefOf, clearReview, consultVerdict, factsOf, hasReturned, isCandidate, isGround, promptOrigin, releaseDecision, revalidateRelease, withRelease, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
 import type { Consultation } from './consult'
 import type { ReleaseOutcome, ReleaseRecord } from '../types'
 import { addDecision, adjudicate, adviceLine, answerOf, callsFor, carriesCredential, decisionOf, deterministicRoute, operatorNotice, readAnswers, routerArgv, routerLabel, routerLine, routerModeOf, routerStateOf, switchRouter, withDecision, AVAILABILITY_STATE, CALL_TIMEOUT_MS, EMPTY_ROUTER, PROVIDER, ROUTER_MODES } from './router'
@@ -440,6 +440,8 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
         // A consultation's advice can be judged, pass or fail, only once Opus has given it.
         const consult = (await read($, ledgerAtom)).consults?.find(c => c.id === id)
         const judged = e['state'] === 'pass' || e['state'] === 'fail'
+        // a recorded release recommendation is final: it is not judged again, so nothing can turn a NO-GO into a GO
+        if (consult?.ground === 'release' && judged && (await releaseHistory($)).some(h => h.id === id && h.outcome !== undefined)) throw new Error('OPUS / RELEASE VERDICT RECORDED. This release consultation already has its recommendation recorded and it is final. Ask again only on a changed commit.')
         if (consult && judged && !hasReturned(task)) throw new Error('OPUS / this consultation has not returned. Spawn cobalt-cockpit:architect with its [task:ID] and let it answer; a review is adjudicated only on an answer Opus gave')
         // A release ground is cleared by a recommendation, not by the advice being sound. The recommendation is the
         // architect's own DECISION line; `release_outcome` is the main session confirming it, and can only be as
@@ -1968,6 +1970,16 @@ export const ledgerTurnComplete = async ($: EngineInterface, e: { turnId: string
       if (!e.agentId) return ended
       // the stored conclusion is one folded, shortened line; the DECISION line is read from the answer as given
       const decision = releaseDecision(e.answer)
+      const first = ended.observedCompletions?.find(c => c.agentId === e.agentId)
+      const owner = swarmState(ended).tasks.find(t => t.agentId === e.agentId)
+      // An architect that has already returned is not asked again for approval: a later turn of the same agent (a message
+      // sent to it, a resume) is kept beside its answer as separate information and changes neither the recorded decision
+      // nor the consultation's state.
+      if (first !== undefined && owner !== undefined && owner.tier === 'OPUS' && hasReturned(owner)) {
+        const later = { at, reason: e.reason, conclusion: textOf(e.answer), ...(decision === undefined ? {} : { decision }) }
+
+        return { ...ended, observedCompletions: (ended.observedCompletions ?? []).map(c => c === first ? { ...c, later: [...(c.later ?? []), later].slice(-4) } : c) }
+      }
       const completed = [...(ended.observedCompletions ?? []).filter(c=>c.agentId!==e.agentId), { agentId:e.agentId,reason:e.reason,conclusion:textOf(e.answer),at,...(decision === undefined ? {} : { decision }) }].slice(-128)
       const task = swarmState(ended).tasks.find(t=>t.agentId===e.agentId)
       return { ...ended, observedCompletions:completed, swarm:task ? finishObserved(swarmState(ended),task.id,e.reason,textOf(e.answer),at) : swarmState(ended) }
@@ -2217,7 +2229,10 @@ export const register: Register = (on, options) => {
       const task = await update($, taskAtom, old => {
         // an unfinished planned task goes on; anything else is a new one
         const isContinuing = old !== null && old.milestones.length > 0 && old.status !== 'done'
-        const base = isContinuing ? old : newTask((old?.id ?? 0) + 1, e.text, now, sha)
+        // A mandatory review the person or the files raised before any plan is not waived by a later prompt: it goes on
+        // with the unplanned task until Opus has answered it. Only a finished task, or an explicit `/cockpit reset`, starts clean.
+        const owed = old !== null && !isContinuing && old.status !== 'done' && old.review !== undefined && old.review.state !== 'adjudicated'
+        const base = isContinuing ? old : { ...newTask((old?.id ?? 0) + 1, e.text, now, sha), ...(owed ? { review: old.review, ...(old.promptGrounds === undefined ? {} : { promptGrounds: old.promptGrounds }) } : {}) }
 
         const prompted: Task = {
           ...base,
@@ -2230,7 +2245,7 @@ export const register: Register = (on, options) => {
         const promptGrounds = [...new Set([...(prompted.promptGrounds ?? []), ...promptGroundsOf(e.text)])]
         const withGrounds: Task = { ...prompted, promptGrounds }
 
-        return settle(discovered(requireReview(withGrounds, mandatoryGrounds(factsOf(withGrounds, 0, promptGrounds))))).task
+        return settle(discovered(requireReview(withGrounds, mandatoryGrounds(factsOf(withGrounds, 0, promptGrounds)), promptOrigin(e.text)))).task
       })
       if (task !== null) await mutateLedger($, l => recordDiscovery(l, task, now))
       if (guidance !== null) added.push(guidance)
