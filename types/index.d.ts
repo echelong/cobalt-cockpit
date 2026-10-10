@@ -139,6 +139,8 @@ export type Task = {
   /** Set once the main loop was reminded that this edited task has no progress plan. */
   progressNudged?: boolean
   /** v0.5.1: set once any edit was seen in this task, by the main session or a helper; survives a plan restart. */
+  /** The working-tree fingerprint when the passed checks were last observed; the goal check is refused over a different tree. */
+  gateTree?: string
   edited?: true
   /** v0.5.1: how much discovery this task warrants and what it found. Absent on tasks stored by older versions. */
   discovery?: Discovery

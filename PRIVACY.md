@@ -1,6 +1,6 @@
 # Privacy
 
-This policy describes what Cobalt Cockpit v0.5.0 observes, what it keeps, where it keeps it, how long it stays, how to remove it, and what can reach a model. It is written from the plugin's source. Where the plugin gives no guarantee, this page says so rather than implying one. Last updated 2026-10-08.
+This policy describes what Cobalt Cockpit v0.5.1 observes, what it keeps, where it keeps it, how long it stays, how to remove it, and what can reach a model. It is written from the plugin's source. Where the plugin gives no guarantee, this page says so rather than implying one. Last updated 2026-10-08.
 
 [SECURITY.md](SECURITY.md) covers the guards, process access and vulnerability reporting. This page covers data.
 
@@ -25,6 +25,8 @@ While a session runs, Cockpit's hooks see the events Claude Code raises. From th
 - **Model requests.** The model and reasoning level requested and observed, and token counts (input, output, cache read, cache write) where Claude Code reports them. Not the content of a request or a response.
 - **Context usage**: tokens used, window size and percent, from Claude Code's own meter.
 - **Git state**: branch name, HEAD and starting commit ids, the repository's folder name, and counts of changed files, from `git status` and `git rev-parse`.
+- **Working-tree fingerprint** (v0.5.1): once a goal check is accepted, Cockpit runs `git diff <commit> --name-only`, `git ls-files -o` and `git hash-object` over the changed and untracked files (up to 2000), reduces them in memory to one short hash, and keeps only that hash with the commit id it was measured against, in the task state. File names and contents are read by git for this and are neither stored nor sent anywhere.
+- **Discovery, criteria and decisions** (v0.5.1): the objective, acceptance criteria, unknowns, risks, the evidence the model reports for each criterion, and recorded decisions (problem, choice, alternatives, evidence), each clipped and redacted for credentials on entry. They stay in the task state; the Run Ledger holds a short entry per task (level, counts, alignment state) and the decision records, redacted again on write and on export. Nothing is written to a project and nothing is sent to a model beyond what the model itself wrote.
 - **Authentication, by kind only.** Whether eight authentication-related environment variables are set (never their values), the names of the settings sources that configure authentication, and the credential kind Claude Code reports (`bearer`, `api-key`, `none` or `unknown`). The handle Claude Code returns is dropped at once.
 - **Claude Code settings**: the configured model and advisor names (to apply the optional Fable and advisor rules), the names of the settings entries that configure authentication, and the saved reasoning level and its cap.
 

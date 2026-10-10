@@ -14,7 +14,7 @@ import { textOf } from './ledger'
 import { atom, read, update } from 'claude-code'
 import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL, OPUS_MODEL, isProfile, DEFAULT_PROFILE } from './model-policy'
 import type { SubagentTier, Profile } from './model-policy'
-import { discoveryRows, guidanceFor, markGuided, unpin, withDiscovery } from './discovery'
+import { discoveryRows, guidanceFor, markGuided, needsAlignment, unpin, withDiscovery } from './discovery'
 import { addConsult, advanceReview, briefOf, consultVerdict, factsOf, hasReturned, isGround, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
 import type { Consultation } from './consult'
 import { addDecision, adjudicate, adviceLine, answerOf, callsFor, carriesCredential, decisionOf, deterministicRoute, operatorNotice, readAnswers, routerArgv, routerLabel, routerLine, routerModeOf, routerStateOf, switchRouter, withDecision, AVAILABILITY_STATE, CALL_TIMEOUT_MS, EMPTY_ROUTER, PROVIDER, ROUTER_MODES } from './router'
@@ -55,7 +55,7 @@ import {
   namesInstructionFile,
 } from './hygiene'
 import type { Attribution } from './hygiene'
-import { applyAction, newTask, noteFailure, oneLine, progressNudge, reopenVerification, setGate, settle, summaryOf, touchFile, treeMoved } from './model'
+import { applyAction, newTask, noteFailure, oneLine, progressNudge, checkedAt, reopenVerification, setGate, settle, stampGates, summaryOf, touchFile, treeMoved } from './model'
 import type { Cue, ProgressInput } from './model'
 import { basename, parseShell, unwrap } from './shell'
 import { COLORS, fit, heading, hudRows, paneRows, visualStateOf } from './view'
@@ -1410,41 +1410,78 @@ const guard = async ($: EngineInterface, e: { tool: string; agentId?: string } &
 }
 
 /**
- * A fingerprint of the project's working tree, from git: tracked changes with their content, untracked files
- * with theirs. Any tool that changes a tracked or unignored file changes it, whatever the tool is called and
- * whether or not it reports a diff; a read does not. Null where there is no repository or git did not answer,
- * and then no mutation outside Edit, Write and a Bash edit diff can be observed. Ignored files are not seen.
+ * A fingerprint of the project's working tree, from git, that depends on file contents and not on how git
+ * stages them: every file that differs from the commit it was taken against (changed, staged, or untracked)
+ * with the hash of its content, and the paths deleted. A commit, an add or a stash therefore leaves it
+ * unchanged, and any tool that changes a tracked or unignored file changes it, whatever the tool is called and
+ * whether or not it reports a diff. A read does not. It is `base:hash`; `base` is the commit it is measured
+ * against and is passed back to measure the same way later. Null where there is no repository, no commit yet,
+ * a git command failed, was cut short or timed out, or more than TREE_FILES files differ; no change outside
+ * Edit, Write and a Bash edit diff can then be observed. Ignored files are not seen.
  */
-const TREE_FILES = 200
-const treeStamp = async ($: EngineInterface): Promise<string | null> => {
+const TREE_FILES = 2000
+const treeStamp = async ($: EngineInterface, base?: string): Promise<string | null> => {
   try {
-    const run = (argv: string[]) => $.process.run(['git', '--no-optional-locks', ...argv], { timeoutMs: GIT_TIMEOUT_MS * 3 })
-    const status = await run(['status', '--porcelain=v2', '-z', '--untracked-files=all'])
-    if (status.exitCode !== 0) return null
-    const diff = await run(['diff', 'HEAD', '--binary', '--no-ext-diff', '--no-color'])
-    const listed = await run(['ls-files', '-o', '--exclude-standard', '-z'])
-    const names = listed.exitCode === 0 ? listed.stdout.split('\0').filter(Boolean) : []
-    const hashed = names.length === 0 ? null : await run(['hash-object', '--', ...names.slice(0, TREE_FILES)])
-    const text = [status.stdout, diff.exitCode === 0 ? diff.stdout : '', names.length, hashed?.stdout ?? ''].join('\u0001')
-    // FNV-1a over the text, twice with different seeds: a change detector, not a security boundary
+    const sh = async (argv: string[]): Promise<string | null> => {
+      const r = await $.process.run(['git', '--no-optional-locks', ...argv], { timeoutMs: GIT_TIMEOUT_MS })
+
+      return r.exitCode === 0 && !r.isStdoutTruncated ? r.stdout : null
+    }
+    const top = (await sh(['rev-parse', '--show-toplevel']))?.trim()
+    if (!top) return null
+    const at = (...argv: string[]) => sh(['-C', top, ...argv])
+    const head = base ?? (await at('rev-parse', '--verify', 'HEAD'))?.trim()
+    if (!head) return null
+    const changed = await at('diff', head, '--no-renames', '--name-only', '-z', '--diff-filter=d')
+    const deleted = await at('diff', head, '--no-renames', '--name-only', '-z', '--diff-filter=D')
+    const untracked = await at('ls-files', '-o', '--exclude-standard', '-z')
+    if (changed === null || deleted === null || untracked === null) return null
+    const paths = [...new Set([...changed.split('\0'), ...untracked.split('\0')].filter(Boolean))].sort()
+    if (paths.length > TREE_FILES) return null
+    const lines: string[] = [...deleted.split('\0').filter(Boolean).sort().map(path => `D\0${path}`)]
+    for (let i = 0; i < paths.length; i += 100) {
+      const chunk = paths.slice(i, i + 100)
+      const hashes = await at('hash-object', '--', ...chunk)
+      const got = hashes?.split('\n').filter(Boolean)
+      if (got === undefined || got.length !== chunk.length) return null
+      chunk.forEach((path, n) => lines.push(`${got[n]}\0${path}`))
+    }
+    const text = lines.join('\n')
+    // FNV-1a twice with different seeds: a change detector, not a security boundary. Paths and hashes never leave this function.
     let a = 0x811c9dc5, b = 0x01000193
     for (let i = 0; i < text.length; i++) { const c = text.charCodeAt(i); a = Math.imul(a ^ c, 0x01000193) >>> 0; b = Math.imul(b + c, 0x85ebca6b) >>> 0 }
 
-    return `${text.length}:${a.toString(16)}${b.toString(16)}`
+    return `${head}:${lines.length}.${a.toString(16)}${b.toString(16)}`
   } catch {
     return null
   }
 }
+const baseOf = (stamp: string | undefined): string | undefined => (typeof stamp === 'string' && stamp.includes(':') ? stamp.slice(0, stamp.indexOf(':')) : undefined)
 
 /** If a goal check was accepted for another working tree than the present one, it is stale now. */
-const reconcileTree = async ($: EngineInterface): Promise<void> => {
+const reconcileOnce = async ($: EngineInterface): Promise<void> => {
   const task = await read($, taskAtom)
-  if (task?.alignment?.state !== 'ALIGNED' || typeof task.alignment.tree !== 'string') return
-  const tree = await treeStamp($)
-  if (tree === null || tree === task.alignment.tree) return
+  const accepted = task?.alignment?.tree
+  if (task?.alignment?.state !== 'ALIGNED' || typeof accepted !== 'string') return
+  const tree = await treeStamp($, baseOf(accepted))
+  if (tree === null || tree === accepted) return
   const now = await $.clock.now()
-  const held = await update($, taskAtom, t => (t === null ? t : treeMoved(t, tree)))
+  // only the check that was measured: one made since is about a newer tree
+  const held = await update($, taskAtom, t => (t === null || t.alignment?.tree !== accepted ? t : settle(treeMoved(t, tree)).task))
   if (held !== null) await quiet(async () => { await mutateLedger($, l => recordDiscovery(l, held, now)); await persist($) })
+}
+// One measurement at a time; calls that arrive while one runs share the next, which starts after they did.
+let reconciling: Promise<void> | null = null
+let reconcileNext: Promise<void> | null = null
+const reconcileTree = ($: EngineInterface): Promise<void> => {
+  if (reconciling === null) {
+    reconciling = reconcileOnce($).finally(() => { reconciling = null })
+
+    return reconciling
+  }
+  reconcileNext ??= reconciling.then(() => { reconcileNext = null; return reconcileTree($) })
+
+  return reconcileNext
 }
 
 const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: string }): Promise<{ result: string }> => {
@@ -1457,13 +1494,23 @@ const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: 
   const sha = (await read($, gitAtom))?.sha ?? null
   await quiet(() => reconcileTree($))
   // the tree an accepted goal check is about, taken before the answer is recorded
-  const stamp = e.action === 'align' ? await treeStamp($) : null
+  const before = e.action === 'align' || e.action === 'gate' ? await read($, taskAtom) : null
+  const goalChecked = before !== null && needsAlignment(before)
+  const stamp = goalChecked && e.action === 'align' ? await treeStamp($, baseOf(before.gateTree)) : null
+  const gateStamp = goalChecked && e.action === 'gate' ? await treeStamp($) : null
   let reply = ''
+  let unprotected = ''
   let cues: Cue[] = []
   const pin = await read($, discoveryPinAtom)
   const held = await update($, taskAtom, old => {
     cues = []
-    const outcome = applyAction(old ?? newTask(1, '', now, sha), e, now, sha)
+    // the passed checks must be about the tree the goal check is made for
+    if (e.action === 'align' && old !== null && stamp !== null && old.gateTree !== undefined && old.gateTree !== stamp) {
+      reply = 'error: ALIGNED refused: the working tree changed after the checks were last observed, so they no longer describe it. Run the checks again, record the gates, then align. Nothing was recorded'
+
+      return reopenVerification(old, 'the working tree changed since the checks were observed')
+    }
+    const outcome = applyAction(old === null ? newTask(1, '', now, sha) : checkedAt(old, gateStamp), e, now, sha)
     if (outcome.error !== undefined) {
       reply = `error: ${outcome.error}`
 
@@ -1472,10 +1519,12 @@ const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: 
     // The person's pin and the evidence of the plan are applied before the task is settled, so the goal check counts toward DONE.
     // A task stored by v0.5.0 (milestones, no discovery) keeps the rules it began under, unless this call starts a new one.
     const isLegacy = old !== null && old.milestones.length > 0 && old.discovery === undefined && e.action !== 'plan'
-    const stamped = stamp !== null && outcome.task.alignment?.state === 'ALIGNED' ? { ...outcome.task, alignment: { ...outcome.task.alignment, tree: stamp } } : outcome.task
+    const gated = e.action === 'gate' ? stampGates(outcome.task, gateStamp) : outcome.task
+    const stamped = stamp !== null && gated.alignment?.state === 'ALIGNED' ? { ...gated, alignment: { ...gated.alignment, tree: stamp } } : gated
+    if (goalChecked && e.action === 'align' && stamp === null && gated.alignment?.state === 'ALIGNED') unprotected = 'No working-tree fingerprint could be taken here (no git repository, no commit, or git did not answer), so a later change outside Edit, Write and Bash edit diffs will not be noticed.'
     const settled = settle(isLegacy ? stamped : withDiscovery(stamped, pin))
     cues = settled.cues
-    reply = [outcome.note, summaryOf(settled.task)].filter(Boolean).join(' ')
+    reply = [outcome.note, unprotected, summaryOf(settled.task)].filter(Boolean).join(' ')
 
     return settled.task
   })
@@ -1567,12 +1616,15 @@ const noteEnd = async (
         )
       : []
 
+  const observed = readings.some(r => r.state === 'pass') ? await treeStamp($) : null
   if (edits.length > 0 || readings.length > 0) {
     await change($, (task, now) => {
       let chain = task
       for (const edit of edits) chain = touchFile(chain, edit.path, edit.added, edit.removed)
+      if (observed !== null) chain = checkedAt(chain, observed)
       if (edits.length > 0 && isSonnetLed()) chain = requireReview(chain, mandatoryGrounds(factsOf({ ...chain, files: chain.files.map(f => ({ ...f, path: relative(f.path) })) }, 0, chain.promptGrounds ?? [])))
       for (const reading of readings) chain = setGate(chain, reading.gate, reading.state, reading.evidence, 'auto', now)
+      if (observed !== null) chain = stampGates(chain, observed)
 
       return chain
     })

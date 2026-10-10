@@ -437,7 +437,7 @@ describe('completion integrity after DONE', () => {
 
   test('a tool that is neither Edit nor Write but changed the working tree revokes alignment', options, async ($, on) => {
     const w = world(on); await done($)
-    w.gitStatus = `${w.gitStatus}1 .M N... 100644 100644 100644 aaa bbb notebooks/analysis.ipynb\n`
+    w.tree['notebooks/analysis.ipynb'] = 'print(2)'
     await $.tool.call({ tool: 'NotebookEdit', notebook_path: '/work/example/notebooks/analysis.ipynb', new_source: 'x', tool_use_id: 'nb' } as never)
     expect(await progress($, { action: 'status' })).toContain('alignment PENDING')
     await restore($)
@@ -447,16 +447,49 @@ describe('completion integrity after DONE', () => {
     const w = world(on); await done($)
     await $.tool.call({ tool: 'mcp__fs__write_file', path: '/work/example/src/api.js', content: 'same', tool_use_id: 'mcp-noop' } as never)
     expect(await progress($, { action: 'status' })).toStartWith('DONE 100%')
-    w.gitStatus = `${w.gitStatus}1 .M N... 100644 100644 100644 aaa bbb src/api.js\n`
+    w.tree['src/api.js'] = 'new'
     await $.tool.call({ tool: 'mcp__fs__write_file', path: '/work/example/src/api.js', content: 'new', tool_use_id: 'mcp-real' } as never)
     expect(await progress($, { action: 'status' })).toContain('alignment PENDING')
   })
 
   test('a shell command that changed a tracked file revokes alignment even with no edit diff', options, async ($, on) => {
     const w = world(on); await done($)
-    w.gitStatus = `${w.gitStatus}1 .M N... 100644 100644 100644 aaa bbb src/store.js\n`
+    w.tree['src/store.js'] = 'sed'
     await bash($, "sed -i 's/a/b/' src/store.js")
     expect(await progress($, { action: 'status' })).toContain('alignment PENDING')
+  })
+
+  test('staging, committing or stashing after DONE changes no content and revokes nothing', options, async ($, on) => {
+    const w = world(on); w.tree['src/api.js'] = 'cancel'; await done($)
+    w.gitStatus = `${w.gitStatus}2 A. N... 000000 100644 100644 0000 abc src/api.js\n`
+    await bash($, 'git add -A && git commit -m cancel')
+    await bash($, 'git stash')
+    expect(await progress($, { action: 'status' })).toStartWith('DONE 100%')
+  })
+
+  test('a write nobody observed between the checks and align refuses ALIGNED until the checks are run again', options, async ($, on) => {
+    const w = world(on); await start($)
+    await prompt($, 'Add booking cancellation to the API and the UI')
+    await progress($, { action: 'discover', criteria: ['A booking can be cancelled'] })
+    await planAndComplete($, 4)
+    await passAllGates($, { align: false })
+    w.tree['src/api.js'] = 'edited by a tool nothing watches'
+    const refused = await progress($, aligned)
+    expect(refused).toStartWith('error: ALIGNED refused')
+    expect(refused).toContain('working tree changed')
+    expect(await progress($, { action: 'status' })).toContain('TEST pending')
+    await passAllGates($, { align: false })
+    expect(await progress($, aligned)).toContain('alignment ALIGNED')
+  })
+
+  test('a revocation made by the tree is settled: the stored task is no longer done and the next prompt continues it', options, async ($, on) => {
+    const w = world(on); await done($)
+    w.tree['notebooks/a.ipynb'] = 'print(2)'
+    await $.tool.call({ tool: 'NotebookEdit', notebook_path: '/work/example/notebooks/a.ipynb', new_source: 'x', tool_use_id: 'nb-settle' } as never)
+    await prompt($, 'Now double-check the cancellation')
+    const after = await progress($, { action: 'status' })
+    expect(after).toContain('5/5 milestones')
+    expect(after).toContain('UNVERIFIED')
   })
 
   test('where git cannot answer, only Edit, Write and Bash edit diffs are seen: the documented gap', options, async ($, on) => {

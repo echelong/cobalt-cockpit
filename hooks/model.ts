@@ -483,12 +483,21 @@ export const touchFile = (task: Task, path: string, added: number, removed: numb
  */
 export const reopenVerification = (task: Task, why: string): Task => {
   const goalChecked = needsAlignment(task)
-  const reopened = invalidateAlignment(task, why)
+  const { gateTree: _observed, ...rest } = task
+  const reopened = invalidateAlignment(rest, why)
   if (!goalChecked || !Object.values(reopened.gates).some(g => g.state === 'pass')) return reopened
   const gates = Object.fromEntries(Object.entries(reopened.gates).map(([name, g]) => [name, g.state === 'pass' ? { ...g, state: 'pending' as const, evidence: `stale: ${why}` } : g])) as Task['gates']
 
   return { ...reopened, gates }
 }
+
+/** Before a check is recorded: checks that passed on another tree than this one are stale, whatever they were. */
+export const checkedAt = (task: Task, tree: string | null): Task =>
+  tree !== null && needsAlignment(task) && task.gateTree !== undefined && task.gateTree !== tree ? reopenVerification(task, 'the working tree changed since the checks were observed') : task
+
+/** After a check is recorded: the passed checks are about this tree. */
+export const stampGates = (task: Task, tree: string | null): Task =>
+  tree !== null && needsAlignment(task) && Object.values(task.gates).some(g => g.state === 'pass') ? { ...task, gateTree: tree } : task
 
 /** Where the working tree no longer matches the one ALIGNED was accepted for, that acceptance is stale. */
 export const treeMoved = (task: Task, tree: string | null): Task => {
