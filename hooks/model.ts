@@ -369,14 +369,15 @@ export const failMilestone = (task: Task, ref: unknown, note: string | null, now
   if (found === undefined) return { task, error: unknownMilestone(task, ref) }
   const failed: Milestone = { ...found, state: 'failed', note }
 
+  const next: Task = {
+    ...task,
+    milestones: replaceMilestone(task, failed),
+    failures: withFailure(task.failures, now, `${found.title} failed${note ? `: ${note}` : ''}`),
+    updatedAt: now,
+  }
+
   return {
-    task: {
-      ...task,
-      milestones: replaceMilestone(task, failed),
-      failures: withFailure(task.failures, now, `${found.title} failed${note ? `: ${note}` : ''}`),
-      updatedAt: now,
-      ...(task.alignment === undefined ? {} : { alignment: invalidateAlignment(task, 'milestone failed').alignment! }),
-    },
+    task: invalidateAlignment(next, 'milestone failed'),
   }
 }
 

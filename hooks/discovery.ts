@@ -76,8 +76,9 @@ export const classify = (facts: DiscoveryFacts): { level: DiscoveryLevel; reason
   return { level, reasons: [...new Set(reasons)].slice(0, MAX_REASONS) }
 }
 
+// The plan's own goal counts too: a bare "go ahead" must not hide what is being built.
 const factsOf = (task: Task): DiscoveryFacts => ({
-  prompt: task.lastPrompt,
+  prompt: [task.lastPrompt, task.goal].filter(Boolean).join('\n'),
   files: task.files.map(f => f.path),
   milestones: task.milestones.length,
   grounds: task.promptGrounds ?? [],
@@ -184,7 +185,7 @@ const normal = (text: string): string => text.toLowerCase().replace(/[^a-z0-9]+/
 export const evidenceProblem = (evidence: string, criterion: string): string | null => {
   if (evidence.length < 20) return 'is too short to show what was observed'
   if (GENERIC.test(evidence)) return 'is a bare verdict, not an observation'
-  if (!/[`'"][^`'"]{3,}[`'"]|\b[\w./-]+\.[a-z]{1,5}\b|\d/.test(evidence)) return 'names no file, test, command, output or figure'
+  if (!/[`'"][^`'"]{3,}[`'"]|\b[\w./-]+\.[a-z]{1,5}\b|\d/.test(evidence.replace(/\bc\d+\b/gi, ''))) return 'names no file, test, command, output or figure'
   if (normal(evidence) === normal(criterion)) return 'only restates the criterion'
 
   return null
@@ -372,7 +373,10 @@ export const align = (task: Task, input: AlignInput, now: number, open: readonly
     const row = (one !== null && typeof one === 'object' ? one : {}) as Record<string, unknown>
     const evidence = clip(row['evidence'], 160)
     if (!evidence) return { task, error: 'each "demonstrated" entry needs "evidence": the check that showed it. Nothing was recorded' }
-    const status: CriterionStatus = row['status'] === 'failed' || row['status'] === 'unresolved' ? row['status'] : 'met'
+    const said = typeof row['status'] === 'string' ? row['status'].trim().toLowerCase() : 'met'
+    // an unrecognised status is never read as met
+    if (said !== 'met' && said !== 'failed' && said !== 'unresolved') return { task, error: `criterion status "${clip(row['status'], 20)}" must be met, failed or unresolved. Nothing was recorded` }
+    const status: CriterionStatus = said
     demonstrated.push({ id: idOf(row, n), evidence, status })
   }
   const missing = list(raw['missing'], MAX_CRITERIA, 120)

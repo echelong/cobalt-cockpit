@@ -358,6 +358,34 @@ describe('the acceptance-criteria invariant', () => {
       expect(out.task.alignment).toBeUndefined()
     }
   })
+  test('an unrecognised criterion status is refused, never read as met', () => {
+    const task = ready(['A booking can be cancelled'])
+    for (const status of ['not met', 'pending', 'partial', 'mett']) {
+      const out = claim(task, [{ id: 'c1', evidence: EV, status }])
+      expect(out.error).toContain('must be met, failed or unresolved')
+      expect(out.task).toBe(task)
+    }
+    expect(claim(task, [{ id: 'c1', evidence: EV, status: 'FAILED' }]).task.alignment).toBeUndefined()
+    expect(claim(task, [{ id: 'c1', evidence: EV, status: ' MET ' }]).error).toBeUndefined()
+  })
+  test('evidence that is only the criterion id as a figure is refused', () => {
+    const task = ready(['A booking can be cancelled'])
+    expect(claim(task, [{ id: 'c1', evidence: 'criterion c1 is met now, verified' }]).error).toContain('names no file')
+  })
+  test('a plan whose goal is high-risk is classified from the goal, not only a bare follow-up prompt', () => {
+    const base = stage('go ahead')
+    expect(base.discovery!.level).toBe('LIGHT')
+    const planned = applyAction(base, { action: 'plan', goal: 'Migrate the payments schema to the new ledger', kind: 'coding', milestones: FIVE }, 5, null).task
+    expect(planned.discovery!.level).toBe('DEEP')
+  })
+  test('failing a milestone clears every criterion evaluation, not only the alignment state', () => {
+    const checked = claim(ready(['A booking can be cancelled']), [{ id: 'c1', evidence: EV }]).task
+    expect(checked.discovery!.criteria[0]!.status).toBe('met')
+    const failed = applyAction(checked, { action: 'fail', milestone: 'm2', note: 'broke' }, 41, null).task
+    expect(failed.alignment!.state).toBe('PENDING')
+    expect(failed.discovery!.criteria[0]!.status).toBe('pending')
+    expect(failed.discovery!.criteria[0]!.evidence).toBeNull()
+  })
   test('the completion predicate itself refuses an ALIGNED mark that has no criteria behind it', () => {
     // a hand-built or stored task claiming ALIGNED with an empty criteria set is not "all criteria met"
     const forged = { ...ready([]), alignment: { state: 'ALIGNED' as const, demonstrated: [{ id: 'e1', evidence: EV }], missing: [], assumptions: [], note: null, at: 1 } }
