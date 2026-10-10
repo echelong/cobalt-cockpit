@@ -465,6 +465,22 @@ describe('completion integrity after DONE', () => {
     await bash($, 'git add -A && git commit -m cancel')
     await bash($, 'git stash')
     expect(await progress($, { action: 'status' })).toStartWith('DONE 100%')
+    // the commit moved HEAD; checks reported afterwards, and a goal check made after them, still stand
+    w.head = 'def5678def5678'
+    await bash($, 'git commit -m again')
+    await progress($, { action: 'gate', gate: 'GIT', state: 'pass', evidence: 'committed' })
+    expect(await progress($, { action: 'status' })).toStartWith('DONE 100%')
+    expect(await progress($, { action: 'status' })).toContain('TEST pass')
+  })
+
+  test('a commit between the checks and the goal check does not stale the checks', options, async ($, on) => {
+    const w = world(on); w.tree['src/api.js'] = 'cancel'; await start($)
+    await prompt($, 'Add booking cancellation to the API and the UI')
+    await progress($, { action: 'discover', criteria: ['A booking can be cancelled'] })
+    await planAndComplete($, 4)
+    await passAllGates($, { align: false })
+    w.head = 'def5678def5678'
+    expect(await progress($, aligned)).toContain('alignment ALIGNED')
   })
 
   test('a write nobody observed between the checks and align refuses ALIGNED until the checks are run again', options, async ($, on) => {

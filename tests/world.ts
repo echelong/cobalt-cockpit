@@ -31,6 +31,8 @@ export type World = {
   gitStatus: string | null
   /** The working tree as git sees it against HEAD: path to content. Changing it is a change the fingerprint must notice. */
   tree: Record<string, string>
+  /** HEAD: a commit moves it and leaves `tree` alone. */
+  head: string
   players: Record<string, PlayerBehavior>
   /** A program that answers with this stdout (exit 0), by name; checked before `players`. */
   outputs: Record<string, (argv: readonly string[]) => string>
@@ -108,6 +110,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
     blits: 0,
     gitStatus: CLEAN_REPO,
     tree: {},
+    head: 'abc1234abc1234',
     players: { 'pw-play': 'ok' },
     outputs: {},
     registered: [],
@@ -261,7 +264,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
 
       const sub = e.argv.slice(e.argv[1] === '--no-optional-locks' ? 2 : 1)
       const git = sub[0] === '-C' ? sub.slice(2) : sub
-      if (git[0] === 'rev-parse') return ran(0, git.includes('--verify') ? 'abc1234abc1234\n' : '/work/example\n')
+      if (git[0] === 'rev-parse') return ran(0, git.includes('--verify') ? `${w.head}\n` : '/work/example\n')
       if (git[0] === 'diff') return ran(0, git.includes('--diff-filter=D') ? '' : Object.keys(w.tree).join('\0') + (Object.keys(w.tree).length ? '\0' : ''))
       if (git[0] === 'ls-files') return ran(0, '')
       if (git[0] === 'hash-object') return ran(0, git.slice(git.indexOf('--') + 1).map(path => `h${[...(w.tree[path] ?? '')].reduce((n, c) => (n * 31 + c.charCodeAt(0)) >>> 0, 7)}`).join('\n') + '\n')

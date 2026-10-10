@@ -492,6 +492,13 @@ describe('the acceptance-criteria invariant', () => {
     expect(pinned.discovery!.source).toBe('operator')
     expect(unpin(pinned).discovery!.level).toBe('STANDARD')
   })
+  test('returning to the rules takes a loosely accepted ALIGNED back when the level rises', () => {
+    const risky = withDiscovery(stage('Migrate the payments schema to the new ledger'), null)
+    const light = withDiscovery(risky, 'LIGHT')
+    const aligned = { ...light, alignment: { state: 'ALIGNED' as const, demonstrated: [], missing: [], assumptions: [], note: null, at: 1 } }
+    expect(unpin(aligned).discovery!.level).toBe('DEEP')
+    expect(unpin(aligned).alignment!.state).toBe('PENDING')
+  })
   test('LIGHT tasks and read-only questions are not asked for criteria', () => {
     const light = drive(stage('Fix the typo in the README heading'), run)
     expect(light).toMatchObject({ percent: 100, status: 'done' })

@@ -1441,7 +1441,7 @@ const treeStamp = async ($: EngineInterface, base?: string): Promise<string | nu
     const lines: string[] = [...deleted.split('\0').filter(Boolean).sort().map(path => `D\0${path}`)]
     for (let i = 0; i < paths.length; i += 100) {
       const chunk = paths.slice(i, i + 100)
-      const hashes = await at('hash-object', '--', ...chunk)
+      const hashes = await at('hash-object', '--no-filters', '--', ...chunk)
       const got = hashes?.split('\n').filter(Boolean)
       if (got === undefined || got.length !== chunk.length) return null
       chunk.forEach((path, n) => lines.push(`${got[n]}\0${path}`))
@@ -1479,7 +1479,7 @@ const reconcileTree = ($: EngineInterface): Promise<void> => {
 
     return reconciling
   }
-  reconcileNext ??= reconciling.then(() => { reconcileNext = null; return reconcileTree($) })
+  reconcileNext ??= reconciling.then(() => { reconcileNext = null; return reconcileTree($) }, () => { reconcileNext = null; return reconcileTree($) })
 
   return reconcileNext
 }
@@ -1494,10 +1494,10 @@ const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: 
   const sha = (await read($, gitAtom))?.sha ?? null
   await quiet(() => reconcileTree($))
   // the tree an accepted goal check is about, taken before the answer is recorded
-  const before = e.action === 'align' || e.action === 'gate' ? await read($, taskAtom) : null
+  const before = e.action === 'align' || e.action === 'gate' || (e.action as string) === 'gates' ? await read($, taskAtom) : null
   const goalChecked = before !== null && needsAlignment(before)
   const stamp = goalChecked && e.action === 'align' ? await treeStamp($, baseOf(before.gateTree)) : null
-  const gateStamp = goalChecked && e.action === 'gate' ? await treeStamp($) : null
+  const gateStamp = goalChecked && (e.action === 'gate' || (e.action as string) === 'gates') ? await treeStamp($, baseOf(before.gateTree)) : null
   let reply = ''
   let unprotected = ''
   let cues: Cue[] = []
@@ -1519,7 +1519,7 @@ const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: 
     // The person's pin and the evidence of the plan are applied before the task is settled, so the goal check counts toward DONE.
     // A task stored by v0.5.0 (milestones, no discovery) keeps the rules it began under, unless this call starts a new one.
     const isLegacy = old !== null && old.milestones.length > 0 && old.discovery === undefined && e.action !== 'plan'
-    const gated = e.action === 'gate' ? stampGates(outcome.task, gateStamp) : outcome.task
+    const gated = e.action === 'gate' || (e.action as string) === 'gates' ? stampGates(outcome.task, gateStamp) : outcome.task
     const stamped = stamp !== null && gated.alignment?.state === 'ALIGNED' ? { ...gated, alignment: { ...gated.alignment, tree: stamp } } : gated
     if (goalChecked && e.action === 'align' && stamp === null && gated.alignment?.state === 'ALIGNED') unprotected = 'No working-tree fingerprint could be taken here (no git repository, no commit, or git did not answer), so a later change outside Edit, Write and Bash edit diffs will not be noticed.'
     const settled = settle(isLegacy ? stamped : withDiscovery(stamped, pin))
@@ -1616,7 +1616,7 @@ const noteEnd = async (
         )
       : []
 
-  const observed = readings.some(r => r.state === 'pass') ? await treeStamp($) : null
+  const observed = readings.some(r => r.state === 'pass') ? await treeStamp($, baseOf((await read($, taskAtom))?.gateTree)) : null
   if (edits.length > 0 || readings.length > 0) {
     await change($, (task, now) => {
       let chain = task

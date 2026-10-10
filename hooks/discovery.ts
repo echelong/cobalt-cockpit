@@ -118,7 +118,10 @@ export const unpin = (task: Task, facts: DiscoveryFacts = factsOf(task)): Task =
   const level = floor !== undefined && rank(floor) > rank(found.level) ? floor : found.level
   const { floor: _kept, ...rest } = task.discovery
 
-  return { ...task, discovery: { ...rest, level, source: 'auto', reasons: level === found.level ? found.reasons : [...found.reasons, 'earlier-level'].slice(0, MAX_REASONS) } }
+  const back: Task = { ...task, discovery: { ...rest, level, source: 'auto', reasons: level === found.level ? found.reasons : [...found.reasons, 'earlier-level'].slice(0, MAX_REASONS) } }
+
+  // a level that rises takes the goal check back, as on every other path that raises it
+  return rank(level) > rank(task.discovery.level) ? invalidateAlignment(back, 'level raised') : back
 }
 
 const blank = (level: DiscoveryLevel): Discovery => ({ level, source: 'auto', reasons: [], objective: null, criteria: [], unknowns: [], risks: [], guided: null })
