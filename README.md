@@ -1,4 +1,4 @@
-# Cobalt Cockpit v0.5.0 — Elastic Swarm + Adaptive Intelligence
+# Cobalt Cockpit v0.5.1 — Elastic Swarm + Adaptive Intelligence
 
 **Mission control for Claude Code.** Follow real task progress, coordinate bounded subagents, review verification gates, and replay what happened, without replacing Claude Code's native model and permission controls.
 
@@ -108,9 +108,11 @@ A `--plugin-dir` copy stops loading when you omit the flag next session.
 | `/cockpit mute` / `/cockpit unmute` | Persist sound preference |
 | `/cockpit hud off` / `/cockpit hud on` | Persist HUD preference |
 | `/cockpit reset` | Clear the current task |
+| `/cockpit discovery` / `/cockpit discovery light\|standard\|deep\|auto` | Show the discovery level, open unknowns, decisions and goal check, or pin a level (this session only) |
 | `/cockpit router` / `/cockpit router off\|nobodywho\|jev` | Show this session's router, or switch it (this session only; a new session starts OFF) |
 | `/ledger` | Open local Run Ledger |
 | `/ledger export json` | Print sanitized telemetry JSON |
+| `/ledger export decisions` | Print recorded decisions as Markdown to paste into project docs (nothing is written to disk) |
 | `/replay` | Browse successful edit/write snapshots |
 | `/park` | Save a deterministic checkpoint for later resume |
 
@@ -173,6 +175,33 @@ A completed turn does not complete a task. Missing measurements stay unknown.
 Ledger records observed runs, agents, tools, usage, verification and optional local-control receipts. It keeps up to eight sessions in the host's plugin store, with a 384,000-byte budget per stored ledger and bounded detail windows. Live agents and originating runs are retained; oldest detail is evicted first. `/park` stores phase, explicit goal/milestones, blockers and Git checkpoint data. Resuming the same session restores its checkpoint; this is not an automatic new-session handoff or model summary.
 
 Replay retains at most 24 snapshots, with a 96,000-character aggregate budget and 12,000-character per-step budget. Sensitive filenames, detected credentials and oversized content are omitted. JSON export excludes snapshot bodies, agent descriptions and checkpoint prose. It includes sanitized structured task assignments, ownership, results and lifecycle evidence.
+
+## Discovery, decisions and goal check
+
+Added in v0.5.1. It is Cockpit's own heuristic, not an Anthropic workflow or endorsement, and it adds no model call: the level comes from deterministic rules over the prompt, the files the host saw edited and the consultation grounds Cockpit already reads. A router (NobodyWho or JEV) may still advise on routing; it cannot lower a level, skip a gate or waive a consultation.
+
+| Level | When | What changes |
+| --- | --- | --- |
+| `LIGHT` | A typo, a label, a rename, a question, a single obvious edit | Nothing is added to the prompt. No questions, no record. Progress and gates apply as before. |
+| `STANDARD` | A change request, a feature, real debugging, three or more files edited | One short line once: state the objective and acceptance criteria, name only unknowns that change the implementation, assume safely otherwise, record consequential choices, check the goal before DONE. |
+| `DEEP` | A migration, authentication, payments, concurrency, data integrity, architecture, or a security or architecture consultation ground | A longer line once: establish the architecture, name only the risk categories that apply, compare approaches. Any Opus consultation still goes through `swarm consult` and its admission rules. |
+
+A level only goes up during a task, and each level's guidance is given once. The progress tool gained three actions: `discover` (objective, acceptance criteria, material unknowns, relevant risks), `decide` (one decision) and `align` (the goal check). `/cockpit discovery` shows the state:
+
+```
+COBALT / DISCOVERY
+LEVEL / STANDARD
+GOAL / Implement booking cancellation
+UNKNOWNS / 2 unresolved
+DECISIONS / 1 recorded
+ALIGNMENT / PENDING
+```
+
+**Decisions.** A record holds a problem, the chosen approach, alternatives with the reason each was rejected, trade-offs, evidence and a status (`provisional`, `verified`, `revised`). Cockpit stores what the model reported and nothing else: an alternative without its reason, or a `verified` decision without evidence, is refused rather than filled in. Records are redacted for credential shapes before they enter task state or the Run Ledger, bounded (12 per task, 64 per ledger, detail dropped before records when the 384,000-byte budget is tight) and not required for LIGHT work. The ledger also keeps one entry per task saying which level was chosen and why, in short codes, with no prompt text. Cockpit never creates `DECISIONS.md` or `CLAUDE.md`; `/ledger export decisions` prints Markdown for you to paste.
+
+**Goal check.** A coding task above LIGHT cannot read DONE until `align` reports `ALIGNED`: every declared acceptance criterion needs its own evidence, nothing reported missing, no unknown still open, every earlier milestone done, no blocker and every required gate passed. Passing tests are one input, never the whole. `PARTIAL`, `BLOCKED` and `UNKNOWN` are recorded and do not complete the task. Editing files or failing a required gate afterwards takes the check back. The result is a hold on the existing progress model (the task stays UNVERIFIED below 100%), not a second percentage. LIGHT, read-only and operator-pinned LIGHT tasks, and tasks stored before v0.5.1, are never held by it. A pin changes only this check and the guidance: mandatory Opus consultations and the six gates are unaffected.
+
+**Limits.** The level is a heuristic over words and file names, so it can misjudge a terse or oddly worded prompt in either direction; pin it with `/cockpit discovery`. The goal check is as honest as the evidence the model reports: Cockpit refuses an `ALIGNED` that is incomplete on its face but cannot judge whether the evidence is true.
 
 ## Safety
 

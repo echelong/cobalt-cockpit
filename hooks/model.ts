@@ -16,6 +16,7 @@ import type {
   TouchedFile,
   WorkPhase,
 } from '../types'
+import { align, alignmentNote, decide, discover, discoverySummary, invalidateAlignment, isAlignmentSatisfied, withDiscovery } from './discovery'
 
 export const GATES: readonly GateName[] = ['CODE', 'TEST', 'TYPE', 'BUILD', 'SECURITY', 'GIT']
 export const WORK_PHASES: readonly WorkPhase[] = [
@@ -144,6 +145,9 @@ export const unsatisfiedGates = (task: Task): GateName[] =>
 /** True when no Opus consultation the task requires is still outstanding (SONNET_LED). */
 export const isReviewSatisfied = (task: Task): boolean => task.review === undefined || task.review.state === 'adjudicated'
 
+/** True when nothing but the gates, the consultation and the goal check stand between the milestones and DONE. */
+const isVerified = (task: Task): boolean => areGatesSatisfied(task) && isReviewSatisfied(task) && isAlignmentSatisfied(task)
+
 const reviewNote = (task: Task): string =>
   task.review === undefined ? '' : `Opus consultation (${task.review.grounds.join(', ')}) ${task.review.state}`
 
@@ -157,7 +161,7 @@ export const percentOf = (task: Task): number => {
   const done = task.milestones.filter(one => one.state === 'done').length
   const percent = Math.floor((100 * done) / total)
 
-  return percent === 100 && (!areGatesSatisfied(task) || !isReviewSatisfied(task)) ? UNVERIFIED_CAP : percent
+  return percent === 100 && !isVerified(task) ? UNVERIFIED_CAP : percent
 }
 
 const statusOf = (task: Task, percent: number): TaskStatus => {
@@ -166,7 +170,7 @@ const statusOf = (task: Task, percent: number): TaskStatus => {
   if (percent === 100) return 'done'
   const open = task.milestones.filter(one => one.state !== 'done')
   const isOnlyVerifyLeft = open.every(one => one.phase === 'VERIFY')
-  if (isOnlyVerifyLeft && (!areGatesSatisfied(task) || !isReviewSatisfied(task)) && failingGates(task).length === 0) {
+  if (isOnlyVerifyLeft && !isVerified(task) && failingGates(task).length === 0) {
     return 'unverified'
   }
 
@@ -300,7 +304,7 @@ export const planTask = (task: Task, input: PlanInput, now: number): Outcome => 
     updatedAt: now,
   }
 
-  return { task: planned }
+  return { task: withDiscovery(planned, null) }
 }
 
 export const startMilestone = (task: Task, ref: unknown, now: number): Outcome => {
@@ -341,6 +345,14 @@ export const completeMilestone = (task: Task, ref: unknown, note: string | null,
     return {
       task: { ...task, milestones: replaceMilestone(task, held), updatedAt: now },
       note: `${found.id} is HELD, not complete: ${reviewNote(task)}, and this task cannot finish without it. Request it with swarm action "consult", run the architect it admits, then verify its advice with swarm action "verify" (pass or fail, with evidence).`,
+    }
+  }
+  if (found.phase === 'VERIFY' && !isAlignmentSatisfied(task)) {
+    const held: Milestone = { ...found, state: 'active', note: `held: ${alignmentNote(task)}` }
+
+    return {
+      task: { ...task, milestones: replaceMilestone(task, held), updatedAt: now },
+      note: `${found.id} is HELD, not complete: ${alignmentNote(task)}. Compare the result with the original request and report it with action "align" (ALIGNED only with evidence for each acceptance criterion; otherwise PARTIAL, BLOCKED or UNKNOWN).`,
     }
   }
   const done: Milestone = { ...found, state: 'done', note }
@@ -438,7 +450,9 @@ export const setGate = (
     }
   }
 
-  return { ...task, gates: { ...task.gates, [name]: gate }, milestones, failures, updatedAt: now }
+  const next: Task = { ...task, gates: { ...task.gates, [name]: gate }, milestones, failures, updatedAt: now }
+
+  return state === 'fail' && before.isRequired ? invalidateAlignment(next, `${name} failed`) : next
 }
 
 /** Adds one edit's line counts to the files the task has touched. */
@@ -453,7 +467,7 @@ export const touchFile = (task: Task, path: string, added: number, removed: numb
         )
       : [...task.files, { path, added, removed }].slice(-MAX_FILES)
 
-  return { ...task, files }
+  return invalidateAlignment({ ...task, files }, 'files changed')
 }
 
 /** Distinct files the main loop edits before a task without a plan is reminded of one. */
@@ -484,7 +498,7 @@ export const summaryOf = (task: Task | null): string => {
   if (task === null) return 'No task yet.'
   const gates = GATES.map(name => `${name} ${task.gates[name].state}`).join(', ')
   if (task.milestones.length === 0) {
-    return `No milestones defined (phase ${task.phase}). Gates: ${gates}.`
+    return `No milestones defined (phase ${task.phase}). Gates: ${gates}.${discoverySummary(task)}`
   }
   const done = task.milestones.filter(one => one.state === 'done').length
   const list = task.milestones.map(one => `${one.id} ${one.title} [${one.state}]`).join('; ')
@@ -494,7 +508,9 @@ export const summaryOf = (task: Task | null): string => {
       ? 'DONE: every milestone complete and every required gate satisfied.'
       : task.status === 'unverified'
         ? open.length === 0
-          ? `UNVERIFIED: not done until the ${reviewNote(task)} is adjudicated.`
+          ? !isReviewSatisfied(task)
+            ? `UNVERIFIED: not done until the ${reviewNote(task)} is adjudicated.`
+            : `UNVERIFIED: not done until ${alignmentNote(task)} is ALIGNED (action "align").`
           : `UNVERIFIED: not done until ${open.join(', ')} ${open.length === 1 ? 'is' : 'are'} pass or na.`
         : task.status === 'blocked'
           ? `BLOCKED: ${task.blocker ?? 'a milestone is blocked'}.`
@@ -504,7 +520,7 @@ export const summaryOf = (task: Task | null): string => {
 
   const review = task.review === undefined ? '' : ` Review: ${reviewNote(task)}.`
 
-  return `${task.phase} ${task.percent}% (${done}/${task.milestones.length} milestones). ${verdict} Milestones: ${list}. Gates: ${gates}.${review}`
+  return `${task.phase} ${task.percent}% (${done}/${task.milestones.length} milestones). ${verdict} Milestones: ${list}. Gates: ${gates}.${review}${discoverySummary(task)}`
 }
 
 /** The progress tool's input, as the model sends it. */
@@ -521,6 +537,14 @@ export type ProgressInput = {
   state?: unknown
   evidence?: unknown
   note?: unknown
+  /** discover: the level to raise to, acceptance criteria, unknowns and relevant risk categories. */
+  level?: unknown
+  criteria?: unknown
+  unknowns?: unknown
+  risks?: unknown
+  /** decide: one decision record. align: the original-goal check. */
+  decision?: unknown
+  alignment?: unknown
 }
 
 const optionalText = (value: unknown): string | null =>
@@ -550,6 +574,8 @@ export const applyAction = (task: Task, input: ProgressInput, now: number, sha: 
               // it follows the work into the next plan until Opus has answered it.
               ...(task.review === undefined ? {} : { review: task.review }),
               ...(task.promptGrounds === undefined ? {} : { promptGrounds: task.promptGrounds }),
+              // The operator's pinned level outlives the task; any other is read again from the new one.
+              ...(task.discovery?.source === 'operator' ? { discovery: { ...task.discovery, objective: null, criteria: [], unknowns: [], risks: [], guided: task.discovery.guided } } : {}),
             }
           : task
 
@@ -597,9 +623,15 @@ export const applyAction = (task: Task, input: ProgressInput, now: number, sha: 
 
       return { task: setGate(task, input.gate, state, evidence, 'model', now) }
     }
+    case 'discover':
+      return discover(task, input as Parameters<typeof discover>[1], now)
+    case 'decide':
+      return decide(task, input as Parameters<typeof decide>[1], now)
+    case 'align':
+      return align(task, input as Parameters<typeof align>[1], now, unsatisfiedGates(task))
     case 'status':
       return { task }
     default:
-      return { task, error: '"action" must be plan, start, complete, fail, block, unblock, gate or status' }
+      return { task, error: '"action" must be plan, start, complete, fail, block, unblock, gate, discover, decide, align or status' }
   }
 }

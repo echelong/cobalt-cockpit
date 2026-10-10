@@ -3,6 +3,8 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
+import { withDiscovery } from '../hooks/discovery'
+
 import {
   applyAction,
   completeMilestone,
@@ -37,7 +39,8 @@ const drive = (task: Task, calls: Record<string, unknown>[], at = 1000): { task:
   return { task: current, cues, notes }
 }
 
-const planned = (): Task => drive(newTask(1, 'Add rate limiting', 0, 'abc1234'), [{ action: 'plan', milestones: FIVE }]).task
+// Pinned LIGHT: these tests are about milestones and gates; the goal check of STANDARD and DEEP work is in discovery.test.ts.
+const planned = (): Task => withDiscovery(drive(newTask(1, 'Add rate limiting', 0, 'abc1234'), [{ action: 'plan', milestones: FIVE }]).task, 'LIGHT')
 
 const allGatesPass = GATES.map(gate => ({ action: 'gate', gate, state: 'pass', evidence: `${gate} checked` }))
 

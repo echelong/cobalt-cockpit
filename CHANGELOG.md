@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1 — Discovery and decision quality
+
+- Adaptive discovery: a deterministic LIGHT, STANDARD or DEEP level per task, from the prompt, the files edited and the existing consultation grounds. LIGHT work gets no added prompt text; STANDARD and DEEP get one short line, once per level. No new model call, router or consultation path.
+- The progress tool gains `discover`, `decide` and `align`. Decisions are bounded records in the Run Ledger (alternatives, reasons, evidence, status), redacted before storage; older ledgers stay readable. `/ledger export decisions` prints them as Markdown. Nothing is written to a project.
+- Original-goal check: a coding task above LIGHT stays UNVERIFIED until `align` reports ALIGNED with evidence for each acceptance criterion. It is a hold inside the existing progress model, beside the six gates and any mandatory Opus consultation, never in place of them.
+- `/cockpit discovery` shows and pins the level for the session.
+- Existing fixtures that exercise milestones and gates only now pin LIGHT; the shared test helper reports the goal check after the gates.
+- Details, schema, measurements and limits: [docs/implementation-v0.5.1-discovery.md](docs/implementation-v0.5.1-discovery.md).
+
 ## 0.5.0 — Sonnet-led profile and session router
 
 The session router:

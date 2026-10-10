@@ -1,5 +1,5 @@
 // Pure, bounded accounting. Every absent measurement is literally unknown.
-import type { EffortVia, GitState, NwhoEvent, Task, Value, Counts, Run, LedgerAgent, ToolEntry, Reading, Request, Checkpoint, Ledger } from '../types'
+import type { DecisionRecord, DiscoveryEntry, EffortVia, GitState, NwhoEvent, Task, Value, Counts, Run, LedgerAgent, ToolEntry, Reading, Request, Checkpoint, Ledger } from '../types'
 export type { Value, Counts, Run, LedgerAgent, ToolEntry, Reading, Request, Checkpoint, Ledger } from '../types'
 import { appendReplay, safeFile, safeText, secretText } from './replay'
 import type { ReplayStep } from './replay'
@@ -8,8 +8,10 @@ import { statusOf as consultStatus } from './consult'
 import { decisionLine } from './router'
 import { roleOf } from './orchestra'
 import { activityOf } from './classify'
+import { redactSecrets } from './secrets'
+import { needsAlignment } from './discovery'
 export const UNKNOWN = 'unknown' as const
-export const LIMITS = { runs: 32, agents: 96, tools: 512, requests: 512, usage: 64, receipts: 256, warnings: 32 }
+export const LIMITS = { runs: 32, agents: 96, tools: 512, requests: 512, usage: 64, receipts: 256, warnings: 32, decisions: 64, discoveries: 16 }
 const counts = (): Counts => ({ tools: 0, reads: 0, edits: 0, writes: 0, tests: 0, builds: 0, git: 0, failures: 0, retries: UNKNOWN })
 export const emptyLedger = (sessionId: string = UNKNOWN): Ledger => ({ schema: 2, swarm: emptySwarm(), sessionId, currentRun: UNKNOWN, turns: {}, runs: [], agents: [], tools: [], requests: [], usage: [], receipts: [], warnings: [], replay: [], checkpoint: null })
 export const word = (v: unknown): Value<string> => typeof v === 'string' && /^[a-zA-Z0-9_.:/ -]{1,160}$/.test(v) && !secretText(v) ? safeText(v) : UNKNOWN
@@ -138,7 +140,7 @@ export const ledgerLines = (l: Ledger, now: number, auth: string = UNKNOWN, cost
   for (const t of l.tools.filter(t => t.file !== UNKNOWN).slice(-32)) rows.push(`${t.tool} ${t.file} · ${t.status}`)
   rows.push('07 FAILURES / RETRIES', `tools ${run?.counts.tools ?? 0} · failures ${run?.counts.failures ?? 0} · retries unknown`)
   for (const t of l.tools.filter(t => t.status === 'failure').slice(-12)) rows.push(`${t.id} · ${t.tool} · failure`)
-  rows.push('08 VERIFICATION', ...Object.entries(l.checkpoint?.gates ?? {}).map(([k, v]) => `${k} ${v}`), `git ${l.checkpoint?.branch ?? UNKNOWN} · ${l.checkpoint?.currentSha ?? UNKNOWN} · dirty ${l.checkpoint?.dirty ?? UNKNOWN}`, '09 REPLAY / HISTORY', `${l.replay.length} snapshots · /replay · ${l.runs.length} runs`, 'Bounded observed history; unknown means unexposed or unobserved. No cost estimates.')
+  rows.push('08 VERIFICATION', ...Object.entries(l.checkpoint?.gates ?? {}).map(([k, v]) => `${k} ${v}`), `git ${l.checkpoint?.branch ?? UNKNOWN} · ${l.checkpoint?.currentSha ?? UNKNOWN} · dirty ${l.checkpoint?.dirty ?? UNKNOWN}`, ...discoveryRows(l), '09 REPLAY / HISTORY', `${l.replay.length} snapshots · /replay · ${l.runs.length} runs`, 'Bounded observed history; unknown means unexposed or unobserved. No cost estimates.')
   if (l.swarm?.tasks.length) {
     rows.push('10 ELASTIC SWARM', `wave ${l.swarm.wave} · requested ${l.swarm.requested} · actual ${l.swarm.actual} · high-water ${l.swarm.highWater} · conflicts ${l.swarm.conflicts}`)
     for (const t of l.swarm.tasks) rows.push(`${t.id} ${t.tier} ${t.role} · ${t.state} · effort ${t.requestedEffort}${t.appliedEffort ? ` → ${t.appliedEffort}` : ''} · agent ${t.agentId ?? UNKNOWN} · parent ${t.parentTask ?? UNKNOWN}/${t.parentAgent ?? UNKNOWN}`, `why ${t.spawnReason} · objective ${t.objective}`, `ownership ${t.mode} ${t.owned.join(', ')} · dependencies ${t.dependencies.join(', ') || 'none'} · wave ${t.wave}`, `result ${t.result?.conclusion ?? UNKNOWN} · report ${t.resultDelivery ?? 'unavailable'} · verification ${t.verification}${t.escalation ? ` · escalation ${t.tier} → ${t.escalation.to}: ${t.escalation.question}` : ''}${t.effortEscalation ? ` · effort escalation ${t.effortEscalation.from} → ${t.effortEscalation.to}: ${t.effortEscalation.reason}` : ''}`)
@@ -163,6 +165,8 @@ export const storageLedger = (ledger: Ledger): Ledger => {
     else if (l.swarm && l.swarm.events.length > 8) l = { ...l, swarm: { ...l.swarm, events: l.swarm.events.slice(Math.max(1,Math.floor(l.swarm.events.length / 4))), droppedEvents: l.swarm.droppedEvents + Math.max(1,Math.floor(l.swarm.events.length / 4)) } }
     else if (l.swarm?.tasks.some(t => t.result && (t.result.evidence.length || t.result.changes.length || t.result.verification.length || t.result.conclusion.length > 160) || t.escalation && (t.escalation.evidence.length || t.escalation.discoveries.length))) l = { ...l, swarm: { ...l.swarm, tasks: l.swarm.tasks.map(t => ({ ...t, result: t.result ? { ...t.result, conclusion: t.result.conclusion.slice(0,160), evidence:[], changes:[], verification:[], unresolved:['Stored detail pruned; commander verification unchanged'], confidence:null, escalation:null, rawRef:null } : null, escalation: t.escalation ? { ...t.escalation, evidence:[], discoveries:[], question:t.escalation.question.slice(0,160), nextAction:t.escalation.nextAction.slice(0,160), locations:t.escalation.locations.slice(0,4) } : null })) } }
     else if (l.consults?.some(c => c.packet.architecture.length > 160 || c.packet.files.length || c.packet.alternatives.length || c.packet.failures.length || c.packet.objective.length > 160 || c.packet.decision.length > 160 || c.packet.risk.length > 160)) l = { ...l, consults: l.consults.map(c => ({ ...c, packet: { objective: c.packet.objective.slice(0, 160), decision: c.packet.decision.slice(0, 160), risk: c.packet.risk.slice(0, 160), architecture: c.packet.architecture.slice(0, 160), files: [], alternatives: [], failures: [] } })) }
+    else if (l.decisions?.some(d => d.alternatives.length || d.evidence.length || d.problem.length > 80)) l = { ...l, decisions: l.decisions.map(d => ({ ...d, alternatives: [], evidence: [], problem: d.problem.slice(0, 80), tradeoffs: null })) }
+    else if ((l.decisions?.length ?? 0) > 8) l = { ...l, decisions: l.decisions!.slice(Math.max(1, Math.floor(l.decisions!.length / 4))) }
     else if (l.receipts.length > 8) l.receipts = l.receipts.slice(Math.max(1, Math.floor(l.receipts.length / 4)))
     else break
   }
@@ -196,4 +200,39 @@ export const classicTelemetry = (l: Ledger, e: { tool_use_id: string; agent_id?:
 }
 
 /** Upgrade retained v1 histories without inventing missing assignments. */
-export const migrateLedger = (l: Ledger): Ledger => ({ ...l, schema: 2, swarm: l.swarm ?? emptySwarm() })
+export const migrateLedger = (l: Ledger): Ledger => ({ ...l, schema: 2, swarm: l.swarm ?? emptySwarm(), decisions: Array.isArray(l.decisions) ? l.decisions : [], discoveries: Array.isArray(l.discoveries) ? l.discoveries : [] })
+const redact = (text: string, max: number): string => redactSecrets(text).replace(/\s+/g, ' ').trim().slice(0, max)
+/** The same record with every free-text field redacted again: nothing reaches storage unredacted, whatever called this. */
+const safeDecision = (d: DecisionRecord): DecisionRecord => ({ ...d, problem: redact(d.problem, 160), chosen: redact(d.chosen, 200), alternatives: d.alternatives.slice(0, 4).map(a => ({ option: redact(a.option, 120), rejectedBecause: redact(a.rejectedBecause, 160) })), tradeoffs: d.tradeoffs === null ? null : redact(d.tradeoffs, 200), evidence: d.evidence.slice(0, 4).map(e => redact(e, 120)) })
+/**
+ * Mirrors the task's discovery level (and why) and its decision records into the
+ * ledger. Records are keyed by task and id, so a revised decision replaces its
+ * earlier form; only what the task holds is copied, nothing is added.
+ */
+export const recordDiscovery = (l: Ledger, task: Task, at: number): Ledger => {
+  const d = task.discovery
+  if (d === undefined && (task.decisions ?? []).length === 0) return l
+  const discoveries = d === undefined ? l.discoveries ?? [] : [...(l.discoveries ?? []).filter(e => e.taskId !== task.id), { taskId: task.id, level: d.level, source: d.source, reasons: d.reasons.map(r => redact(r, 40)), unknownsOpen: d.unknowns.filter(u => u.state === 'open').length, alignment: needsAlignment(task) ? task.alignment?.state ?? 'PENDING' : 'NONE', at } satisfies DiscoveryEntry].slice(-LIMITS.discoveries)
+  const mine = (task.decisions ?? []).map(safeDecision)
+  const decisions = [...(l.decisions ?? []).filter(e => e.taskId !== task.id || !mine.some(m => m.id === e.id)), ...mine].slice(-LIMITS.decisions)
+  if (JSON.stringify(discoveries) === JSON.stringify(l.discoveries) && JSON.stringify(decisions) === JSON.stringify(l.decisions)) return l
+
+  return { ...l, discoveries, decisions }
+}
+/**
+ * The recorded decisions as Markdown the operator can paste into project docs.
+ * Printed, never written: Cockpit creates no file in a project. Already redacted when stored; redacted again here.
+ */
+export const decisionsMarkdown = (l: Ledger): string => {
+  const ds = (l.decisions ?? []).map(safeDecision)
+  if (ds.length === 0) return 'No decisions recorded in this ledger.'
+
+  return ['# Decisions', '', ...ds.flatMap(d => [`## ${d.id} (task ${d.taskId}): ${d.problem}`, '', `- Status: ${d.status}`, `- Chosen: ${d.chosen}`, ...d.alternatives.map(a => `- Rejected: ${a.option} — ${a.rejectedBecause}`), ...(d.tradeoffs ? [`- Trade-offs: ${d.tradeoffs}`] : []), ...d.evidence.map(e => `- Evidence: ${e}`), ''])].join('\n').trimEnd()
+}
+const discoveryRows = (l: Ledger): string[] => {
+  const rows: string[] = []
+  for (const e of (l.discoveries ?? []).slice(-4)) rows.push(`DISCOVERY task ${e.taskId} ${e.level}${e.source === 'operator' ? ' (operator)' : ''} · why ${e.reasons.join(', ') || UNKNOWN} · unknowns open ${e.unknownsOpen} · alignment ${e.alignment}`)
+  for (const d of (l.decisions ?? []).slice(-6)) rows.push(`DECISION ${d.id} task ${d.taskId} ${d.status} · ${d.chosen}${d.alternatives.length ? ` · rejected ${d.alternatives.map(a => a.option).join('; ')}` : ''}${d.evidence.length ? ` · evidence ${d.evidence.length}` : ''}`)
+
+  return rows
+}

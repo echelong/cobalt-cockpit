@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { applyAction, newTask, settle, setGate } from '../hooks/model'
+import { withDiscovery } from '../hooks/discovery'
 import { FOLD_MS, GLIDE_MS, PALETTE, STATE_COLOR, STATE_GLOW, STATE_GLYPH, cellsOf, escapeXml, fitText, layoutOf, markersOf, particleBits, positionAt, secondaryText, stageLabel, stripGrid, stripText, trackGrid, trackSvg, transition, visibleAgents, visualOf } from '../hooks/progress-visual'
 import { hex, pack } from '../hooks/pixels'
 import type { HudInput } from '../hooks/view'
@@ -10,6 +11,8 @@ const taskAt = (count = 2): Task => {
   let t = applyAction(newTask(1, 'Inspect → implement', 0, null), { action: 'plan', milestones: [
     {title:'Inspect',phase:'RESEARCH'}, {title:'Implement API',phase:'IMPLEMENT'}, {title:'Implement UI',phase:'IMPLEMENT'}, {title:'Test',phase:'TEST'}, {title:'Verify',phase:'VERIFY'}
   ] }, 0, null).task
+  // Pinned LIGHT: this file is about appearance; the goal check of STANDARD work is in discovery.test.ts.
+  t=withDiscovery(t,'LIGHT')
   for(let n=1;n<=count;n++) t=applyAction(t,{action:'complete',milestone:`m${n}`},n*100,null).task
   return settle(t).task
 }

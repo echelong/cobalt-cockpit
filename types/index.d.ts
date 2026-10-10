@@ -138,7 +138,53 @@ export type Task = {
   promptGrounds?: ConsultGround[]
   /** Set once the main loop was reminded that this edited task has no progress plan. */
   progressNudged?: boolean
+  /** v0.5.1: how much discovery this task warrants and what it found. Absent on tasks stored by older versions. */
+  discovery?: Discovery
+  /** v0.5.1: the original-goal check; required for a coding task above LIGHT before it can read DONE. */
+  alignment?: Alignment
+  /** v0.5.1: consequential decisions the model reported, bounded and redacted. */
+  decisions?: DecisionRecord[]
 }
+
+export type DiscoveryLevel = 'LIGHT' | 'STANDARD' | 'DEEP'
+export type UnknownItem = { id: string; text: string; state: 'open' | 'resolved' | 'assumed'; note: string | null }
+export type Discovery = {
+  level: DiscoveryLevel
+  /** `operator` when the person pinned it with /cockpit discovery. */
+  source: 'auto' | 'operator'
+  /** Why this level, as short codes (never prompt text). */
+  reasons: string[]
+  objective: string | null
+  criteria: { id: string; text: string }[]
+  unknowns: UnknownItem[]
+  /** Risk categories the model named as relevant; never a fixed checklist. */
+  risks: string[]
+  /** The level the prompt-time guidance was last given for: guidance is never repeated for it. */
+  guided: DiscoveryLevel | null
+}
+export type AlignmentState = 'PENDING' | 'ALIGNED' | 'PARTIAL' | 'BLOCKED' | 'UNKNOWN'
+export type Alignment = {
+  state: AlignmentState
+  demonstrated: { id: string; evidence: string }[]
+  missing: string[]
+  assumptions: string[]
+  note: string | null
+  at: number
+}
+export type DecisionStatus = 'provisional' | 'verified' | 'revised'
+export type DecisionRecord = {
+  id: string
+  taskId: number
+  problem: string
+  chosen: string
+  alternatives: { option: string; rejectedBecause: string }[]
+  tradeoffs: string | null
+  evidence: string[]
+  status: DecisionStatus
+  at: number
+}
+/** What the Run Ledger keeps of a task's discovery: the level and why, no prompt text. */
+export type DiscoveryEntry = { taskId: number; level: DiscoveryLevel; source: 'auto' | 'operator'; reasons: string[]; unknownsOpen: number; alignment: AlignmentState | 'NONE'; at: number }
 
 /** Which model leads the main loop when orchestration is enforced. */
 export type Profile = 'OPUS_LED' | 'SONNET_LED'
@@ -448,7 +494,7 @@ export type ToolEntry = { id: string; runId: Value<string>; turnId: Value<string
 export type Reading = { at: number; turnId: Value<string>; tokens: Value<number>; window: Value<number>; percent: Value<number> }
 export type Request = { id: string; runId: Value<string>; turnId: string; agentId: Value<string>; requestedModel: Value<string>; requestedEffort: Value<string>; model: Value<string>; effort: Value<string>; effectiveEffort: Value<string>; input: Value<number>; output: Value<number>; cacheRead: Value<number>; cacheWrite: Value<number> }
 export type Checkpoint = { at: number; goal: string; phase: string; completed: string[]; remaining: string[]; latest: string; gates: Record<string, string>; branch: string; startingSha: string; currentSha: string; repo: string; dirty: Value<number>; blockers: string[]; backgroundAgents: string[] }
-export type Ledger = { schema: 1 | 2; observedCompletions?: { agentId: string; reason: string; conclusion: string; at: number }[]; swarm?: Swarm; sessionId: string; currentRun: Value<string>; turns: Record<string, string>; runs: Run[]; agents: LedgerAgent[]; tools: ToolEntry[]; requests: Request[]; usage: Reading[]; receipts: NwhoEvent[]; warnings: string[]; replay: ReplayStep[]; checkpoint: Checkpoint | null; /** Opus consultations (SONNET_LED); absent in older ledgers. */ consults?: Consultation[]; /** The session router's decisions, newest last; absent until one is made. */ routing?: RouterDecision[] }
+export type Ledger = { schema: 1 | 2; observedCompletions?: { agentId: string; reason: string; conclusion: string; at: number }[]; swarm?: Swarm; sessionId: string; currentRun: Value<string>; turns: Record<string, string>; runs: Run[]; agents: LedgerAgent[]; tools: ToolEntry[]; requests: Request[]; usage: Reading[]; receipts: NwhoEvent[]; warnings: string[]; replay: ReplayStep[]; checkpoint: Checkpoint | null; /** Opus consultations (SONNET_LED); absent in older ledgers. */ consults?: Consultation[]; /** The session router's decisions, newest last; absent until one is made. */ routing?: RouterDecision[]; /** v0.5.1 decision records, newest last; absent in v0.5.0 ledgers. */ decisions?: DecisionRecord[]; /** v0.5.1: why each task got its discovery level; absent in v0.5.0 ledgers. */ discoveries?: DiscoveryEntry[] }
 export type ReplayStep = { id: string; runId: string; turnId: string; agentId: string; file: string; kind: 'Edit' | 'Write'; at: number; before: string; after: string; scope: 'fragment' | 'file'; omitted: boolean }
 export type Cursor = { offset: number; size: number; seen: string[]; primed: boolean }
 

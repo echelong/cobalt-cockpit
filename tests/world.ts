@@ -531,4 +531,6 @@ export const planAndComplete = async ($: Engine, done: number): Promise<string> 
 
 export const passAllGates = async ($: Engine): Promise<void> => {
   for (const gate of GATE_NAMES) await progress($, { action: 'gate', gate, state: 'pass', evidence: `${gate} verified` })
+  // The goal check STANDARD and DEEP work needs. It is refused, and changes nothing, while milestones before verification are open.
+  await progress($, { action: 'align', alignment: { state: 'ALIGNED', demonstrated: [{ id: 'e1', evidence: 'fixture: acceptance behaviour checked' }] } })
 }

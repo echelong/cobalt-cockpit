@@ -14,6 +14,7 @@ import { textOf } from './ledger'
 import { atom, read, update } from 'claude-code'
 import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL, OPUS_MODEL, isProfile, DEFAULT_PROFILE } from './model-policy'
 import type { SubagentTier, Profile } from './model-policy'
+import { discoveryRows, guidanceFor, markGuided, unpin, withDiscovery } from './discovery'
 import { addConsult, advanceReview, briefOf, consultVerdict, factsOf, hasReturned, isGround, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
 import type { Consultation } from './consult'
 import { addDecision, adjudicate, adviceLine, answerOf, callsFor, carriesCredential, decisionOf, deterministicRoute, operatorNotice, readAnswers, routerArgv, routerLabel, routerLine, routerModeOf, routerStateOf, switchRouter, withDecision, AVAILABILITY_STATE, CALL_TIMEOUT_MS, EMPTY_ROUTER, PROVIDER, ROUTER_MODES } from './router'
@@ -34,11 +35,11 @@ import {
 import type { EffortFacts, EffortResolution, HostEffortSignals } from './effort'
 import { orchestrationGraph, orchestrationTape } from './field'
 import type { EngineInterface, On, Register, RenderElement, Timer } from 'claude-code'
-import { addAgent, adoptAgent, beginTool, checkpointOf, classicTelemetry, migrateLedger, emptyLedger, exportJSON, finishTool, finishTurn, ledgerLines, originOf, reading, recordRequest, receipts, storageLedger, jsonBytes, startRun, UNKNOWN, warn, word, withReplay, usageByTier } from './ledger'
+import { addAgent, adoptAgent, beginTool, checkpointOf, classicTelemetry, decisionsMarkdown, migrateLedger, recordDiscovery, emptyLedger, exportJSON, finishTool, finishTurn, ledgerLines, originOf, reading, recordRequest, receipts, storageLedger, jsonBytes, startRun, UNKNOWN, warn, word, withReplay, usageByTier } from './ledger'
 import type { Ledger } from './ledger'
 import { replayTimeline, safeFile, STEP_BYTES } from './replay'
 
-import type { Activity, ActivityLog, AgentStrip, AuthState, Credential, EffortLevel, EffortRequest, GitState, GuardFinding, GuardRequest, Meter, Prefs, ReasoningMode, Task } from '../types'
+import type { Activity, ActivityLog, AgentStrip, AuthState, Credential, EffortLevel, EffortRequest, GitState, GuardFinding, GuardRequest, Meter, Prefs, ReasoningMode, Task, DiscoveryLevel } from '../types'
 import { ASSETS, PLAYERS, PLAY_TIMEOUT_MS, clampVolume } from './audio'
 import type { Player } from './audio'
 import { EMPTY_LOG, EVENT_TTL_MS, callOf, closeOf, liveOf, push } from './activity'
@@ -169,6 +170,8 @@ const orchestraAtom = atom({ plugin: 'cobalt-cockpit', key: 'orchestra' } as con
 // in from the engine's own applied level, so a declared baseline is replaced
 // only by a fact. It lives in `$.state`, so a hot reload keeps it.
 // The session's router: OFF in every fresh session, switched only by /cockpit router, never stored.
+/** The discovery level the person pinned with /cockpit discovery; null lets the rules decide. This session only. */
+const discoveryPinAtom = atom({ plugin: 'cobalt-cockpit', key: 'discovery-pin' } as const, null as DiscoveryLevel | null)
 const routerAtom = atom({ plugin: 'cobalt-cockpit', key: 'router' } as const, EMPTY_ROUTER as RouterState)
 const effortKnownAtom = atom({ plugin: 'cobalt-cockpit', key: 'effort-known' } as const, {} as Record<string, readonly EffortLevel[]>)
 
@@ -462,12 +465,15 @@ const PROGRESS_TOOL = {
     'action "plan": define the milestones of a substantial task before editing (3-7, in order, each with a phase; kind "coding" or "readonly"; replan true only to refine the current plan). ' +
     '"start" / "complete" / "fail" / "block" / "unblock": move one milestone (by id such as m2, or title); give "note" for fail and block. ' +
     '"gate": report a verification gate (CODE, TEST, TYPE, BUILD, SECURITY, GIT) as pass, fail, na or pending with one line of "evidence"; or several at once in "gates". ' +
+    '"discover": for a multi-file or risky task, record the objective, acceptance "criteria", material "unknowns" and relevant "risks". ' +
+    '"decide": record one consequential decision as "decision" {problem, chosen, alternatives[{option, rejected_because}], tradeoffs, evidence[], status}. ' +
+    '"align": before DONE, check the result against the original request as "alignment" {state ALIGNED|PARTIAL|BLOCKED|UNKNOWN, demonstrated[{id, evidence}], missing[], assumptions[]}; ALIGNED needs evidence per criterion. ' +
     '"status": read the current state. ' +
     'Progress is completed milestones over all milestones; 100% needs every milestone complete and every required gate pass or na. Never complete a milestone that is not finished.',
   inputSchema: {
     type: 'object',
     properties: {
-      action: { type: 'string', enum: ['plan', 'start', 'complete', 'fail', 'block', 'unblock', 'gate', 'status'] },
+      action: { type: 'string', enum: ['plan', 'start', 'complete', 'fail', 'block', 'unblock', 'gate', 'discover', 'decide', 'align', 'status'] },
       goal: { type: 'string', description: 'plan: the task in one line' },
       kind: { type: 'string', enum: ['coding', 'readonly'], description: 'plan: readonly tasks need no verification gates' },
       milestones: {
@@ -489,6 +495,12 @@ const PROGRESS_TOOL = {
       evidence: { type: 'string', description: 'gate: the command run and its outcome, or why the gate does not apply' },
       gates: { type: 'array', description: 'gate: several gates in one call; all are recorded or none', items: { type: 'object', properties: { gate: { type: 'string', enum: ['CODE', 'TEST', 'TYPE', 'BUILD', 'SECURITY', 'GIT'] }, state: { type: 'string', enum: ['pass', 'fail', 'na', 'pending'] }, evidence: { type: 'string' } }, required: ['gate', 'state'] } },
       note: { type: 'string', description: 'why a milestone failed or is blocked, or a remark on its completion' },
+      level: { type: 'string', enum: ['STANDARD', 'DEEP'], description: 'discover: raise the discovery level (never lowers it)' },
+      criteria: { type: 'array', items: { type: 'string' }, description: 'discover: acceptance criteria, one line each' },
+      unknowns: { type: 'array', description: 'discover: material unknowns {id?, text, state open|resolved|assumed, note}', items: { type: 'object', properties: { id: { type: 'string' }, text: { type: 'string' }, state: { type: 'string', enum: ['open', 'resolved', 'assumed'] }, note: { type: 'string' } } } },
+      risks: { type: 'array', items: { type: 'string' }, description: 'discover: only the risk categories that apply' },
+      decision: { type: 'object', description: 'decide: {id?, problem, chosen, alternatives[{option, rejected_because}], tradeoffs, evidence[], status provisional|verified|revised}' },
+      alignment: { type: 'object', description: 'align: {state, demonstrated[{id, evidence}], missing[], assumptions[], note}' },
     },
     required: ['action'],
   },
@@ -525,6 +537,7 @@ const HELP =
   '/cockpit hud off    hide the HUD (kept across sessions); hud on to undo\n' +
   '/cockpit auth       print how the session is authenticated and the Fable policy\n' +
   '/cockpit version    print the loaded plugin version, its source path and the reasoning mode\n' +
+  '/cockpit discovery  show the discovery level, unknowns, decisions and goal check; pin light | standard | deep, or auto\n' +
   '/cockpit router     show this session\'s router, or switch it: off, nobodywho, jev (this session only)\n' +
   '/cockpit sound      play both cues'
 
@@ -1406,7 +1419,8 @@ const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: 
   const sha = (await read($, gitAtom))?.sha ?? null
   let reply = ''
   let cues: Cue[] = []
-  await update($, taskAtom, old => {
+  const pin = await read($, discoveryPinAtom)
+  const held = await update($, taskAtom, old => {
     cues = []
     const outcome = applyAction(old ?? newTask(1, '', now, sha), e, now, sha)
     if (outcome.error !== undefined) {
@@ -1414,13 +1428,15 @@ const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: 
 
       return old
     }
-    const settled = settle(outcome.task)
+    // The person's pin and the evidence of the plan are applied before the task is settled, so the goal check counts toward DONE.
+    const settled = settle(withDiscovery(outcome.task, pin))
     cues = settled.cues
     reply = [outcome.note, summaryOf(settled.task)].filter(Boolean).join(' ')
 
     return settled.task
   })
   for (const cue of cues) void sound($, cue)
+  if (held !== null) await quiet(async () => { await mutateLedger($, l => recordDiscovery(l, held, now)); await persist($) })
 
   return { result: reply }
 }
@@ -1754,7 +1770,8 @@ export const registerLedger = (on: On): void => {
     await checkpoint($)
     const l = await read($, ledgerAtom)
     if (e.args.trim() === 'export' || e.args.trim() === 'export json') return { text: exportJSON(l) }
-    if (e.args.trim() !== '') return { text: 'Usage: /ledger | /ledger export json' }
+    if (e.args.trim() === 'export decisions') return { text: decisionsMarkdown(l) }
+    if (e.args.trim() !== '') return { text: 'Usage: /ledger | /ledger export json | /ledger export decisions' }
     await $.ui.open({ id: LEDGER_PANE, title: 'COBALT / RUN LEDGER', focus: true })
     return { text: 'COBALT / RUN LEDGER' }
   }).catch(($, e, next) => next.called ? next(e) : { text: 'Cobalt: the Run Ledger could not be read; nothing was opened.' })
@@ -1938,6 +1955,15 @@ export const register: Register = (on, options) => {
       const sha = (await read($, gitAtom))?.sha ?? null
       const before = await read($, taskAtom)
       const isNewTask = !(before !== null && before.milestones.length > 0 && before.status !== 'done')
+      const pin = await read($, discoveryPinAtom)
+      let guidance: string | null = null
+      // Discovery is read from the full prompt (the stored one is clipped) and only ever goes up; guidance is said once per level.
+      const discovered = (t: Task): Task => {
+        const d = withDiscovery(t, pin, { prompt: e.text, files: t.files.map(f => f.path), milestones: t.milestones.length, grounds: [...new Set([...(t.promptGrounds ?? []), ...promptGroundsOf(e.text)])] })
+        guidance = guidanceFor(d)
+
+        return guidance === null ? d : markGuided(d)
+      }
       const task = await update($, taskAtom, old => {
         // an unfinished planned task goes on; anything else is a new one
         const isContinuing = old !== null && old.milestones.length > 0 && old.status !== 'done'
@@ -1949,13 +1975,15 @@ export const register: Register = (on, options) => {
           updatedAt: now,
           hasInstructionFileRequest: base.hasInstructionFileRequest || namesInstructionFile(e.text),
         }
-        if (!isSonnetLed()) return prompted
+        if (!isSonnetLed()) return settle(discovered(prompted)).task
         // Grounds are read from the full prompt: the stored one is clipped.
         const promptGrounds = [...new Set([...(prompted.promptGrounds ?? []), ...promptGroundsOf(e.text)])]
         const withGrounds: Task = { ...prompted, promptGrounds }
 
-        return settle(requireReview(withGrounds, mandatoryGrounds(factsOf(withGrounds, 0, promptGrounds)))).task
+        return settle(discovered(requireReview(withGrounds, mandatoryGrounds(factsOf(withGrounds, 0, promptGrounds))))).task
       })
+      if (task !== null) await mutateLedger($, l => recordDiscovery(l, task, now))
+      if (guidance !== null) added.push(guidance)
       if (task !== null && task.milestones.length > 0) added.push(`Cobalt Cockpit, state of the task in progress: ${summaryOf(task)}`)
       // The session router, when one is selected, is asked once at the start of
       // a task and never for a prompt inside one, a tool call or a helper.
@@ -2582,6 +2610,22 @@ export const register: Register = (on, options) => {
         await savePrefs({ isHudHidden })
 
         return { text: isHudHidden ? 'Cockpit: HUD hidden.' : 'Cockpit: HUD shown.' }
+      }
+      case 'discovery': {
+        const pinned = value === '' ? undefined : value === 'auto' ? null : (['light', 'standard', 'deep'].includes(value) ? value.toUpperCase() as DiscoveryLevel : undefined)
+        const isPerson = e.origin.kind === 'composer' || e.origin.kind === 'bridge' || e.origin.kind === 'sdk'
+        if (value !== '' && pinned === undefined) return { text: `Cockpit: "${value}" is not a level. Use /cockpit discovery light | standard | deep | auto.` }
+        // Only the person pins a level; a command another plugin ran may look.
+        if (pinned !== undefined && !isPerson) return { text: 'Cockpit: the discovery level is pinned only by a command you type; nothing was changed.' }
+        if (pinned !== undefined) {
+          await update($, discoveryPinAtom, () => pinned)
+          await change($, task => pinned === null ? unpin(task) : withDiscovery(task, pinned))
+        }
+        const columns = (e as { presentation?: { columns?: number } }).presentation?.columns
+        const task = await read($, taskAtom)
+        const pin = await read($, discoveryPinAtom)
+
+        return { text: [...discoveryRows(task, columns ?? 72), `PIN / ${pin ?? 'none (rules decide)'}${value === '' ? ' · /cockpit discovery light | standard | deep | auto (this session only; gates and consultations are unchanged)' : ''}`].join('\n') }
       }
       case 'router': {
         const held = await read($, routerAtom)
