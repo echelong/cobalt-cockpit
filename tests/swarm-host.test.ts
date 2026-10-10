@@ -365,14 +365,14 @@ test('an observed pre-v0.2 running agent resumes only after explicit safe owners
 
 describe('a helper edit after the goal check', () => {
   const editAs = ($: Engine, agentId: string, file_path: string, id: string) => $.tool.call({ tool: 'Edit', agentId, file_path, old_string: 'a', new_string: 'b', tool_use_id: id } as never)
-  const aligned = { action: 'align', alignment: { state: 'ALIGNED', demonstrated: [{ id: 'c1', evidence: 'cancel test passes' }] } }
+  const aligned = { action: 'align', alignment: { state: 'ALIGNED', demonstrated: [{ id: 'c1', evidence: "cancel test 'frees the slot' passes in test/api.test.js (4 pass)" }] } }
 
   test('a worker\'s successful edit takes ALIGNED back; a denied or failed one does not; renewed evidence restores DONE', options, async ($, on) => {
     const w = world(on); await start($)
     await prompt($, 'Add booking cancellation to the API and the UI')
     await progress($, { action: 'discover', criteria: ['A booking can be cancelled'] })
     await planAndComplete($, 4)
-    await passAllGates($)
+    await passAllGates($, { align: false })
     expect(await progress($, aligned)).toContain('alignment ALIGNED')
     await assign($, 'writer', ['/work/owned.ts'], 'write')
     const a = (await spawn($, 'writer')).agentId!

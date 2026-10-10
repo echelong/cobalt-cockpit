@@ -529,8 +529,13 @@ export const planAndComplete = async ($: Engine, done: number): Promise<string> 
   return last
 }
 
-export const passAllGates = async ($: Engine): Promise<void> => {
+/**
+ * Passes every gate. Unless `align` is false it also records one acceptance criterion and its evidence, which is what STANDARD
+ * and DEEP work needs before it can read DONE. Both are refused, and change nothing, while milestones before verification are open.
+ */
+export const passAllGates = async ($: Engine, options: { align?: boolean } = {}): Promise<void> => {
   for (const gate of GATE_NAMES) await progress($, { action: 'gate', gate, state: 'pass', evidence: `${gate} verified` })
-  // The goal check STANDARD and DEEP work needs. It is refused, and changes nothing, while milestones before verification are open.
-  await progress($, { action: 'align', alignment: { state: 'ALIGNED', demonstrated: [{ id: 'e1', evidence: 'fixture: acceptance behaviour checked' }] } })
+  if (options.align === false) return
+  await progress($, { action: 'discover', criteria: ['The fixture behaviour is accepted'] })
+  await progress($, { action: 'align', alignment: { state: 'ALIGNED', demonstrated: [{ id: 'c1', evidence: "fixture test 'acceptance' passes in fixture.test.ts (1 pass)" }] } })
 }

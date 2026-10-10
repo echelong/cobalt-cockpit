@@ -496,11 +496,11 @@ const PROGRESS_TOOL = {
       gates: { type: 'array', description: 'gate: several gates in one call; all are recorded or none', items: { type: 'object', properties: { gate: { type: 'string', enum: ['CODE', 'TEST', 'TYPE', 'BUILD', 'SECURITY', 'GIT'] }, state: { type: 'string', enum: ['pass', 'fail', 'na', 'pending'] }, evidence: { type: 'string' } }, required: ['gate', 'state'] } },
       note: { type: 'string', description: 'why a milestone failed or is blocked, or a remark on its completion' },
       level: { type: 'string', enum: ['STANDARD', 'DEEP'], description: 'discover: raise the discovery level (never lowers it)' },
-      criteria: { type: 'array', items: { type: 'string' }, description: 'discover: acceptance criteria, one line each' },
+      criteria: { type: 'array', items: { type: 'string' }, description: 'discover: acceptance criteria, each a checkable sentence (at least two words); required before ALIGNED for STANDARD and DEEP work' },
       unknowns: { type: 'array', description: 'discover: material unknowns {id?, text, state open|resolved|assumed, note}', items: { type: 'object', properties: { id: { type: 'string' }, text: { type: 'string' }, state: { type: 'string', enum: ['open', 'resolved', 'assumed'] }, note: { type: 'string' } } } },
       risks: { type: 'array', items: { type: 'string' }, description: 'discover: only the risk categories that apply' },
       decision: { type: 'object', description: 'decide: one consequential decision. An alternative needs the reason it was rejected; verified needs evidence', properties: { id: { type: 'string' }, problem: { type: 'string' }, chosen: { type: 'string' }, alternatives: { type: 'array', items: { type: 'object', properties: { option: { type: 'string' }, rejected_because: { type: 'string' } }, required: ['option', 'rejected_because'] } }, tradeoffs: { type: 'string' }, evidence: { type: 'array', items: { type: 'string' } }, status: { type: 'string', enum: ['provisional', 'verified', 'revised'] } }, required: ['problem', 'chosen'] },
-      alignment: { type: 'object', description: 'align: the original-goal check. ALIGNED needs one demonstrated entry per criterion id from discover, with its evidence', properties: { state: { type: 'string', enum: ['ALIGNED', 'PARTIAL', 'BLOCKED', 'UNKNOWN'] }, demonstrated: { type: 'array', items: { type: 'object', properties: { id: { type: 'string', description: 'criterion id such as c1' }, evidence: { type: 'string' } }, required: ['evidence'] } }, missing: { type: 'array', items: { type: 'string' } }, assumptions: { type: 'array', items: { type: 'string' } }, note: { type: 'string' } }, required: ['state'] },
+      alignment: { type: 'object', description: 'align: the original-goal check. ALIGNED needs one demonstrated entry per criterion id from discover, with its evidence', properties: { state: { type: 'string', enum: ['ALIGNED', 'PARTIAL', 'BLOCKED', 'UNKNOWN'] }, demonstrated: { type: 'array', description: 'one entry per criterion id, each with its own observed evidence (a file, test name, command output or figure)', items: { type: 'object', properties: { id: { type: 'string', description: 'criterion id such as c1' }, status: { type: 'string', enum: ['met', 'failed', 'unresolved'] }, evidence: { type: 'string' } }, required: ['id', 'evidence'] } }, missing: { type: 'array', items: { type: 'string' } }, assumptions: { type: 'array', items: { type: 'string' } }, note: { type: 'string' } }, required: ['state'] },
     },
     required: ['action'],
   },
@@ -1484,8 +1484,14 @@ const noteEnd = async (
   if (e.agentId !== undefined) {
     // A helper's edit never moves the task, but it does make an earlier goal check stale.
     const made = (ran.deny === undefined && ran.isError !== true ? ran.result : null) as Record<string, unknown> | null
+    const now = await $.clock.now()
     const wrote = made !== null && made['staged'] !== true && (e.tool === 'Edit' || e.tool === 'Write' || (e.tool === 'Bash' && Array.isArray((made['bashEditDiff'] as { files?: unknown } | undefined)?.files)))
-    if (wrote) await quiet(() => change($, task => invalidateAlignment(task, 'a helper changed files')))
+    if (wrote) {
+      await quiet(async () => {
+        const held = await change($, task => invalidateAlignment({ ...task, edited: true }, 'a helper changed files'))
+        if (held !== null) await mutateLedger($, l => recordDiscovery(l, held, now))
+      })
+    }
 
     return
   }

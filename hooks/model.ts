@@ -16,7 +16,7 @@ import type {
   TouchedFile,
   WorkPhase,
 } from '../types'
-import { align, alignmentNote, decide, discover, discoverySummary, foldAliases, invalidateAlignment, isAlignmentSatisfied, withDiscovery } from './discovery'
+import { align, alignmentNote, criteriaMissing, decide, discover, discoverySummary, foldAliases, invalidateAlignment, isAlignmentSatisfied, resetCriteria, withDiscovery } from './discovery'
 
 export const GATES: readonly GateName[] = ['CODE', 'TEST', 'TYPE', 'BUILD', 'SECURITY', 'GIT']
 export const WORK_PHASES: readonly WorkPhase[] = [
@@ -306,7 +306,7 @@ export const planTask = (task: Task, input: PlanInput, now: number): Outcome => 
   // A goal check made before or across a plan checked a different plan: it starts over.
   const { alignment: _stale, ...unchecked } = planned
 
-  return { task: withDiscovery(unchecked, null) }
+  return { task: withDiscovery(resetCriteria(unchecked), null) }
 }
 
 export const startMilestone = (task: Task, ref: unknown, now: number): Outcome => {
@@ -354,7 +354,9 @@ export const completeMilestone = (task: Task, ref: unknown, note: string | null,
 
     return {
       task: { ...task, milestones: replaceMilestone(task, held), updatedAt: now },
-      note: `${found.id} is HELD, not complete: ${alignmentNote(task)}. Compare the result with the original request and report it with action "align" (ALIGNED only with evidence for each acceptance criterion; otherwise PARTIAL, BLOCKED or UNKNOWN).`,
+      note: criteriaMissing(task)
+        ? `${found.id} is HELD, not complete: ${alignmentNote(task)}. No acceptance criteria were recorded. Record them with action "discover" (criteria), then evaluate each by id with action "align".`
+        : `${found.id} is HELD, not complete: ${alignmentNote(task)}. Compare the result with the original request and report it with action "align" (ALIGNED only with observed evidence for each acceptance criterion; otherwise PARTIAL, BLOCKED or UNKNOWN).`,
     }
   }
   const done: Milestone = { ...found, state: 'done', note }
@@ -470,7 +472,7 @@ export const touchFile = (task: Task, path: string, added: number, removed: numb
         )
       : [...task.files, { path, added, removed }].slice(-MAX_FILES)
 
-  return invalidateAlignment({ ...task, files }, 'files changed')
+  return invalidateAlignment({ ...task, files, edited: true }, 'files changed')
 }
 
 /** Distinct files the main loop edits before a task without a plan is reminded of one. */
@@ -577,6 +579,8 @@ export const applyAction = (task: Task, given: ProgressInput, now: number, sha: 
               // A review the person or the files made necessary is not planned away:
               // it follows the work into the next plan until Opus has answered it.
               ...(task.review === undefined ? {} : { review: task.review }),
+              // Edits already made are not unmade by planning again, whatever the new plan calls itself.
+              ...(task.edited === true || task.files.length > 0 ? { edited: true as const } : {}),
               ...(task.promptGrounds === undefined ? {} : { promptGrounds: task.promptGrounds }),
               // The operator's pinned level outlives the task; any other is read again from the new one.
               // The level the evidence reached is a floor for the next plan: a restart cannot lower it. The rest starts over.

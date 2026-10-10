@@ -9,7 +9,7 @@
 // model reports (criteria, unknowns, decisions, evidence) is stored as
 // reported, redacted and clipped, and never completed on its behalf.
 
-import type { Alignment, AlignmentState, ConsultGround, DecisionRecord, Discovery, DiscoveryLevel, Task, TaskKind, UnknownItem } from '../types'
+import type { Alignment, AlignmentState, ConsultGround, Criterion, CriterionStatus, DecisionRecord, Discovery, DiscoveryLevel, Task, TaskKind, UnknownItem } from '../types'
 import { groundsAvailable } from './consult'
 import { redactSecrets } from './secrets'
 
@@ -94,22 +94,28 @@ export const withDiscovery = (task: Task, override: DiscoveryLevel | null, facts
   if (override !== null) {
     if (held?.source === 'operator' && held.level === override) return task
 
-    return { ...task, discovery: { ...(held ?? blank(override)), level: override, source: 'operator', reasons: ['operator'] } }
+    const floor = held === undefined ? undefined : held.source === 'auto' ? held.level : held.floor
+    const pinned: Task = { ...task, discovery: { ...(held ?? blank(override)), level: override, source: 'operator', reasons: ['operator'], ...(floor === undefined ? {} : { floor }) } }
+
+    return held !== undefined && rank(override) > rank(held.level) ? invalidateAlignment(pinned, 'level raised') : pinned
   }
   if (held?.source === 'operator') return task
   const found = classify(facts)
   if (held === undefined) return { ...task, discovery: { ...blank(found.level), reasons: found.reasons } }
   if (rank(found.level) <= rank(held.level)) return task
 
-  return { ...task, discovery: { ...held, level: found.level, reasons: [...new Set([...found.reasons, ...held.reasons])].slice(0, MAX_REASONS) } }
+  // a higher level asks more of the goal check than the one it was made under
+  return invalidateAlignment({ ...task, discovery: { ...held, level: found.level, reasons: [...new Set([...found.reasons, ...held.reasons])].slice(0, MAX_REASONS) } }, 'level raised')
 }
 
 /** Gives the level back to the deterministic rules: the person's pin ends and the evidence decides again. */
 export const unpin = (task: Task, facts: DiscoveryFacts = factsOf(task)): Task => {
   if (task.discovery === undefined) return withDiscovery(task, null, facts)
   const found = classify(facts)
+  const level = task.discovery.floor !== undefined && rank(task.discovery.floor) > rank(found.level) ? task.discovery.floor : found.level
+  const { floor: _kept, ...rest } = task.discovery
 
-  return { ...task, discovery: { ...task.discovery, level: found.level, source: 'auto', reasons: found.reasons } }
+  return { ...task, discovery: { ...rest, level, source: 'auto', reasons: level === found.level ? found.reasons : [...found.reasons, 'earlier-level'].slice(0, MAX_REASONS) } }
 }
 
 const blank = (level: DiscoveryLevel): Discovery => ({ level, source: 'auto', reasons: [], objective: null, criteria: [], unknowns: [], risks: [], guided: null })
@@ -143,7 +149,7 @@ export const markGuided = (task: Task): Task =>
 export const foldAliases = <T extends Record<string, unknown>>(input: T): T => {
   const out: Record<string, unknown> = { ...input }
   if (out['action'] === 'gates') out['action'] = 'gate'
-  if (out['goal'] === undefined && typeof out['objective'] === 'string') out['goal'] = out['objective']
+  if (out['action'] === 'discover' && out['goal'] === undefined && typeof out['objective'] === 'string') out['goal'] = out['objective']
   if (out['criteria'] === undefined && Array.isArray(out['acceptance'])) out['criteria'] = out['acceptance']
   if (out['action'] === 'align' && (out['alignment'] === undefined || typeof out['alignment'] !== 'object') && typeof out['state'] === 'string') {
     const evidence = typeof out['evidence'] === 'string' ? out['evidence'] : undefined
@@ -159,6 +165,46 @@ export const foldAliases = <T extends Record<string, unknown>>(input: T): T => {
 
   return out as T
 }
+
+// --- acceptance criteria and their evidence --------------------------------
+
+const GENERIC = /^(?:all |the )?(?:tests? |it |this |that |everything )?(?:pass(?:es|ed)?|works?|working|ok(?:ay)?|done|good|fine|verified|complete[d]?|implemented|correct|looks good|lgtm|as expected|all good|success(?:ful)?)\W*$/i
+
+/** A criterion must say something checkable: at least ten characters and two words, and not a bare verdict. */
+export const criterionProblem = (text: string): string | null =>
+  text.length < 10 || text.split(/\s+/).length < 2 || GENERIC.test(text) ? 'too short or generic to be checked' : null
+
+const normal = (text: string): string => text.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+
+/**
+ * Evidence must name something that was observed: a file, a quoted test or output, a command, or a
+ * figure, and must not be a bare verdict or the criterion restated. This checks the form of what was
+ * reported. It cannot check that the report is true.
+ */
+export const evidenceProblem = (evidence: string, criterion: string): string | null => {
+  if (evidence.length < 20) return 'is too short to show what was observed'
+  if (GENERIC.test(evidence)) return 'is a bare verdict, not an observation'
+  if (!/[`'"][^`'"]{3,}[`'"]|\b[\w./-]+\.[a-z]{1,5}\b|\d/.test(evidence)) return 'names no file, test, command, output or figure'
+  if (normal(evidence) === normal(criterion)) return 'only restates the criterion'
+
+  return null
+}
+
+const unevaluated = (c: Criterion): Criterion => (c.status === undefined || c.status === 'pending') && !c.evidence ? c : { id: c.id, text: c.text, status: 'pending', evidence: null }
+
+/** Evidence gathered before a change is not evidence of what exists after it. */
+export const resetCriteria = (task: Task): Task => {
+  const d = task.discovery
+  if (d === undefined || d.criteria.every(c => unevaluated(c) === c)) return task
+
+  return { ...task, discovery: { ...d, criteria: d.criteria.map(unevaluated) } }
+}
+
+/** A task that must be goal-checked and has no criterion to check it against. */
+export const criteriaMissing = (task: Task): boolean => needsAlignment(task) && (task.discovery?.criteria.length ?? 0) === 0
+
+/** The state shown for the goal check: BLOCKED while there is nothing to check against. */
+export const alignmentShown = (task: Task): string => (criteriaMissing(task) ? 'BLOCKED' : task.alignment?.state ?? 'PENDING')
 
 export type DiscoverInput = { goal?: unknown; level?: unknown; criteria?: unknown; unknowns?: unknown; risks?: unknown }
 
@@ -181,8 +227,23 @@ export const discover = (task: Task, input: DiscoverInput, now: number): Change 
     if (rank(asked) > rank(d.level)) d = { ...d, level: asked, reasons: [...new Set([...d.reasons, 'model-raised'])].slice(0, MAX_REASONS) }
   }
   let criteria = d.criteria
-  for (const text of list(input.criteria, MAX_CRITERIA, 120)) {
-    if (criteria.length < MAX_CRITERIA && !criteria.some(c => c.text === text)) criteria = [...criteria, { id: `c${criteria.length + 1}`, text }]
+  let revised = false
+  const offered = (Array.isArray(input.criteria) ? input.criteria : []).slice(0, MAX_CRITERIA).map(one => {
+    const row = (one !== null && typeof one === 'object' ? one : { text: one }) as Record<string, unknown>
+
+    return { id: typeof row['id'] === 'string' ? row['id'].trim() : undefined, text: clip(row['text'], 120) }
+  })
+  for (const one of offered) {
+    const why = criterionProblem(one.text)
+    if (why !== null) return { task, error: `criterion ${JSON.stringify(one.text.slice(0, 40))} is ${why}: say what can be observed. Nothing was recorded` }
+  }
+  for (const one of offered) {
+    const known = one.id === undefined ? undefined : criteria.find(c => c.id === one.id)
+    if (known !== undefined) {
+      if (known.text !== one.text) { criteria = criteria.map(c => c.id === known.id ? { id: c.id, text: one.text, status: 'pending' as const, evidence: null } : c); revised = true }
+    } else if (criteria.length < MAX_CRITERIA && !criteria.some(c => normal(c.text) === normal(one.text))) {
+      criteria = [...criteria, { id: `c${criteria.length + 1}`, text: one.text, status: 'pending' as const, evidence: null }]
+    }
   }
   let unknowns = d.unknowns
   for (const row of (Array.isArray(input.unknowns) ? input.unknowns : []).slice(0, MAX_UNKNOWNS).map(unknownRow)) {
@@ -197,9 +258,9 @@ export const discover = (task: Task, input: DiscoverInput, now: number): Change 
   const next: Task = { ...task, discovery: { ...d, criteria, unknowns, risks }, updatedAt: now }
   // A criterion added after alignment was claimed is one it did not check.
   const reopened = unknowns.filter(u => u.state === 'open').length > base.unknowns.filter(u => u.state === 'open').length
-  const settled = criteria.length > base.criteria.length || reopened ? invalidateAlignment(next, 'criteria or unknowns changed') : next
+  const settled = criteria.length > base.criteria.length || revised || reopened || rank(d.level) > rank(base.level) ? invalidateAlignment(next, 'criteria or unknowns changed') : next
   // The ids are what `align` answers to, so they are told back here.
-  const note = criteria.length === 0 ? undefined : `Criteria: ${criteria.map(c => `${c.id} ${c.text.slice(0, 50)}`).join('; ')}. Report each by id in align.demonstrated.`
+  const note = criteria.length === 0 ? undefined : `Criteria: ${criteria.map(c => `${c.id} ${c.text.slice(0, 50)}`).join('; ')}. Evaluate each by id in align.demonstrated, with the evidence you observed.`
 
   return { task: settled, ...(note === undefined ? {} : { note }) }
 }
@@ -258,58 +319,111 @@ export const ALIGNMENT_STATES: readonly AlignmentState[] = ['ALIGNED', 'PARTIAL'
 
 /** A coding task above LIGHT is not done until its result was checked against the request. */
 // a plan declared read-only that went on to edit files is coding work for this purpose
-export const needsAlignment = (task: Task): boolean => (task.kind === 'coding' || task.files.length > 0) && task.discovery !== undefined && task.discovery.level !== 'LIGHT'
+export const needsAlignment = (task: Task): boolean => (task.kind === 'coding' || task.files.length > 0 || task.edited === true) && task.discovery !== undefined && task.discovery.level !== 'LIGHT'
 
-export const isAlignmentSatisfied = (task: Task): boolean => !needsAlignment(task) || task.alignment?.state === 'ALIGNED'
+/**
+ * The completion rule, stated here and not only at `align`: a goal-checked task is satisfied only when it has
+ * criteria, every one is met with evidence recorded for it, and the check itself says ALIGNED. An empty set of
+ * criteria is never "all met".
+ */
+export const isAlignmentSatisfied = (task: Task): boolean => {
+  if (!needsAlignment(task)) return true
+  const criteria = task.discovery?.criteria ?? []
+
+  return criteria.length > 0 && criteria.every(c => c.status === 'met' && !!c.evidence) && task.alignment?.state === 'ALIGNED'
+}
 
 export const alignmentNote = (task: Task): string =>
-  `goal alignment ${task.alignment?.state ?? 'PENDING'}`
+  criteriaMissing(task) ? 'CRITERIA MISSING (record acceptance criteria with action "discover"); goal alignment BLOCKED' : `goal alignment ${task.alignment?.state ?? 'PENDING'}`
 
 /** Work or criteria changed after the check: what it vouched for is no longer what exists. */
-export const invalidateAlignment = (task: Task, why: string): Task =>
-  task.alignment === undefined || task.alignment.state === 'PENDING' ? task : { ...task, alignment: { ...task.alignment, state: 'PENDING', note: clip(`reset: ${why}`, 120) } }
+export const invalidateAlignment = (task: Task, why: string): Task => {
+  const cleared = resetCriteria(task)
+
+  return cleared.alignment === undefined || cleared.alignment.state === 'PENDING' ? cleared : { ...cleared, alignment: { ...cleared.alignment, state: 'PENDING', note: clip(`reset: ${why}`, 120) } }
+}
 
 export type AlignInput = { alignment?: unknown }
 
 /**
- * Records the original-goal check. ALIGNED is refused unless every declared
- * criterion has its own evidence, nothing is reported missing, no unknown is
- * still open, no milestone before verification is unfinished and every required
- * gate is satisfied: passing tests are one of those, never the whole.
+ * Records the original-goal check. For work above LIGHT, ALIGNED is refused (and a claim of it without criteria
+ * is recorded as BLOCKED) unless: acceptance criteria exist; every one has its own entry, marked met, with
+ * evidence that names an observation and is not shared with another criterion; nothing is reported missing; no
+ * unknown is open; every milestone before verification is done; there is no blocker; and every required gate
+ * passes. Passing tests are one of those conditions, never the whole. Evidence is what the model reported:
+ * its form is checked here, its truth is not.
  */
 export const align = (task: Task, input: AlignInput, now: number, open: readonly string[]): Change => {
   const raw = (input.alignment !== null && typeof input.alignment === 'object' ? input.alignment : {}) as Record<string, unknown>
   const state = typeof raw['state'] === 'string' ? raw['state'].toUpperCase() as AlignmentState : undefined
   if (state === undefined || !(ALIGNMENT_STATES as readonly string[]).includes(state)) return { task, error: '"alignment.state" must be ALIGNED, PARTIAL, BLOCKED or UNKNOWN' }
+  const declared = task.discovery?.criteria ?? []
+  const idOf = (row: Record<string, unknown>, n: number): string => {
+    const named = typeof row['id'] === 'string' ? row['id'].trim() : ''
+    if (declared.some(c => c.id === named)) return named
+    // a model that restates the criterion instead of quoting its id still points at one
+    const byText = [row['criterion'], row['text'], named].map(t => (typeof t === 'string' ? normal(t) : '')).find(t => t !== '' && declared.some(c => normal(c.text) === t))
+    if (byText !== undefined) return declared.find(c => normal(c.text) === byText)!.id
+
+    return /^[A-Za-z0-9]{1,8}$/.test(named) ? named : `e${n + 1}`
+  }
   const demonstrated: Alignment['demonstrated'] = []
-  for (const one of (Array.isArray(raw['demonstrated']) ? raw['demonstrated'] : []).slice(0, MAX_CRITERIA)) {
+  for (const [n, one] of (Array.isArray(raw['demonstrated']) ? raw['demonstrated'] : []).slice(0, MAX_CRITERIA).entries()) {
     const row = (one !== null && typeof one === 'object' ? one : {}) as Record<string, unknown>
     const evidence = clip(row['evidence'], 160)
     if (!evidence) return { task, error: 'each "demonstrated" entry needs "evidence": the check that showed it. Nothing was recorded' }
-    demonstrated.push({ id: typeof row['id'] === 'string' && /^[A-Za-z0-9]{1,8}$/.test(row['id'].trim()) ? row['id'].trim() : `e${demonstrated.length + 1}`, evidence })
+    const status: CriterionStatus = row['status'] === 'failed' || row['status'] === 'unresolved' ? row['status'] : 'met'
+    demonstrated.push({ id: idOf(row, n), evidence, status })
   }
   const missing = list(raw['missing'], MAX_CRITERIA, 120)
   const assumptions = list(raw['assumptions'], MAX_CRITERIA, 120)
   const note = clip(raw['note'], 160)
+  const strict = task.discovery !== undefined && task.discovery.level !== 'LIGHT'
+  let recorded: AlignmentState = state
+  let say: string | undefined
   if (state === 'ALIGNED') {
     const problems: string[] = []
     if (task.milestones.length === 0) problems.push('no plan exists yet, so nothing was built to check')
-    const criteria = task.discovery?.criteria ?? []
-    if (criteria.length === 0 && task.discovery?.level === 'DEEP') problems.push('high-risk (DEEP) work needs declared acceptance criteria: record them with action "discover" (criteria), then report each by id')
-    if (criteria.length === 0 && demonstrated.length === 0) problems.push('no demonstrated acceptance evidence; send alignment {state, demonstrated: [{id, evidence}]}')
-    for (const c of criteria) if (!demonstrated.some(d => d.id === c.id)) problems.push(`criterion ${c.id} (${c.text.slice(0, 40)}) has no evidence under id "${c.id}"`)
-    if (missing.length > 0) problems.push(`${missing.length} requirement(s) reported missing`)
-    const unknowns = (task.discovery?.unknowns ?? []).filter(u => u.state === 'open')
-    if (unknowns.length > 0) problems.push(`${unknowns.length} unknown(s) still open`)
-    if (task.blocker !== null) problems.push('the task is blocked')
-    const unfinished = task.milestones.filter(m => m.phase !== 'VERIFY' && m.state !== 'done')
-    if (unfinished.length > 0) problems.push(`milestone(s) ${unfinished.map(m => m.id).join(', ')} not complete`)
-    if (open.length > 0) problems.push(`gate(s) ${open.join(', ')} not satisfied`)
-    if (problems.length > 0) return { task, error: `ALIGNED refused: ${problems.join('; ')}. Report PARTIAL, BLOCKED or UNKNOWN, or finish the work and report the evidence. Nothing was recorded` }
+    if (strict && declared.length === 0) {
+      // Nothing to check against: the claim is recorded as BLOCKED, never accepted and never silently dropped.
+      recorded = 'BLOCKED'
+      say = 'CRITERIA MISSING: no acceptance criteria were recorded, so ALIGNED cannot be established. Alignment is BLOCKED. Record criteria with action "discover" (criteria), then evaluate each by id in align.demonstrated.'
+    } else if (strict) {
+      const seen = new Set<string>()
+      for (const c of declared) {
+        const entries = demonstrated.filter(d => d.id === c.id)
+        const mine = entries[entries.length - 1]
+        if (mine === undefined) { problems.push(`criterion ${c.id} (${c.text.slice(0, 40)}) has no evaluation under id "${c.id}"`); continue }
+        if (mine.status !== 'met') { problems.push(`criterion ${c.id} is ${mine.status}`); continue }
+        const why = evidenceProblem(mine.evidence, c.text)
+        if (why !== null) { problems.push(`criterion ${c.id} evidence ${why}`); continue }
+        const key = normal(mine.evidence)
+        if (seen.has(key)) problems.push(`criterion ${c.id} reuses another criterion's evidence`)
+        seen.add(key)
+      }
+    }
+    if (recorded === 'ALIGNED') {
+      if (missing.length > 0) problems.push(`${missing.length} requirement(s) reported missing`)
+      const unknowns = (task.discovery?.unknowns ?? []).filter(u => u.state === 'open')
+      if (unknowns.length > 0) problems.push(`${unknowns.length} unknown(s) still open`)
+      if (task.blocker !== null) problems.push('the task is blocked')
+      const unfinished = task.milestones.filter(m => m.phase !== 'VERIFY' && m.state !== 'done')
+      if (unfinished.length > 0) problems.push(`milestone(s) ${unfinished.map(m => m.id).join(', ')} not complete`)
+      if (open.length > 0) problems.push(`gate(s) ${open.join(', ')} not satisfied`)
+      if (problems.length > 0) return { task, error: `ALIGNED refused: ${problems.join('; ')}. Report PARTIAL, BLOCKED or UNKNOWN, or finish the work and report the evidence. Nothing was recorded` }
+    }
   }
-  const alignment: Alignment = { state, demonstrated, missing, assumptions, note: note || null, at: now }
+  const criteria = declared.map(c => {
+    const mine = demonstrated.filter(d => d.id === c.id).pop()
 
-  return { task: { ...task, alignment, updatedAt: now } }
+    return mine === undefined ? c : { id: c.id, text: c.text, status: mine.status ?? 'met', evidence: mine.evidence, basis: 'reported' as const }
+  })
+  // a claim that was not accepted leaves no criterion looking met
+  const evaluated: Criterion[] = recorded === 'ALIGNED' ? criteria : criteria.map(c => (c.status === 'met' && state === 'ALIGNED' ? { ...c, status: 'unresolved' as const } : c))
+  const alignment: Alignment = { state: recorded, demonstrated, missing, assumptions, note: (say === undefined ? note : 'criteria missing') || null, at: now }
+  const next: Task = { ...task, alignment, ...(task.discovery === undefined ? {} : { discovery: { ...task.discovery, criteria: evaluated } }), updatedAt: now }
+
+  return { task: next, ...(say === undefined ? {} : { note: say }) }
 }
 
 // --- presentation ----------------------------------------------------------
@@ -322,7 +436,7 @@ export const discoverySummary = (task: Task): string => {
   if (d === undefined || d.level === 'LIGHT') return ''
   const open = d.unknowns.filter(u => u.state === 'open').length
 
-  return ` Discovery ${d.level}: ${open} unknown${open === 1 ? '' : 's'} open, ${(task.decisions ?? []).length} decision${(task.decisions ?? []).length === 1 ? '' : 's'}, alignment ${needsAlignment(task) ? task.alignment?.state ?? 'PENDING' : task.kind === 'unplanned' ? 'decided at plan' : 'not required'}.`
+  return ` Discovery ${d.level}: ${open} unknown${open === 1 ? '' : 's'} open, ${(task.decisions ?? []).length} decision${(task.decisions ?? []).length === 1 ? '' : 's'}, alignment ${needsAlignment(task) ? alignmentShown(task) : task.kind === 'unplanned' ? 'decided at plan' : 'not required'}${criteriaMissing(task) ? ' (criteria missing)' : ''}.`
 }
 
 /** The `/cockpit discovery` view; every row is clipped to `width` so a narrow terminal stays readable. */
@@ -338,7 +452,8 @@ export const discoveryRows = (task: Task | null, width = 72): string[] => {
     `GOAL / ${d.objective ?? task.goal ?? 'unknown'}`,
     `UNKNOWNS / ${open.length} unresolved`,
     `DECISIONS / ${(task.decisions ?? []).length} recorded`,
-    `ALIGNMENT / ${needsAlignment(task) ? task.alignment?.state ?? 'PENDING' : 'NOT REQUIRED'}`,
+    `CRITERIA / ${d.criteria.length === 0 ? (needsAlignment(task) ? 'MISSING' : 'none') : `${d.criteria.filter(c => c.status === 'met').length} of ${d.criteria.length} met`}`,
+    `ALIGNMENT / ${needsAlignment(task) ? alignmentShown(task) : 'NOT REQUIRED'}`,
     `WHY / ${d.reasons.join(', ') || 'unknown'}`,
   ]
   for (const u of open.slice(0, 4)) rows.push(`  ${u.id} ${u.text}`)

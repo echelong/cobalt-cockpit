@@ -9,7 +9,7 @@ import { decisionLine } from './router'
 import { roleOf } from './orchestra'
 import { activityOf } from './classify'
 import { redactSecrets } from './secrets'
-import { needsAlignment } from './discovery'
+import { alignmentShown, needsAlignment } from './discovery'
 export const UNKNOWN = 'unknown' as const
 export const LIMITS = { runs: 32, agents: 96, tools: 512, requests: 512, usage: 64, receipts: 256, warnings: 32, decisions: 64, discoveries: 16 }
 const counts = (): Counts => ({ tools: 0, reads: 0, edits: 0, writes: 0, tests: 0, builds: 0, git: 0, failures: 0, retries: UNKNOWN })
@@ -212,7 +212,7 @@ const safeDecision = (d: DecisionRecord): DecisionRecord => ({ ...d, problem: re
 export const recordDiscovery = (l: Ledger, task: Task, at: number): Ledger => {
   const d = task.discovery
   if (d === undefined && (task.decisions ?? []).length === 0) return l
-  const discoveries = d === undefined ? l.discoveries ?? [] : [...(l.discoveries ?? []).filter(e => e.taskId !== task.id), { taskId: task.id, level: d.level, source: d.source, reasons: d.reasons.map(r => redact(r, 40)), unknownsOpen: d.unknowns.filter(u => u.state === 'open').length, alignment: needsAlignment(task) ? task.alignment?.state ?? 'PENDING' : 'NONE', at } satisfies DiscoveryEntry].slice(-LIMITS.discoveries)
+  const discoveries = d === undefined ? l.discoveries ?? [] : [...(l.discoveries ?? []).filter(e => e.taskId !== task.id), { taskId: task.id, level: d.level, source: d.source, reasons: d.reasons.map(r => redact(r, 40)), unknownsOpen: d.unknowns.filter(u => u.state === 'open').length, alignment: needsAlignment(task) ? alignmentShown(task) as DiscoveryEntry['alignment'] : 'NONE', criteriaTotal: d.criteria.length, criteriaMet: d.criteria.filter(c => c.status === 'met').length, at } satisfies DiscoveryEntry].slice(-LIMITS.discoveries)
   const mine = (task.decisions ?? []).map(safeDecision)
   const decisions = [...(l.decisions ?? []).filter(e => e.taskId !== task.id || !mine.some(m => m.id === e.id)), ...mine].slice(-LIMITS.decisions)
   if (JSON.stringify(discoveries) === JSON.stringify(l.discoveries) && JSON.stringify(decisions) === JSON.stringify(l.decisions)) return l
@@ -231,7 +231,7 @@ export const decisionsMarkdown = (l: Ledger): string => {
 }
 const discoveryRows = (l: Ledger): string[] => {
   const rows: string[] = []
-  for (const e of (l.discoveries ?? []).slice(-4)) rows.push(`DISCOVERY task ${e.taskId} ${e.level}${e.source === 'operator' ? ' (operator)' : ''} · why ${e.reasons.join(', ') || UNKNOWN} · unknowns open ${e.unknownsOpen} · alignment ${e.alignment}`)
+  for (const e of (l.discoveries ?? []).slice(-4)) rows.push(`DISCOVERY task ${e.taskId} ${e.level}${e.source === 'operator' ? ' (operator)' : ''} · why ${e.reasons.join(', ') || UNKNOWN} · criteria ${e.criteriaMet ?? UNKNOWN}/${e.criteriaTotal ?? UNKNOWN} · unknowns open ${e.unknownsOpen} · alignment ${e.alignment}`)
   for (const d of (l.decisions ?? []).slice(-6)) rows.push(`DECISION ${d.id} task ${d.taskId} ${d.status} · ${d.chosen}${d.alternatives.length ? ` · rejected ${d.alternatives.map(a => a.option).join('; ')}` : ''}${d.evidence.length ? ` · evidence ${d.evidence.length}` : ''}`)
 
   return rows

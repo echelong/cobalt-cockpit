@@ -138,6 +138,8 @@ export type Task = {
   promptGrounds?: ConsultGround[]
   /** Set once the main loop was reminded that this edited task has no progress plan. */
   progressNudged?: boolean
+  /** v0.5.1: set once any edit was seen in this task, by the main session or a helper; survives a plan restart. */
+  edited?: true
   /** v0.5.1: how much discovery this task warrants and what it found. Absent on tasks stored by older versions. */
   discovery?: Discovery
   /** v0.5.1: the original-goal check; required for a coding task above LIGHT before it can read DONE. */
@@ -155,17 +157,22 @@ export type Discovery = {
   /** Why this level, as short codes (never prompt text). */
   reasons: string[]
   objective: string | null
-  criteria: { id: string; text: string }[]
+  criteria: Criterion[]
   unknowns: UnknownItem[]
   /** Risk categories the model named as relevant; never a fixed checklist. */
   risks: string[]
+  /** The level the rules had reached when the operator pinned one: `auto` gives it back no lower than this. */
+  floor?: DiscoveryLevel
   /** The level the prompt-time guidance was last given for: guidance is never repeated for it. */
   guided: DiscoveryLevel | null
 }
+/** One acceptance criterion: its own id, description, state and the evidence the model reported for it. */
+export type CriterionStatus = 'pending' | 'met' | 'failed' | 'unresolved'
+export type Criterion = { id: string; text: string; status?: CriterionStatus; evidence?: string | null; /** Evidence is what the model reported; Cockpit checks its form and completeness, never its truth. */ basis?: 'reported' }
 export type AlignmentState = 'PENDING' | 'ALIGNED' | 'PARTIAL' | 'BLOCKED' | 'UNKNOWN'
 export type Alignment = {
   state: AlignmentState
-  demonstrated: { id: string; evidence: string }[]
+  demonstrated: { id: string; evidence: string; status?: CriterionStatus }[]
   missing: string[]
   assumptions: string[]
   note: string | null
@@ -184,7 +191,7 @@ export type DecisionRecord = {
   at: number
 }
 /** What the Run Ledger keeps of a task's discovery: the level and why, no prompt text. */
-export type DiscoveryEntry = { taskId: number; level: DiscoveryLevel; source: 'auto' | 'operator'; reasons: string[]; unknownsOpen: number; alignment: AlignmentState | 'NONE'; at: number }
+export type DiscoveryEntry = { taskId: number; level: DiscoveryLevel; source: 'auto' | 'operator'; reasons: string[]; unknownsOpen: number; alignment: AlignmentState | 'NONE'; criteriaTotal?: number; criteriaMet?: number; at: number }
 
 /** Which model leads the main loop when orchestration is enforced. */
 export type Profile = 'OPUS_LED' | 'SONNET_LED'
