@@ -3,7 +3,11 @@
 // shape here is not caught. See PRIVACY.md.
 const PRIVATE_KEY = '-----BEGIN [A-Z ]{0,20}PRIVATE KEY'
 // a name that says secret, then a value (no leading wildcard: it would make long runs quadratic): api_key=…, SECRET_KEY: …, db-password = …, authToken=…
-const NAMED_VALUE = '(?:api[_-]?key|secret|token|passw(?:or)?d|passwd|pwd|credential|private[_-]?key|access[_-]?key|session[_-]?key|authorization|auth[_-]?(?:token|key|secret))[A-Za-z0-9_.-]{0,40}["\']?\\s*[=:]\\s*["\']?[^\\s"\']{3,}'
+const NAMED_VALUE = '(?:api[_-]?key|secret|token|passw(?:or)?d|passwd|pwd|credential|private[_-]?key|access[_-]?key|session[_-]?key|authorization|auth[_-]?(?:token|key|secret))[A-Za-z0-9_.-]{0,40}["\']?(?<!\\.[A-Za-z]{1,5}["\']?)\\s*[=:]\\s*(?:"[^"\\n]{1,200}"|\'[^\'\\n]{1,200}\'|(?:(?:Basic|Digest|Token|Bearer|Negotiate)\\s+)?["\']?[^\\s"\']{3,})'
+// a bare auth key (docker config, npm _auth) holds base64; prose such as "Fix auth: login" does not match
+const BARE_AUTH = '\\b_?auth["\']?\\s*[=:]\\s*["\']?[A-Za-z0-9+\\/=]{12,}'
+// a scheme word, then the credential: Authorization: Basic …, Token …
+const AUTH_SCHEME = '\\b(?:Basic|Digest|Token|Negotiate)\\s+[A-Za-z0-9+\\/=._~-]{8,}'
 const SAID_IN_WORDS = '\\b(?:password|passphrase|passcode|secret|token|api\\s+key)\\s+(?:is|was)\\s+\\S+'
 // inside a URL, on a command line, or a webhook that is itself the secret
 const URL_USERINFO = '\\b[a-z][a-z0-9+.-]{0,20}:\\/\\/[^\\s\\/@:]{0,64}:[^\\s\\/@]{1,128}@'
@@ -15,7 +19,7 @@ const JWT = '\\beyJ[A-Za-z0-9_-]{1,1024}\\.[A-Za-z0-9_-]{1,1024}\\.[A-Za-z0-9_-]
 // a long unbroken run of letters and digits: a key or a digest, whatever it is called
 const LONG_RUN = '(?<![A-Za-z0-9+_=-])(?=[A-Za-z0-9+_=-]*[0-9])(?=[A-Za-z0-9+_=-]*[A-Za-z])[A-Za-z0-9+_=-]{32,}'
 
-const ANY_CASE = [PRIVATE_KEY, NAMED_VALUE, SAID_IN_WORDS, URL_USERINFO, CLI_USER, WEBHOOK, BEARER, PREFIXED, JWT]
+const ANY_CASE = [PRIVATE_KEY, NAMED_VALUE, BARE_AUTH, AUTH_SCHEME, SAID_IN_WORDS, URL_USERINFO, CLI_USER, WEBHOOK, BEARER, PREFIXED, JWT]
 // AWS long-term (AKIA), temporary (ASIA) and the other documented key-ID kinds
 const AWS_KEY_ID = '\\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ABIA|ACCA)[A-Z0-9]{16}\\b'
 const EXACT_CASE = [AWS_KEY_ID, '\\bAIza[A-Za-z0-9_-]{20,}',
@@ -31,7 +35,7 @@ const NARROW = build(ANY_CASE, EXACT_CASE, '')
 const BROAD = build([...ANY_CASE, LONG_RUN], [...EXACT_CASE, ENV_LINE], '')
 const REDACT = build(ANY_CASE.slice(1), [...EXACT_CASE, ENV_LINE], 'g')
 // a private key is replaced from its header through its END line (or the end of the text): the body is the secret
-const PEM = new RegExp(`${PRIVATE_KEY}[\\s\\S]*?(?:-----END [A-Z ]{0,20}PRIVATE KEY-----|$)`, 'g')
+const PEM = new RegExp(`${PRIVATE_KEY}[\\s\\S]*?(?:-----END [A-Z ]{0,20}PRIVATE KEY-----|$)`, 'gi')
 /** No text longer than this is scanned: every stored field is cut well below it, and anything longer is withheld. */
 export const SCAN_MAX = 20_000
 
@@ -41,4 +45,4 @@ export const secretText = (text: string): boolean => text.length > 4 * SCAN_MAX 
 export const carriesCredential = (text: string): boolean => text.length > SCAN_MAX || BROAD.some(re => re.test(text))
 export const REDACTED = '[redacted]'
 /** Text with each credential-shaped span replaced; useful state around it is kept. Not a guarantee. */
-export const redactSecrets = (text: string): string => REDACT.reduce((out, re) => out.replace(re, REDACTED), text.slice(0, SCAN_MAX).replace(PEM, REDACTED))
+export const redactSecrets = (text: string): string => REDACT.reduce((out, re) => out.replace(re, REDACTED), (text.length > SCAN_MAX ? text.slice(0, SCAN_MAX).replace(/\S*$/, '') : text).replace(PEM, REDACTED))

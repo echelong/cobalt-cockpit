@@ -30,15 +30,28 @@ if [[ -z "$bin" ]]; then
   bin=$tmp/gitleaks
 fi
 
-# A scan must not be configurable by what it scans: a repository config or an
-# inline allow marker would let a change switch the check off.
+# A scan must not be configurable by what it scans. A repository config, an
+# inline allow marker (in the tree or in any commit) or a changed ignore list
+# would let a change switch the check off, so each is refused here. This script
+# and the files it pins are protected by CODEOWNERS and required review: a change
+# to the pins below is a change to the security check and is reviewed as one.
+IGNORE_SHA256=8be19d883c581024128750b36a95d61c15d1779fa1a4e3605ccfa251d1eb4337
+CONFIG_SHA256=27630a96d6c55755cc37620f3933d5cab94b1eb78a726a32e11212972525d76e
+marker='gitleaks[:]allow'
 if [[ -e .gitleaks.toml || -e .gitleaks.yaml || -e .gitleaks.yml ]]; then echo "secret scan: a repository gitleaks config is not allowed" >&2; exit 1; fi
-if git grep -nI 'gitleaks:allow' -- . ':!scripts/scan-secrets.sh' >/dev/null; then echo "secret scan: gitleaks:allow markers are not allowed" >&2; exit 1; fi
+if git grep -nIE "$marker" >/dev/null; then echo "secret scan: allow markers are not allowed" >&2; exit 1; fi
+# the one historical line (commit 812b074) that spelled the marker, pinned by exact content
+KNOWN_LINE_SHA256=9fe40b878fc575b835eb9d02fdfc82804c5b4b239270198b9e3e2dad10747fab
+while IFS= read -r added; do
+  [[ "$(printf '%s' "$added" | sha256sum | cut -c1-64)" == "$KNOWN_LINE_SHA256" ]] || { echo "secret scan: an allow marker appears in history" >&2; exit 1; }
+done < <(git log --all -p --format= -G "$marker" | grep -E '^\+' | grep -E "$marker" || true)
+echo "$IGNORE_SHA256  .gitleaksignore" | sha256sum --check --quiet - || { echo "secret scan: .gitleaksignore changed" >&2; exit 1; }
+echo "$CONFIG_SHA256  .github/gitleaks.toml" | sha256sum --check --quiet - || { echo "secret scan: .github/gitleaks.toml changed" >&2; exit 1; }
 cfg=$root/.github/gitleaks.toml
 
 status=0
-"$bin" git --config "$cfg" --no-banner --redact=100 --verbose=false --report-format json --report-path "$out/history.json" --log-opts="--all" . >/dev/null 2>"$out/history.log" || status=1
-"$bin" dir --config "$cfg" --no-banner --redact=100 --report-format json --report-path "$out/worktree.json" . >/dev/null 2>"$out/worktree.log" || status=1
+"$bin" git --config "$cfg" --ignore-gitleaks-allow --no-banner --redact=100 --verbose=false --report-format json --report-path "$out/history.json" --log-opts="--all" . >/dev/null 2>"$out/history.log" || status=1
+"$bin" dir --config "$cfg" --ignore-gitleaks-allow --no-banner --redact=100 --report-format json --report-path "$out/worktree.json" . >/dev/null 2>"$out/worktree.log" || status=1
 
 for scan in history worktree; do
   python3 -I - "$out/$scan.json" "$scan" <<'PY'

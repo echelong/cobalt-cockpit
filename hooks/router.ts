@@ -150,6 +150,8 @@ export const routerStateOf = (prompt: string, mode: ActiveMode): string | null =
     return words.length === 0 ? null : `task keywords: ${words.slice(0, 12).join(', ')}; size: ${line.length < 120 ? 'short' : line.length < 400 ? 'medium' : 'long'}`
   }
 
+  if (mode !== 'NOBODYWHO') return null
+
   return `task: ${line.length > TASK_MAX ? `${line.slice(0, TASK_MAX - 1)}…` : line}`
 }
 

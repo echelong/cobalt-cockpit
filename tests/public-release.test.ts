@@ -3,6 +3,7 @@ import { command, hostState, mountHud, mountPane, planAndComplete, progress, pro
 import { emptyLedger, exportJSON } from '../hooks/ledger'
 import { replayStep, secretText } from '../hooks/replay'
 import { carriesCredential, redactSecrets } from '../hooks/secrets'
+import { routerStateOf } from '../hooks/router'
 import { emptySwarm, finishTask, submitTask } from '../hooks/swarm'
 import { packetOf, readScopeOf } from '../hooks/consult'
 import type { Ledger, ReplayStep } from '../types'
@@ -141,5 +142,39 @@ describe('credential filter hardening', () => {
       expect(performance.now() - started).toBeLessThan(250)
     }
     expect(carriesCredential('word '.repeat(10_000))).toBe(true)
+  })
+})
+
+describe('credential filter, second review', () => {
+  const join = (...parts: string[]): string => parts.join('')
+  test('auth schemes and quoted multi-word values lose the whole value', () => {
+    expect(redactSecrets(`Authorization: ${join('Ba', 'sic')} ${join('dXNlcjpw', 'YXNzd29yZA==')} end`)).not.toContain('dXNlcjpw')
+    expect(redactSecrets(`password = "correct horse battery" end`)).toBe('[redacted] end')
+    expect(secretText(`password: "ab cd"`)).toBe(true)
+    expect(secretText(`"auth": "${join('dXNlcjpw', 'YXNzd29yZA==')}"`)).toBe(true)
+    expect(secretText(`_auth=${join('dXNlcjpw', 'YXNzd29yZA==')}`)).toBe(true)
+  })
+  test('file references stay readable in free text', () => {
+    for (const text of ['fails in src/token-store.ts:120', 'see hooks/auth.ts:120:3', 'Fix auth: login fails']) expect(redactSecrets(text)).toBe(text)
+  })
+  test('a secret cut by the scan limit is not left half-redacted', () => {
+    const key = join('wJalrXUtnFEMI', 'K7MDENGbPxRfiCYEXAMPLEKEY'.slice(0, 27))
+    const out = redactSecrets('a '.repeat(9_995) + key)
+    expect(out).not.toContain(key.slice(0, 20))
+  })
+  test('hostile input just under each limit is fast in every filter', () => {
+    for (const size of [19_999, 79_999]) for (const unit of ['x://:', 'a-', 'token', 'eyJ-', 'A']) {
+      const text = unit.repeat(Math.ceil(size / unit.length)).slice(0, size)
+      for (const run of [redactSecrets, carriesCredential, secretText]) {
+        const started = performance.now(); run(text)
+        expect([unit, size, performance.now() - started < 250]).toEqual([unit, size, true])
+      }
+    }
+  })
+  test('only a local router is ever shown the task line', () => {
+    const line = 'Refactor the payments module across every file'
+    expect(routerStateOf(line, 'NOBODYWHO')).toContain('payments')
+    expect(routerStateOf(line, 'JEV')).not.toContain('payments')
+    expect(routerStateOf(line, 'OFF' as never)).toBeNull()
   })
 })
