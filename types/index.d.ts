@@ -157,10 +157,6 @@ export type EvidencePacket = {
   decision: string
 }
 
-/** NobodyWho's advice on a consultation, only from a real router receipt. */
-/** `checkRequestId`: the receipt of the same question with the choices swapped; advice is kept only when both agree. */
-export type LocalAdvice = { requestId: string; choice: string | null; abstain: boolean; tier: number | null; latencyMs: number | null; provider: string; checkRequestId?: string }
-
 /**
  * One Opus consultation. Its lifecycle (running, returned, failed) and the main
  * session's verification are read off the swarm task it ran as; this record
@@ -177,10 +173,6 @@ export type Consultation = {
   /** Whether the ground made this consultation mandatory for the task. */
   isMandatory: boolean
   requestedAt: number
-  /** NobodyWho's advice, or null when no receipt exists (unavailable, timed out, off). */
-  advice: LocalAdvice | null
-  /** Why advice is absent, when it is. */
-  adviceNote: string | null
 }
 
 export type ReviewRequirement = {
@@ -383,6 +375,8 @@ declare module 'claude-code' {
       'ledger-resume': boolean
       'control-cursor': Cursor | null
       'effort-known': Record<string, readonly EffortLevel[]>
+      /** The session's router and what it has done; never stored beyond the session. */
+      router: RouterState
     }
   }
 }
@@ -454,6 +448,55 @@ export type ToolEntry = { id: string; runId: Value<string>; turnId: Value<string
 export type Reading = { at: number; turnId: Value<string>; tokens: Value<number>; window: Value<number>; percent: Value<number> }
 export type Request = { id: string; runId: Value<string>; turnId: string; agentId: Value<string>; requestedModel: Value<string>; requestedEffort: Value<string>; model: Value<string>; effort: Value<string>; effectiveEffort: Value<string>; input: Value<number>; output: Value<number>; cacheRead: Value<number>; cacheWrite: Value<number> }
 export type Checkpoint = { at: number; goal: string; phase: string; completed: string[]; remaining: string[]; latest: string; gates: Record<string, string>; branch: string; startingSha: string; currentSha: string; repo: string; dirty: Value<number>; blockers: string[]; backgroundAgents: string[] }
-export type Ledger = { schema: 1 | 2; observedCompletions?: { agentId: string; reason: string; conclusion: string; at: number }[]; swarm?: Swarm; sessionId: string; currentRun: Value<string>; turns: Record<string, string>; runs: Run[]; agents: LedgerAgent[]; tools: ToolEntry[]; requests: Request[]; usage: Reading[]; receipts: NwhoEvent[]; warnings: string[]; replay: ReplayStep[]; checkpoint: Checkpoint | null; /** Opus consultations (SONNET_LED); absent in older ledgers. */ consults?: Consultation[] }
+export type Ledger = { schema: 1 | 2; observedCompletions?: { agentId: string; reason: string; conclusion: string; at: number }[]; swarm?: Swarm; sessionId: string; currentRun: Value<string>; turns: Record<string, string>; runs: Run[]; agents: LedgerAgent[]; tools: ToolEntry[]; requests: Request[]; usage: Reading[]; receipts: NwhoEvent[]; warnings: string[]; replay: ReplayStep[]; checkpoint: Checkpoint | null; /** Opus consultations (SONNET_LED); absent in older ledgers. */ consults?: Consultation[]; /** The session router's decisions, newest last; absent until one is made. */ routing?: RouterDecision[] }
 export type ReplayStep = { id: string; runId: string; turnId: string; agentId: string; file: string; kind: 'Edit' | 'Write'; at: number; before: string; after: string; scope: 'fragment' | 'file'; omitted: boolean }
 export type Cursor = { offset: number; size: number; seen: string[]; primed: boolean }
+
+// ---------------------------------------------------------------------------
+// The session router (hooks/router.ts).
+// ---------------------------------------------------------------------------
+
+/** The session's router. OFF in every new session; chosen with /cockpit router; never stored. */
+export type RouterMode = 'OFF' | 'NOBODYWHO' | 'JEV'
+export type ActiveMode = Exclude<RouterMode, 'OFF'>
+/** What a router may recommend for a task. A recommendation starts nothing. */
+export type Route = 'direct' | 'scout' | 'delegate' | 'effort' | 'opus'
+
+/** One routing decision as the ledger keeps it: no prompt text, no credential, only what happened. */
+export type RouterDecision = {
+  at: number
+  mode: ActiveMode
+  /** What was asked for; one kind today. */
+  asked: 'route'
+  /** The provider and model that really answered; null when none did. */
+  provider: string | null
+  model: string | null
+  /** Receipts of the requests that really ran, clipped; empty when none did. */
+  receipts: string[]
+  /** Requests sent, and how many came back with a receipt. */
+  calls: number
+  answered: number
+  /** Wall time of the whole reading by Cockpit's clock, and the provider's own figures summed. */
+  wallMs: number | null
+  providerMs: number | null
+  agreed: number
+  advice: Route | null
+  /** What the rules alone say for this task. */
+  rules: Route
+  outcome: 'accepted' | 'rejected' | 'fallback'
+  reason: string
+}
+
+export type RouterState = {
+  mode: RouterMode
+  /** Raised at every switch: a reading begun under another epoch is never used. */
+  epoch: number
+  /** What is known of the selected provider: nothing yet, that it answered, or why it did not. */
+  link: 'unchecked' | 'connected' | 'unavailable'
+  detail: string | null
+  asked: number
+  accepted: number
+  rejected: number
+  fallbacks: number
+  last: RouterDecision | null
+}

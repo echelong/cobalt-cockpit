@@ -5,6 +5,7 @@ import { appendReplay, safeFile, safeText, secretText } from './replay'
 import type { ReplayStep } from './replay'
 import { emptySwarm } from './swarm'
 import { statusOf as consultStatus } from './consult'
+import { decisionLine } from './router'
 import { roleOf } from './orchestra'
 import { activityOf } from './classify'
 export const UNKNOWN = 'unknown' as const
@@ -87,7 +88,7 @@ export const receipts = (l: Ledger, events: readonly NwhoEvent[]): Ledger => ({ 
 export const checkpointOf = (l: Ledger, task: Task | null, git: GitState | null, at: number): Checkpoint => ({ at, goal: task?.milestones.length && task.goal !== task.lastPrompt ? textOf(task.goal) : UNKNOWN, phase: task?.phase ?? UNKNOWN, completed: task?.milestones.filter(m => m.state === 'done').map(m => textOf(m.title)) ?? [], remaining: task?.milestones.filter(m => m.state !== 'done').map(m => textOf(m.title)) ?? [], latest: l.tools.at(-1)?.tool ?? UNKNOWN, gates: Object.fromEntries(Object.entries(task?.gates ?? {}).map(([k, g]) => [k, g.state])), branch: word(git?.branch), startingSha: word(git?.startSha), currentSha: word(git?.sha), repo: word(git?.project), dirty: git?.isRepo ? numberOf(git.dirty) : UNKNOWN, blockers: task?.blocker ? [textOf(task.blocker)] : [], backgroundAgents: l.agents.filter(a => a.status === 'running').map(a => a.id) })
 export const withReplay = (l: Ledger, step: ReplayStep): Ledger => ({ ...l, replay: appendReplay(l.replay, step) })
 // Export explicitly excludes snapshots and any checkpoint prose. Only typed telemetry.
-export const exportJSON = (l: Ledger): string => JSON.stringify({ schema: l.schema, sessionId: l.sessionId, swarm: l.swarm, runs: l.runs, agents: l.agents.map(({ name: _name, ...a }) => a), tools: l.tools, requests: l.requests, usage: l.usage, nobodywho: l.receipts, warnings: l.warnings, replay: l.replay.map(({ before: _before, after: _after, ...s }) => s), checkpoint: l.checkpoint === null ? null : { at: l.checkpoint.at, phase: l.checkpoint.phase, gates: l.checkpoint.gates, branch: l.checkpoint.branch, startingSha: l.checkpoint.startingSha, currentSha: l.checkpoint.currentSha, repo: l.checkpoint.repo, dirty: l.checkpoint.dirty, backgroundAgents: l.checkpoint.backgroundAgents }, ...(l.consults?.length ? { consults: l.consults } : {}) }, (_key, value: unknown) => typeof value === 'string' ? (secretText(value) ? UNKNOWN : safeText(value)) : value, 2)
+export const exportJSON = (l: Ledger): string => JSON.stringify({ schema: l.schema, sessionId: l.sessionId, swarm: l.swarm, runs: l.runs, agents: l.agents.map(({ name: _name, ...a }) => a), tools: l.tools, requests: l.requests, usage: l.usage, nobodywho: l.receipts, warnings: l.warnings, replay: l.replay.map(({ before: _before, after: _after, ...s }) => s), checkpoint: l.checkpoint === null ? null : { at: l.checkpoint.at, phase: l.checkpoint.phase, gates: l.checkpoint.gates, branch: l.checkpoint.branch, startingSha: l.checkpoint.startingSha, currentSha: l.checkpoint.currentSha, repo: l.checkpoint.repo, dirty: l.checkpoint.dirty, backgroundAgents: l.checkpoint.backgroundAgents }, ...(l.consults?.length ? { consults: l.consults } : {}), ...(l.routing?.length ? { routing: l.routing } : {}) }, (_key, value: unknown) => typeof value === 'string' ? (secretText(value) ? UNKNOWN : safeText(value)) : value, 2)
 export type TierName = 'OPUS' | 'SONNET' | 'HAIKU' | 'OTHER'
 export type TierFigures = { requests: number; reported: number; input: number; output: number; cacheRead: number; cacheWrite: number }
 export type TierUsage = Partial<Record<TierName, TierFigures>>
@@ -119,7 +120,7 @@ const consultLines = (l: Ledger): string[] => {
   const rows = ['11 OPUS CONSULTATIONS']
   for (const c of l.consults) {
     const t = l.swarm?.tasks.find(x => x.id === c.id)
-    rows.push(`${c.id} ${c.ground}${c.isMandatory ? ' (mandatory)' : ''} · status ${consultStatus(t)} · admitted: ground holds · agent ${t?.agentId ?? UNKNOWN}`, `asked ${c.packet.decision}`, `decision ${t?.result?.conclusion || 'not returned'}`, `verified by main ${t?.verification ?? UNKNOWN}`, `nobodywho ${c.advice ? `${c.advice.abstain ? 'abstain' : c.advice.choice ?? 'none'} · receipt ${c.advice.requestId} · tier ${c.advice.tier ?? UNKNOWN} · advisory` : `no receipt (${c.adviceNote ?? 'unavailable'})`}`)
+    rows.push(`${c.id} ${c.ground}${c.isMandatory ? ' (mandatory)' : ''} · status ${consultStatus(t)} · admitted: ground holds · agent ${t?.agentId ?? UNKNOWN}`, `asked ${c.packet.decision}`, `decision ${t?.result?.conclusion || 'not returned'}`, `verified by main ${t?.verification ?? UNKNOWN}`)
   }
   return rows
 }
@@ -144,6 +145,8 @@ export const ledgerLines = (l: Ledger, now: number, auth: string = UNKNOWN, cost
     rows.push(`Lifecycle ${l.swarm.events.length} retained events · ${l.swarm.droppedEvents} evicted · /replay`)
   }
   rows.push(...consultLines(l))
+  // Router metrics stand apart from model usage: they are not requests of a Claude model.
+  if (l.routing?.length) rows.push('12 SESSION ROUTER', 'advisory; the rules decide. Wall time by this session\'s clock; no prompt text or credential is kept.', ...l.routing.map(decisionLine))
   return rows
 }
 

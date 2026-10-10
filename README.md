@@ -47,6 +47,7 @@ Opus remains **one main commander** and keeps the reasoning effort you select in
 - Narrow-terminal and reduced-motion layouts; preserves the engine's image viewer.
 - Optional read-only NobodyWho telemetry and opt-in orchestration policy enforcement.
 - Optional Sonnet-led profile (`profile: SONNET_LED`): Sonnet 5.5 is the main model at your effort, and Opus 5.5 runs at High only as an admitted, read-only architect consultation. `OPUS_LED` stays the default.
+- Optional per-session router (`/cockpit router`): OFF by default, NobodyWho (local) or JEV (TypeSafe API) for advisory routing recommendations. Cockpit's deterministic rules stay authoritative.
 - Read-only helpers can deliver their reports: a bound helper may use the host's tool discovery and report hand-back without gaining any write, shell or delegation right, and each task records how its report arrived.
 
 ## Quick start
@@ -77,7 +78,7 @@ claude plugin marketplace update cobalt-cockpit
 claude plugin update cobalt-cockpit@cobalt-cockpit
 ```
 
-Restart Claude Code and check `/cockpit version`. Your settings, preferences and saved Run Ledgers are kept. v0.5.0 keeps `OPUS_LED` as the default profile, so the main model does not change unless you choose `SONNET_LED` (below). Its one changed default is `localAdvice`, now false.
+Restart Claude Code and check `/cockpit version`. Your settings, preferences and saved Run Ledgers are kept. v0.5.0 keeps `OPUS_LED` as the default profile, so the main model does not change unless you choose `SONNET_LED` (below). It adds one option, `routerConfigDir`, empty by default, and the session router is OFF in every new session.
 
 The marketplace name in this repository is `cobalt-cockpit`. Some existing private/local setups use a separately registered marketplace alias such as `cobalt`; for those, use the identity shown by `claude plugin list` rather than copying the public suffix.
 
@@ -107,6 +108,7 @@ A `--plugin-dir` copy stops loading when you omit the flag next session.
 | `/cockpit mute` / `/cockpit unmute` | Persist sound preference |
 | `/cockpit hud off` / `/cockpit hud on` | Persist HUD preference |
 | `/cockpit reset` | Clear the current task |
+| `/cockpit router` / `/cockpit router off\|nobodywho\|jev` | Show this session's router, or switch it (this session only; a new session starts OFF) |
 | `/ledger` | Open local Run Ledger |
 | `/ledger export json` | Print sanitized telemetry JSON |
 | `/replay` | Browse successful edit/write snapshots |
@@ -180,14 +182,14 @@ Cockpit does not take part in Claude Code's permission check. It registers no ho
 
 ### Sonnet-led profile
 
-`profile: SONNET_LED` (with orchestration enforced): **Sonnet builds. Haiku scouts. Opus reviews. NobodyWho advises.**
+`profile: SONNET_LED` (with orchestration enforced): **Sonnet builds. Haiku scouts. Opus reviews. A router, if you select one, advises.**
 
 - The main loop is requested on Sonnet 5.5 at your own effort (`/effort`, settings, `modelSettings`); Cockpit never rewrites that effort.
 - Haiku scouts and Sonnet workers run as before. AUTO budgets are conservative: 4 helpers in all, 2 Sonnet, 2 Haiku and 1 Opus within them. Explicit `maxSubagents`/pool values still win.
 - Opus 5.5 is never the main loop and never a background model. The main session requests it with `swarm action consult`: a ground (`architecture`, `security`, `repeated-failure`, `asked`, `release`) and a concise evidence packet (objective, architecture, files, alternatives, failures, risk, decision). Cockpit admits it only where the ground holds on evidence: a large or spread change, or architecture named in the prompt; security-sensitive files or a security prompt; the same failure three times in a row; an explicit request for Opus; a release approval. One Opus at a time, an unchanged problem consulted once, one retry after a failed run, three per task. The admitted consultation runs as `cobalt-cockpit:architect` (read-only, Opus, high effort) and returns a structured decision; Sonnet implements and verifies it.
 - Opus cannot be reached around this: an unassigned Agent call naming Opus or the architect, an `assign` of tier OPUS, or the architect on a Sonnet task is refused.
 - Mandatory consultations: an explicit request for Opus, a release approval, or a change to security-sensitive files (auth, secrets, credentials, permissions, policy, guards, `.env`, keys) holds the task below 100% until a consultation has returned and the main session has verified its advice with `swarm action verify` (pass or fail, with evidence). Review findings are advice until verified.
-- NobodyWho advice is off by default (`localAdvice`). Measured for v0.5.0, the local classifier followed option position, not content, so deterministic admission decides. When turned on, the local router (`decision ask --caller cockpit`) is asked only after the rules admit a non-mandatory consultation, twice with the choices swapped. Its answer is kept only when both receipts agree, and it never decides admission.
+- No router is asked when Opus is admitted: admission is by the rules alone. The optional session router (below) is asked only at the start of a task and never decides admission.
 - HUD and Ledger name the roles (MAIN, SCOUT, ENGINEER, ARCHITECT, LOCAL CONTROL), list each consultation with its ground, whether it returned, its decision and Sonnet's verification, and report host-reported tokens per tier. Requests without usage figures are counted as unreported; nothing is estimated. `/ledger` shows the host's `/cost` total where it keeps one.
 - Context: set Sonnet's compaction window natively (`/autocompact 400k`, stored as `modelSettings["claude-sonnet-5-5"].autoCompactWindow`). Cockpit does not compact or change settings. Subagents keep their own model defaults.
 
@@ -209,9 +211,44 @@ printf '%s\n' '{"profile":"OPUS_LED"}' | claude plugin configure cobalt-cockpit@
 
 Run Ledgers and preferences stay readable in both directions. Design, measurements and the v0.5.0 corrections are in [docs/implementation-v0.5-sonnet-led.md](docs/implementation-v0.5-sonnet-led.md) and [docs/delivery-v0.5.0-hardening.md](docs/delivery-v0.5.0-hardening.md).
 
+## Session router
+
+A router is an optional, lightweight classifier that **recommends** how to handle a new task. You choose it per session:
+
+```
+/cockpit router              show the active router (and choose one, in an interactive session)
+/cockpit router off          Cockpit's deterministic policy only (every new session starts here)
+/cockpit router nobodywho    the local decision router, local provider only
+/cockpit router jev          the same router's TypeSafe JEV provider (an external API)
+```
+
+The choice lasts for the session and is never saved. One router is active at a time, and switching discards everything the previous one said. `/cockpit` and `/cockpit version` show it: `ROUTER / OFF`, `ROUTER / NOBODYWHO · LOCAL`, `ROUTER / JEV · CONNECTED`.
+
+What a router may do is recommend one of five routes: handle it in the main session, scout with Haiku, delegate bounded parts to Sonnet, consider a higher effort, or consider an Opus consultation. What it may not do is anything else. It never starts an agent, admits or skips an Opus consultation, or changes a model, an effort, a permission, an ownership rule or a verification gate. Cockpit's rules judge every recommendation:
+
+- The rules go first. When they already settle the route (a mandatory consultation, or a route read off the prompt), no router is asked at all.
+- A recommendation for Opus is refused unless a consultation ground already holds on evidence. You are shown a notice instead, and asking for Opus yourself is a ground the rules honour.
+- An accepted recommendation adds one advisory line to the task. A scout or worker it suggests still goes through assignment and admission.
+- If the router is down, slow, or its answer does not hold up, the deterministic policy decides and the fallback is recorded.
+
+A router is asked once, at the start of a task the rules do not settle, never per prompt, tool call or helper. The question is five fixed yes/no features of the task, each asked in both orders. A feature counts only when both orders agree, and the whole reading is discarded when fewer than four of five agree or more than three are affirmed. That is what makes the answer independent of option position: the local classifiers measurably follow position otherwise.
+
+Measured for v0.5.0 on 56 balanced synthetic tasks (details and limits in [docs/delivery-v0.5.0-router.md](docs/delivery-v0.5.0-router.md)): the rules alone classified 45; the router's reading alone was right for 49 with the local Qwen3 4B model and 51 with JEV, and 8 with the router's 0.6B tier-1 specialist, which is why NobodyWho mode uses the router's plain local provider. With the rules going first, as shipped, the outcome was right for 47 (NobodyWho) and 46 (JEV): most of what a router adds is "this is one for Opus", which it may only tell you. JEV answered in about 250 ms per request (p50 246 ms, p95 297 ms), not the 16 ms sometimes quoted.
+
+**JEV sends data off your machine.** In JEV mode the first 400 characters of a new task's prompt go to the TypeSafe API through your own decision router and key. Nothing else is sent, a prompt with credential-shaped text is withheld, and Cockpit never sees the key. JEV works only if your router allows it: either its own JEV switch is on, or you point Cockpit at a router configuration you made for this purpose:
+
+```sh
+# one time: a copy of your router config with JEV enabled, used by Cockpit's JEV mode only
+mkdir -m 700 -p ~/.config/cobalt-cockpit/router-jev
+python3 -c "import json,os;h=os.path.expanduser;c=json.load(open(h('~/.config/decision-router/config.json')));c.setdefault('jev',{})['enabled']=True;open(h('~/.config/cobalt-cockpit/router-jev/config.json'),'w').write(json.dumps(c,indent=1)+'\n')"
+printf '%s\n' '{"routerConfigDir":"~/.config/cobalt-cockpit/router-jev"}' | claude plugin configure cobalt-cockpit@cobalt-cockpit --values-stdin
+```
+
+Your global router configuration is untouched, so nothing else on the machine reaches JEV. Without `routerConfigDir`, JEV mode reports `JEV · UNAVAILABLE (jev_disabled)` whenever the router's own switch is off.
+
 ## NobodyWho integration
 
-Optional and read-only. By default, Cockpit checks `$XDG_STATE_HOME/decision-router/ledger.jsonl`, or `$HOME/.local/state/decision-router/ledger.jsonl`. Set `ledgerPath` to override it; set `localControl` false to stop reading.
+This section is the read-only telemetry; the router you can select is described above. By default, Cockpit checks `$XDG_STATE_HOME/decision-router/ledger.jsonl`, or `$HOME/.local/state/decision-router/ledger.jsonl`. Set `ledgerPath` to override it; set `localControl` false to stop reading.
 
 Only `caller: "claude"` receipts arriving after startup are shown. Decision comes from an `ask` receipt; Pruning comes from a `prune` receipt. They stay separate. Missing, malformed or unavailable ledgers are silent; LOCAL CONTROL is omitted when nothing is observed. There is no fake activity, JEV integration, cloud fallback or dependency on local control. Raw prompts, hidden reasoning, receipt details and credential values are not copied into this adapter's telemetry.
 
@@ -241,7 +278,7 @@ Restart Claude Code after changing configuration. To enable just Fable blocking 
 | `reasoningMode` | `AUTO`; `MANUAL` honours fixed per-tier levels for subagents; the main loop's effort stays yours |
 | `maxEffort` | `max`; lower ceilings cap every subagent request and are recorded |
 | `profile` | `OPUS_LED` (legacy: Opus main loop); `SONNET_LED` runs the main loop on Sonnet and consults Opus on admission |
-| `localAdvice` | false; `SONNET_LED` only: ask the local NobodyWho router, both ways round, for advisory input on an admitted non-mandatory consultation |
+| `routerConfigDir` | empty; a decision-router configuration directory you created for the JEV router mode, used only while a session's router is JEV |
 
 ## Compatibility
 
@@ -255,11 +292,11 @@ Run Ledger is local. Cockpit observes tool calls, paths, agent events, token/con
 
 ### What Cockpit runs, reads and sends
 
-Cockpit installs no launcher and downloads nothing. It runs local processes, with your privileges and without prompting, for five reasons: `realpath -m` canonicalizes a path a subagent claims as its own (orchestration only), `tail -c` reads the end of a telemetry ledger larger than 512 KiB, `git status --porcelain=v2` and `git rev-parse --show-toplevel` feed the HUD, one of nine audio players plays the optional cues (`pw-play`, `paplay`, `aplay`, `ffplay`, `mpv`, `play`, `canberra-gtk-play`, `afplay`, then a terminal bell), and in the `SONNET_LED` profile with `localAdvice` on (off by default), `decision ask --caller cockpit --json <question>` asks the local NobodyWho router, twice, for advice on an admitted Opus consultation; the question is the consultation's ground, counts, objective and risk, and the router runs on this machine. Each is an argument array: no shell string is ever built from model or user text.
+Cockpit installs no launcher and downloads nothing. It runs local processes, with your privileges and without prompting, for five reasons: `realpath -m` canonicalizes a path a subagent claims as its own (orchestration only), `tail -c` reads the end of a telemetry ledger larger than 512 KiB, `git status --porcelain=v2` and `git rev-parse --show-toplevel` feed the HUD, one of nine audio players plays the optional cues (`pw-play`, `paplay`, `aplay`, `ffplay`, `mpv`, `play`, `canberra-gtk-play`, `afplay`, then a terminal bell), and, only while a session router is selected (`/cockpit router`, off in every new session), `decision ask --caller cockpit --mode local|jev --json <question>` asks the local decision router about a new task: the question is the first 400 characters of your prompt and one fixed yes/no question. With `local` the router's own model answers on this machine. With `jev` the router sends the request to the TypeSafe JEV API under your key, which Cockpit never reads; an operator-set `routerConfigDir` is passed to that process as `DECISION_ROUTER_CONFIG_DIR` in JEV mode only. Each is an argument array: no shell string is ever built from model or user text.
 
 It reads files: the decision-router ledger (read-only, optional, `localControl`), a file about to be written (a bounded replay snapshot), and Claude Code's settings. It reads environment variables **by name**: `CLAUDE_CODE_EFFORT_LEVEL`, `XDG_STATE_HOME`, `HOME`, `COBALT_REDUCED_MOTION`, and eight authentication variables — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_MANTLE` — whose values are reduced to set-or-not-set on the spot and never stored, logged, exported or sent. It writes nothing outside the host's plugin store, which holds up to eight bounded run ledgers, bounded replay bodies, checkpoints and two preferences.
 
-It makes no network request of its own: no fetch, no model call, no MCP call. Its two prompt hooks add text to the request Claude Code already sends — the discipline, safety and policy sections of the system prompt, and one line of task status — which is the only route by which anything Cockpit observed reaches a model. Every path above is listed with its call site in [docs/implementation-v0.3.2.md](docs/implementation-v0.3.2.md).
+It makes no network request of its own: no fetch, no model call, no MCP call. The one program it starts that can is the decision router in JEV mode, in a session where you selected it. Its two prompt hooks add text to the request Claude Code already sends — the discipline, safety and policy sections of the system prompt, and one line of task status — which is the only route by which anything Cockpit observed reaches a model. Every path above is listed with its call site in [docs/implementation-v0.3.2.md](docs/implementation-v0.3.2.md).
 
 The guards are not a sandbox: they use recognizable syntax and your confirmation. Keep Claude Code's permission controls enabled.
 

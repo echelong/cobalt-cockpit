@@ -14,8 +14,10 @@ import { textOf } from './ledger'
 import { atom, read, update } from 'claude-code'
 import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL, OPUS_MODEL, isProfile, DEFAULT_PROFILE } from './model-policy'
 import type { SubagentTier, Profile } from './model-policy'
-import { addConsult, adviceOf, adviceRequest, advanceReview, briefOf, consultVerdict, factsOf, isGround, mandatoryGrounds, orderChecked, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
-import type { Consultation, LocalAdvice } from './consult'
+import { addConsult, advanceReview, briefOf, consultVerdict, factsOf, isGround, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
+import type { Consultation } from './consult'
+import { addDecision, adjudicate, adviceLine, answerOf, callsFor, carriesCredential, decisionOf, deterministicRoute, operatorNotice, readAnswers, routerArgv, routerLabel, routerLine, routerModeOf, routerStateOf, switchRouter, withDecision, AVAILABILITY_STATE, CALL_TIMEOUT_MS, EMPTY_ROUTER, PROVIDER, ROUTER_MODES } from './router'
+import type { ActiveMode, RouterAnswer, RouterMode, RouterPolicy, RouterState } from './router'
 import {
   DEFAULT_CEILING,
   capabilityFor,
@@ -166,6 +168,8 @@ const orchestraAtom = atom({ plugin: 'cobalt-cockpit', key: 'orchestra' } as con
 // The effort capability this session has really observed, by model id: folded
 // in from the engine's own applied level, so a declared baseline is replaced
 // only by a fact. It lives in `$.state`, so a hot reload keeps it.
+// The session's router: OFF in every fresh session, switched only by /cockpit router, never stored.
+const routerAtom = atom({ plugin: 'cobalt-cockpit', key: 'router' } as const, EMPTY_ROUTER as RouterState)
 const effortKnownAtom = atom({ plugin: 'cobalt-cockpit', key: 'effort-known' } as const, {} as Record<string, readonly EffortLevel[]>)
 
 // Synchronous fence covers the whole awaited commander effect, including path resolution.
@@ -224,8 +228,7 @@ const finishObserved = (s: Swarm, id: string, reason: string, conclusion: string
 }
 /**
  * One Opus consultation requested by the main session (SONNET_LED). The ground
- * and packet are checked by `consultVerdict`; NobodyWho's advice, when a real
- * receipt comes back, is recorded beside it and never decides it. Admission
+ * and packet are checked by `consultVerdict` alone; no router is asked. Admission
  * reserves nothing yet: the OPUS swarm task it submits is admitted again, with
  * ownership and budget, when the architect's Agent call arrives.
  */
@@ -247,25 +250,6 @@ const serveConsult = async ($: EngineInterface, e: Record<string, unknown>, at: 
   // inside the project only; a packet that names none reads the project, never `*`.
   const root = await canonicalResource($, cwd || '.')
   if (root === '*') throw new Error('OPUS / the project root could not be resolved, so no read scope can be given; nothing was admitted')
-  let advice: LocalAdvice | null = null
-  let adviceNote: string | null = null
-  // Admission is already decided above, by the rules. Advice is sought only
-  // when it could say something (not for a mandatory consultation), and kept
-  // only when it survives the choices being swapped.
-  if (!config.hasLocalAdvice) adviceNote = 'local advice off'
-  else if (verdict.isMandatory) adviceNote = 'mandatory: no advice sought'
-  else {
-    try {
-      const ask = async (swapped: boolean) => {
-        const r = await $.process.run(['decision', 'ask', '--caller', 'cockpit', '--json', adviceRequest(ground, made.packet, facts, swapped)], { timeoutMs: 20_000 })
-        if (r.exitCode !== 0) throw new Error(`router exited ${r.exitCode}`)
-        return adviceOf(r.stdout)
-      }
-      const checked = orderChecked(await ask(false), await ask(true))
-      if ('advice' in checked) advice = checked.advice
-      else adviceNote = checked.note
-    } catch (error) { adviceNote = error instanceof Error && error.message.startsWith('router exited') ? error.message : 'router unavailable' }
-  }
   const named = await Promise.all(readScopeOf(made.packet).map(p => canonicalResource($, p)))
   const owned = named.filter(p => p !== '*' && (p === root || p.startsWith(`${root}/`)))
   const outside = named.length - owned.length
@@ -276,14 +260,13 @@ const serveConsult = async ($: EngineInterface, e: Record<string, unknown>, at: 
   if (!again.ok) throw new Error(again.reason)
   const id = `opus-${(fresh.consults ?? []).length + 1}-${verdict.key.slice(0, 6)}`
   await changeSwarm($, held => submitTask(held, { id, tier: 'OPUS', role: ground === 'release' || ground === 'security' ? 'REVIEW' : 'ARCHITECT', objective: made.packet.decision, scope: `Opus consultation · ${ground}`, owned: owned.length ? owned : [root], mode: 'read', parentTask: null, effort: CONSULT_EFFORT, effortReason: `Opus consultation: ${CONSULT_EFFORT} by default`, spawnReason: `Opus admitted on ${ground}${verdict.isMandatory ? ' (mandatory)' : ''}` }, at).swarm)
-  const c: Consultation = { id, ground, key: verdict.key, packet: made.packet, progressTask: task?.id ?? null, isMandatory: verdict.isMandatory, requestedAt: at, advice, adviceNote }
+  const c: Consultation = { id, ground, key: verdict.key, packet: made.packet, progressTask: task?.id ?? null, isMandatory: verdict.isMandatory, requestedAt: at }
   await mutateLedger($, l => ({ ...l, consults: addConsult(l.consults ?? [], c) }))
   if (task !== null) await change($, t => t.id !== task.id ? t : { ...t, review: advanceReview(verdict.isMandatory ? requireReview(t, [ground]).review : t.review, id, 'admitted') })
-  const local = advice === null ? `NobodyWho: no advice (${adviceNote}).` : `NobodyWho, order-checked: ${advice.choice} (receipts ${advice.requestId.slice(0, 12)}, ${advice.checkRequestId?.slice(0, 12) ?? '?'}); advisory only, admission was decided by the rules.`
 
   const scope = `Read scope: ${owned.length ? `${owned.length} named file${owned.length === 1 ? '' : 's'}` : 'the project'}${outside ? `; ${outside} location${outside === 1 ? '' : 's'} not readable (outside the project, home-relative or not a plain path)` : ''}.`
 
-  return `OPUS ADMITTED / ${id} · ${ground}${verdict.isMandatory ? ' · mandatory for this task' : ''}. ${local} ${scope}\nSpawn Agent with subagent_type "cobalt-cockpit:architect", description "[task:${id}] Opus ${ground} consultation", and exactly this brief as the prompt:\n\n${briefOf(c)}\n\nIts answer is advice until you verify it. Then record swarm action "verify" for ${id}: pass when the advice checks out, fail when it does not, with evidence either way.`
+  return `OPUS ADMITTED / ${id} · ${ground}${verdict.isMandatory ? ' · mandatory for this task' : ''}. ${scope}\nSpawn Agent with subagent_type "cobalt-cockpit:architect", description "[task:${id}] Opus ${ground} consultation", and exactly this brief as the prompt:\n\n${briefOf(c)}\n\nIts answer is advice until you verify it. Then record swarm action "verify" for ${id}: pass when the advice checks out, fail when it does not, with evidence either way.`
 }
 const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promise<{ result: string; isError?: boolean }> => {
   try {
@@ -529,6 +512,7 @@ const HELP =
   '/cockpit hud off    hide the HUD (kept across sessions); hud on to undo\n' +
   '/cockpit auth       print how the session is authenticated and the Fable policy\n' +
   '/cockpit version    print the loaded plugin version, its source path and the reasoning mode\n' +
+  '/cockpit router     show this session\'s router, or switch it: off, nobodywho, jev (this session only)\n' +
   '/cockpit sound      play both cues'
 
 const isAtLeast = (version: string, floor: readonly number[]): boolean => {
@@ -605,8 +589,12 @@ type Config = {
   modelEffort: Readonly<Record<string, readonly EffortLevel[]>>
   /** OPUS_LED (legacy): Opus commands. SONNET_LED: Sonnet builds and Opus is consulted on admission. */
   profile: Profile
-  /** Whether an Opus consultation asks NobodyWho (`decision ask`) for advisory input. */
-  hasLocalAdvice: boolean
+  /**
+   * A decision-router configuration directory the operator made for Cockpit's
+   * JEV mode, or empty. It is handed to the router child process alone, and
+   * only while the session's router is JEV; Cockpit never creates or edits it.
+   */
+  routerConfigDir: string
 }
 
 /** SONNET_LED is in force only where orchestration is enforced. */
@@ -626,7 +614,7 @@ const capabilityOf = (model: string, known: Readonly<Record<string, readonly Eff
 
 // Set by register(); the rest is rebuilt as events arrive after a reload.
 // Nothing a drawing depends on lives here: that is all in `$.state`.
-let config: Config = { hasHud: true, isAnimated: true, hasSounds: true, hasGuard: true, hasAttributionGuard: true, volume: 0.6, hasLocalControl: true, ledgerPath: '', blocksFable: false, isStrict: false, hasOrchestration: false, maxSubagents: 16, maxSonnet: 'AUTO', maxHaiku: 'AUTO', isSubscriptionOnly: false, reasoningMode: 'AUTO', maxEffort: DEFAULT_CEILING, modelEffort: {}, profile: DEFAULT_PROFILE, hasLocalAdvice: false }
+let config: Config = { hasHud: true, isAnimated: true, hasSounds: true, hasGuard: true, hasAttributionGuard: true, volume: 0.6, hasLocalControl: true, ledgerPath: '', blocksFable: false, isStrict: false, hasOrchestration: false, maxSubagents: 16, maxSonnet: 'AUTO', maxHaiku: 'AUTO', isSubscriptionOnly: false, reasoningMode: 'AUTO', maxEffort: DEFAULT_CEILING, modelEffort: {}, profile: DEFAULT_PROFILE, routerConfigDir: '' }
 let isSupported = true
 /** True once the engine is known to take `effort` on an Agent call. */
 let hasNativeEffort = false
@@ -1147,6 +1135,99 @@ const refreshMeter = async ($: EngineInterface): Promise<void> => {
   } catch {
     // no reading yet
   }
+}
+
+const routerPolicy = (): RouterPolicy => ({ profile: config.profile, hasOrchestration: config.hasOrchestration, hasHaiku: config.maxHaiku !== 0, hasSonnet: config.maxSonnet !== 0 })
+
+/**
+ * Runs the router's own CLI once per body, at the same time, and reads each
+ * answer. This is the only place a router process starts, and it starts only
+ * for a mode the person selected. In JEV mode alone, and only when the operator
+ * configured one, the child is pointed at the operator's router configuration
+ * directory; nothing of it, and no credential, enters this process.
+ */
+const askRouter = async ($: EngineInterface, mode: ActiveMode, bodies: readonly string[]): Promise<(RouterAnswer | null)[]> => {
+  let env: Record<string, string> | undefined
+  if (mode === 'JEV' && config.routerConfigDir !== '') {
+    const home = config.routerConfigDir.startsWith('~/') ? await $.env.get('HOME').catch(() => undefined) : ''
+    if (home !== undefined) env = { DECISION_ROUTER_CONFIG_DIR: config.routerConfigDir.startsWith('~/') ? `${home}${config.routerConfigDir.slice(1)}` : config.routerConfigDir }
+  }
+
+  return Promise.all(bodies.map(async body => {
+    try {
+      const r = await $.process.run(routerArgv(mode, body), { timeoutMs: CALL_TIMEOUT_MS[mode], ...(env === undefined ? {} : { env }) })
+
+      return r.exitCode === 0 && !r.isStdoutTruncated ? answerOf(r.stdout) : null
+    } catch { return null }
+  }))
+}
+
+/**
+ * The router's reading of a new task, when one is selected and the rules have
+ * not already settled the route. Returns the one advisory line an accepted
+ * recommendation adds to the task, or null. Whatever happened is recorded as
+ * it happened; a reading begun before a switch is dropped, not used.
+ */
+const routeTask = async ($: EngineInterface, text: string, facts: Parameters<typeof deterministicRoute>[0]): Promise<string | null> => {
+  const held = await read($, routerAtom)
+  if (held.mode === 'OFF') return null
+  const mode = held.mode
+  // Decided more cheaply by rule: a mandatory consultation, or a route the rules read off the task.
+  if (mandatoryGrounds(facts).length > 0) return null
+  const rules = deterministicRoute(facts)
+  if (rules.route !== 'direct') return null
+  const state = routerStateOf(text)
+  const calls = state === null ? [] : callsFor(state)
+  if (state === null && !carriesCredential(text)) return null
+  const started = await $.clock.now()
+  const answers = calls.length === 0 ? [] : await askRouter($, mode, calls.map(c => c.body))
+  const at = await $.clock.now()
+  const reading = calls.length === 0 ? { route: null, features: {}, agreed: 0, invalid: 'prompt withheld: credential-shaped text is never shown to a router' } : readAnswers(mode, calls, answers)
+  const verdict = reading.route === null ? null : adjudicate(reading.route, facts, routerPolicy())
+  const decision = decisionOf({ at, mode, calls: calls.length, answers, wallMs: calls.length === 0 ? null : at - started, reading, rules: rules.route, verdict })
+  if ((await read($, routerAtom)).epoch !== held.epoch) return null
+  await update($, routerAtom, s => withDecision(s, held.epoch, decision))
+  await mutateLedger($, l => ({ ...l, routing: addDecision(l.routing ?? [], decision) }))
+  // An Opus reading the rules refuse goes to the person, never to the model.
+  const notice = operatorNotice(mode, reading, verdict)
+  if (notice !== null) await quiet(() => $.ui.toast(notice, { timeoutMs: 15_000 }))
+
+  return decision.outcome === 'accepted' && reading.route !== null ? adviceLine(mode, reading.route) : null
+}
+
+/** Switches the session's router and, for a provider, checks once that it answers. Returns what to tell the person. */
+const selectRouter = async ($: EngineInterface, mode: RouterMode): Promise<string> => {
+  const switched = await update($, routerAtom, s => switchRouter(s, mode))
+  if (mode === 'OFF') return 'ROUTER / OFF · deterministic policy only. No router is asked in this session.'
+  // One fixed question that carries nothing of the session, so the mode's state is seen, not assumed.
+  const probe = callsFor(AVAILABILITY_STATE)[0]!
+  const started = await $.clock.now()
+  const [answer = null] = await askRouter($, mode, [probe.body])
+  const wall = (await $.clock.now()) - started
+  const isUp = answer !== null && answer.provider === PROVIDER[mode] && answer.failure === null && answer.choice !== null
+  const detail = isUp ? `${answer.model ?? PROVIDER[mode]} · ${wall}ms` : answer === null ? 'no answer' : answer.failure ?? `answered by ${answer.provider}`
+  const now = await update($, routerAtom, s => s.epoch !== switched.epoch ? s : { ...s, link: isUp ? 'connected' as const : 'unavailable' as const, detail })
+
+  return [
+    `ROUTER / ${routerLabel(now)}${isUp ? ` · ${detail}` : ''}`,
+    mode === 'JEV'
+      ? `JEV is the TypeSafe API, reached through the local decision router${config.routerConfigDir === '' ? ' under its own JEV switch (no routerConfigDir is set)' : ' with the router configuration you set in routerConfigDir'}. For a new task the rules do not settle, the first 400 characters of your prompt are sent to it; nothing else is, and a prompt with credential-shaped text is withheld.`
+      : 'NobodyWho runs on this machine through the local decision router (its local provider only).',
+    'Advisory only: Cockpit\'s rules still decide admission, ownership, mandatory consultations and verification gates. This session only; a new session starts OFF.',
+  ].join('\n')
+}
+
+/** The engine's own dialog for the three modes; null when dismissed or when there is no one to ask. */
+const pickRouter = async ($: EngineInterface, current: RouterMode): Promise<RouterMode | null> => {
+  try {
+    await update($, visualAtom, old => ({ ...old, waiting: old.waiting + 1 }))
+    stopTicker()
+    try {
+      return routerModeOf(await $.ui.ask(`Which router should advise this session? (now ${current})`, { options: [...ROUTER_MODES], header: 'Router' }))
+    } finally {
+      await update($, visualAtom, old => ({ ...old, waiting: Math.max(0, old.waiting - 1) }))
+    }
+  } catch { return null }
 }
 
 const ask = async ($: EngineInterface, question: string, header: string, choices: readonly [string, string]): Promise<string | null> => {
@@ -1678,7 +1759,7 @@ export const register: Register = (on, options) => {
     maxEffort: isEffortLevel(options['maxEffort']) ? options['maxEffort'] : DEFAULT_CEILING,
     modelEffort: parseModelEffort(options['modelEffort']),
     profile,
-    hasLocalAdvice: options['localAdvice'] === true,
+    routerConfigDir: typeof options['routerConfigDir'] === 'string' && /^(?:\/|~\/)[^\0\n]{1,1024}$/.test(options['routerConfigDir'].trim()) ? options['routerConfigDir'].trim() : '',
   }
 
   registerLedger(on)
@@ -1794,12 +1875,14 @@ export const register: Register = (on, options) => {
     if (!isSupported) return next(e)
     // The init line has done its job the moment real work arrives.
     await dismissStartup($)
-    let context: string | null = null
+    const added: string[] = []
     await quiet(async () => {
       const isPerson = e.origin.kind === 'composer' || e.origin.kind === 'bridge' || e.origin.kind === 'sdk'
       if (!isPerson) return
       const now = await $.clock.now()
       const sha = (await read($, gitAtom))?.sha ?? null
+      const before = await read($, taskAtom)
+      const isNewTask = !(before !== null && before.milestones.length > 0 && before.status !== 'done')
       const task = await update($, taskAtom, old => {
         // an unfinished planned task goes on; anything else is a new one
         const isContinuing = old !== null && old.milestones.length > 0 && old.status !== 'done'
@@ -1818,14 +1901,20 @@ export const register: Register = (on, options) => {
 
         return settle(requireReview(withGrounds, mandatoryGrounds(factsOf(withGrounds, 0, promptGrounds)))).task
       })
-      if (task !== null && task.milestones.length > 0) context = `Cobalt Cockpit, state of the task in progress: ${summaryOf(task)}`
+      if (task !== null && task.milestones.length > 0) added.push(`Cobalt Cockpit, state of the task in progress: ${summaryOf(task)}`)
+      // The session router, when one is selected, is asked once at the start of
+      // a task and never for a prompt inside one, a tool call or a helper.
+      if (isNewTask) {
+        const advice = await routeTask($, e.text, { prompt: e.text, files: [], milestones: 0, errorStreak: (await read($, orchestraAtom)).errorStreak, promptGrounds: task?.promptGrounds ?? [] }).catch(() => null)
+        if (advice !== null) added.push(advice)
+      }
     })
 
     // A prompt goes on either way: this hook adds what it observed to the
     // context, and a hook that fails would be skipped rather than drop one.
-    if (context === null) return next(e)
+    if (added.length === 0) return next(e)
 
-    return next({ ...e, context: [...(e.context ?? []), context] })
+    return next({ ...e, context: [...(e.context ?? []), ...added] })
   }).catch(async ($, e, next) => {
     // The three drops this hook makes — the strict preset's advisor line, a
     // session set to use Fable, and the subscription policy's — are made here
@@ -2439,6 +2528,17 @@ export const register: Register = (on, options) => {
 
         return { text: isHudHidden ? 'Cockpit: HUD hidden.' : 'Cockpit: HUD shown.' }
       }
+      case 'router': {
+        const held = await read($, routerAtom)
+        let target = value === '' ? null : routerModeOf(value)
+        if (value !== '' && target === null) return { text: `Cockpit: "${value}" is not a router. Use /cockpit router off | nobodywho | jev.\nROUTER / ${routerLine(held)}` }
+        // no word given: the engine's own dialog, where there is someone to ask
+        if (target === null) target = await pickRouter($, held.mode)
+        if (target === null) return { text: `ROUTER / ${routerLine(held)}\nSwitch with /cockpit router off | nobodywho | jev. The choice lasts for this session; a new session starts OFF.` }
+        if (target === held.mode) return { text: `ROUTER / ${routerLine(held)} (unchanged)` }
+
+        return { text: await selectRouter($, target) }
+      }
       case 'version':
       case 'source': {
         // What is really loaded, and where from: the manifest on disk, not a
@@ -2461,7 +2561,8 @@ export const register: Register = (on, options) => {
             `PLUGIN / ${$.plugin.name} ${version}`,
             `SOURCE / ${$.plugin.root}`,
             `SESSION MODEL / ${model === '' ? UNKNOWN : model}`,
-            ...(config.hasOrchestration ? [`PROFILE / ${config.profile}${isSonnetLed() ? ` · main ${AGENT_MODEL} · Opus on admission · budget ${config.maxSubagents} (Sonnet ${String(config.maxSonnet)} · Haiku ${String(config.maxHaiku)} · Opus 1) · NobodyWho advice ${config.hasLocalAdvice ? 'on' : 'off'}` : ` · main ${MAIN_MODEL}`}`] : []),
+            ...(config.hasOrchestration ? [`PROFILE / ${config.profile}${isSonnetLed() ? ` · main ${AGENT_MODEL} · Opus on admission · budget ${config.maxSubagents} (Sonnet ${String(config.maxSonnet)} · Haiku ${String(config.maxHaiku)} · Opus 1)` : ` · main ${MAIN_MODEL}`}`] : []),
+            `ROUTER / ${routerLine(await read($, routerAtom))}`,
             `REASONING / ${config.reasoningMode} · ceiling ${config.maxEffort.toUpperCase()}`,
             // the main loop's level is the host's: read, with what was seen of its origin
             `MAIN EFFORT / host-resolved, never rewritten${meter.effort ? ` · ${meter.effort}${meter.hostSource ? ` (${meter.hostSource})` : ''}` : ''}${advised !== undefined && meter.effort && advised !== meter.effort ? ` · AUTO would name ${advised}: /effort ${advised} to set it` : ''}`,
@@ -2749,6 +2850,7 @@ export const register: Register = (on, options) => {
     const paneNow = await $.clock.now()
     const newest = control.lastPrune !== null && (control.lastDecision === null || control.lastPrune.at >= control.lastDecision.at) ? control.lastPrune : control.lastDecision
     const paneLedger = await read($, ledgerAtom)
+    const paneRouter = await read($, routerAtom)
     const view: OrchestraView = {
       meter: input.meter,
       task: input.task,
@@ -2760,6 +2862,8 @@ export const register: Register = (on, options) => {
       limit: config.maxSubagents,
       now: paneNow,
       ...(isSonnetLed() ? { profile: 'SONNET_LED' as const, consults: paneLedger.consults ?? [], usage: usageByTier(paneLedger.requests) } : {}),
+      // the session router is named whenever one is selected, and in SONNET_LED also when it is OFF
+      ...(paneRouter.mode !== 'OFF' || isSonnetLed() ? { router: routerLine(paneRouter) } : {}),
     }
     const rows = [
       ...base,

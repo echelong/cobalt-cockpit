@@ -57,7 +57,7 @@ Unchanged, and covered by tests: a turn ending never completes a task; gates alo
 
 With neutral labels, the tier-1 specialist chose `option_a` in 94 of 96 calls, whatever the content. Swapping the order flipped its answer for 13 of 24 problems with Cockpit's keys and 23 of 24 with neutral keys. Its consistency across repeats comes from the fixed seeds, not from judgement. Neither local route distinguishes trivial from architectural work independently of option position. In the baseline live run it advised `sonnet_continues` on a *mandatory* consultation.
 
-**Change.**
+**Change (superseded before release).** The `localAdvice` option described in the next three points never shipped. It was replaced by the per-session router, which asks at the start of a task and never at admission; see [delivery-v0.5.0-router.md](delivery-v0.5.0-router.md). The measurements above stand.
 - `localAdvice` is now **off by default**. Admission, mandatory consultations and their limits are decided by the deterministic rules alone.
 - When someone turns it on, the router is asked only after the rules have admitted a **non-mandatory** consultation. It is asked twice, with the choices swapped. The advice is kept only if both receipts are distinct and name the same offered choice. Otherwise it is discarded, and both receipt ids are recorded with the reason (for example `order-sensitive: … discarded`).
 - No classification result can admit, refuse or bypass a consultation. This was already true, and it is now tested from both sides.

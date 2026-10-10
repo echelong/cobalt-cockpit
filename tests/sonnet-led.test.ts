@@ -1,10 +1,10 @@
-// SONNET_LED: Sonnet builds, Haiku scouts, Opus reviews on admission, NobodyWho
-// advises. The pure policy first (grounds, packet, bounds, the review hold),
+// SONNET_LED: Sonnet builds, Haiku scouts, Opus reviews on admission. The
+// session router has its own file (router.test.ts). The pure policy first (grounds, packet, bounds, the review hold),
 // then the same rules through the real host hooks: what reached the engine,
 // what was refused, and what the task model let finish.
 
 import { describe, expect, test } from 'claude-code/testing'
-import { adviceOf, adviceRequest, consultVerdict, groundsAvailable, locationPath, mandatoryGrounds, orderChecked, packetOf, problemKey, promptGroundsOf, readScopeOf, requireReview, statusOf, CONSULT_EFFORT, FAILURE_STREAK, MAX_PER_TASK } from '../hooks/consult'
+import { consultVerdict, groundsAvailable, locationPath, mandatoryGrounds, packetOf, problemKey, promptGroundsOf, readScopeOf, requireReview, statusOf, CONSULT_EFFORT, FAILURE_STREAK, MAX_PER_TASK } from '../hooks/consult'
 import type { ConsultFacts } from '../hooks/consult'
 import { desiredRequest, mainModel, policyMismatch, OPUS_MODEL } from '../hooks/model-policy'
 import { applyAction, newTask, percentOf, settle } from '../hooks/model'
@@ -23,7 +23,7 @@ const LEGACY = { options: { orchestration: true } }
 
 const facts = (over: Partial<ConsultFacts> = {}): ConsultFacts => ({ prompt: 'Fix the typo in the README', files: ['README.md'], milestones: 2, errorStreak: 0, ...over })
 const packet = (over: Partial<EvidencePacket> = {}): EvidencePacket => ({ objective: 'Choose the cache layer', architecture: 'Single process; JSON store', files: ['src/cache.ts'], alternatives: ['LRU in memory', 'SQLite'], failures: [], risk: 'Stale reads under concurrency', decision: 'Which cache design?', ...over })
-const consult = (id: string, p: EvidencePacket, ground: Consultation['ground'] = 'architecture', progressTask: number | null = 1): Consultation => ({ id, ground, key: problemKey(ground, p), packet: p, progressTask, isMandatory: false, requestedAt: 0, advice: null, adviceNote: 'router unavailable' })
+const consult = (id: string, p: EvidencePacket, ground: Consultation['ground'] = 'architecture', progressTask: number | null = 1): Consultation => ({ id, ground, key: problemKey(ground, p), packet: p, progressTask, isMandatory: false, requestedAt: 0 })
 const ledSwarm = (): Swarm => configureSwarm(emptySwarm(), SONNET_LED_SWARM)
 const opusTask = (s: Swarm, id: string): Swarm => submitTask(s, { id, tier: 'OPUS', role: 'ARCHITECT', objective: `decide ${id}`, owned: [`/r/${id}`], mode: 'read' }, 0).swarm
 
@@ -140,31 +140,6 @@ describe('consultation admission', () => {
     const legacy = admitTask(opusTask(emptySwarm(), 'L'), 'L', 1).swarm
     expect(() => bindAgent(legacy, 'L', 'a', 1)).toThrow()
   })
-  test('NobodyWho advice exists only with a real receipt', () => {
-    const real = JSON.stringify({ request_id: '5d476f453c8a4473b1a6375b6982037d', decision: { provider: 'nobodywho', choice: 'consult_opus', abstain: false, latency_ms: 2066 }, tier: 1 })
-    expect(adviceOf(real)).toEqual({ requestId: '5d476f453c8a4473b1a6375b6982037d', choice: 'consult_opus', abstain: false, tier: 1, latencyMs: 2066, provider: 'nobodywho' })
-    expect(adviceOf(JSON.stringify({ decision: { choice: 'consult_opus' } }))).toBeNull()
-    expect(adviceOf('not json')).toBeNull()
-    expect(adviceOf(JSON.stringify({ request_id: 'abcdef123456', decision: { abstain: true, choice: 'x' } }))?.choice).toBeNull()
-  })
-  test('the router is asked both ways round; only advice that survives the swap is kept', () => {
-    const p = packet()
-    const asked = JSON.parse(adviceRequest('architecture', p, facts()))
-    const swapped = JSON.parse(adviceRequest('architecture', p, facts(), true))
-    expect(Object.keys(asked.choices)).toEqual(['consult_opus', 'sonnet_continues'])
-    expect(Object.keys(swapped.choices)).toEqual(['sonnet_continues', 'consult_opus'])
-    expect({ ...swapped, choices: null }).toEqual({ ...asked, choices: null })
-    const a = (requestId: string, choice: string | null, abstain = false) => ({ requestId, choice, abstain, tier: null, latencyMs: 300, provider: 'nobodywho' })
-    // a position-following classifier: the first option both times
-    expect(orderChecked(a('aaaaaaaa1', 'consult_opus'), a('bbbbbbbb2', 'sonnet_continues'))).toEqual({ note: 'order-sensitive: consult_opus first, sonnet_continues with the choices swapped (receipts aaaaaaaa1, bbbbbbbb2); discarded' })
-    expect(orderChecked(a('aaaaaaaa1', 'sonnet_continues'), a('bbbbbbbb2', 'sonnet_continues'))).toEqual({ advice: { ...a('aaaaaaaa1', 'sonnet_continues'), checkRequestId: 'bbbbbbbb2' } })
-    expect(orderChecked(a('aaaaaaaa1', null, true), a('bbbbbbbb2', 'consult_opus'))).toEqual({ note: 'abstained (receipts aaaaaaaa1, bbbbbbbb2)' })
-    expect(orderChecked(a('aaaaaaaa1', 'option_a'), a('bbbbbbbb2', 'option_a'))).toEqual({ note: 'answered outside the offered choices (receipts aaaaaaaa1, bbbbbbbb2)' })
-    expect(orderChecked(null, a('bbbbbbbb2', 'consult_opus'))).toEqual({ note: 'one of the two order-checked answers had no receipt' })
-    expect(orderChecked(null, null)).toEqual({ note: 'no receipt in router output' })
-    // one receipt for both orders is a cached answer, not a second judgement
-    expect(orderChecked(a('aaaaaaaa1', 'consult_opus'), a('aaaaaaaa1', 'consult_opus'))).toEqual({ note: 'one receipt for both orders (receipts aaaaaaaa1, aaaaaaaa1); not order-checked' })
-  })
 })
 
 describe('the review a task cannot finish without', () => {
@@ -221,10 +196,10 @@ describe('presentation and accounting', () => {
   test('the ledger records why Opus was admitted, what it returned and whether Sonnet verified it', () => {
     let swarm = finishTask(bindAgent(admitTask(opusTask(ledSwarm(), 'opus-1-abc'), 'opus-1-abc', 1).swarm, 'opus-1-abc', 'a9', 1), 'opus-1-abc', 'completed', { conclusion: 'Use SQLite with WAL' }, 2)
     swarm = { ...swarm, tasks: swarm.tasks.map(t => ({ ...t, verification: 'pass' as const })) }
-    const c = { ...consult('opus-1-abc', packet(), 'release'), isMandatory: true, advice: { requestId: 'req123456789', choice: 'consult_opus', abstain: false, tier: 1, latencyMs: 10, provider: 'nobodywho' } }
+    const c = { ...consult('opus-1-abc', packet(), 'release'), isMandatory: true }
     const l: Ledger = { ...emptyLedger('s'), swarm, consults: [c] }
     const lines = ledgerLines(l, 3, 'SUBSCRIPTION', 'unavailable').join('\n')
-    for (const s of ['11 OPUS CONSULTATIONS', 'opus-1-abc release (mandatory) · status returned', 'decision Use SQLite with WAL', 'verified by main pass', 'receipt req123456789', 'host cost unavailable']) expect(lines).toContain(s)
+    for (const s of ['11 OPUS CONSULTATIONS', 'opus-1-abc release (mandatory) · status returned', 'decision Use SQLite with WAL', 'verified by main pass', 'host cost unavailable']) expect(lines).toContain(s)
     expect(ledgerLines(emptyLedger('s'), 3).join('\n')).not.toContain('OPUS CONSULTATIONS')
     const big: Ledger = { ...l, receipts: [], consults: Array.from({ length: 32 }, (_, i) => ({ ...c, id: `c${i}`, packet: packet({ architecture: 'z'.repeat(1200), objective: 'o'.repeat(1200), files: Array.from({ length: 12 }, () => 'f'.repeat(300)) }) })), replay: [], tools: [], requests: [] }
     const stored = storageLedger({ ...big, warnings: Array.from({ length: 32 }, () => 'w'.repeat(10_000)) })
@@ -247,19 +222,6 @@ const spawn = ($: Engine, description: string, subagentType = 'cobalt-cockpit:ar
 const finish = ($: Engine, agentId: string) => $.turn.complete({ agentId, turnId: `turn-${agentId}`, reason: 'answer', answer: 'DECISION: ship', durationMs: 20, isAborted: false } as never)
 const ledger = (held: ReturnType<typeof hostState>) => held.get('run-ledger')!.value as Ledger
 const task = (held: ReturnType<typeof hostState>) => held.get('task')!.value as Task
-const ADVICE = { options: { orchestration: true, profile: 'SONNET_LED', localAdvice: true } }
-const archPacket = { action: 'consult', ground: 'architecture', objective: 'Choose the cache layer', architecture: 'Single process; JSON store', locations: ['src/cache.ts:10-40', 'src/store.ts'], alternatives: ['LRU in memory', 'SQLite'], risk: 'Stale reads under concurrency', question: 'Which cache design?' }
-/** A local router that answers `choices` in turn, each with a receipt; or, `positional`, whatever is listed first. */
-const router = (w: ReturnType<typeof world>, choices: string[], positional = false) => {
-  const asked: { choices: Record<string, string> }[] = []
-  w.outputs['decision'] = argv => {
-    const body = JSON.parse(String(argv.at(-1)))
-    asked.push(body)
-    const choice = positional ? Object.keys(body.choices)[0] : choices[asked.length - 1]
-    return JSON.stringify({ request_id: `rcpt${asked.length}`.padEnd(16, 'f'), mode: 'local-first', follow: choice, decision: { provider: 'nobodywho', choice, abstain: false, latency_ms: 300 } })
-  }
-  return asked
-}
 const releasePacket = { action: 'consult', ground: 'release', objective: 'Release v0.5.0', architecture: 'Plugin hooks', locations: ['hooks/consult.ts'], risk: 'Broken admission in production', question: 'Approve the release?' }
 
 describe('SONNET_LED through the host', () => {
@@ -308,8 +270,8 @@ describe('SONNET_LED through the host', () => {
 
     const reply = String((await call($, releasePacket)).result)
     expect(reply).toContain('OPUS ADMITTED')
-    // local advice is off by default: the rules decide and no router is asked
-    expect(reply).toContain('NobodyWho: no advice (local advice off)')
+    // admission is by the rules alone: no router is asked at a consultation, in any mode
+    expect(reply).not.toContain('NobodyWho')
     expect(w.runs.some(argv => argv[0] === 'decision')).toBe(false)
     const id = ledger(held).consults![0]!.id
     expect(task(held).review?.state).toBe('admitted')
@@ -335,40 +297,6 @@ describe('SONNET_LED through the host', () => {
     await progress($, { action: 'plan', milestones: FIVE })
     await $.tool.call({ tool: 'Edit', file_path: '/work/example/hooks/guard.ts', old_string: 'a', new_string: 'b', tool_use_id: 'e1' } as never)
     expect(task(held).review?.grounds).toContain('security')
-  })
-  test('a router that answers without a receipt is not reported as a decision', ADVICE, async ($, on) => {
-    const w = world(on); const held = hostState(on, {}); w.players['decision'] = 'ok'; await start($)
-    await prompt($, 'Redesign the cache architecture across the modules')
-    expect(String((await call($, archPacket)).result)).toContain('no receipt in router output')
-    expect(ledger(held).consults![0]!.advice).toBeNull()
-  })
-  test('a position-following router is discarded with both receipts; the rules still admit', ADVICE, async ($, on) => {
-    const w = world(on); const held = hostState(on, {}); const asked = router(w, [], true); await start($)
-    await prompt($, 'Redesign the cache architecture across the modules')
-    const reply = String((await call($, archPacket)).result)
-    expect(reply).toContain('OPUS ADMITTED')
-    expect(reply).toContain('order-sensitive: consult_opus first, sonnet_continues with the choices swapped (receipts rcpt1fffffff, rcpt2fffffff); discarded')
-    expect(asked.map(a => Object.keys(a.choices)[0])).toEqual(['consult_opus', 'sonnet_continues'])
-    expect(ledger(held).consults![0]!.advice).toBeNull()
-    expect(w.runs.filter(argv => argv[0] === 'decision').every(argv => !argv.includes('--mode'))).toBe(true)
-  })
-  test('advice that survives the swap is shown as advisory, and cannot refuse an admitted consultation', ADVICE, async ($, on) => {
-    const w = world(on); const held = hostState(on, {}); router(w, ['sonnet_continues', 'sonnet_continues']); await start($)
-    await prompt($, 'Redesign the cache architecture across the modules')
-    const reply = String((await call($, archPacket)).result)
-    expect(reply).toContain('OPUS ADMITTED')
-    expect(reply).toContain('NobodyWho, order-checked: sonnet_continues (receipts rcpt1fffffff, rcpt2fffffff); advisory only, admission was decided by the rules.')
-    expect(ledger(held).consults![0]!.advice).toMatchObject({ choice: 'sonnet_continues', requestId: 'rcpt1fffffffffff', checkRequestId: 'rcpt2fffffffffff' })
-  })
-  test('advice can never admit what the rules refuse, and is not sought for a mandatory consultation', ADVICE, async ($, on) => {
-    const w = world(on); const held = hostState(on, {}); const asked = router(w, ['consult_opus', 'consult_opus']); await start($)
-    await prompt($, 'Fix the typo in the README')
-    expect(String((await call($, { ...archPacket, objective: 'typo' })).result)).toContain('NOT ADMITTED')
-    expect(asked).toHaveLength(0)
-    expect(ledger(held).consults ?? []).toHaveLength(0)
-    await prompt($, 'Please approve the release of v0.5.0')
-    expect(String((await call($, releasePacket)).result)).toContain('NobodyWho: no advice (mandatory: no advice sought)')
-    expect(asked).toHaveLength(0)
   })
   // The profile picks the main model; strict mode adds safety, not a model.
   // [options, the session's model, the model the main request reaches the engine on]

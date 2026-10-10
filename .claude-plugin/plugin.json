@@ -84,11 +84,11 @@
       "options": ["OPUS_LED", "SONNET_LED"],
       "default": "OPUS_LED"
     },
-    "localAdvice": {
-      "type": "boolean",
-      "title": "NobodyWho consultation advice",
-      "description": "SONNET_LED only, off by default: after the rules admit a non-mandatory Opus consultation, ask the local decision router (`decision ask`, NobodyWho) twice with the choices swapped. Advice is shown only when both receipts agree; it never decides admission. Measured on this release, the local classifier followed option position rather than content, so the rules decide.",
-      "default": false
+    "routerConfigDir": {
+      "type": "string",
+      "title": "Router configuration for JEV mode",
+      "description": "Optional. A decision-router configuration directory you created for Cockpit's JEV mode (for example ~/.config/cobalt-cockpit/router-jev, a copy of your router config with JEV enabled). It is passed as DECISION_ROUTER_CONFIG_DIR to the router's child process only while this session's router is JEV (/cockpit router jev). Empty: the router's own configuration and its JEV switch apply. Cockpit never creates or edits router configuration, and the router is OFF in every new session.",
+      "default": ""
     },
     "maxSubagents": {
       "type": "number",

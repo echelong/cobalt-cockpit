@@ -50,15 +50,15 @@ Compaction: `~/.claude*/settings.json` already holds `modelSettings["claude-sonn
 ### Host wiring (`hooks/register.tsx`)
 
 - `turn.step`: main tier SONNET in `SONNET_LED`; a subagent bound to an OPUS task is requested on Opus.
-- `swarm consult`: validates ground and packet, runs `consultVerdict`, asks NobodyWho (`decision ask --caller cockpit --json …`, 20 s timeout, twice with the choices swapped, never for a mandatory consultation) when `localAdvice` is on (off by default since the v0.5.0 hardening), records the consultation, submits a read-only OPUS task owning the packet's files, advances the task's review to `admitted`, and returns the architect brief.
+- `swarm consult`: validates ground and packet, runs `consultVerdict` (no router is asked), records the consultation, submits a read-only OPUS task owning the packet's files inside the project, advances the task's review to `admitted`, and returns the architect brief.
 - `swarm assign` refuses tier OPUS in `SONNET_LED`; `swarm verify` on a consultation adjudicates the task's review.
 - `agent.spawn`: an OPUS task spawns only with a recorded consultation and only as `cobalt-cockpit:architect`, on Opus. An unassigned call naming Opus or the architect, or the architect on a non-OPUS task, is refused (not silently downgraded).
 - `prompt.submit` and edits: mandatory grounds are computed from the **full** prompt text (the stored prompt is clipped) and from touched files.
 - System prompt: a `SONNET_LED` section replaces the commander text.
 
-### NobodyWho
+### Session router
 
-Advisory only, through the router's supported CLI. `adviceOf` accepts the output only if it carries a `request_id`; otherwise the consultation records `advice: null` and why (`router unavailable`, exit code, `no receipt in router output`, `local advice off`). Admission never depends on it. In a probe during development, NobodyWho advised `consult_opus` for a deliberately trivial case. That is why it advises and does not decide.
+The consult-time NobodyWho advice first built for this profile was removed before release. Routing advice is now a per-session choice (`/cockpit router`: off, NobodyWho or JEV), asked once at the start of a task and judged by the rules. Design and measurements are in [delivery-v0.5.0-router.md](delivery-v0.5.0-router.md).
 
 ### HUD and Ledger
 
@@ -67,7 +67,7 @@ Advisory only, through the router's supported CLI. `adviceOf` accepts the output
 ## 3. Migration
 
 1. Keep `orchestration` (or `cobaltStrict`) on.
-2. `claude plugin configure cobalt-cockpit@cobalt-cockpit`, and set `profile` to `SONNET_LED` (`localAdvice` is off by default; see [delivery-v0.5.0-hardening.md](delivery-v0.5.0-hardening.md) before turning it on).
+2. `claude plugin configure cobalt-cockpit@cobalt-cockpit`, and set `profile` to `SONNET_LED`.
 3. Pick the main model's effort as usual (`/effort medium` recommended). Set the compaction window natively if wanted: `/autocompact 400k` while on Sonnet.
 4. Restart Claude Code. `/cockpit` shows `PROFILE / SONNET_LED · main claude-sonnet-5-5 · Opus on admission · budget 4 …`.
 

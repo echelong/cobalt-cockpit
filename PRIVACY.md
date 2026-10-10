@@ -8,9 +8,9 @@ This policy describes what Cobalt Cockpit v0.4.0 observes, what it keeps, where 
 
 - Cobalt Cockpit is a Claude Code mod that runs on your machine, inside Claude Code, with your user privileges.
 - It has no server, no account, no analytics and no telemetry backend of its own. Nobody operating Cobalt Cockpit receives anything from your sessions, because nothing is sent to them.
-- It makes no network request of its own: no HTTP fetch, no model call, no MCP call.
+- It makes no network request of its own: no HTTP fetch, no model call, no MCP call. One thing it can start does: if you select the JEV router for a session (`/cockpit router jev`), the local decision router sends an excerpt of a new task's prompt to the TypeSafe JEV API. That is off in every new session and is described under [The session router](#the-session-router).
 - It keeps session state in Claude Code's memory and saves a bounded record of each session, the Run Ledger, to one local file that Claude Code manages.
-- Some of what it observes is added to the request Claude Code already sends to your model provider. That is the only route by which anything Cockpit observed leaves your machine, and it is listed below.
+- Some of what it observes is added to the request Claude Code already sends to your model provider. Apart from the JEV router you may select for a session, that is the only route by which anything Cockpit observed leaves your machine, and it is listed below.
 - There is no command that erases the saved ledgers. Removing them is a manual step, described under [Deleting your data](#deleting-your-data).
 
 ## What Cockpit observes
@@ -103,21 +103,36 @@ Cockpit never calls a model. It does add text to requests that Claude Code itsel
 - **System prompt.** A fixed section of instructions: working discipline, repository hygiene, safety, and, when you enable them, the orchestration, reasoning-effort and Fable rules. It is the same text for every user apart from the numbers taken from your configuration. It contains nothing observed from your session.
 - **Task status.** When a planned task is in progress, one line is added to a prompt you submit: percent, phase, each milestone's id, title and state, gate states, and a blocker's text if the task is blocked. Milestone titles and blocker text are words the model or you wrote.
 - **Tool results.** The `progress` and `swarm` tools are called by the model and answer it with task and assignment status. A guard's refusal is returned to the model as the result of the call it refused. With orchestration on, a note that the same failure is repeating is added to that failure's result; it names what failed and, if a NobodyWho decision arrived since the failures began, that decision's route label.
+- **Router advice.** With a session router selected, one line naming its recommendation is added to the prompt that starts a task, and only when Cockpit's rules accept it.
 - **Command output.** Text a Cockpit command prints, such as `/cockpit status`, `/cockpit auth` or `/ledger export json`, goes into the Claude Code transcript like any command's output. Cockpit does not decide what Claude Code later does with its transcript.
 
 Replay snapshots and stored ledgers are not added to requests by Cockpit, and apart from the route label above neither are NobodyWho receipts.
 
 ## Optional NobodyWho telemetry
 
-NobodyWho is a separate, optional local tool. Cockpit does not install it, start it or send it anything.
+NobodyWho is a separate, optional local tool. Cockpit does not install it, and starts it only when you select a session router (next section). The telemetry described here only reads its ledger.
 
 When `localControl` is on (the default), Cockpit looks for a decision-router ledger at `$XDG_STATE_HOME/decision-router/ledger.jsonl`, then `$HOME/.local/state/decision-router/ledger.jsonl`, or at the path in `ledgerPath`. If the file is missing or unreadable nothing happens and nothing is shown. If it exists, Cockpit reads it, and never writes it, about every 1.2 seconds, from the end of the file, taking only lines written after the session started.
 
 From each line it keeps the operation (a decision or a prune), the tier, the latency, the timestamp, the request id, a route label of at most twelve characters, whether the router abstained, and block counts. It discards every other field, including prompt, state and detail fields, and ignores receipts whose caller is not `claude`. The reduced receipts appear in the HUD and are saved in the Run Ledger with the rest.
 
+## The session router
+
+Cockpit has an optional router you choose per session with `/cockpit router`: `off`, `nobodywho` or `jev`. Every new session starts `off`, the choice is held in session state and is never saved, and with it off no router program is started.
+
+When a router is selected, Cockpit asks it about a **new task** that its own rules do not already settle. It is not asked for a prompt inside a task in progress, for a tool call or for a helper, and it is not asked when the rules already require an Opus consultation or read a route off the prompt.
+
+- **What is sent.** The first 400 characters of the prompt you submitted, on one line, with five fixed yes/no questions about it (ten requests: each question in both orders). Nothing else: no file content, no path Cockpit observed, no history, no credential. A prompt that contains something credential-shaped is not sent at all.
+- **NobodyWho** runs on your machine. Cockpit starts the local `decision` router with its local provider only; nothing leaves the machine.
+- **JEV is an external service.** In JEV mode the same requests go from the local `decision` router to the TypeSafe JEV API over HTTPS, under your own TypeSafe key. Cockpit never reads, holds or logs that key: the router reads it from its own key file. If you set `routerConfigDir`, that directory is passed to the router's child process as `DECISION_ROUTER_CONFIG_DIR`, in JEV mode only; Cockpit never creates or edits router configuration. What TypeSafe does with a request is governed by TypeSafe's terms, not by Cockpit.
+- **What is kept.** For each decision: the mode, the provider and model that answered, up to four request ids, how many requests were answered, the two latencies, the recommendation, what Cockpit's rules said and whether they accepted it. Not the prompt. The last sixteen are kept in the Run Ledger.
+- **What reaches your model.** One line, only when Cockpit's rules accept a recommendation other than "handle it directly". A recommendation for Opus that the rules refuse is shown to you as a notice and is not given to the model.
+
+A router recommends. It cannot start an agent, admit or skip an Opus consultation, change a model, a permission, an ownership rule or a verification gate.
+
 ## Local processes, files and environment
 
-Cockpit starts a small set of local programs (`git`, `realpath`, `tail`, one audio player for the optional cues, and in the `SONNET_LED` profile with `localAdvice` on, the local `decision` router when an Opus consultation is requested) and reads environment variables by name. The consultation's evidence packet summary is passed to that local router as its question; the router runs on this machine and Cockpit sends nothing over the network. None of this sends data anywhere. The full list, with the reason for each, is in [SECURITY.md](SECURITY.md) and the README's section on what Cockpit runs, reads and sends.
+Cockpit starts a small set of local programs (`git`, `realpath`, `tail`, one audio player for the optional cues, and, only while a session router is selected, the local `decision` router) and reads environment variables by name. Apart from the JEV router described above, none of this sends data anywhere. The full list, with the reason for each, is in [SECURITY.md](SECURITY.md) and the README's section on what Cockpit runs, reads and sends.
 
 ## Exports and sharing
 
@@ -125,7 +140,7 @@ Cockpit starts a small set of local programs (`git`, `realpath`, `tail`, one aud
 
 ## What Cockpit does not do
 
-- It does not send data to its authors or to any third party.
+- It does not send data to its authors. It sends nothing to any third party either, with one exception you control: the JEV router, when you select it for a session, sends a prompt excerpt to TypeSafe through your own decision router and key.
 - It does not collect analytics, usage statistics or crash reports.
 - It does not create accounts, set cookies or track you across machines.
 - It does not store, log, export or transmit credential values. The eight authentication variables are read only to test whether each is set.

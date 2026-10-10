@@ -8,9 +8,9 @@
 // This module is pure. It reads facts the host already reported (the person's
 // prompt, the files the task touched, the failure streak, the swarm) and
 // answers whether a consultation may start, whether the task needs one before
-// it can finish, and what the consultation is told. It never spawns, never
-// calls a model and never decides for NobodyWho: the local advice is parsed
-// from a real router receipt or it is absent.
+// it can finish, and what the consultation is told. It never spawns and never
+// calls a model or a router: the session router (router.ts) is asked at the
+// start of a task, never at admission, and never decides it.
 //
 //   - GROUNDS. architecture, security, repeated-failure, asked, release. A
 //     ground holds on evidence, not on the main loop's say-so.
@@ -20,8 +20,8 @@
 //   - BOUNDS. One live Opus at a time; an unchanged problem is consulted once;
 //     a failed consultation is retried at most once; three per task.
 
-import type { ConsultGround, Consultation, EvidencePacket, LocalAdvice, Profile, ReviewRequirement, Swarm, SwarmTask, Task } from '../types'
-export type { ConsultGround, Consultation, EvidencePacket, LocalAdvice, ReviewRequirement } from '../types'
+import type { ConsultGround, Consultation, EvidencePacket, Profile, ReviewRequirement, Swarm, SwarmTask, Task } from '../types'
+export type { ConsultGround, Consultation, EvidencePacket, ReviewRequirement } from '../types'
 
 export const GROUNDS: readonly ConsultGround[] = ['architecture', 'security', 'repeated-failure', 'asked', 'release']
 export const MANDATORY: readonly ConsultGround[] = ['asked', 'release', 'security']
@@ -259,63 +259,11 @@ export const briefOf = (c: Consultation): string => {
   ].join('\n')
 }
 
-const ADVICE_CHOICES = { consult_opus: 'Consult Opus once with the evidence packet', sonnet_continues: 'Sonnet continues and verifies alone' } as const
-
-/**
- * The local router question for a consultation. The packet stays local: the
- * router is on this machine. `swapped` lists the choices in the other order:
- * the local classifier measurably favours a position (see
- * docs/delivery-v0.5.0-hardening.md), so a question is asked both ways.
- */
-export const adviceRequest = (ground: ConsultGround, p: EvidencePacket, facts: ConsultFacts, swapped = false): string => JSON.stringify({
-  state: clip(`ground=${ground}; files=${facts.files.length}; milestones=${facts.milestones}; failure_streak=${facts.errorStreak}; objective=${p.objective}; risk=${p.risk}`, 600),
-  question: 'Does this problem genuinely need an Opus architect or reviewer, or can the Sonnet main session complete it alone?',
-  choices: swapped ? { sonnet_continues: ADVICE_CHOICES.sonnet_continues, consult_opus: ADVICE_CHOICES.consult_opus } : ADVICE_CHOICES,
-  allow_abstain: true,
-})
-
-/**
- * Advice that survives having its choices swapped, or why it does not. Both
- * answers need a receipt and must name the same offered choice; an abstention,
- * a choice not offered or a change of mind under reordering is position, not
- * judgement, and is discarded with its receipts named.
- */
-export const orderChecked = (first: LocalAdvice | null, swapped: LocalAdvice | null): { advice: LocalAdvice } | { note: string } => {
-  if (first === null || swapped === null) return { note: first === null && swapped === null ? 'no receipt in router output' : 'one of the two order-checked answers had no receipt' }
-  const receipts = `receipts ${first.requestId.slice(0, 12)}, ${swapped.requestId.slice(0, 12)}`
-  if (first.requestId === swapped.requestId) return { note: `one receipt for both orders (${receipts}); not order-checked` }
-  if (first.abstain || swapped.abstain) return { note: `abstained (${receipts})` }
-  const offered = (c: string | null) => c !== null && Object.hasOwn(ADVICE_CHOICES, c)
-  if (!offered(first.choice) || !offered(swapped.choice)) return { note: `answered outside the offered choices (${receipts})` }
-  if (first.choice !== swapped.choice) return { note: `order-sensitive: ${first.choice} first, ${swapped.choice} with the choices swapped (${receipts}); discarded` }
-
-  return { advice: { ...first, checkRequestId: swapped.requestId } }
-}
-
-/** NobodyWho's advice from `decision ask` output, only when it carries a real receipt id. */
-export const adviceOf = (stdout: string): LocalAdvice | null => {
-  let row: Record<string, unknown>
-  try { row = JSON.parse(stdout.trim().split('\n').filter(Boolean).at(-1) ?? '') as Record<string, unknown> } catch { return null }
-  if (row === null || typeof row !== 'object' || typeof row['request_id'] !== 'string' || !/^[\w-]{8,64}$/.test(row['request_id'])) return null
-  const d = (row['decision'] && typeof row['decision'] === 'object' ? row['decision'] : {}) as Record<string, unknown>
-  const choice = typeof d['choice'] === 'string' && /^[a-z_]{1,32}$/.test(d['choice']) ? d['choice'] : null
-
-  return {
-    requestId: row['request_id'],
-    choice: d['abstain'] === true ? null : choice,
-    abstain: d['abstain'] === true,
-    tier: typeof row['tier'] === 'number' ? row['tier'] : null,
-    latencyMs: typeof d['latency_ms'] === 'number' ? Math.round(d['latency_ms']) : null,
-    provider: typeof d['provider'] === 'string' && /^[\w.-]{1,32}$/.test(d['provider']) ? d['provider'] : 'unknown',
-  }
-}
-
 /** One line for a consultation, as the HUD and the ledger show it. */
 export const consultLine = (c: Consultation, swarm: Swarm): string => {
   const t = taskOf(swarm, c.id)
   const status = statusOf(t)
   const verified = t?.verification ?? 'unknown'
-  const advice = c.advice === null ? 'nwho n/a' : `nwho ${c.advice.abstain ? 'abstain' : c.advice.choice ?? 'none'}`
 
-  return `${c.id} ${c.ground.toUpperCase()}${c.isMandatory ? '*' : ''} · ${status}${status === 'returned' ? ` · verified ${verified}` : ''} · ${advice}`
+  return `${c.id} ${c.ground.toUpperCase()}${c.isMandatory ? '*' : ''} · ${status}${status === 'returned' ? ` · verified ${verified}` : ''}`
 }

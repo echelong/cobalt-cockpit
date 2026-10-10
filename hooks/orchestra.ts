@@ -229,6 +229,8 @@ export type OrchestraView = {
   consults?: readonly Consultation[]
   /** Host-reported request tokens by tier; never estimated. */
   usage?: TierUsage
+  /** The session router's line; absent when it is OFF outside SONNET_LED, so an older view is unchanged. */
+  router?: string
 }
 
 /** SONNET_LED's role for each model tier the engine really ran. */
@@ -292,6 +294,7 @@ export const orchestraRows = (view: OrchestraView, columns: number, colors: { ac
   // host's own, shown with where it was seen to come from.
   if (view.meter.reasoningMode) rows.push(pair('REASONING', `${view.meter.reasoningMode}${view.meter.effort ? ` · main ${view.meter.effort.toUpperCase()}` : ''}${view.meter.hostSource ? ` · ${view.meter.hostSource}` : ''}`, colors.steel))
   if (view.nwho !== null) rows.push(pair(led ? 'LOCAL CONTROL / NWHO' : 'NWHO / LOCAL', view.nwho, colors.steel))
+  if (view.router !== undefined) rows.push(pair('ROUTER', view.router, colors.steel))
   if (view.agents.length > 0) {
     rows.push(pair(groupLabel(view.agents), `${running(view.agents)}/${view.limit} running`, colors.accent))
     const groups = new Map<string, AgentStrip[]>()
@@ -370,6 +373,6 @@ Sonnet-led orchestration (Cobalt Cockpit, SONNET_LED):
 - Before each delegated spawn, use swarm action assign (task_id, tier SONNET or HAIKU, role, objective, scope, dependencies, owned_resources, mode, spawn_reason) and put the exact [task:ID] in the Agent description. Overlapping writers are serialized; read-only work may overlap. Children never spawn agents.
 - Opus 5.5 is an on-demand architect and final high-risk reviewer, never a background model. Request it with swarm action consult: a ground (architecture, security, repeated-failure, asked, release), and a concise evidence packet (objective, architecture, locations, alternatives, failures, risk, question). Cockpit admits it only where the ground holds, one at a time, once per unchanged problem, with bounded retries. Then spawn cobalt-cockpit:architect with the returned [task:ID] and brief. Opus returns a structured plan or review; you implement and verify it.
 - Some tasks cannot finish without Opus: when the user asks for Opus, asks for a release approval, or the task changes security-sensitive files, progress holds below 100% until a consultation has returned and you have verified its advice with swarm action verify (pass or fail, with evidence). Review findings are advice until verified.
-- NobodyWho is optional local advice, off by default. When on, it is asked only after the rules admit a non-mandatory consultation, both ways round, and shown only when both receipts agree; it never decides admission. Never claim a NobodyWho decision without a receipt.
+- A session router (OFF unless the user selects one with /cockpit router) may add one advisory line to a new task: handle it directly, scout with Haiku, delegate to Sonnet, consider a higher effort, or consider an Opus consultation. It is a recommendation. It admits, starts and approves nothing; assignment, admission, mandatory consultations and gates are unchanged. Never claim a router decision without a receipt.
 - Use result, escalate, cancel, resolve and verify as before. A reported result is evidence, not proof. Before calling the work done, inspect the integrated changes and run the real verification gates yourself. Unknown model activity, effort, cost and token usage stay unknown.
 - ${FABLE_RULE}`

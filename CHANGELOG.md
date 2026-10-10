@@ -1,24 +1,32 @@
 # Changelog
 
-## 0.5.0 — Sonnet-led profile
+## 0.5.0 — Sonnet-led profile and session router
+
+The session router:
+
+- New `/cockpit router`: each session chooses `off` (the default in every new session), `nobodywho` (the local decision router, local provider only) or `jev` (the same router's TypeSafe JEV provider). The choice is session state and is never saved. One router is active at a time, and a switch discards what the previous one said.
+- A router recommends one of five routes for a new task: handle it directly, scout with Haiku, delegate to Sonnet, consider a higher effort, or consider an Opus consultation. It starts, admits and approves nothing. The rules go first: when they settle the route no router is asked, and a recommendation for Opus is refused unless a consultation ground already holds, in which case you are shown a notice instead.
+- Position-independent questions. The local classifier's first-option bias was traced to the router's seeded shuffle, which never reorders a two-option list, combined with early stopping. Cockpit now asks five fixed yes/no features, each in both orders, and discards a reading when fewer than four agree or more than three are affirmed.
+- JEV is external: the first 400 characters of a new task's prompt go to the TypeSafe API through your own decision router and key, which Cockpit never reads. A prompt with credential-shaped text is withheld. New option `routerConfigDir` (empty by default) names a router configuration you created for this mode; it reaches the router's child process in JEV mode only.
+- Each decision is a bounded ledger record: provider, model, receipts, both latencies, the recommendation, and whether the rules accepted it. Router figures are never counted as model usage.
+- Removed before release: the `localAdvice` option and the router call at Opus admission. Admission is by the rules alone.
+- Measurements, limits and the live acceptance are in [docs/delivery-v0.5.0-router.md](docs/delivery-v0.5.0-router.md). Suite: 1049 → 1079.
 
 Release hardening:
 
 - Fixed: the Opus architect could not read the files it was consulted about. A location written `path:line` became its owned resource verbatim. Line references are now dropped from the read scope, which is confined to project files. A consultation that names no file reads the project, not everything as before. A Glob or Grep pattern that is absolute, home-relative or climbs out is refused, and so is a `~` path.
 - Fixed: admitted Opus consultations ran at Medium. They now request High, under the operator ceiling. The engine's applied level is recorded, and any difference is reported as a fallback. The main loop's effort is untouched.
 - Progress: when the main loop edits a second file in a task with no plan, it gets one reminder, from that observed edit. `action: "gate"` takes several gates at once (`gates`), all or none. Listing the progress tool in the prompt was measured (+768 tokens a request, no more reporting) and not adopted.
-- NobodyWho: `localAdvice` is now off by default. Measured on 288 local calls, the classifier followed option position, not content. When on, it is asked only after the rules admit a non-mandatory consultation, both ways round, and kept only when both receipts agree. It never decides admission.
-- Suite: 1023 → 1049. Root causes, measurements, the security review and the isolated live acceptance are in [docs/delivery-v0.5.0-hardening.md](docs/delivery-v0.5.0-hardening.md).
+- Root causes, measurements, the security review and the isolated live acceptance are in [docs/delivery-v0.5.0-hardening.md](docs/delivery-v0.5.0-hardening.md).
 
 The Sonnet-led profile:
 
-- New `profile` option. `OPUS_LED` (the default) is 0.4.0's behaviour, unchanged. `SONNET_LED` means: Sonnet builds, Haiku scouts, Opus reviews, NobodyWho advises. The main loop is requested on Sonnet 5.5 at the user's own effort, and Opus 5.5 runs only as an admitted, read-only `cobalt-cockpit:architect` consultation.
+- New `profile` option. `OPUS_LED` (the default) is 0.4.0's behaviour, unchanged. `SONNET_LED` means: Sonnet builds, Haiku scouts, Opus reviews. The main loop is requested on Sonnet 5.5 at the user's own effort, and Opus 5.5 runs only as an admitted, read-only `cobalt-cockpit:architect` consultation.
 - Opus admission (`swarm action consult`): a ground that must hold on evidence (architecture, security, repeated failure, explicit request, release approval) and a bounded evidence packet. One Opus at a time; an unchanged problem is consulted once; one retry; three per task. Routes around it (an unassigned Opus or architect spawn, an OPUS assignment) are refused.
 - Mandatory consultations: an explicit request for Opus, a release approval, or a change to security-sensitive files holds the task below 100% until the consultation returns and the main session verifies its advice.
-- NobodyWho advice through the local `decision ask` router (new `localAdvice` option). It is recorded only with a real receipt and never decides admission.
 - HUD and Ledger: role labels (MAIN, SCOUT, ENGINEER, ARCHITECT, LOCAL CONTROL), consultation records (ground, decision, verification, receipt), host-reported usage per tier, and the host's cost total. Nothing is estimated.
 - `SONNET_LED` AUTO budgets: 4 helpers in all (2 Sonnet, 2 Haiku, 1 Opus).
-- Suite: 995 → 1023. Design, migration and rollback are in [docs/implementation-v0.5-sonnet-led.md](docs/implementation-v0.5-sonnet-led.md).
+- Suite: 995 → 1023 → 1049 with the hardening. Design, migration and rollback are in [docs/implementation-v0.5-sonnet-led.md](docs/implementation-v0.5-sonnet-led.md).
 
 ## 0.4.0 — Read-only helpers deliver their reports
 

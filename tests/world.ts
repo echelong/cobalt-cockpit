@@ -16,6 +16,8 @@ export type World = {
   clock: MockClock
   /** Every `$.process.run`, as its argv. */
   runs: string[][]
+  /** The environment each process was started with over the host's own, in the order of `runs`; undefined when none was given. */
+  runEnvs: (Readonly<Record<string, string>> | undefined)[]
   /** The tool calls that reached the engine, in order: what actually ran. */
   ran: Record<string, unknown>[]
   /** The questions put to the person. */
@@ -76,6 +78,8 @@ export type World = {
   /** Every value the plugin handed to `$.store.set`, in order: what it persisted
    * beyond the session, so a test can read back a stored ledger. */
   storeWrites: { key: string; value: unknown }[]
+  /** Runs inside a process call, before it answers: a host event racing a process (a command typed while a router request is in flight). */
+  duringRun: ((argv: readonly string[]) => void | Promise<void>) | null
   /** Runs inside the native tool call, before it answers: a host event racing a
    * tool (a turn completing while its handback is still running). */
   duringToolCall: ((call: Record<string, unknown>) => void | Promise<void>) | null
@@ -94,6 +98,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
   const w: World = {
     clock: mock.clock(on, { now: 1_000_000 }),
     runs: [],
+    runEnvs: [],
     ran: [],
     asked: [],
     answer: 'Cancel',
@@ -125,6 +130,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
     outbound: [],
     storeWrites: [],
     duringToolCall: null,
+    duringRun: null,
     ...overrides,
   }
   // A store write is the plugin's durable persistence. `mock.store` registers
@@ -243,6 +249,8 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
 
   on('process.run', async ($, e) => {
     w.runs.push([...e.argv])
+    w.runEnvs.push(e.init?.env)
+    if (w.duringRun !== null) await w.duringRun(e.argv)
     const program = e.argv[0] ?? ''
     if (program === 'realpath') return ran(0, String(e.argv.at(-1)) + '\n')
     if (program === 'git') {
