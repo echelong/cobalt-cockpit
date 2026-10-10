@@ -16,7 +16,7 @@ import type {
   TouchedFile,
   WorkPhase,
 } from '../types'
-import { align, alignmentNote, decide, discover, discoverySummary, invalidateAlignment, isAlignmentSatisfied, withDiscovery } from './discovery'
+import { align, alignmentNote, decide, discover, discoverySummary, foldAliases, invalidateAlignment, isAlignmentSatisfied, withDiscovery } from './discovery'
 
 export const GATES: readonly GateName[] = ['CODE', 'TEST', 'TYPE', 'BUILD', 'SECURITY', 'GIT']
 export const WORK_PHASES: readonly WorkPhase[] = [
@@ -560,7 +560,8 @@ const REPORTABLE: readonly GateState[] = ['pass', 'fail', 'na', 'pending']
  * was already planned, unless it is a re-plan, begins the next task: its
  * milestones, gates, files and cue flags start over.
  */
-export const applyAction = (task: Task, input: ProgressInput, now: number, sha: string | null): Outcome => {
+export const applyAction = (task: Task, given: ProgressInput, now: number, sha: string | null): Outcome => {
+  const input = foldAliases(given as Record<string, unknown>) as ProgressInput
   const note = optionalText(input.note)
   switch (input.action) {
     case 'plan': {

@@ -200,7 +200,7 @@ describe('original-goal verification', () => {
   test('ALIGNED is refused while evidence, work, gates or unknowns are missing', () => {
     const open = drive(standard(), [{ action: 'discover', unknowns: [{ text: 'Refund policy?' }] }])
     const cases: [Task, Record<string, unknown>, string][] = [
-      [finished(standard()), { action: 'align', alignment: { state: 'ALIGNED' } }, 'criterion c1 has no evidence'],
+      [finished(standard()), { action: 'align', alignment: { state: 'ALIGNED' } }, 'criterion c1 (A booking can be cancelled) has no evidence under id "c1"'],
       [finished(standard()), { action: 'align', alignment: { state: 'ALIGNED', demonstrated: [{ id: 'c1', evidence: 'ok' }], missing: ['admin override'] } }, 'reported missing'],
       [standard(), aligned, 'milestone(s) m1, m2, m3, m4 not complete'],
       [drive(standard(), [{ action: 'complete', milestone: 'm1' }, { action: 'complete', milestone: 'm2' }, { action: 'complete', milestone: 'm3' }, { action: 'complete', milestone: 'm4' }]), aligned, 'gate(s) CODE, TEST, TYPE, BUILD, SECURITY, GIT not satisfied'],
@@ -214,6 +214,12 @@ describe('original-goal verification', () => {
     }
     expect(applyAction(standard(), { action: 'align', alignment: { state: 'GREAT' } }, 5, null).error).toContain('must be')
     expect(applyAction(standard(), { action: 'align' }, 5, null).error).toBeDefined()
+  })
+  test('DEEP work cannot be ALIGNED on one blanket line: its criteria must have been declared', () => {
+    const deep = drive(stage('Migrate the payments schema to the new ledger'), [PLAN, ...[1, 2, 3, 4].map(n => ({ action: 'complete', milestone: `m${n}` })), ...pass])
+    expect(deep.discovery!.level).toBe('DEEP')
+    expect(applyAction(deep, { action: 'align', state: 'ALIGNED', evidence: 'npm test passes' }, 3, null).error).toContain('needs declared acceptance criteria')
+    expect(applyAction(drive(deep, [{ action: 'discover', criteria: ['migrates'] }]), { action: 'align', alignment: { state: 'ALIGNED', demonstrated: [{ id: 'c1', evidence: 'dry run' }] } }, 3, null).task.alignment!.state).toBe('ALIGNED')
   })
   test('PARTIAL, BLOCKED and UNKNOWN are recorded, and none of them completes the task', () => {
     for (const state of ['PARTIAL', 'BLOCKED', 'UNKNOWN']) {
@@ -315,6 +321,28 @@ describe('bypasses found in review', () => {
   test('the evidence id is a short plain token, never free text', () => {
     const out = align(finished(standard()), { alignment: { state: 'PARTIAL', demonstrated: [{ id: secret, evidence: 'x' }] } }, 5, [])
     expect(JSON.stringify(out.task)).not.toContain(secret)
+  })
+})
+
+describe('field names a model reaches for', () => {
+  test('are folded into the documented ones, and every rule still applies', () => {
+    let task = drive(stage('Add booking cancellation to the API and the UI'), [{ action: 'discover', objective: 'Cancel bookings', acceptance: ['A booking can be cancelled'] }])
+    expect(task.discovery).toMatchObject({ objective: 'Cancel bookings', criteria: [{ id: 'c1' }] })
+    expect(applyAction(newTask(1, 'x', 0, null), { action: 'discover', criteria: ['one'] }, 1, null).note).toContain('c1 one')
+    task = drive(task, [PLAN, { action: 'decide', problem: 'p', chosen: 'c', alternatives: [{ option: 'o', rejected_because: 'r' }] }])
+    expect(task.decisions![0]).toMatchObject({ problem: 'p', chosen: 'c', alternatives: [{ option: 'o', rejectedBecause: 'r' }] })
+    // names are mapped, nothing is invented: a bare list of rejected options has no reasons
+    expect(applyAction(task, { action: 'decide', problem: 'p', chosen: 'c', alternatives: ['sqlite'] }, 2, null).error).toBeDefined()
+    // a blanket evidence string cannot stand in for a declared criterion's own id
+    const done = drive(task, [...[1, 2, 3, 4].map(n => ({ action: 'complete', milestone: `m${n}` })), { action: 'gates', gates: pass.map(g => ({ gate: g.gate, state: 'pass', evidence: 'ok' })) }])
+    expect(applyAction(done, { action: 'align', state: 'ALIGNED', evidence: 'npm test passes' }, 3, null).error).toContain('criterion c1')
+    expect(applyAction(done, { action: 'align', state: 'ALIGNED', evidence: 'npm test passes', alignment: undefined }, 3, null).task.alignment).toBeUndefined()
+    const ok = applyAction(done, { action: 'align', alignment: { state: 'ALIGNED', demonstrated: [{ id: 'c1', evidence: 'cancel test' }] } }, 3, null)
+    expect(ok.task.alignment!.state).toBe('ALIGNED')
+    // with no declared criteria one evidence string is enough for the shorthand, as for the long form
+    const bare = drive(stage('Add booking cancellation to the API and the UI'), [PLAN, ...[1, 2, 3, 4].map(n => ({ action: 'complete', milestone: `m${n}` })), ...pass])
+    expect(applyAction(bare, { action: 'align', state: 'PARTIAL', evidence: 'half done', missing: ['admin'] }, 3, null).task.alignment).toMatchObject({ state: 'PARTIAL', missing: ['admin'] })
+    expect(applyAction(bare, { action: 'align', state: 'ALIGNED', evidence: 'npm test passes' }, 3, null).task.alignment!.state).toBe('ALIGNED')
   })
 })
 

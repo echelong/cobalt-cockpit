@@ -134,6 +134,32 @@ export const markGuided = (task: Task): Task =>
 
 // --- the `discover` action -------------------------------------------------
 
+/**
+ * Folds the field names a model plausibly reaches for into the documented ones: `objective` for `goal`,
+ * `acceptance` for `criteria`, top-level `state`/`evidence`/`missing` for `alignment`, and top-level
+ * `problem`/`chosen`/`alternatives` for `decision`. Only names are mapped; no value is made up, so every
+ * rule about evidence and reasons applies as before.
+ */
+export const foldAliases = <T extends Record<string, unknown>>(input: T): T => {
+  const out: Record<string, unknown> = { ...input }
+  if (out['action'] === 'gates') out['action'] = 'gate'
+  if (out['goal'] === undefined && typeof out['objective'] === 'string') out['goal'] = out['objective']
+  if (out['criteria'] === undefined && Array.isArray(out['acceptance'])) out['criteria'] = out['acceptance']
+  if (out['action'] === 'align' && (out['alignment'] === undefined || typeof out['alignment'] !== 'object') && typeof out['state'] === 'string') {
+    const evidence = typeof out['evidence'] === 'string' ? out['evidence'] : undefined
+    out['alignment'] = { state: out['state'], ...(evidence === undefined ? {} : { demonstrated: [{ id: 'e1', evidence }] }), missing: out['missing'], assumptions: out['assumptions'], note: out['note'] }
+  }
+  if (out['action'] === 'align' && out['alignment'] !== null && typeof out['alignment'] === 'object') {
+    const a = out['alignment'] as Record<string, unknown>
+    if (a['demonstrated'] === undefined && typeof a['evidence'] === 'string') out['alignment'] = { ...a, demonstrated: [{ id: 'e1', evidence: a['evidence'] }] }
+  }
+  if (out['action'] === 'decide' && (out['decision'] === undefined || typeof out['decision'] !== 'object') && (out['problem'] !== undefined || out['chosen'] !== undefined)) {
+    out['decision'] = { problem: out['problem'], chosen: out['chosen'], alternatives: out['alternatives'], tradeoffs: out['tradeoffs'], evidence: out['evidence'], status: out['status'], id: out['id'] }
+  }
+
+  return out as T
+}
+
 export type DiscoverInput = { goal?: unknown; level?: unknown; criteria?: unknown; unknowns?: unknown; risks?: unknown }
 
 const unknownRow = (raw: unknown): { id?: string; text?: string; state?: UnknownItem['state']; note?: string | null } => {
@@ -172,8 +198,10 @@ export const discover = (task: Task, input: DiscoverInput, now: number): Change 
   // A criterion added after alignment was claimed is one it did not check.
   const reopened = unknowns.filter(u => u.state === 'open').length > base.unknowns.filter(u => u.state === 'open').length
   const settled = criteria.length > base.criteria.length || reopened ? invalidateAlignment(next, 'criteria or unknowns changed') : next
+  // The ids are what `align` answers to, so they are told back here.
+  const note = criteria.length === 0 ? undefined : `Criteria: ${criteria.map(c => `${c.id} ${c.text.slice(0, 50)}`).join('; ')}. Report each by id in align.demonstrated.`
 
-  return { task: settled }
+  return { task: settled, ...(note === undefined ? {} : { note }) }
 }
 
 // --- decision records ------------------------------------------------------
@@ -267,8 +295,9 @@ export const align = (task: Task, input: AlignInput, now: number, open: readonly
     const problems: string[] = []
     if (task.milestones.length === 0) problems.push('no plan exists yet, so nothing was built to check')
     const criteria = task.discovery?.criteria ?? []
-    if (criteria.length === 0 && demonstrated.length === 0) problems.push('no demonstrated acceptance evidence')
-    for (const c of criteria) if (!demonstrated.some(d => d.id === c.id)) problems.push(`criterion ${c.id} has no evidence`)
+    if (criteria.length === 0 && task.discovery?.level === 'DEEP') problems.push('high-risk (DEEP) work needs declared acceptance criteria: record them with action "discover" (criteria), then report each by id')
+    if (criteria.length === 0 && demonstrated.length === 0) problems.push('no demonstrated acceptance evidence; send alignment {state, demonstrated: [{id, evidence}]}')
+    for (const c of criteria) if (!demonstrated.some(d => d.id === c.id)) problems.push(`criterion ${c.id} (${c.text.slice(0, 40)}) has no evidence under id "${c.id}"`)
     if (missing.length > 0) problems.push(`${missing.length} requirement(s) reported missing`)
     const unknowns = (task.discovery?.unknowns ?? []).filter(u => u.state === 'open')
     if (unknowns.length > 0) problems.push(`${unknowns.length} unknown(s) still open`)
