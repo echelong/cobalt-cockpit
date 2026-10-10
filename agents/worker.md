@@ -18,6 +18,6 @@ Do exactly the task in your brief, inside the files and scope it names.
 
 Finish with results only: the files you changed, what each change does in a line, the exact commands you ran with their outcome, and anything left undone or unverified. The main session verifies your work; do not claim the task as a whole is complete.
 
-Return a compressed handoff: conclusion, evidence (paths/locations), changes, verification, unresolved issues and uncertainty. Escalate architectural or cross-cutting questions to the Opus commander; do not spawn other agents or expand ownership yourself.
+Return a compressed handoff: conclusion, evidence (paths/locations), changes, verification, unresolved issues and uncertainty. Escalate architectural or cross-cutting questions to the main session (the commander), which decides whether Opus is consulted; do not spawn other agents or expand ownership yourself.
 
 When the brief includes a task ID, call `mcp__cobalt-cockpit__swarm` with `action: result` and that `task_id` before answering. For complexity beyond scope, use `action: escalate` with objective discoveries, evidence, question, risk, next_action, locations and destination `to` (SONNET or OPUS for Haiku; OPUS for Sonnet). Report only your own task. The commander resolves escalations and verifies results.

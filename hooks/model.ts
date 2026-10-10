@@ -141,6 +141,12 @@ export const unsatisfiedGates = (task: Task): GateName[] =>
     return gate.isRequired && gate.state !== 'pass' && gate.state !== 'na'
   })
 
+/** True when no Opus consultation the task requires is still outstanding (SONNET_LED). */
+export const isReviewSatisfied = (task: Task): boolean => task.review === undefined || task.review.state === 'adjudicated'
+
+const reviewNote = (task: Task): string =>
+  task.review === undefined ? '' : `Opus consultation (${task.review.grounds.join(', ')}) ${task.review.state}`
+
 const failingGates = (task: Task): GateName[] =>
   GATES.filter(name => task.gates[name].isRequired && task.gates[name].state === 'fail')
 
@@ -151,7 +157,7 @@ export const percentOf = (task: Task): number => {
   const done = task.milestones.filter(one => one.state === 'done').length
   const percent = Math.floor((100 * done) / total)
 
-  return percent === 100 && !areGatesSatisfied(task) ? UNVERIFIED_CAP : percent
+  return percent === 100 && (!areGatesSatisfied(task) || !isReviewSatisfied(task)) ? UNVERIFIED_CAP : percent
 }
 
 const statusOf = (task: Task, percent: number): TaskStatus => {
@@ -160,7 +166,7 @@ const statusOf = (task: Task, percent: number): TaskStatus => {
   if (percent === 100) return 'done'
   const open = task.milestones.filter(one => one.state !== 'done')
   const isOnlyVerifyLeft = open.every(one => one.phase === 'VERIFY')
-  if (isOnlyVerifyLeft && !areGatesSatisfied(task) && failingGates(task).length === 0) {
+  if (isOnlyVerifyLeft && (!areGatesSatisfied(task) || !isReviewSatisfied(task)) && failingGates(task).length === 0) {
     return 'unverified'
   }
 
@@ -329,6 +335,14 @@ export const completeMilestone = (task: Task, ref: unknown, note: string | null,
       )} not satisfied. Run the checks and report each with action "gate" (pass/fail), or mark a gate "na" with the reason it does not apply.`,
     }
   }
+  if (found.phase === 'VERIFY' && !isReviewSatisfied(task)) {
+    const held: Milestone = { ...found, state: 'active', note: `held: ${reviewNote(task)}` }
+
+    return {
+      task: { ...task, milestones: replaceMilestone(task, held), updatedAt: now },
+      note: `${found.id} is HELD, not complete: ${reviewNote(task)}, and this task cannot finish without it. Request it with swarm action "consult", run the architect it admits, then verify its advice with swarm action "verify" (pass or fail, with evidence).`,
+    }
+  }
   const done: Milestone = { ...found, state: 'done', note }
 
   return { task: { ...task, milestones: replaceMilestone(task, done), updatedAt: now } }
@@ -461,14 +475,18 @@ export const summaryOf = (task: Task | null): string => {
     task.status === 'done'
       ? 'DONE: every milestone complete and every required gate satisfied.'
       : task.status === 'unverified'
-        ? `UNVERIFIED: not done until ${open.join(', ')} ${open.length === 1 ? 'is' : 'are'} pass or na.`
+        ? open.length === 0
+          ? `UNVERIFIED: not done until the ${reviewNote(task)} is adjudicated.`
+          : `UNVERIFIED: not done until ${open.join(', ')} ${open.length === 1 ? 'is' : 'are'} pass or na.`
         : task.status === 'blocked'
           ? `BLOCKED: ${task.blocker ?? 'a milestone is blocked'}.`
           : open.length > 0
             ? `Open gates: ${open.join(', ')}.`
             : 'All required gates satisfied.'
 
-  return `${task.phase} ${task.percent}% (${done}/${task.milestones.length} milestones). ${verdict} Milestones: ${list}. Gates: ${gates}.`
+  const review = task.review === undefined ? '' : ` Review: ${reviewNote(task)}.`
+
+  return `${task.phase} ${task.percent}% (${done}/${task.milestones.length} milestones). ${verdict} Milestones: ${list}. Gates: ${gates}.${review}`
 }
 
 /** The progress tool's input, as the model sends it. */

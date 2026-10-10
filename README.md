@@ -177,6 +177,21 @@ Blast-radius protection asks before recognized destructive shell commands. Repos
 
 Cockpit does not take part in Claude Code's permission check. It registers no hook on it and makes no permission query; its guards run before it and can only refuse a call or ask you about it, never approve one.
 
+### Sonnet-led profile
+
+`profile: SONNET_LED` (with orchestration enforced): **Sonnet builds. Haiku scouts. Opus reviews. NobodyWho advises.**
+
+- The main loop is requested on Sonnet 5.5 at your own effort (`/effort`, settings, `modelSettings`); Cockpit never rewrites that effort.
+- Haiku scouts and Sonnet workers run as before. AUTO budgets are conservative: 4 helpers in all, 2 Sonnet, 2 Haiku and 1 Opus within them. Explicit `maxSubagents`/pool values still win.
+- Opus 5.5 is never the main loop and never a background model. The main session requests it with `swarm action consult`: a ground (`architecture`, `security`, `repeated-failure`, `asked`, `release`) and a concise evidence packet (objective, architecture, files, alternatives, failures, risk, decision). Cockpit admits it only where the ground holds on evidence: a large or spread change, or architecture named in the prompt; security-sensitive files or a security prompt; the same failure three times in a row; an explicit request for Opus; a release approval. One Opus at a time, an unchanged problem consulted once, one retry after a failed run, three per task. The admitted consultation runs as `cobalt-cockpit:architect` (read-only, Opus, high effort) and returns a structured decision; Sonnet implements and verifies it.
+- Opus cannot be reached around this: an unassigned Agent call naming Opus or the architect, an `assign` of tier OPUS, or the architect on a Sonnet task is refused.
+- Mandatory consultations: an explicit request for Opus, a release approval, or a change to security-sensitive files (auth, secrets, credentials, permissions, policy, guards, `.env`, keys) holds the task below 100% until a consultation has returned and the main session has verified its advice with `swarm action verify` (pass or fail, with evidence). Review findings are advice until verified.
+- NobodyWho advises: with `localAdvice` on, each consultation request asks the local router (`decision ask --caller cockpit`). Its answer is recorded beside the consultation only with a real receipt id, and never decides admission. Unavailable advice degrades to deterministic admission.
+- HUD and Ledger name the roles (MAIN, SCOUT, ENGINEER, ARCHITECT, LOCAL CONTROL), list each consultation with its ground, whether it returned, its decision and Sonnet's verification, and report host-reported tokens per tier. Requests without usage figures are counted as unreported; nothing is estimated. `/ledger` shows the host's `/cost` total where it keeps one.
+- Context: set Sonnet's compaction window natively (`/autocompact 400k`, stored as `modelSettings["claude-sonnet-5-5"].autoCompactWindow`). Cockpit does not compact or change settings. Subagents keep their own model defaults.
+
+`OPUS_LED` remains the default and behaves exactly as before. Migration and rollback are in [docs/implementation-v0.5-sonnet-led.md](docs/implementation-v0.5-sonnet-led.md).
+
 ## NobodyWho integration
 
 Optional and read-only. By default, Cockpit checks `$XDG_STATE_HOME/decision-router/ledger.jsonl`, or `$HOME/.local/state/decision-router/ledger.jsonl`. Set `ledgerPath` to override it; set `localControl` false to stop reading.
@@ -208,6 +223,8 @@ Restart Claude Code after changing configuration. To enable just Fable blocking 
 | `blockFable`, `subscriptionOnly`, `cobaltStrict` | false |
 | `reasoningMode` | `AUTO`; `MANUAL` honours fixed per-tier levels for subagents; the main loop's effort stays yours |
 | `maxEffort` | `max`; lower ceilings cap every subagent request and are recorded |
+| `profile` | `OPUS_LED` (legacy: Opus main loop); `SONNET_LED` runs the main loop on Sonnet and consults Opus on admission |
+| `localAdvice` | true; `SONNET_LED` only: ask the local NobodyWho router for advisory input on a consultation |
 
 ## Compatibility
 
@@ -221,7 +238,7 @@ Run Ledger is local. Cockpit observes tool calls, paths, agent events, token/con
 
 ### What Cockpit runs, reads and sends
 
-Cockpit installs no launcher and downloads nothing. It runs local processes, with your privileges and without prompting, for four reasons: `realpath -m` canonicalizes a path a subagent claims as its own (orchestration only), `tail -c` reads the end of a telemetry ledger larger than 512 KiB, `git status --porcelain=v2` and `git rev-parse --show-toplevel` feed the HUD, and one of nine audio players plays the optional cues (`pw-play`, `paplay`, `aplay`, `ffplay`, `mpv`, `play`, `canberra-gtk-play`, `afplay`, then a terminal bell). Each is an argument array: no shell string is ever built from model or user text.
+Cockpit installs no launcher and downloads nothing. It runs local processes, with your privileges and without prompting, for five reasons: `realpath -m` canonicalizes a path a subagent claims as its own (orchestration only), `tail -c` reads the end of a telemetry ledger larger than 512 KiB, `git status --porcelain=v2` and `git rev-parse --show-toplevel` feed the HUD, one of nine audio players plays the optional cues (`pw-play`, `paplay`, `aplay`, `ffplay`, `mpv`, `play`, `canberra-gtk-play`, `afplay`, then a terminal bell), and in the `SONNET_LED` profile with `localAdvice` on, `decision ask --caller cockpit` asks the local NobodyWho router for advice when an Opus consultation is requested. Each is an argument array: no shell string is ever built from model or user text.
 
 It reads files: the decision-router ledger (read-only, optional, `localControl`), a file about to be written (a bounded replay snapshot), and Claude Code's settings. It reads environment variables **by name**: `CLAUDE_CODE_EFFORT_LEVEL`, `XDG_STATE_HOME`, `HOME`, `COBALT_REDUCED_MOTION`, and eight authentication variables — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_MANTLE` — whose values are reduced to set-or-not-set on the spot and never stored, logged, exported or sent. It writes nothing outside the host's plugin store, which holds up to eight bounded run ledgers, bounded replay bodies, checkpoints and two preferences.
 

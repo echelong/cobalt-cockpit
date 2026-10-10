@@ -117,7 +117,7 @@ From each line it keeps the operation (a decision or a prune), the tier, the lat
 
 ## Local processes, files and environment
 
-Cockpit starts a small set of local programs (`git`, `realpath`, `tail`, and one audio player for the optional cues) and reads environment variables by name. None of this sends data anywhere. The full list, with the reason for each, is in [SECURITY.md](SECURITY.md) and the README's section on what Cockpit runs, reads and sends.
+Cockpit starts a small set of local programs (`git`, `realpath`, `tail`, one audio player for the optional cues, and in the `SONNET_LED` profile with `localAdvice` on, the local `decision` router when an Opus consultation is requested) and reads environment variables by name. The consultation's evidence packet summary is passed to that local router as its question; the router runs on this machine and Cockpit sends nothing over the network. None of this sends data anywhere. The full list, with the reason for each, is in [SECURITY.md](SECURITY.md) and the README's section on what Cockpit runs, reads and sends.
 
 ## Exports and sharing
 

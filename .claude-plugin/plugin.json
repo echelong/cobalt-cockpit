@@ -77,6 +77,19 @@
       "description": "Observe by default. Enable the Opus 5.5 commander at the effort you set, elastic Sonnet 5.5 engineering and Haiku 5.5 utility pools with task-aware effort, task ownership and resource admission.",
       "default": false
     },
+    "profile": {
+      "type": "string",
+      "title": "Orchestration profile",
+      "description": "With orchestration enforced: OPUS_LED (default, legacy) keeps the Opus 5.5 main loop as commander. SONNET_LED runs the main loop on Sonnet 5.5 at your chosen effort, Haiku 5.5 scouts, and Opus 5.5 only as an admitted architect/reviewer consultation (one at a time; mandatory for explicit requests, release approval and security-sensitive files). SONNET_LED's AUTO budgets are 4 helpers: 2 Sonnet, 2 Haiku, 1 Opus.",
+      "options": ["OPUS_LED", "SONNET_LED"],
+      "default": "OPUS_LED"
+    },
+    "localAdvice": {
+      "type": "boolean",
+      "title": "NobodyWho consultation advice",
+      "description": "SONNET_LED only: ask the local decision router (`decision ask`, NobodyWho) for advisory input when an Opus consultation is requested. Advice is recorded only with a real receipt and never decides admission; unavailable advice degrades to deterministic admission.",
+      "default": true
+    },
     "maxSubagents": {
       "type": "number",
       "title": "Parallel subagents",

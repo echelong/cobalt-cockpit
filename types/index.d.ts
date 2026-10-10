@@ -128,6 +128,64 @@ export type Task = {
   files: TouchedFile[]
   failures: Stamped[]
   lastAction: Stamped | null
+  /**
+   * An Opus consultation this task cannot finish without (SONNET_LED only):
+   * absent when none is required. Holds the task below 100% until the
+   * consultation has returned and the main session has adjudicated it.
+   */
+  review?: ReviewRequirement
+  /** Consultation grounds the person's full prompts raised in this task (SONNET_LED). */
+  promptGrounds?: ConsultGround[]
+}
+
+/** Which model leads the main loop when orchestration is enforced. */
+export type Profile = 'OPUS_LED' | 'SONNET_LED'
+
+/** Why an Opus consultation may be admitted. */
+export type ConsultGround = 'architecture' | 'security' | 'repeated-failure' | 'asked' | 'release'
+
+/** What Opus is given instead of the conversation: bounded, specific, decision-shaped. */
+export type EvidencePacket = {
+  objective: string
+  architecture: string
+  files: string[]
+  alternatives: string[]
+  failures: string[]
+  risk: string
+  decision: string
+}
+
+/** NobodyWho's advice on a consultation, only from a real router receipt. */
+export type LocalAdvice = { requestId: string; choice: string | null; abstain: boolean; tier: number | null; latencyMs: number | null; provider: string }
+
+/**
+ * One Opus consultation. Its lifecycle (running, returned, failed) and the main
+ * session's verification are read off the swarm task it ran as; this record
+ * holds why it was admitted and what it was asked.
+ */
+export type Consultation = {
+  id: string
+  ground: ConsultGround
+  /** Hash of the problem as stated: an unchanged problem is not consulted twice. */
+  key: string
+  packet: EvidencePacket
+  /** The progress task it belongs to, or null outside one. */
+  progressTask: number | null
+  /** Whether the ground made this consultation mandatory for the task. */
+  isMandatory: boolean
+  requestedAt: number
+  /** NobodyWho's advice, or null when no receipt exists (unavailable, timed out, off). */
+  advice: LocalAdvice | null
+  /** Why advice is absent, when it is. */
+  adviceNote: string | null
+}
+
+export type ReviewRequirement = {
+  grounds: ConsultGround[]
+  /** The consultation that answers it, once admitted. */
+  consult: string | null
+  /** required → admitted → returned → adjudicated (main session verified the advice, pass or fail). */
+  state: 'required' | 'admitted' | 'returned' | 'adjudicated'
 }
 
 export type ActivityKind =
@@ -381,7 +439,7 @@ export type SwarmTask = {
   createdAt: number; startedAt: number | null; endedAt: number | null; lastActivityAt: number; reason: string | null
 }
 export type SwarmEvent = { seq: number; at: number; kind: string; taskId: string | null; agentId: string | null; wave: Wave; detail: string }
-export type SwarmConfig = { sonnet: number | 'AUTO'; haiku: number | 'AUTO'; total: number | 'AUTO'; maxTasks: number; maxEvents: number; stallMs: number }
+export type SwarmConfig = { sonnet: number | 'AUTO'; haiku: number | 'AUTO'; total: number | 'AUTO'; /** Opus specialist subagents allowed at once; 0 (and absent, in older ledgers) keeps OPUS tasks in the main loop. Counted in `total` when above 0. */ opus?: number; maxTasks: number; maxEvents: number; stallMs: number }
 export type Swarm = { version: 2; wave: Wave; config: SwarmConfig; tasks: SwarmTask[]; events: SwarmEvent[]; sequence: number; requested: number; actual: number; highWater: number; conflicts: number; droppedEvents: number }
 export type TaskInput = Pick<SwarmTask, 'id' | 'tier' | 'role' | 'objective'> & Partial<Pick<SwarmTask, 'parentTask' | 'parentAgent' | 'scope' | 'dependencies' | 'owned' | 'mode' | 'wave' | 'spawnReason'>> & { /** Requested reasoning level, or AUTO to choose from the task. */ effort?: EffortRequest; /** Why the effort was chosen. */ effortReason?: string }
 
@@ -393,6 +451,6 @@ export type ToolEntry = { id: string; runId: Value<string>; turnId: Value<string
 export type Reading = { at: number; turnId: Value<string>; tokens: Value<number>; window: Value<number>; percent: Value<number> }
 export type Request = { id: string; runId: Value<string>; turnId: string; agentId: Value<string>; requestedModel: Value<string>; requestedEffort: Value<string>; model: Value<string>; effort: Value<string>; effectiveEffort: Value<string>; input: Value<number>; output: Value<number>; cacheRead: Value<number>; cacheWrite: Value<number> }
 export type Checkpoint = { at: number; goal: string; phase: string; completed: string[]; remaining: string[]; latest: string; gates: Record<string, string>; branch: string; startingSha: string; currentSha: string; repo: string; dirty: Value<number>; blockers: string[]; backgroundAgents: string[] }
-export type Ledger = { schema: 1 | 2; observedCompletions?: { agentId: string; reason: string; conclusion: string; at: number }[]; swarm?: Swarm; sessionId: string; currentRun: Value<string>; turns: Record<string, string>; runs: Run[]; agents: LedgerAgent[]; tools: ToolEntry[]; requests: Request[]; usage: Reading[]; receipts: NwhoEvent[]; warnings: string[]; replay: ReplayStep[]; checkpoint: Checkpoint | null }
+export type Ledger = { schema: 1 | 2; observedCompletions?: { agentId: string; reason: string; conclusion: string; at: number }[]; swarm?: Swarm; sessionId: string; currentRun: Value<string>; turns: Record<string, string>; runs: Run[]; agents: LedgerAgent[]; tools: ToolEntry[]; requests: Request[]; usage: Reading[]; receipts: NwhoEvent[]; warnings: string[]; replay: ReplayStep[]; checkpoint: Checkpoint | null; /** Opus consultations (SONNET_LED); absent in older ledgers. */ consults?: Consultation[] }
 export type ReplayStep = { id: string; runId: string; turnId: string; agentId: string; file: string; kind: 'Edit' | 'Write'; at: number; before: string; after: string; scope: 'fragment' | 'file'; omitted: boolean }
 export type Cursor = { offset: number; size: number; seen: string[]; primed: boolean }

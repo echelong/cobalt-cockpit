@@ -8,12 +8,14 @@
 // in variables (timers, the mounted waveform) is rebuilt as events arrive.
 // No bookkeeping in this file may fail a tool call: it runs under `quiet`.
 
-import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, acknowledgeHandback, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, overlaps, ownershipAllows, setAppliedEffort, setLaunchEffort } from './swarm'
+import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, acknowledgeHandback, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, overlaps, ownershipAllows, setAppliedEffort, setLaunchEffort, SONNET_LED_SWARM } from './swarm'
 import type { Swarm, SwarmTask, ModelTier, Wave, Verification } from './swarm'
 import { textOf } from './ledger'
 import { atom, read, update } from 'claude-code'
-import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL } from './model-policy'
-import type { SubagentTier } from './model-policy'
+import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL, OPUS_MODEL, isProfile, DEFAULT_PROFILE } from './model-policy'
+import type { SubagentTier, Profile } from './model-policy'
+import { addConsult, adviceOf, adviceRequest, advanceReview, briefOf, consultVerdict, factsOf, isGround, mandatoryGrounds, packetOf, promptGroundsOf, requireReview, GROUNDS } from './consult'
+import type { Consultation, LocalAdvice } from './consult'
 import {
   DEFAULT_CEILING,
   capabilityFor,
@@ -30,7 +32,7 @@ import {
 import type { EffortFacts, EffortResolution, HostEffortSignals } from './effort'
 import { orchestrationGraph, orchestrationTape } from './field'
 import type { EngineInterface, On, Register, RenderElement, Timer } from 'claude-code'
-import { addAgent, adoptAgent, beginTool, checkpointOf, classicTelemetry, migrateLedger, emptyLedger, exportJSON, finishTool, finishTurn, ledgerLines, originOf, reading, recordRequest, receipts, storageLedger, jsonBytes, startRun, UNKNOWN, warn, word, withReplay } from './ledger'
+import { addAgent, adoptAgent, beginTool, checkpointOf, classicTelemetry, migrateLedger, emptyLedger, exportJSON, finishTool, finishTurn, ledgerLines, originOf, reading, recordRequest, receipts, storageLedger, jsonBytes, startRun, UNKNOWN, warn, word, withReplay, usageByTier } from './ledger'
 import type { Ledger } from './ledger'
 import { replayTimeline, safeFile, STEP_BYTES } from './replay'
 
@@ -183,9 +185,11 @@ const parseModelEffort = (v: unknown): Record<string, readonly EffortLevel[]> =>
   return out
 }
 const SWARM_TOOL = {
-  name: 'swarm', description: 'Commander task ownership and elastic admission. Assign before Agent; put [task:ID] in Agent description. Queue is commander dispatched: retry Agent after dependencies/resources clear. Result/escalate preserve locks until observed turn completion. No automatic model spawning. Read-only tools may run within declared scope; scoped writers cannot use Bash (declare exclusive * ownership for shell work).',
+  name: 'swarm', description: 'Commander task ownership and elastic admission. SONNET_LED: action consult requests one Opus consultation (ground, objective, architecture, locations, alternatives, failures, risk, question) and returns the brief for cobalt-cockpit:architect. Assign before Agent; put [task:ID] in Agent description. Queue is commander dispatched: retry Agent after dependencies/resources clear. Result/escalate preserve locks until observed turn completion. No automatic model spawning. Read-only tools may run within declared scope; scoped writers cannot use Bash (declare exclusive * ownership for shell work).',
   inputSchema: { type: 'object', properties: {
-    action: { type: 'string', enum: ['assign','status','wave','result','escalate','cancel','verify','resolve','adopt'] },
+    action: { type: 'string', enum: ['assign','status','wave','result','escalate','cancel','verify','resolve','adopt','consult'] },
+    ground: { type: 'string', enum: [...GROUNDS], description: 'consult (SONNET_LED): why Opus is needed — architecture, security, repeated-failure, asked or release' },
+    architecture: { type: 'string', description: 'consult: the current architecture, briefly' }, alternatives: { type: 'array', items: { type: 'string' }, description: 'consult: approaches considered or already tried' }, failures: { type: 'array', items: { type: 'string' }, description: 'consult: failing output, briefly' },
     task_id: { type: 'string' }, agent_id: { type: 'string', description: 'adopt: existing running host agent ID; commander binds an explicit assignment when old ownership was unavailable' }, tier: { type: 'string', enum: ['OPUS','SONNET','HAIKU'] }, role: { type: 'string' }, objective: { type: 'string' }, scope: { type: 'string' },
     dependencies: { type: 'array', items: { type: 'string' } }, owned_resources: { type: 'array', items: { type: 'string' } }, mode: { type: 'string', enum: ['read','write'] },
     parent_task: { type: 'string' }, spawn_reason: { type: 'string' }, wave: { type: 'string', enum: ['RECONNAISSANCE','ENGINEERING','REVIEW','INTEGRATION','VERIFICATION'] },
@@ -217,6 +221,47 @@ const finishObserved = (s: Swarm, id: string, reason: string, conclusion: string
     return finishTask(s,id,'failed',{ ...result, unresolved:[...('unresolved' in result ? result.unresolved : []),'Host stopped with unresolved dependencies/child work; completion rejected'] },at)
   }
 }
+/**
+ * One Opus consultation requested by the main session (SONNET_LED). The ground
+ * and packet are checked by `consultVerdict`; NobodyWho's advice, when a real
+ * receipt comes back, is recorded beside it and never decides it. Admission
+ * reserves nothing yet: the OPUS swarm task it submits is admitted again, with
+ * ownership and budget, when the architect's Agent call arrives.
+ */
+const serveConsult = async ($: EngineInterface, e: Record<string, unknown>, at: number): Promise<string> => {
+  const ground = e['ground']
+  if (!isGround(ground)) throw new Error(`Valid ground required: ${GROUNDS.join(', ')}`)
+  const made = packetOf(ground, { objective: e['objective'], architecture: e['architecture'], files: e['locations'], alternatives: e['alternatives'], failures: e['failures'], risk: e['risk'], decision: e['question'] })
+  if ('error' in made) throw new Error(`Evidence packet incomplete: ${made.error}`)
+  const task = await read($, taskAtom)
+  const facts = factsOf(task, (await read($, orchestraAtom)).errorStreak, task?.promptGrounds ?? [])
+  const ledger = await read($, ledgerAtom)
+  const consults = ledger.consults ?? []
+  const verdict = consultVerdict({ profile: config.hasOrchestration ? config.profile : 'OPUS_LED', ground, packet: made.packet, facts, consults, swarm: swarmState(ledger), progressTask: task?.id ?? null })
+  if (!verdict.ok) {
+    await quiet(() => mutateLedger($, l => warn(l, `${verdict.reason.split('.')[0]} (${ground})`)))
+    throw new Error(verdict.reason)
+  }
+  let advice: LocalAdvice | null = null
+  let adviceNote: string | null = null
+  if (!config.hasLocalAdvice) adviceNote = 'local advice off'
+  else {
+    try {
+      const r = await $.process.run(['decision', 'ask', '--caller', 'cockpit', '--json', adviceRequest(ground, made.packet, facts)], { timeoutMs: 20_000 })
+      advice = r.exitCode === 0 ? adviceOf(r.stdout) : null
+      if (advice === null) adviceNote = r.exitCode === 0 ? 'no receipt in router output' : `router exited ${r.exitCode}`
+    } catch { adviceNote = 'router unavailable' }
+  }
+  const id = `opus-${consults.length + 1}-${verdict.key.slice(0, 6)}`
+  const owned = await Promise.all(made.packet.files.map(p => canonicalResource($, p)))
+  await changeSwarm($, held => submitTask(held, { id, tier: 'OPUS', role: ground === 'release' || ground === 'security' ? 'REVIEW' : 'ARCHITECT', objective: made.packet.decision, scope: `Opus consultation · ${ground}`, owned: owned.length ? owned : ['*'], mode: 'read', parentTask: null, spawnReason: `Opus admitted on ${ground}${verdict.isMandatory ? ' (mandatory)' : ''}` }, at).swarm)
+  const c: Consultation = { id, ground, key: verdict.key, packet: made.packet, progressTask: task?.id ?? null, isMandatory: verdict.isMandatory, requestedAt: at, advice, adviceNote }
+  await mutateLedger($, l => ({ ...l, consults: addConsult(l.consults ?? [], c) }))
+  if (task !== null) await change($, t => t.id !== task.id ? t : { ...t, review: advanceReview(verdict.isMandatory ? requireReview(t, [ground]).review : t.review, id, 'admitted') })
+  const local = advice === null ? `NobodyWho: no advice (${adviceNote}).` : `NobodyWho advised ${advice.abstain ? 'abstain' : advice.choice ?? 'nothing'} (receipt ${advice.requestId.slice(0, 12)}, tier ${advice.tier ?? '?'}); advisory only.`
+
+  return `OPUS ADMITTED / ${id} · ${ground}${verdict.isMandatory ? ' · mandatory for this task' : ''}. ${local}\nSpawn Agent with subagent_type "cobalt-cockpit:architect", description "[task:${id}] Opus ${ground} consultation", and exactly this brief as the prompt:\n\n${briefOf(c)}\n\nIts answer is advice until you verify it. Then record swarm action "verify" for ${id}: pass when the advice checks out, fail when it does not, with evidence either way.`
+}
 const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promise<{ result: string; isError?: boolean }> => {
   try {
     const action = String(e['action'] ?? ''), id = String(e['task_id'] ?? ''), agent = typeof e['agentId'] === 'string' ? e['agentId'] : undefined
@@ -232,11 +277,13 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
     if (action === 'assign') {
       if (typeof e['objective'] !== 'string' || !e['objective'].trim()) throw new Error('Bounded objective required')
       if (!/^[\w.-]{1,80}$/.test(id) || !['OPUS','SONNET','HAIKU'].includes(String(e['tier']))) throw new Error('Valid task_id and tier required')
+      if (e['tier'] === 'OPUS' && isSonnetLed()) throw new Error('OPUS / in SONNET_LED an Opus task is admitted only through action consult, with a ground and an evidence packet')
       const owned = await Promise.all(list('owned_resources').map(p => canonicalResource($, p)))
       const assignedSwarm = await changeSwarm($, held => { const submitted = submitTask(held, { id, tier: e['tier'] as ModelTier, role: str('role'), objective: str('objective'), scope: str('scope'), dependencies:list('dependencies'), owned, mode: e['mode'] === 'write' ? 'write' : 'read', parentTask: typeof e['parent_task'] === 'string' ? e['parent_task'] : null, spawnReason: str('spawn_reason'), ...(isEffortRequest(e['effort']) ? { effort: e['effort'] } : {}), ...(typeof e['effort_reason'] === 'string' ? { effortReason: str('effort_reason') } : {}) }, at).swarm; if (jsonBytes(submitted.tasks.map(t=>({ ...t,result:null,escalation:null }))) > 192_000) throw new Error('Ownership metadata storage budget reached; finish/archive work before assigning more'); return submitted })
       const assigned = assignedSwarm.tasks.find(t => t.id === id)
       return { result: assigned ? `Task ${id} ${assigned.state}; use Agent description [task:${id}]. OPUS tasks stay in main.` : 'Duplicate suppressed; see swarm status for existing task.' }
     }
+    if (action === 'consult') { const reply = await serveConsult($, e, at); await persist($); return { result: reply } }
     if (action === 'wave') { if (!['RECONNAISSANCE','ENGINEERING','REVIEW','INTEGRATION','VERIFICATION'].includes(String(e['wave']))) throw new Error('Valid wave required'); await changeSwarm($, held => setWave(held, e['wave'] as Wave, at)) }
     else {
       if (!task) throw new Error('Unknown task')
@@ -248,16 +295,20 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
       } else if (action === 'result') {
         await changeSwarm($, held => {
           let chain = held
-          if (task.tier === 'OPUS' && ['queued','blocked'].includes(task.state)) { const admitted = admitTask(held,id,at); if (!admitted.ok) throw new Error(admitted.reason!); chain = admitted.swarm }
+          if (task.tier === 'OPUS' && (held.config.opus ?? 0) === 0 && ['queued','blocked'].includes(task.state)) { const admitted = admitTask(held,id,at); if (!admitted.ok) throw new Error(admitted.reason!); chain = admitted.swarm }
           chain = reportResult(chain, id, { conclusion:str('conclusion'), evidence:list('evidence'), changes:list('changes'), verification:list('verification'), unresolved:list('unresolved'), confidence: typeof e['confidence'] === 'string' ? str('confidence') : null }, at)
-          return task.tier === 'OPUS' ? finishTask(chain,id,'completed',chain.tasks.find(t=>t.id===id)!.result,at) : chain
+          return task.tier === 'OPUS' && (held.config.opus ?? 0) === 0 ? finishTask(chain,id,'completed',chain.tasks.find(t=>t.id===id)!.result,at) : chain
         })
       } else if (action === 'escalate') {
         if (!['SONNET','OPUS'].includes(String(e['to']))) throw new Error('Valid escalation destination required')
         await changeSwarm($, held => escalateTask(held,id,{ objective: task.objective, discoveries:list('discoveries'), evidence:list('evidence'), question:str('question'), risk:str('risk'), nextAction:str('next_action'), locations:list('locations'), to:e['to'] as ModelTier, effort: isEffortLevel(e['effort']) ? e['effort'] : null, effortReason: typeof e['effort_reason'] === 'string' ? str('effort_reason') : null },at))
       } else if (action === 'resolve') await changeSwarm($, held => resolveEscalation(held,id,{ conclusion:str('conclusion'),evidence:list('evidence'), changes:list('changes'), verification:list('verification'), unresolved:list('unresolved') },at))
       else if (action === 'cancel') await changeSwarm($, held => requestCancel(held,id,at))
-      else if (action === 'verify') { if (!['pending','pass','fail','unknown'].includes(String(e['state']))) throw new Error('Valid verification state required'); await changeSwarm($, held => verifyTask(held,id,e['state'] as Verification,at,list('evidence').join('; '))) }
+      else if (action === 'verify') { if (!['pending','pass','fail','unknown'].includes(String(e['state']))) throw new Error('Valid verification state required'); await changeSwarm($, held => verifyTask(held,id,e['state'] as Verification,at,list('evidence').join('; ')))
+        // The main session adjudicating a consultation's advice, pass or fail, is what a required review waits for.
+        const consult = (await read($, ledgerAtom)).consults?.find(c => c.id === id)
+        if (consult && (e['state'] === 'pass' || e['state'] === 'fail')) await change($, t => t.id === consult.progressTask && t.review ? { ...t, review: advanceReview(t.review, id, 'adjudicated') } : t)
+      }
       else throw new Error('Unknown swarm action')
     }
     await persist($)
@@ -296,12 +347,12 @@ const launchEffort = async ($: EngineInterface, call: Record<string, unknown>): 
   const task = id === undefined ? undefined : swarmState(await read($, ledgerAtom)).tasks.find(t => t.id === id)
   // the tier and the work an unassigned call gets are the ones `agent.spawn` gives it
   const role = roleOf(type)
-  const tier: SubagentTier = (task ? task.tier === 'HAIKU' : tierOf(String(call['model'] ?? '')) === 'HAIKU' || role === 'SCOUT' || role === 'UTILITY') ? 'HAIKU' : 'SONNET'
+  const tier: SubagentTier = task?.tier === 'OPUS' && isSonnetLed() ? 'OPUS' : (task ? task.tier === 'HAIKU' : tierOf(String(call['model'] ?? '')) === 'HAIKU' || role === 'SCOUT' || role === 'UTILITY') ? 'HAIKU' : 'SONNET'
   const facts: EffortFacts = { tier, ...(task ? factsFromRole(task.role, task.mode) : factsFromRole(role, ['EXPLORER', 'RESEARCHER', 'REVIEWER', 'SCOUT', 'UTILITY'].includes(role) ? 'read' : 'write')) }
   const onCall = isEffortLevel(call['effort']) ? call['effort'] : null
   const assigned = task !== undefined && task.requestedEffort !== 'AUTO' ? task.requestedEffort : null
   const named = assigned ?? onCall
-  const fixed = desiredRequest('agent', tier).effort
+  const fixed = desiredRequest('agent', tier, config.profile).effort
   if (config.reasoningMode === 'MANUAL' && named === null && !isEffortLevel(fixed)) return
   const requested: EffortRequest = named ?? (config.reasoningMode === 'MANUAL' && isEffortLevel(fixed) ? fixed : 'AUTO')
   const resolution = chooseEffort(requested, facts, capabilityOf(MODEL_FOR[tier], await read($, effortKnownAtom)), config.maxEffort)
@@ -524,7 +575,14 @@ type Config = {
   maxEffort: EffortLevel
   /** Operator-declared effort capability per model id, overriding the built-in table. */
   modelEffort: Readonly<Record<string, readonly EffortLevel[]>>
+  /** OPUS_LED (legacy): Opus commands. SONNET_LED: Sonnet builds and Opus is consulted on admission. */
+  profile: Profile
+  /** Whether an Opus consultation asks NobodyWho (`decision ask`) for advisory input. */
+  hasLocalAdvice: boolean
 }
+
+/** SONNET_LED is in force only where orchestration is enforced. */
+const isSonnetLed = (): boolean => config.hasOrchestration && config.profile === 'SONNET_LED'
 
 // The model each tier is requested on. The tier is the policy's; the model id is
 // what the engine was asked for, and the capability table reads it.
@@ -540,7 +598,7 @@ const capabilityOf = (model: string, known: Readonly<Record<string, readonly Eff
 
 // Set by register(); the rest is rebuilt as events arrive after a reload.
 // Nothing a drawing depends on lives here: that is all in `$.state`.
-let config: Config = { hasHud: true, isAnimated: true, hasSounds: true, hasGuard: true, hasAttributionGuard: true, volume: 0.6, hasLocalControl: true, ledgerPath: '', blocksFable: false, isStrict: false, hasOrchestration: false, maxSubagents: 16, maxSonnet: 'AUTO', maxHaiku: 'AUTO', isSubscriptionOnly: false, reasoningMode: 'AUTO', maxEffort: DEFAULT_CEILING, modelEffort: {} }
+let config: Config = { hasHud: true, isAnimated: true, hasSounds: true, hasGuard: true, hasAttributionGuard: true, volume: 0.6, hasLocalControl: true, ledgerPath: '', blocksFable: false, isStrict: false, hasOrchestration: false, maxSubagents: 16, maxSonnet: 'AUTO', maxHaiku: 'AUTO', isSubscriptionOnly: false, reasoningMode: 'AUTO', maxEffort: DEFAULT_CEILING, modelEffort: {}, profile: DEFAULT_PROFILE, hasLocalAdvice: true }
 let isSupported = true
 /** True once the engine is known to take `effort` on an Agent call. */
 let hasNativeEffort = false
@@ -1277,6 +1335,7 @@ const noteEnd = async (
     await change($, (task, now) => {
       let chain = task
       for (const edit of edits) chain = touchFile(chain, edit.path, edit.added, edit.removed)
+      if (edits.length > 0 && isSonnetLed()) chain = requireReview(chain, mandatoryGrounds(factsOf({ ...chain, files: chain.files.map(f => ({ ...f, path: relative(f.path) })) }, 0, chain.promptGrounds ?? [])))
       for (const reading of readings) chain = setGate(chain, reading.gate, reading.state, reading.evidence, 'auto', now)
 
       return chain
@@ -1547,7 +1606,9 @@ export const registerLedger = (on: On): void => {
   on('ui.render', { component: 'Pane', requestId: LEDGER_PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const auth = await read($, { plugin: 'cobalt-cockpit', key: 'auth' })
-    const lines = ledgerLines(await read($, ledgerAtom), await $.clock.now(), auth?.mode === 'subscription' ? 'SUBSCRIPTION' : auth?.mode === 'api' ? 'API' : UNKNOWN)
+    // The host's own /cost total where it keeps one; nothing is estimated in its place.
+    const cost = isSonnetLed() ? await $.session.usage().then(u => (u.cost === undefined ? 'unavailable' : `$${u.cost.usd.toFixed(2)} (host-reported, session)`), () => 'unavailable') : undefined
+    const lines = ledgerLines(await read($, ledgerAtom), await $.clock.now(), auth?.mode === 'subscription' ? 'SUBSCRIPTION' : auth?.mode === 'api' ? 'API' : UNKNOWN, cost)
     return <Box flexDirection="column">{lines.map((line, i) => <Text key={String(i)} color={/^COBALT|^\d\d /.test(line) ? COLORS.accent : undefined} wrap="truncate-end">{line}</Text>)}<Button key="close" label="Close" hotkey="q" role="dismiss" onPress={() => $.ui.close({ id: LEDGER_PANE })} /></Box>
   })
   on('ui.render', { component: 'Pane', requestId: REPLAY_PANE }, async ($, e) => {
@@ -1566,6 +1627,8 @@ export const resumeLine = async ($: EngineInterface): Promise<string | null> => 
 }
 
 export const register: Register = (on, options) => {
+  const profile: Profile = isProfile(options['profile']) ? options['profile'] : DEFAULT_PROFILE
+  const isLed = profile === 'SONNET_LED'
   config = {
     hasHud: options['hud'] !== false,
     isAnimated: options['animation'] !== false,
@@ -1578,13 +1641,16 @@ export const register: Register = (on, options) => {
     blocksFable: options['cobaltStrict'] === true || options['blockFable'] === true,
     isStrict: options['cobaltStrict'] === true,
     hasOrchestration: options['cobaltStrict'] === true || options['orchestration'] === true,
-    maxSubagents: limitOf(options['maxSubagents']),
-    maxSonnet: poolBudget(options['maxSonnet'] ?? options['maxSonnetAgents']),
-    maxHaiku: poolBudget(options['maxHaiku'] ?? options['maxHaikuAgents']),
+    // SONNET_LED's AUTO budgets are its conservative ones; an explicit value still wins.
+    maxSubagents: isLed && !(typeof options['maxSubagents'] === 'number' && options['maxSubagents'] > 0) ? (SONNET_LED_SWARM.total as number) : limitOf(options['maxSubagents']),
+    maxSonnet: ((v: number | 'AUTO') => (isLed && v === 'AUTO' ? (SONNET_LED_SWARM.sonnet as number) : v))(poolBudget(options['maxSonnet'] ?? options['maxSonnetAgents'])),
+    maxHaiku: ((v: number | 'AUTO') => (isLed && v === 'AUTO' ? (SONNET_LED_SWARM.haiku as number) : v))(poolBudget(options['maxHaiku'] ?? options['maxHaikuAgents'])),
     isSubscriptionOnly: options['cobaltStrict'] === true || options['subscriptionOnly'] === true,
     reasoningMode: options['reasoningMode'] === 'MANUAL' ? 'MANUAL' : 'AUTO',
     maxEffort: isEffortLevel(options['maxEffort']) ? options['maxEffort'] : DEFAULT_CEILING,
     modelEffort: parseModelEffort(options['modelEffort']),
+    profile,
+    hasLocalAdvice: options['localAdvice'] !== false,
   }
 
   registerLedger(on)
@@ -1634,7 +1700,7 @@ export const register: Register = (on, options) => {
       }
     })
     await ledgerStart($)
-    await changeSwarm($, held => configureSwarm(held, { total: config.maxSubagents, sonnet: config.maxSonnet, haiku: config.maxHaiku }))
+    await changeSwarm($, held => configureSwarm(held, { total: config.maxSubagents, sonnet: config.maxSonnet, haiku: config.maxHaiku, opus: isSonnetLed() ? (SONNET_LED_SWARM.opus as number) : 0 }))
     void refreshGit($)
     void refreshMeter($)
     // The NobodyWho watcher: read-only, stat-gated, and started only once the
@@ -1708,12 +1774,18 @@ export const register: Register = (on, options) => {
         const isContinuing = old !== null && old.milestones.length > 0 && old.status !== 'done'
         const base = isContinuing ? old : newTask((old?.id ?? 0) + 1, e.text, now, sha)
 
-        return {
+        const prompted: Task = {
           ...base,
           lastPrompt: oneLine(e.text, 160),
           updatedAt: now,
           hasInstructionFileRequest: base.hasInstructionFileRequest || namesInstructionFile(e.text),
         }
+        if (!isSonnetLed()) return prompted
+        // Grounds are read from the full prompt: the stored one is clipped.
+        const promptGrounds = [...new Set([...(prompted.promptGrounds ?? []), ...promptGroundsOf(e.text)])]
+        const withGrounds: Task = { ...prompted, promptGrounds }
+
+        return settle(requireReview(withGrounds, mandatoryGrounds(factsOf(withGrounds, 0, promptGrounds)))).task
       })
       if (task !== null && task.milestones.length > 0) context = `Cobalt Cockpit, state of the task in progress: ${summaryOf(task)}`
     })
@@ -1949,6 +2021,9 @@ export const register: Register = (on, options) => {
         if (e.parentAgentId) return { deny: 'SWARM / only commander delegates; escalate a structured handoff' }
         if (assignedId && !assigned) return { deny: 'SWARM / unknown assignment' }
         const at = await $.clock.now()
+        // SONNET_LED: Opus runs only as an admitted consultation. Naming Opus or
+        // the architect on an unassigned call is refused, not quietly downgraded.
+        if (isSonnetLed() && !assigned && (role === 'ARCHITECT' || tierOf(e.model) === 'OPUS')) return { deny: 'OPUS / NOT ADMITTED. Opus runs only as an admitted consultation: request one with swarm action "consult" (ground and evidence packet), then spawn cobalt-cockpit:architect with the [task:ID] it returns. Nothing was started.' }
         if (!assigned) {
           assignedId = `legacy-${e.tool_use_id}-${(await read($, orchestraAtom)).spawned}`.replace(/[^\w.-]/g,'-')
           const tier = tierOf(e.model) === 'HAIKU' || role === 'SCOUT' || role === 'UTILITY' ? 'HAIKU' : 'SONNET'
@@ -1956,13 +2031,17 @@ export const register: Register = (on, options) => {
           assigned = state.tasks.find(t => t.id === assignedId)
           if (!assigned) return { deny: 'SWARM / duplicate work suppressed; inspect swarm status' }
         }
-        if (assigned.tier === 'OPUS') return { deny: 'SWARM / OPUS task stays in commander; no coordinator subagent' }
+        if (assigned.tier === 'OPUS' && !isSonnetLed()) return { deny: 'SWARM / OPUS task stays in commander; no coordinator subagent' }
+        if (assigned.tier === 'OPUS') {
+          if (!(await read($, ledgerAtom)).consults?.some(c => c.id === assigned!.id)) return { deny: 'OPUS / NOT ADMITTED. An OPUS task runs only as an admitted consultation; request one with swarm action "consult". Nothing was started.' }
+          if (role !== 'ARCHITECT') return { deny: 'OPUS / an admitted consultation runs as cobalt-cockpit:architect (read-only) and nothing else. Nothing was started.' }
+        } else if (role === 'ARCHITECT' && isSonnetLed()) return { deny: 'OPUS / the architect runs only for an admitted consultation; its task must come from swarm action "consult". Nothing was started.' }
         let admission: ReturnType<typeof admitTask> | undefined
         await changeSwarm($, held => { admission = admitTask(held,assignedId!,at); return admission.swarm })
         if (!admission!.ok) return { deny: `SWARM / queued ${assignedId}: ${admission!.reason}; retry after dependency/ownership/resource clears` }
         reservedId = assignedId
       }
-      const model = config.hasOrchestration ? (assigned?.tier === 'HAIKU' ? HAIKU_MODEL : AGENT_MODEL) : e.model
+      const model = config.hasOrchestration ? (assigned?.tier === 'HAIKU' ? HAIKU_MODEL : assigned?.tier === 'OPUS' && isSonnetLed() ? OPUS_MODEL : AGENT_MODEL) : e.model
       const originLedger = await read($, ledgerAtom)
       const spawnAt = await $.clock.now()
       // The launch level is on the task before the subagent exists: its first
@@ -2030,12 +2109,14 @@ export const register: Register = (on, options) => {
       const id = task.id
       await quiet(async () => { const at = await $.clock.now(); await changeSwarm($, held => heartbeat(held,id,at)) })
     }
-    // The tier is the policy's: Opus commands, Sonnet engineers, Haiku scouts.
-    // The model id follows from it; the effort below is resolved separately, so
-    // two agents side by side can run at different levels without a global move.
-    const tier: ModelTier = !e.agentId ? 'OPUS' : (task?.tier ?? (tierOf(e.model) === 'HAIKU' ? 'HAIKU' : 'SONNET'))
-    const subTier = tier === 'HAIKU' ? 'HAIKU' : 'SONNET'
-    const wanted = desiredRequest(e.agentId, subTier)
+    // The tier is the policy's. OPUS_LED: Opus commands, Sonnet engineers, Haiku
+    // scouts. SONNET_LED: Sonnet leads and builds, Haiku scouts, and Opus runs
+    // only as an admitted consultation's subagent. The model id follows from the
+    // tier; the effort below is resolved separately, so two agents side by side
+    // can run at different levels without a global move.
+    const tier: ModelTier = !e.agentId ? (isSonnetLed() ? 'SONNET' : 'OPUS') : (task?.tier ?? (tierOf(e.model) === 'HAIKU' ? 'HAIKU' : 'SONNET'))
+    const subTier: SubagentTier = tier === 'HAIKU' ? 'HAIKU' : tier === 'OPUS' && e.agentId !== undefined && isSonnetLed() ? 'OPUS' : 'SONNET'
+    const wanted = desiredRequest(e.agentId, subTier, config.profile)
     const isMain = e.agentId === undefined
     let constrained = e
     let mismatch: string | null = null
@@ -2046,11 +2127,11 @@ export const register: Register = (on, options) => {
     const launched = config.hasOrchestration && isEffortLevel(task?.launchEffort) ? task.launchEffort : null
     let hostReason: string | null = null
     if (config.hasOrchestration && isMain) {
-      // Opus commands; how hard it thinks is the person's to say. A rewrite here
+      // The profile's model leads; how hard it thinks is the person's to say. A rewrite here
       // would outrank `/effort`, `--effort`, the settings and the variable
       // alike, so the main loop's effort is left exactly as the engine resolved it.
       constrained = { ...e, model: wanted.model }
-      mismatch = policyMismatch(e.model, e.effort, e.agentId, subTier)
+      mismatch = policyMismatch(e.model, e.effort, e.agentId, subTier, config.profile)
     } else if (config.hasOrchestration) {
       const facts: EffortFacts = { tier, ...(task ? factsFromRole(task.role, task.mode) : {}) }
       // An explicit level on the task is the commander's, and wins; otherwise
@@ -2073,7 +2154,7 @@ export const register: Register = (on, options) => {
         if (launched !== null) hostReason = launchFallback(resolution, launched, e.effort, wanted.model)
       }
       // a natively launched loop's level is judged against its launch above, not against the fixed tier level
-      mismatch = policyMismatch(e.model, launched === null && !isUnknown ? e.effort : wanted.effort, e.agentId, subTier)
+      mismatch = policyMismatch(e.model, launched === null && !isUnknown ? e.effort : wanted.effort, e.agentId, subTier, config.profile)
       const applied = launched !== null ? (e.effort === undefined ? null : String(e.effort)) : resolution?.applied
       // The engine's own resolution of a level this plugin launched with is a
       // real observation: learned from, and said aloud when it differs.
@@ -2272,7 +2353,7 @@ export const register: Register = (on, options) => {
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     if (!isSupported || e.traits.includes('bare')) return composed
-    const text = `${DISCIPLINE}${config.hasAttributionGuard ? HYGIENE : ''}${config.hasGuard ? SAFETY : ''}${config.hasOrchestration ? orchestrationText(config.maxSubagents) + effortPolicyText(config.reasoningMode, config.maxEffort) : ''}${config.blocksFable ? `\n\n${FABLE_RULE}` : ''}`
+    const text = `${DISCIPLINE}${config.hasAttributionGuard ? HYGIENE : ''}${config.hasGuard ? SAFETY : ''}${config.hasOrchestration ? orchestrationText(config.maxSubagents, config.profile) + effortPolicyText(config.reasoningMode, config.maxEffort, config.profile) : ''}${config.blocksFable ? `\n\n${FABLE_RULE}` : ''}`
 
     return { sections: [...composed.sections, { id: 'cobalt-cockpit:discipline', text, scope: 'session' }] }
   })
@@ -2334,7 +2415,7 @@ export const register: Register = (on, options) => {
         // What AUTO would name for the commander is advice only, and only when
         // no selection of the person's was seen: the level stays the host's.
         const advised = config.hasOrchestration && config.reasoningMode === 'AUTO' && meter.hostSource === 'host'
-          ? chooseEffort('AUTO', { tier: 'OPUS' }, capabilityOf(MAIN_MODEL, Object.fromEntries(observed)), config.maxEffort).applied
+          ? chooseEffort('AUTO', { tier: isSonnetLed() ? 'SONNET' : 'OPUS' }, capabilityOf(isSonnetLed() ? AGENT_MODEL : MAIN_MODEL, Object.fromEntries(observed)), config.maxEffort).applied
           : undefined
 
         return {
@@ -2342,6 +2423,7 @@ export const register: Register = (on, options) => {
             `PLUGIN / ${$.plugin.name} ${version}`,
             `SOURCE / ${$.plugin.root}`,
             `SESSION MODEL / ${model === '' ? UNKNOWN : model}`,
+            ...(config.hasOrchestration ? [`PROFILE / ${config.profile}${isSonnetLed() ? ` · main ${AGENT_MODEL} · Opus on admission · budget ${config.maxSubagents} (Sonnet ${String(config.maxSonnet)} · Haiku ${String(config.maxHaiku)} · Opus 1) · NobodyWho advice ${config.hasLocalAdvice ? 'on' : 'off'}` : ` · main ${MAIN_MODEL}`}`] : []),
             `REASONING / ${config.reasoningMode} · ceiling ${config.maxEffort.toUpperCase()}`,
             // the main loop's level is the host's: read, with what was seen of its origin
             `MAIN EFFORT / host-resolved, never rewritten${meter.effort ? ` · ${meter.effort}${meter.hostSource ? ` (${meter.hostSource})` : ''}` : ''}${advised !== undefined && meter.effort && advised !== meter.effort ? ` · AUTO would name ${advised}: /effort ${advised} to set it` : ''}`,
@@ -2407,7 +2489,7 @@ export const register: Register = (on, options) => {
     const stripRoom = hasCrew ? room - 1 : room
     let agents = visibleAgents(session.agents, now, Math.min(3, stripRoom))
     if (agents.folded && stripRoom > 1) agents = visibleAgents(session.agents, now, Math.min(2, stripRoom - 1))
-    const crewView: OrchestraView = { meter: input.meter, task: input.task, activity: input.activity, isWorking: e.props.isWorking, agents: crew, nwho: null, limit: config.maxSubagents, now }
+    const crewView: OrchestraView = { meter: input.meter, task: input.task, activity: input.activity, isWorking: e.props.isWorking, agents: crew, nwho: null, limit: config.maxSubagents, now, ...(isSonnetLed() ? { profile: 'SONNET_LED' as const } : {}) }
     const crewLine = hasCrew && agents.shown.length > 0 ? headerText(crewView, layout.columns) : ''
     // API-style authentication is the one diagnostic that stays on screen: it
     // is a warning, and it is only ever there when it is true.
@@ -2628,16 +2710,18 @@ export const register: Register = (on, options) => {
     const session = await read($, visualAtom)
     const paneNow = await $.clock.now()
     const newest = control.lastPrune !== null && (control.lastDecision === null || control.lastPrune.at >= control.lastDecision.at) ? control.lastPrune : control.lastDecision
+    const paneLedger = await read($, ledgerAtom)
     const view: OrchestraView = {
       meter: input.meter,
       task: input.task,
       activity,
       isWorking: activity.isWorking,
       agents: session.agents,
-      swarm: (await read($, ledgerAtom)).swarm,
+      swarm: paneLedger.swarm,
       nwho: newest === null ? null : stripText(newest).replace(/^NWHO · /, ''),
       limit: config.maxSubagents,
       now: paneNow,
+      ...(isSonnetLed() ? { profile: 'SONNET_LED' as const, consults: paneLedger.consults ?? [], usage: usageByTier(paneLedger.requests) } : {}),
     }
     const rows = [
       ...base,

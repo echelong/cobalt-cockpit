@@ -4,6 +4,7 @@ export type { Value, Counts, Run, LedgerAgent, ToolEntry, Reading, Request, Chec
 import { appendReplay, safeFile, safeText, secretText } from './replay'
 import type { ReplayStep } from './replay'
 import { emptySwarm } from './swarm'
+import { statusOf as consultStatus } from './consult'
 import { roleOf } from './orchestra'
 import { activityOf } from './classify'
 export const UNKNOWN = 'unknown' as const
@@ -86,8 +87,44 @@ export const receipts = (l: Ledger, events: readonly NwhoEvent[]): Ledger => ({ 
 export const checkpointOf = (l: Ledger, task: Task | null, git: GitState | null, at: number): Checkpoint => ({ at, goal: task?.milestones.length && task.goal !== task.lastPrompt ? textOf(task.goal) : UNKNOWN, phase: task?.phase ?? UNKNOWN, completed: task?.milestones.filter(m => m.state === 'done').map(m => textOf(m.title)) ?? [], remaining: task?.milestones.filter(m => m.state !== 'done').map(m => textOf(m.title)) ?? [], latest: l.tools.at(-1)?.tool ?? UNKNOWN, gates: Object.fromEntries(Object.entries(task?.gates ?? {}).map(([k, g]) => [k, g.state])), branch: word(git?.branch), startingSha: word(git?.startSha), currentSha: word(git?.sha), repo: word(git?.project), dirty: git?.isRepo ? numberOf(git.dirty) : UNKNOWN, blockers: task?.blocker ? [textOf(task.blocker)] : [], backgroundAgents: l.agents.filter(a => a.status === 'running').map(a => a.id) })
 export const withReplay = (l: Ledger, step: ReplayStep): Ledger => ({ ...l, replay: appendReplay(l.replay, step) })
 // Export explicitly excludes snapshots and any checkpoint prose. Only typed telemetry.
-export const exportJSON = (l: Ledger): string => JSON.stringify({ schema: l.schema, sessionId: l.sessionId, swarm: l.swarm, runs: l.runs, agents: l.agents.map(({ name: _name, ...a }) => a), tools: l.tools, requests: l.requests, usage: l.usage, nobodywho: l.receipts, warnings: l.warnings, replay: l.replay.map(({ before: _before, after: _after, ...s }) => s), checkpoint: l.checkpoint === null ? null : { at: l.checkpoint.at, phase: l.checkpoint.phase, gates: l.checkpoint.gates, branch: l.checkpoint.branch, startingSha: l.checkpoint.startingSha, currentSha: l.checkpoint.currentSha, repo: l.checkpoint.repo, dirty: l.checkpoint.dirty, backgroundAgents: l.checkpoint.backgroundAgents } }, (_key, value: unknown) => typeof value === 'string' ? (secretText(value) ? UNKNOWN : safeText(value)) : value, 2)
-export const ledgerLines = (l: Ledger, now: number, auth: string = UNKNOWN): string[] => {
+export const exportJSON = (l: Ledger): string => JSON.stringify({ schema: l.schema, sessionId: l.sessionId, swarm: l.swarm, runs: l.runs, agents: l.agents.map(({ name: _name, ...a }) => a), tools: l.tools, requests: l.requests, usage: l.usage, nobodywho: l.receipts, warnings: l.warnings, replay: l.replay.map(({ before: _before, after: _after, ...s }) => s), checkpoint: l.checkpoint === null ? null : { at: l.checkpoint.at, phase: l.checkpoint.phase, gates: l.checkpoint.gates, branch: l.checkpoint.branch, startingSha: l.checkpoint.startingSha, currentSha: l.checkpoint.currentSha, repo: l.checkpoint.repo, dirty: l.checkpoint.dirty, backgroundAgents: l.checkpoint.backgroundAgents }, ...(l.consults?.length ? { consults: l.consults } : {}) }, (_key, value: unknown) => typeof value === 'string' ? (secretText(value) ? UNKNOWN : safeText(value)) : value, 2)
+export type TierName = 'OPUS' | 'SONNET' | 'HAIKU' | 'OTHER'
+export type TierFigures = { requests: number; reported: number; input: number; output: number; cacheRead: number; cacheWrite: number }
+export type TierUsage = Partial<Record<TierName, TierFigures>>
+const TIER_ORDER: readonly TierName[] = ['SONNET', 'HAIKU', 'OPUS', 'OTHER']
+const tierName = (model: unknown): TierName => { const id = typeof model === 'string' ? model.toLowerCase() : ''; return id.includes('opus') ? 'OPUS' : id.includes('sonnet') ? 'SONNET' : id.includes('haiku') ? 'HAIKU' : 'OTHER' }
+/** Host-reported request tokens by model tier. A request without figures is counted, never estimated. */
+export const usageByTier = (requests: readonly Request[]): TierUsage => {
+  const out: TierUsage = {}
+  for (const r of requests) {
+    const t = tierName(r.model)
+    const f = out[t] ?? { requests: 0, reported: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    f.requests++
+    if (typeof r.input === 'number' && typeof r.output === 'number') {
+      f.reported++; f.input += r.input; f.output += r.output
+      f.cacheRead += typeof r.cacheRead === 'number' ? r.cacheRead : 0; f.cacheWrite += typeof r.cacheWrite === 'number' ? r.cacheWrite : 0
+    }
+    out[t] = f
+  }
+  return out
+}
+const kilo = (n: number): string => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+/** `SONNET in 12.3k out 4.1k (9 req) · HAIKU …`, or `unavailable` when no request carried figures. */
+export const usageLine = (u: TierUsage): string => {
+  const parts = TIER_ORDER.flatMap(t => { const f = u[t]; if (!f) return []; const missing = f.requests - f.reported; return [f.reported === 0 ? `${t} ${f.requests} req unreported` : `${t} in ${kilo(f.input)} out ${kilo(f.output)} (${f.reported} req)${missing ? ` · ${missing} unreported` : ''}`] })
+  return parts.length === 0 || TIER_ORDER.every(t => (u[t]?.reported ?? 0) === 0) ? `unavailable${parts.length ? ` (${parts.join(' · ')})` : ''}` : parts.join(' · ')
+}
+const consultLines = (l: Ledger): string[] => {
+  if (!l.consults?.length) return []
+  const rows = ['11 OPUS CONSULTATIONS']
+  for (const c of l.consults) {
+    const t = l.swarm?.tasks.find(x => x.id === c.id)
+    rows.push(`${c.id} ${c.ground}${c.isMandatory ? ' (mandatory)' : ''} · status ${consultStatus(t)} · admitted: ground holds · agent ${t?.agentId ?? UNKNOWN}`, `asked ${c.packet.decision}`, `decision ${t?.result?.conclusion || 'not returned'}`, `verified by main ${t?.verification ?? UNKNOWN}`, `nobodywho ${c.advice ? `${c.advice.abstain ? 'abstain' : c.advice.choice ?? 'none'} · receipt ${c.advice.requestId} · tier ${c.advice.tier ?? UNKNOWN} · advisory` : `no receipt (${c.adviceNote ?? 'unavailable'})`}`)
+  }
+  return rows
+}
+
+export const ledgerLines = (l: Ledger, now: number, auth: string = UNKNOWN, cost?: string): string[] => {
   const run = l.runs.find(r => r.id === l.currentRun) ?? l.runs.at(-1)
   const tokens = (key: 'input' | 'output' | 'cacheRead' | 'cacheWrite') => l.requests.length === 0 || l.requests.some(r => r[key] === UNKNOWN) ? UNKNOWN : l.requests.reduce((sum, r) => sum + (r[key] as number), 0)
   const tierCounts = (op: 'decision' | 'prune', tiers: string[]) => tiers.map(t => `${t} ${l.receipts.filter(e => e.op === op && e.tier === t).length}`).join(' · ')
@@ -96,7 +133,7 @@ export const ledgerLines = (l: Ledger, now: number, auth: string = UNKNOWN): str
   for (const a of l.agents) rows.push(`TASK ${a.name}`, `CLAUDE role ${a.role} · requested ${a.requestedModel} / ${a.requestedEffort}`, `ACTUAL ${a.model} · ${a.effort} (${a.effortSource}) · observed ${a.effectiveEffort ?? UNKNOWN}${a.fallbackReason !== undefined && a.fallbackReason !== UNKNOWN ? ` · fallback ${a.fallbackReason}` : ''} · ${a.id}`, `origin ${a.runId} / ${a.originTurn} · parent ${a.parentAgent}`, 'NOBODYWHO decision unknown · pruning unknown (no agent correlation in receipts)', `RESULT ${a.status} · ${elapsed(a.start, a.end, now)}ms · tools ${a.counts.tools} · reads ${a.counts.reads} · edits ${a.counts.edits} · writes ${a.counts.writes} · retries ${a.counts.retries}`, `latest ${a.latest}`)
   rows.push('04 NOBODYWHO', `DECISION ${tierCounts('decision', ['P0', '0.6B', '9B'])}`, `PRUNING ${tierCounts('prune', ['P0', 'Q4B', '9B'])}`, `proposed ${ns('proposed')} · accepted ${ns('accepted')} · rejected ${ns('rejected')}`)
   for (const e of l.receipts.slice(-8)) rows.push(`${e.op} ${e.tier} · ${e.route ?? UNKNOWN} · ${e.latencyMs}ms · abstention ${e.abstention ?? UNKNOWN} · fallback ${e.fallbackTier ?? UNKNOWN}`)
-  rows.push('05 USAGE', `context ${l.usage.at(-1)?.tokens ?? UNKNOWN} / ${l.usage.at(-1)?.window ?? UNKNOWN} · ${l.usage.at(-1)?.percent ?? UNKNOWN}%`, `retained request tokens: input ${tokens('input')} · output ${tokens('output')} · cache read ${tokens('cacheRead')} · cache write ${tokens('cacheWrite')}`, `context trend ${l.usage.slice(-12).map(s => s.percent === UNKNOWN ? '?' : `${s.percent}%`).join(' → ')}`, '06 FILES', `read paths ${new Set(l.tools.filter(t => t.tool === 'Read' && t.file !== UNKNOWN).map(t => t.file)).size} · changed paths ${new Set(l.tools.filter(t => (t.tool === 'Edit' || t.tool === 'Write') && t.status === 'success' && t.file !== UNKNOWN).map(t => t.file)).size} (retained history)`)
+  rows.push('05 USAGE', `context ${l.usage.at(-1)?.tokens ?? UNKNOWN} / ${l.usage.at(-1)?.window ?? UNKNOWN} · ${l.usage.at(-1)?.percent ?? UNKNOWN}%`, `retained request tokens: input ${tokens('input')} · output ${tokens('output')} · cache read ${tokens('cacheRead')} · cache write ${tokens('cacheWrite')}`, ...(l.requests.length ? [`observed by tier: ${usageLine(usageByTier(l.requests))}`] : []), ...(cost === undefined ? [] : [`host cost ${cost}`]), `context trend ${l.usage.slice(-12).map(s => s.percent === UNKNOWN ? '?' : `${s.percent}%`).join(' → ')}`, '06 FILES', `read paths ${new Set(l.tools.filter(t => t.tool === 'Read' && t.file !== UNKNOWN).map(t => t.file)).size} · changed paths ${new Set(l.tools.filter(t => (t.tool === 'Edit' || t.tool === 'Write') && t.status === 'success' && t.file !== UNKNOWN).map(t => t.file)).size} (retained history)`)
   for (const t of l.tools.filter(t => t.file !== UNKNOWN).slice(-32)) rows.push(`${t.tool} ${t.file} · ${t.status}`)
   rows.push('07 FAILURES / RETRIES', `tools ${run?.counts.tools ?? 0} · failures ${run?.counts.failures ?? 0} · retries unknown`)
   for (const t of l.tools.filter(t => t.status === 'failure').slice(-12)) rows.push(`${t.id} · ${t.tool} · failure`)
@@ -106,6 +143,7 @@ export const ledgerLines = (l: Ledger, now: number, auth: string = UNKNOWN): str
     for (const t of l.swarm.tasks) rows.push(`${t.id} ${t.tier} ${t.role} · ${t.state} · effort ${t.requestedEffort}${t.appliedEffort ? ` → ${t.appliedEffort}` : ''} · agent ${t.agentId ?? UNKNOWN} · parent ${t.parentTask ?? UNKNOWN}/${t.parentAgent ?? UNKNOWN}`, `why ${t.spawnReason} · objective ${t.objective}`, `ownership ${t.mode} ${t.owned.join(', ')} · dependencies ${t.dependencies.join(', ') || 'none'} · wave ${t.wave}`, `result ${t.result?.conclusion ?? UNKNOWN} · report ${t.resultDelivery ?? 'unavailable'} · verification ${t.verification}${t.escalation ? ` · escalation ${t.tier} → ${t.escalation.to}: ${t.escalation.question}` : ''}${t.effortEscalation ? ` · effort escalation ${t.effortEscalation.from} → ${t.effortEscalation.to}: ${t.effortEscalation.reason}` : ''}`)
     rows.push(`Lifecycle ${l.swarm.events.length} retained events · ${l.swarm.droppedEvents} evicted · /replay`)
   }
+  rows.push(...consultLines(l))
   return rows
 }
 
@@ -121,6 +159,7 @@ export const storageLedger = (ledger: Ledger): Ledger => {
     else if (l.replay.length > 1) l.replay = l.replay.slice(Math.max(1, Math.floor(l.replay.length / 4)))
     else if (l.swarm && l.swarm.events.length > 8) l = { ...l, swarm: { ...l.swarm, events: l.swarm.events.slice(Math.max(1,Math.floor(l.swarm.events.length / 4))), droppedEvents: l.swarm.droppedEvents + Math.max(1,Math.floor(l.swarm.events.length / 4)) } }
     else if (l.swarm?.tasks.some(t => t.result && (t.result.evidence.length || t.result.changes.length || t.result.verification.length || t.result.conclusion.length > 160) || t.escalation && (t.escalation.evidence.length || t.escalation.discoveries.length))) l = { ...l, swarm: { ...l.swarm, tasks: l.swarm.tasks.map(t => ({ ...t, result: t.result ? { ...t.result, conclusion: t.result.conclusion.slice(0,160), evidence:[], changes:[], verification:[], unresolved:['Stored detail pruned; commander verification unchanged'], confidence:null, escalation:null, rawRef:null } : null, escalation: t.escalation ? { ...t.escalation, evidence:[], discoveries:[], question:t.escalation.question.slice(0,160), nextAction:t.escalation.nextAction.slice(0,160), locations:t.escalation.locations.slice(0,4) } : null })) } }
+    else if (l.consults?.some(c => c.packet.architecture.length > 160 || c.packet.files.length || c.packet.alternatives.length || c.packet.failures.length || c.packet.objective.length > 160 || c.packet.decision.length > 160 || c.packet.risk.length > 160)) l = { ...l, consults: l.consults.map(c => ({ ...c, packet: { objective: c.packet.objective.slice(0, 160), decision: c.packet.decision.slice(0, 160), risk: c.packet.risk.slice(0, 160), architecture: c.packet.architecture.slice(0, 160), files: [], alternatives: [], failures: [] } })) }
     else if (l.receipts.length > 8) l.receipts = l.receipts.slice(Math.max(1, Math.floor(l.receipts.length / 4)))
     else break
   }

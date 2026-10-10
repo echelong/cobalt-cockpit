@@ -510,13 +510,13 @@ export const escalationLine = (e: EffortEscalation): string => `${e.from.toUpper
 // The system-prompt section: the rules the hooks also enforce.
 // ---------------------------------------------------------------------------
 
-export const effortPolicyText = (mode: 'AUTO' | 'MANUAL', ceiling: EffortLevel): string => `
+export const effortPolicyText = (mode: 'AUTO' | 'MANUAL', ceiling: EffortLevel, profile: 'OPUS_LED' | 'SONNET_LED' = 'OPUS_LED'): string => `
 
 Dynamic reasoning (Cobalt Cockpit):
-- Reasoning mode is ${mode}. Model selection and effort selection are separate decisions. Three tiers remain: Opus 5.5 commands and verifies, Sonnet 5.5 engineers, Haiku 5.5 scouts.
+- Reasoning mode is ${mode}. Model selection and effort selection are separate decisions. ${profile === 'SONNET_LED' ? 'Three tiers remain: Sonnet 5.5 leads, builds and verifies, Haiku 5.5 scouts, and Opus 5.5 is consulted only on admission.' : 'Three tiers remain: Opus 5.5 commands and verifies, Sonnet 5.5 engineers, Haiku 5.5 scouts.'}
 - Effort is chosen per task, not fixed. ${mode === 'AUTO' ? 'AUTO names a level from the task: extractive inventories, classification and summaries run light; normal feature work and refactors run medium; complex debugging, concurrency, migrations, security and high-risk architectural reasoning run high or xhigh; unusually difficult high-stakes reasoning may use max.' : 'MANUAL honours the configured level unless a task is assigned an explicit effort.'}
 - A level is only ever requested. Every model does not support every level, so the applied level may be lower after a capability fallback; requested and applied effort are recorded separately and a fallback is named, never hidden.
 - The main loop's effort is the user's. Cockpit never sets or rewrites it: /effort, --effort, CLAUDE_CODE_EFFORT_LEVEL, the settings and the host's caps decide it, and launching a subagent does not change it.
 - A subagent's level is set on its Agent call from the assignment; leave the Agent tool's own effort parameter out unless overriding a level by hand. The engine's caps and overrides win, and a level it resolves differently is recorded as a fallback.
-- Escalate when a task is failing: raise effort by one step within the tier first, then move a tier (Haiku → Sonnet → Opus). Never jump straight to the top, and stop at the ceiling budget rather than retrying forever. Name the level per assignment with the swarm tool's effort field when the task itself makes it clear.
+- Escalate when a task is failing: raise effort by one step within the tier first, then move a tier (Haiku → Sonnet${profile === 'SONNET_LED' ? ', and to Opus only through an admitted consultation' : ' → Opus'}). Never jump straight to the top, and stop at the ceiling budget rather than retrying forever. Name the level per assignment with the swarm tool's effort field when the task itself makes it clear.
 - The ceiling for any request is ${ceiling.toUpperCase()}; a higher request falls back and is recorded.`

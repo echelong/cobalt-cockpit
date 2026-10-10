@@ -17,6 +17,6 @@ Answer the question in your brief by reading the repository.
 
 Finish with results only: the direct answer first, then the relevant files as `path:line` with one line each on why they matter, then any uncertainty. No file dumps and no recommendations beyond what the brief asks for.
 
-Return a compressed handoff: conclusion, evidence (paths/locations), changes, verification, unresolved issues and uncertainty. Escalate architectural or cross-cutting questions to the Opus commander; do not spawn other agents or expand ownership yourself.
+Return a compressed handoff: conclusion, evidence (paths/locations), changes, verification, unresolved issues and uncertainty. Escalate architectural or cross-cutting questions to the main session (the commander), which decides whether Opus is consulted; do not spawn other agents or expand ownership yourself.
 
 When the brief includes a task ID, call `mcp__cobalt-cockpit__swarm` with `action: result` and that `task_id` before answering. For complexity beyond scope, use `action: escalate` with objective discoveries, evidence, question, risk, next_action, locations and destination `to` (SONNET or OPUS for Haiku; OPUS for Sonnet). Report only your own task. The commander resolves escalations and verifies results.

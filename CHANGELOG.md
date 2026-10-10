@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — Sonnet-led profile
+
+- New `profile` option. `OPUS_LED` (the default) is 0.4.0's behaviour, unchanged. `SONNET_LED` means: Sonnet builds, Haiku scouts, Opus reviews, NobodyWho advises. The main loop is requested on Sonnet 5.5 at the user's own effort, and Opus 5.5 runs only as an admitted, read-only `cobalt-cockpit:architect` consultation.
+- Opus admission (`swarm action consult`): a ground that must hold on evidence (architecture, security, repeated failure, explicit request, release approval) and a bounded evidence packet. One Opus at a time; an unchanged problem is consulted once; one retry; three per task. Routes around it (an unassigned Opus or architect spawn, an OPUS assignment) are refused.
+- Mandatory consultations: an explicit request for Opus, a release approval, or a change to security-sensitive files holds the task below 100% until the consultation returns and the main session verifies its advice.
+- NobodyWho advice through the local `decision ask` router (new `localAdvice` option). It is recorded only with a real receipt and never decides admission.
+- HUD and Ledger: role labels (MAIN, SCOUT, ENGINEER, ARCHITECT, LOCAL CONTROL), consultation records (ground, decision, verification, receipt), host-reported usage per tier, and the host's cost total. Nothing is estimated.
+- `SONNET_LED` AUTO budgets: 4 helpers in all (2 Sonnet, 2 Haiku, 1 Opus).
+- Suite: 995 → 1023. Design, migration and rollback are in [docs/implementation-v0.5-sonnet-led.md](docs/implementation-v0.5-sonnet-led.md).
+
 ## 0.4.0 — Read-only helpers deliver their reports
 
 - Fixed: a read-only helper could finish its work and have no way to report it. Claude Code delivers a background helper's report through its own hand-back tool (`SubagentHandback`) and reaches deferred tools through tool discovery (`ToolSearch`). Cockpit's read-only guard refused both, so a commander running v0.3.2 was told only that the helper "ended without delivering a report", and the commander's own tool discovery was held while any helper was active. A bound helper may now use those two host control tools, and the commander's discovery is no longer held.

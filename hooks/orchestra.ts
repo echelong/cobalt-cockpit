@@ -25,6 +25,10 @@ import { STAGE_LABEL } from './theme'
 import { duration } from './view'
 import type { Row } from './view'
 import { summarizeSwarm } from './swarm'
+import { consultLine, statusOf as consultStatus } from './consult'
+import type { Consultation } from '../types'
+import { usageLine } from './ledger'
+import type { TierUsage } from './ledger'
 
 export type { AgentRole, Orchestra } from '../types'
 
@@ -65,6 +69,7 @@ export const roleOf = (subagentType: string): AgentRole => {
   const name = subagentType.toLowerCase().replace(/^.*:/, '')
   if (/^(scout|inventory)$/.test(name)) return 'SCOUT'
   if (/^(utility|triage)$/.test(name)) return 'UTILITY'
+  if (/^architect$/.test(name)) return 'ARCHITECT'
   if (/review/.test(name)) return 'REVIEWER'
   if (/^(explore|explorer)$/.test(name)) return 'EXPLORER'
   if (/^(researcher|research|claude-code-guide)$/.test(name)) return 'RESEARCHER'
@@ -219,12 +224,23 @@ export type OrchestraView = {
   limit: number
   now: number
   swarm?: Swarm
+  /** SONNET_LED names roles (MAIN, SCOUT, ENGINEER, ARCHITECT, LOCAL CONTROL); absent or OPUS_LED draws as before. */
+  profile?: 'OPUS_LED' | 'SONNET_LED'
+  consults?: readonly Consultation[]
+  /** Host-reported request tokens by tier; never estimated. */
+  usage?: TierUsage
 }
+
+/** SONNET_LED's role for each model tier the engine really ran. */
+export const CREW_ROLE: Record<'OPUS' | 'SONNET' | 'HAIKU', string> = { HAIKU: 'SCOUT', SONNET: 'ENGINEER', OPUS: 'ARCHITECT' }
 
 const running = (agents: readonly AgentStrip[]): number => agents.filter(a => a.state === 'running' || a.state === 'waiting').length
 
 /** `OPUS / MAIN`, from the model the engine reports for the main loop. */
 export const mainLabel = (meter: Meter): string => `${tierOf(meter.model) ?? 'MODEL'} / MAIN`
+/** `MAIN / SONNET` in SONNET_LED, the legacy label otherwise; the tier is the observed one. */
+export const mainLabelFor = (meter: Meter, profile?: 'OPUS_LED' | 'SONNET_LED'): string => profile === 'SONNET_LED' ? `MAIN / ${tierOf(meter.model) ?? 'MODEL'}` : mainLabel(meter)
+const crewLabel = (tier: string, profile?: 'OPUS_LED' | 'SONNET_LED'): string => profile === 'SONNET_LED' && tier in CREW_ROLE ? `${CREW_ROLE[tier as keyof typeof CREW_ROLE]} / ${tier}` : `${tier} / POOL`
 
 /** `PLAN · HIGH`: the main loop's real phase or activity, and its effort when the engine reported one. */
 export const mainWord = (view: Pick<OrchestraView, 'task' | 'activity' | 'isWorking' | 'meter'>): string => {
@@ -243,7 +259,7 @@ export const isBackToMain = (view: Pick<OrchestraView, 'agents' | 'isWorking'>):
  * many of the limit are running, or that the work is back with main.
  */
 export const headerText = (view: OrchestraView, columns: number): string => {
-  const main = `${mainLabel(view.meter)} · ${mainWord(view)}`
+  const main = `${mainLabelFor(view.meter, view.profile)} · ${mainWord(view)}`
   const group = isBackToMain(view) ? `BACK TO MAIN · ${mainWord(view)}` : `${groupLabel(view.agents)} ${running(view.agents)}/${view.limit}`
 
   return fitText(columns >= 60 ? `${main}   ${group}` : group, columns)
@@ -268,13 +284,14 @@ const pair = (name: string, value: string, color?: string): Row => [
  * BACK TO MAIN.
  */
 export const orchestraRows = (view: OrchestraView, columns: number, colors: { accent: string; ok: string; bad: string; steel: string }): Row[] => {
-  const rows: Row[] = [pair(mainLabel(view.meter), mainWord(view), colors.accent)]
+  const led = view.profile === 'SONNET_LED'
+  const rows: Row[] = [pair(mainLabelFor(view.meter, view.profile), mainWord(view), colors.accent)]
   // The reasoning mode is named only when the policy set one, so an older
   // observation-only view is byte-for-byte what it was.
   // The mode is the policy's, for the subagents; the main loop's level is the
   // host's own, shown with where it was seen to come from.
   if (view.meter.reasoningMode) rows.push(pair('REASONING', `${view.meter.reasoningMode}${view.meter.effort ? ` · main ${view.meter.effort.toUpperCase()}` : ''}${view.meter.hostSource ? ` · ${view.meter.hostSource}` : ''}`, colors.steel))
-  if (view.nwho !== null) rows.push(pair('NWHO / LOCAL', view.nwho, colors.steel))
+  if (view.nwho !== null) rows.push(pair(led ? 'LOCAL CONTROL / NWHO' : 'NWHO / LOCAL', view.nwho, colors.steel))
   if (view.agents.length > 0) {
     rows.push(pair(groupLabel(view.agents), `${running(view.agents)}/${view.limit} running`, colors.accent))
     const groups = new Map<string, AgentStrip[]>()
@@ -283,9 +300,10 @@ export const orchestraRows = (view: OrchestraView, columns: number, colors: { ac
       groups.set(tier, [...(groups.get(tier) ?? []), a])
     }
     for (const [tier, agents] of groups) {
+      if (led && agents.length <= 8) rows.push(pair(crewLabel(tier, view.profile), `${running(agents)} running · ${agents.length} observed`, colors.steel))
       if (agents.length > 8) {
         const count = (state: AgentStrip['state']) => agents.filter(a => a.state === state).length
-        rows.push(pair(`${tier} / POOL`, `${agents.length} observed · ${count('running')} active · ${count('waiting')} waiting · ${count('done')} done · ${count('error')} failed`, colors.accent))
+        rows.push(pair(crewLabel(tier, view.profile), `${agents.length} observed · ${count('running')} active · ${count('waiting')} waiting · ${count('done')} done · ${count('error')} failed`, colors.accent))
         // Preserve individual failures without letting tiny utility tasks flood the HUD.
         for (const a of agents.filter(a => a.state === 'error').slice(-2)) rows.push([{ text: ` ${fitText(`${a.id} ${a.title} ${a.tool}`, Math.max(20, columns - 2))}`, color: colors.bad }])
       } else for (const a of agents) {
@@ -300,13 +318,21 @@ export const orchestraRows = (view: OrchestraView, columns: number, colors: { ac
     const s = summarizeSwarm(view.swarm)
     rows.push(pair('WAVE', s.wave, colors.accent))
     rows.push(pair('TASK GRAPH', `${s.completed}/${s.total} complete · parallel ${s.parallelism} · queue ${s.queue} · blocked ${s.blocked}`, colors.steel))
-    rows.push(pair('POOL / ACTIVE', `SONNET ${s.sonnet} · HAIKU ${s.haiku} · high-water ${s.highWater}`, colors.steel))
+    rows.push(pair('POOL / ACTIVE', `SONNET ${s.sonnet} · HAIKU ${s.haiku}${led ? ` · OPUS ${s.opus}` : ''} · high-water ${s.highWater}`, colors.steel))
     if (s.escalations.length) rows.push(pair('ESCALATIONS', s.escalations.slice(-3).map(e => `${e.task} ${e.from} → ${e.to}`).join(' · '), colors.bad))
     if (s.effortEscalations.length) rows.push(pair('EFFORT STEPS', s.effortEscalations.slice(-3).map(e => `${e.task} ${e.from.toUpperCase()} → ${e.to.toUpperCase()}`).join(' · '), colors.bad))
     rows.push(pair('CONFLICTS', String(s.conflicts), s.conflicts ? colors.bad : colors.steel))
     const tasks = view.swarm.tasks
     rows.push(pair('VERIFICATION', `${tasks.filter(t => t.verification === 'pass').length} pass · ${tasks.filter(t => t.verification === 'fail').length} fail · ${tasks.filter(t => t.verification === 'pending').length} pending · ${tasks.filter(t => t.verification === 'unknown').length} unknown`, colors.steel))
+    if (led && view.consults && view.consults.length > 0) {
+      const swarm = view.swarm
+      const states = view.consults.map(c => consultStatus(swarm.tasks.find(t => t.id === c.id)))
+      const verified = view.consults.filter(c => ['pass', 'fail'].includes(swarm.tasks.find(t => t.id === c.id)?.verification ?? '')).length
+      rows.push(pair('OPUS CONSULTS', `${states.filter(x => x === 'admitted' || x === 'running').length} open · ${states.filter(x => x === 'returned').length} returned · ${verified} verified`, colors.accent))
+      for (const c of view.consults.slice(-3)) rows.push([{ text: ` ${fitText(consultLine(c, swarm), Math.max(20, columns - 2))}` }])
+    }
   }
+  if (led && view.usage !== undefined) rows.push(pair('USAGE / OBSERVED', usageLine(view.usage), colors.steel))
   return rows
 }
 
@@ -315,7 +341,7 @@ export const orchestraRows = (view: OrchestraView, columns: number, colors: { ac
  * nothing the hooks do not also enforce: the limit, the default model, the
  * reviewer's grounds and the Fable block all hold whether or not it is read.
  */
-export const orchestrationText = (limit: number): string => `
+export const orchestrationText = (limit: number, profile: 'OPUS_LED' | 'SONNET_LED' = 'OPUS_LED'): string => profile === 'SONNET_LED' ? sonnetLedText(limit) : `
 
 Elastic swarm orchestration (Cobalt Cockpit):
 - You are the Opus 5.5 commander, at the reasoning effort the user set: understand, plan, decompose, assign bounded ownership, manage dependencies, resolve architecture and escalations, integrate, verify independently and produce the final result. Do not delegate architectural responsibility.
@@ -329,3 +355,21 @@ Elastic swarm orchestration (Cobalt Cockpit):
 - Use cancel for unnecessary, failed or stalled work and verify for independent task verification. Task completion cannot bypass unresolved dependencies. Fresh parallel Sonnet reviewers are allowed for explicitly assigned independent scopes; legacy unassigned reviewers retain their admission grounds. Review independent scopes when warranted; do not merely confirm the implementer's claim. The engine controls observed start/end state; a reported result is evidence, not proof.
 - Before calling the mission done, inspect integrated changes and run real verification gates yourself. Unknown model activity, effective effort, cost and token usage remain unknown.
 - NobodyWho remains local Decision, Pruning and read-only control telemetry. ${FABLE_RULE}`
+
+/**
+ * SONNET_LED: Sonnet builds, Haiku scouts, Opus reviews, NobodyWho advises.
+ * Every rule here is also enforced: the Opus admission, the one-at-a-time and
+ * duplicate bounds, the mandatory review that holds a task below 100%, and
+ * the budgets.
+ */
+const sonnetLedText = (limit: number): string => `
+
+Sonnet-led orchestration (Cobalt Cockpit, SONNET_LED):
+- You are the Sonnet 5.5 main session at the effort the user set. You own planning, implementation, debugging, integration and verification, and you complete ordinary work yourself. Do not consult Opus for routine tests, documentation, file discovery or simple fixes.
+- Delegate only when it saves work: Haiku 5.5 scouts (cobalt-cockpit:scout, utility) for bounded read-only discovery and extraction; Sonnet workers (worker, explorer, researcher, reviewer) for independent coding, focused debugging and review. Never spawn an agent for a single-file lookup. At most ${limit} helpers at once: two Haiku, two Sonnet and one Opus within that. Give each a precise scope and a bounded output, and keep large search results and logs in its context.
+- Before each delegated spawn, use swarm action assign (task_id, tier SONNET or HAIKU, role, objective, scope, dependencies, owned_resources, mode, spawn_reason) and put the exact [task:ID] in the Agent description. Overlapping writers are serialized; read-only work may overlap. Children never spawn agents.
+- Opus 5.5 is an on-demand architect and final high-risk reviewer, never a background model. Request it with swarm action consult: a ground (architecture, security, repeated-failure, asked, release), and a concise evidence packet (objective, architecture, locations, alternatives, failures, risk, question). Cockpit admits it only where the ground holds, one at a time, once per unchanged problem, with bounded retries. Then spawn cobalt-cockpit:architect with the returned [task:ID] and brief. Opus returns a structured plan or review; you implement and verify it.
+- Some tasks cannot finish without Opus: when the user asks for Opus, asks for a release approval, or the task changes security-sensitive files, progress holds below 100% until a consultation has returned and you have verified its advice with swarm action verify (pass or fail, with evidence). Review findings are advice until verified.
+- NobodyWho is local advice: its receipt, when one exists, is shown beside a consultation and never decides it. Never claim a NobodyWho decision without a receipt.
+- Use result, escalate, cancel, resolve and verify as before. A reported result is evidence, not proof. Before calling the work done, inspect the integrated changes and run the real verification gates yourself. Unknown model activity, effort, cost and token usage stay unknown.
+- ${FABLE_RULE}`

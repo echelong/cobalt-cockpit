@@ -5,11 +5,14 @@
 import type { EffortLevel, ModelTier, Wave, TaskState, Verification, SwarmResult, Handoff, SwarmTask, SwarmEvent, SwarmConfig, Swarm, TaskInput } from '../types'
 export type { ModelTier, Wave, TaskState, Verification, SwarmResult, Handoff, SwarmTask, SwarmEvent, SwarmConfig, Swarm, TaskInput } from '../types'
 import { BASE_EFFORT, effortEscalation, isEffortLevel } from './effort'
-export const DEFAULT_SWARM_CONFIG: SwarmConfig = { sonnet: 'AUTO', haiku: 'AUTO', total: 'AUTO', maxTasks: 512, maxEvents: 256, stallMs: 300_000 }
+export const DEFAULT_SWARM_CONFIG: SwarmConfig = { sonnet: 'AUTO', haiku: 'AUTO', total: 'AUTO', opus: 0, maxTasks: 512, maxEvents: 256, stallMs: 300_000 }
+/** SONNET_LED's conservative budget: four helpers in all, two Sonnet, two Haiku and one Opus within them. */
+export const SONNET_LED_SWARM: Partial<SwarmConfig> = { total: 4, sonnet: 2, haiku: 2, opus: 1 }
 const integer = (n: number, fallback: number, min = 0): number => Number.isFinite(n) ? Math.max(min, Math.floor(n)) : fallback
 const normalizeConfig = (c: Partial<SwarmConfig>): SwarmConfig => {
   const out = { ...DEFAULT_SWARM_CONFIG, ...c }
   for (const key of ['sonnet', 'haiku', 'total'] as const) out[key] = out[key] === 'AUTO' ? 'AUTO' : integer(out[key], key === 'sonnet' ? 8 : 16)
+  out.opus = integer(out.opus ?? 0, 0)
   out.maxTasks = integer(out.maxTasks, 512, 1); out.maxEvents = integer(out.maxEvents, 256, 1); out.stallMs = integer(out.stallMs, 300_000, 1)
   return out
 }
@@ -61,12 +64,17 @@ export const admissionReason = (s: Swarm, id: string): string | null => {
   if (task.state !== 'queued' && task.state !== 'blocked') return `task ${task.state}`
   const dep = dependencyReason(s, task); if (dep) return dep
   const live = active(s)
-  if (task.tier === 'OPUS') { if (live.some(t => t.tier === 'OPUS')) return 'commander occupied' }
-  else {
-    const total = s.config.total === 'AUTO' ? 16 : s.config.total
+  const opus = s.config.opus ?? 0
+  const total = s.config.total === 'AUTO' ? 16 : s.config.total
+  if (task.tier === 'OPUS' && opus === 0) { if (live.some(t => t.tier === 'OPUS')) return 'commander occupied' }
+  else if (task.tier === 'OPUS') {
+    // An Opus specialist is a real subagent here: one pool, inside the total.
+    if (live.filter(t => t.tier === 'OPUS').length >= opus) return 'architect occupied'
+    if (live.length >= total) return 'resource budget'
+  } else {
     const pool = task.tier === 'SONNET' ? s.config.sonnet : s.config.haiku
     const limit = pool === 'AUTO' ? (task.tier === 'SONNET' ? 8 : 16) : pool
-    if (live.filter(t => t.tier !== 'OPUS').length >= total || live.filter(t => t.tier === task.tier).length >= limit) return 'resource budget'
+    if (live.filter(t => opus > 0 || t.tier !== 'OPUS').length >= total || live.filter(t => t.tier === task.tier).length >= limit) return 'resource budget'
   }
   const collision = live.find(t => (task.mode === 'write' || t.mode === 'write') && task.owned.some(a => t.owned.some(b => overlaps(a, b))))
   return collision ? `ownership conflict: ${collision.id}` : null
@@ -85,7 +93,7 @@ export const admitTask = (s: Swarm, id: string, at: number): { swarm: Swarm; ok:
 }
 export const bindAgent = (s: Swarm, id: string, agentId: string, at: number, kind: 'spawn' | 'adopt' = 'spawn'): Swarm => {
   const t = s.tasks.find(t => t.id === id)
-  if ((!t || (t.state !== 'reserved' && !(t.state === 'stalled' && t.startedAt !== null && t.agentId === null))) || t.tier === 'OPUS' || !agentId || s.tasks.some(t => t.agentId === agentId)) throw new Error('Agent binding requires a unique observed agent and reserved subagent task')
+  if ((!t || (t.state !== 'reserved' && !(t.state === 'stalled' && t.startedAt !== null && t.agentId === null))) || (t.tier === 'OPUS' && (s.config.opus ?? 0) === 0) || !agentId || s.tasks.some(t => t.agentId === agentId)) throw new Error('Agent binding requires a unique observed agent and reserved subagent task')
   return event({ ...update(s, id, { agentId, state: 'running', lastActivityAt: at }), actual: s.actual + 1 }, kind, id, at, `${t.tier} ${t.role}${kind === 'adopt' ? ' · observed existing host agent; no new spawn' : ''}`)
 }
 const text = (s: string): string => s.slice(0, 1500)
@@ -146,7 +154,7 @@ export const resolveEscalation = (s: Swarm, id: string, result: Partial<SwarmRes
   if (!result.conclusion?.trim() || !result.evidence?.some(e => e.trim())) throw new Error('Resolution requires commander conclusion and evidence')
   return event(update(s, id, { state: 'completed', result: compressResult(result), verification: 'pending', reason: null }), 'escalation_resolved', id, at, result.conclusion)
 }
-export const summarizeSwarm = (s: Swarm) => ({ wave: s.wave, parallelism: active(s).length, queue: s.tasks.filter(t => t.state === 'queued').length, blocked: s.tasks.filter(t => t.state === 'blocked' || t.state === 'stalled').length, completed: s.tasks.filter(t => t.state === 'completed').length, total: s.tasks.length, sonnet: s.tasks.filter(t => t.tier === 'SONNET' && occupied(t)).length, haiku: s.tasks.filter(t => t.tier === 'HAIKU' && occupied(t)).length, escalations: s.tasks.filter(t => t.escalation !== null).map(t => ({ task: t.id, from: t.tier, to: t.escalation!.to })), effortEscalations: s.tasks.filter(t => t.effortEscalation !== null).map(t => ({ task: t.id, from: t.effortEscalation!.from, to: t.effortEscalation!.to })), conflicts: s.conflicts, requested: s.requested, actual: s.actual, highWater: s.highWater, tokens: null, cost: null })
+export const summarizeSwarm = (s: Swarm) => ({ wave: s.wave, parallelism: active(s).length, queue: s.tasks.filter(t => t.state === 'queued').length, blocked: s.tasks.filter(t => t.state === 'blocked' || t.state === 'stalled').length, completed: s.tasks.filter(t => t.state === 'completed').length, total: s.tasks.length, sonnet: s.tasks.filter(t => t.tier === 'SONNET' && occupied(t)).length, haiku: s.tasks.filter(t => t.tier === 'HAIKU' && occupied(t)).length, opus: (s.config.opus ?? 0) > 0 ? s.tasks.filter(t => t.tier === 'OPUS' && occupied(t)).length : 0, escalations: s.tasks.filter(t => t.escalation !== null).map(t => ({ task: t.id, from: t.tier, to: t.escalation!.to })), effortEscalations: s.tasks.filter(t => t.effortEscalation !== null).map(t => ({ task: t.id, from: t.effortEscalation!.from, to: t.effortEscalation!.to })), conflicts: s.conflicts, requested: s.requested, actual: s.actual, highWater: s.highWater, tokens: null, cost: null })
 /** Semantic evidence, not keyword routing. Explicit commander choice wins. */
 export const routeTask = (facts: { commanderChoice?: ModelTier; trivial?: boolean; coupled?: boolean; architecture?: boolean; ambiguous?: boolean; highRisk?: boolean; extractive?: boolean; bounded?: boolean }): ModelTier => facts.commanderChoice ?? (facts.trivial || facts.coupled || facts.architecture || facts.ambiguous || facts.highRisk ? 'OPUS' : facts.extractive && facts.bounded ? 'HAIKU' : 'SONNET')
 
