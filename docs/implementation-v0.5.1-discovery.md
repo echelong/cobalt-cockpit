@@ -47,3 +47,7 @@ SONNET_LED and OPUS_LED, router modes, model roles, effort handling, admission a
 ## Known limits
 
 The level is a regex heuristic. The goal check trusts the evidence the model reports and cannot verify it. Haiku scouts can feed `discover`, but only the main session records, and nothing marks an unverified scout claim as a fact.
+
+## Completion integrity after the goal check
+
+`reopenVerification` (model.ts) is the one transition for "the implementation changed": `invalidateAlignment` plus every passed gate to pending ("stale: reason"), for goal-checked work only. `touchFile` (Edit, Write, Bash edit diff) and the helper-edit branch of `noteEnd` use it. `Alignment.tree` holds a git working-tree fingerprint (`treeStamp`: status, diff against HEAD, content hashes of up to 200 untracked files) taken by `serveProgress` when ALIGNED is accepted. `reconcileTree` compares it after every non-progress tool call of the main loop or a helper, and before every progress call; a mismatch calls `treeMoved`, which reopens verification. `invalidateAlignment` drops the stamp, so a second reconcile cannot undo checks that were re-observed. Where git gives no fingerprint the stamp is null and only the direct paths apply. `unpin` (`/cockpit discovery auto`) keeps the level the task already reached as a floor.

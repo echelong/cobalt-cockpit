@@ -16,7 +16,7 @@ import type {
   TouchedFile,
   WorkPhase,
 } from '../types'
-import { align, alignmentNote, criteriaMissing, decide, discover, discoverySummary, foldAliases, invalidateAlignment, isAlignmentSatisfied, resetCriteria, withDiscovery } from './discovery'
+import { align, alignmentNote, criteriaMissing, decide, discover, discoverySummary, foldAliases, invalidateAlignment, isAlignmentSatisfied, needsAlignment, resetCriteria, withDiscovery } from './discovery'
 
 export const GATES: readonly GateName[] = ['CODE', 'TEST', 'TYPE', 'BUILD', 'SECURITY', 'GIT']
 export const WORK_PHASES: readonly WorkPhase[] = [
@@ -473,7 +473,29 @@ export const touchFile = (task: Task, path: string, added: number, removed: numb
         )
       : [...task.files, { path, added, removed }].slice(-MAX_FILES)
 
-  return invalidateAlignment({ ...task, files, edited: true }, 'files changed')
+  return reopenVerification({ ...task, files, edited: true }, 'files changed')
+}
+
+/**
+ * A change to the implementation makes what was shown about it stale: the goal check starts over, and every
+ * check that had passed is pending again until it is observed again. Only goal-checked work is reopened.
+ * New, independently observed gate results and a new `align` restore completion; nothing else does.
+ */
+export const reopenVerification = (task: Task, why: string): Task => {
+  const goalChecked = needsAlignment(task)
+  const reopened = invalidateAlignment(task, why)
+  if (!goalChecked || !Object.values(reopened.gates).some(g => g.state === 'pass')) return reopened
+  const gates = Object.fromEntries(Object.entries(reopened.gates).map(([name, g]) => [name, g.state === 'pass' ? { ...g, state: 'pending' as const, evidence: `stale: ${why}` } : g])) as Task['gates']
+
+  return { ...reopened, gates }
+}
+
+/** Where the working tree no longer matches the one ALIGNED was accepted for, that acceptance is stale. */
+export const treeMoved = (task: Task, tree: string | null): Task => {
+  const accepted = task.alignment?.tree
+  if (tree === null || task.alignment?.state !== 'ALIGNED' || typeof accepted !== 'string' || accepted === tree) return task
+
+  return reopenVerification({ ...task, edited: true }, 'the working tree changed')
 }
 
 /** Distinct files the main loop edits before a task without a plan is reminded of one. */

@@ -113,7 +113,9 @@ export const withDiscovery = (task: Task, override: DiscoveryLevel | null, facts
 export const unpin = (task: Task, facts: DiscoveryFacts = factsOf(task)): Task => {
   if (task.discovery === undefined) return withDiscovery(task, null, facts)
   const found = classify(facts)
-  const level = task.discovery.floor !== undefined && rank(task.discovery.floor) > rank(found.level) ? task.discovery.floor : found.level
+  // Returning to the rules never lowers a level the task already reached, pinned or not.
+  const floor = task.discovery.source === 'auto' ? task.discovery.level : task.discovery.floor
+  const level = floor !== undefined && rank(floor) > rank(found.level) ? floor : found.level
   const { floor: _kept, ...rest } = task.discovery
 
   return { ...task, discovery: { ...rest, level, source: 'auto', reasons: level === found.level ? found.reasons : [...found.reasons, 'earlier-level'].slice(0, MAX_REASONS) } }
@@ -341,7 +343,7 @@ export const alignmentNote = (task: Task): string =>
 export const invalidateAlignment = (task: Task, why: string): Task => {
   const cleared = resetCriteria(task)
 
-  return cleared.alignment === undefined || cleared.alignment.state === 'PENDING' ? cleared : { ...cleared, alignment: { ...cleared.alignment, state: 'PENDING', note: clip(`reset: ${why}`, 120) } }
+  return cleared.alignment === undefined || cleared.alignment.state === 'PENDING' ? cleared : { ...cleared, alignment: (({ tree: _tree, ...rest }) => ({ ...rest, state: 'PENDING' as const, note: clip(`reset: ${why}`, 120) }))(cleared.alignment) }
 }
 
 export type AlignInput = { alignment?: unknown }

@@ -177,6 +177,8 @@ export type Alignment = {
   assumptions: string[]
   note: string | null
   at: number
+  /** A fingerprint of the working tree when ALIGNED was accepted; null where git could not give one. */
+  tree?: string | null
 }
 export type DecisionStatus = 'provisional' | 'verified' | 'revised'
 export type DecisionRecord = {

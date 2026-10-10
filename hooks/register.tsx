@@ -14,7 +14,7 @@ import { textOf } from './ledger'
 import { atom, read, update } from 'claude-code'
 import { desiredRequest, policyMismatch, AGENT_MODEL, HAIKU_MODEL, MAIN_MODEL, OPUS_MODEL, isProfile, DEFAULT_PROFILE } from './model-policy'
 import type { SubagentTier, Profile } from './model-policy'
-import { discoveryRows, guidanceFor, invalidateAlignment, markGuided, unpin, withDiscovery } from './discovery'
+import { discoveryRows, guidanceFor, markGuided, unpin, withDiscovery } from './discovery'
 import { addConsult, advanceReview, briefOf, consultVerdict, factsOf, hasReturned, isGround, mandatoryGrounds, packetOf, promptGroundsOf, readScopeOf, requireReview, CONSULT_EFFORT, GROUNDS } from './consult'
 import type { Consultation } from './consult'
 import { addDecision, adjudicate, adviceLine, answerOf, callsFor, carriesCredential, decisionOf, deterministicRoute, operatorNotice, readAnswers, routerArgv, routerLabel, routerLine, routerModeOf, routerStateOf, switchRouter, withDecision, AVAILABILITY_STATE, CALL_TIMEOUT_MS, EMPTY_ROUTER, PROVIDER, ROUTER_MODES } from './router'
@@ -55,7 +55,7 @@ import {
   namesInstructionFile,
 } from './hygiene'
 import type { Attribution } from './hygiene'
-import { applyAction, newTask, noteFailure, oneLine, progressNudge, setGate, settle, summaryOf, touchFile } from './model'
+import { applyAction, newTask, noteFailure, oneLine, progressNudge, reopenVerification, setGate, settle, summaryOf, touchFile, treeMoved } from './model'
 import type { Cue, ProgressInput } from './model'
 import { basename, parseShell, unwrap } from './shell'
 import { COLORS, fit, heading, hudRows, paneRows, visualStateOf } from './view'
@@ -1409,6 +1409,44 @@ const guard = async ($: EngineInterface, e: { tool: string; agentId?: string } &
   return null
 }
 
+/**
+ * A fingerprint of the project's working tree, from git: tracked changes with their content, untracked files
+ * with theirs. Any tool that changes a tracked or unignored file changes it, whatever the tool is called and
+ * whether or not it reports a diff; a read does not. Null where there is no repository or git did not answer,
+ * and then no mutation outside Edit, Write and a Bash edit diff can be observed. Ignored files are not seen.
+ */
+const TREE_FILES = 200
+const treeStamp = async ($: EngineInterface): Promise<string | null> => {
+  try {
+    const run = (argv: string[]) => $.process.run(['git', '--no-optional-locks', ...argv], { timeoutMs: GIT_TIMEOUT_MS * 3 })
+    const status = await run(['status', '--porcelain=v2', '-z', '--untracked-files=all'])
+    if (status.exitCode !== 0) return null
+    const diff = await run(['diff', 'HEAD', '--binary', '--no-ext-diff', '--no-color'])
+    const listed = await run(['ls-files', '-o', '--exclude-standard', '-z'])
+    const names = listed.exitCode === 0 ? listed.stdout.split('\0').filter(Boolean) : []
+    const hashed = names.length === 0 ? null : await run(['hash-object', '--', ...names.slice(0, TREE_FILES)])
+    const text = [status.stdout, diff.exitCode === 0 ? diff.stdout : '', names.length, hashed?.stdout ?? ''].join('\u0001')
+    // FNV-1a over the text, twice with different seeds: a change detector, not a security boundary
+    let a = 0x811c9dc5, b = 0x01000193
+    for (let i = 0; i < text.length; i++) { const c = text.charCodeAt(i); a = Math.imul(a ^ c, 0x01000193) >>> 0; b = Math.imul(b + c, 0x85ebca6b) >>> 0 }
+
+    return `${text.length}:${a.toString(16)}${b.toString(16)}`
+  } catch {
+    return null
+  }
+}
+
+/** If a goal check was accepted for another working tree than the present one, it is stale now. */
+const reconcileTree = async ($: EngineInterface): Promise<void> => {
+  const task = await read($, taskAtom)
+  if (task?.alignment?.state !== 'ALIGNED' || typeof task.alignment.tree !== 'string') return
+  const tree = await treeStamp($)
+  if (tree === null || tree === task.alignment.tree) return
+  const now = await $.clock.now()
+  const held = await update($, taskAtom, t => (t === null ? t : treeMoved(t, tree)))
+  if (held !== null) await quiet(async () => { await mutateLedger($, l => recordDiscovery(l, held, now)); await persist($) })
+}
+
 const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: string }): Promise<{ result: string }> => {
   if (e.agentId !== undefined) {
     return {
@@ -1417,6 +1455,9 @@ const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: 
   }
   const now = await $.clock.now()
   const sha = (await read($, gitAtom))?.sha ?? null
+  await quiet(() => reconcileTree($))
+  // the tree an accepted goal check is about, taken before the answer is recorded
+  const stamp = e.action === 'align' ? await treeStamp($) : null
   let reply = ''
   let cues: Cue[] = []
   const pin = await read($, discoveryPinAtom)
@@ -1431,7 +1472,8 @@ const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: 
     // The person's pin and the evidence of the plan are applied before the task is settled, so the goal check counts toward DONE.
     // A task stored by v0.5.0 (milestones, no discovery) keeps the rules it began under, unless this call starts a new one.
     const isLegacy = old !== null && old.milestones.length > 0 && old.discovery === undefined && e.action !== 'plan'
-    const settled = settle(isLegacy ? outcome.task : withDiscovery(outcome.task, pin))
+    const stamped = stamp !== null && outcome.task.alignment?.state === 'ALIGNED' ? { ...outcome.task, alignment: { ...outcome.task.alignment, tree: stamp } } : outcome.task
+    const settled = settle(isLegacy ? stamped : withDiscovery(stamped, pin))
     cues = settled.cues
     reply = [outcome.note, summaryOf(settled.task)].filter(Boolean).join(' ')
 
@@ -1488,10 +1530,11 @@ const noteEnd = async (
     const wrote = made !== null && made['staged'] !== true && (e.tool === 'Edit' || e.tool === 'Write' || (e.tool === 'Bash' && Array.isArray((made['bashEditDiff'] as { files?: unknown } | undefined)?.files)))
     if (wrote) {
       await quiet(async () => {
-        const held = await change($, task => invalidateAlignment({ ...task, edited: true }, 'a helper changed files'))
+        const held = await change($, task => reopenVerification({ ...task, edited: true }, 'a helper changed files'))
         if (held !== null) await mutateLedger($, l => recordDiscovery(l, held, now))
       })
     }
+    if (ran.deny === undefined && e.tool !== TOOL) await quiet(() => reconcileTree($))
 
     return
   }
@@ -1554,6 +1597,8 @@ const noteEnd = async (
       old.toolUseId === e.tool_use_id ? { ...old, kind: old.isWorking ? 'THINK' : 'IDLE', detail: '', toolUseId: null } : old,
     )
   }
+  // Whatever else a tool did to the project, a goal check made for another tree is stale.
+  if (ran.deny === undefined && e.tool !== TOOL) await quiet(() => reconcileTree($))
   scheduleGit($)
   void refreshMeter($)
 }

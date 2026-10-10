@@ -3,7 +3,7 @@ import { addAgent, checkpointOf, emptyLedger, jsonBytes, startRun, storageLedger
 import { admitTask, bindAgent, emptySwarm, finishTask, reportResult, submitTask } from '../hooks/swarm'
 import { replayTimeline } from '../hooks/replay'
 import type { Ledger } from '../types'
-import { fieldRowsOf, hostState, mountHud, mountPane, passAllGates, planAndComplete, progress, prompt, rowsOf, start, world } from './world'
+import { bash, command, fieldRowsOf, hostState, mountHud, mountPane, passAllGates, planAndComplete, progress, prompt, rowsOf, start, world } from './world'
 
 type Engine = Parameters<typeof start>[0]
 const SWARM = 'mcp__cobalt-cockpit__swarm'
@@ -390,8 +390,88 @@ describe('a helper edit after the goal check', () => {
     const held = await progress($, { action: 'complete', milestone: 'm5' })
     expect(held).toContain('HELD')
     expect(held).not.toContain('DONE')
-    // renewed verification, with its own evidence, is what finishes it
+    // the checks that passed before the edit are pending again; renewed verification, with its own evidence, finishes it
+    expect(await progress($, { action: 'status' })).toContain('TEST pending')
+    expect(await progress($, aligned)).toStartWith('error:')
+    await passAllGates($, { align: false })
     expect(await progress($, aligned)).toContain('alignment ALIGNED')
     expect(await progress($, { action: 'complete', milestone: 'm5' })).toStartWith('DONE 100%')
+  })
+})
+
+describe('completion integrity after DONE', () => {
+  const aligned = { action: 'align', alignment: { state: 'ALIGNED', demonstrated: [{ id: 'c1', evidence: "cancel test 'frees the slot' passes in test/api.test.js (4 pass)" }] } }
+  const done = async ($: Engine) => {
+    await start($)
+    await prompt($, 'Add booking cancellation to the API and the UI')
+    await progress($, { action: 'discover', criteria: ['A booking can be cancelled'] })
+    await planAndComplete($, 4)
+    await passAllGates($, { align: false })
+    await progress($, aligned)
+    expect(await progress($, { action: 'complete', milestone: 'm5' })).toStartWith('DONE 100%')
+  }
+  const restore = async ($: Engine) => {
+    expect(await progress($, { action: 'status' })).not.toStartWith('DONE')
+    await passAllGates($, { align: false })
+    expect(await progress($, aligned)).toContain('alignment ALIGNED')
+    expect(await progress($, { action: 'status' })).toStartWith('DONE 100%')
+  }
+
+  test('a main-session edit after DONE revokes alignment and the passed checks; new observations restore it', options, async ($, on) => {
+    world(on); await done($)
+    await $.tool.call({ tool: 'Edit', file_path: '/work/example/src/api.js', old_string: 'a', new_string: 'b', tool_use_id: 'late-edit' } as never)
+    const after = await progress($, { action: 'status' })
+    expect(after).toContain('alignment PENDING')
+    expect(after).toContain('UNVERIFIED')
+    expect(after).toContain('TEST pending')
+    expect(after).not.toStartWith('DONE')
+    await restore($)
+  })
+
+  test('reading after DONE revokes nothing', options, async ($, on) => {
+    world(on); await done($)
+    for (const tool of ['Read', 'Grep', 'Glob']) await $.tool.call({ tool, file_path: '/work/example/src/api.js', tool_use_id: `r-${tool}` } as never)
+    await bash($, 'git log --oneline -3')
+    expect(await progress($, { action: 'status' })).toStartWith('DONE 100%')
+  })
+
+  test('a tool that is neither Edit nor Write but changed the working tree revokes alignment', options, async ($, on) => {
+    const w = world(on); await done($)
+    w.gitStatus = `${w.gitStatus}1 .M N... 100644 100644 100644 aaa bbb notebooks/analysis.ipynb\n`
+    await $.tool.call({ tool: 'NotebookEdit', notebook_path: '/work/example/notebooks/analysis.ipynb', new_source: 'x', tool_use_id: 'nb' } as never)
+    expect(await progress($, { action: 'status' })).toContain('alignment PENDING')
+    await restore($)
+  })
+
+  test('an MCP filesystem writer is seen by the tree, not by its name, and a no-op writer is not', options, async ($, on) => {
+    const w = world(on); await done($)
+    await $.tool.call({ tool: 'mcp__fs__write_file', path: '/work/example/src/api.js', content: 'same', tool_use_id: 'mcp-noop' } as never)
+    expect(await progress($, { action: 'status' })).toStartWith('DONE 100%')
+    w.gitStatus = `${w.gitStatus}1 .M N... 100644 100644 100644 aaa bbb src/api.js\n`
+    await $.tool.call({ tool: 'mcp__fs__write_file', path: '/work/example/src/api.js', content: 'new', tool_use_id: 'mcp-real' } as never)
+    expect(await progress($, { action: 'status' })).toContain('alignment PENDING')
+  })
+
+  test('a shell command that changed a tracked file revokes alignment even with no edit diff', options, async ($, on) => {
+    const w = world(on); await done($)
+    w.gitStatus = `${w.gitStatus}1 .M N... 100644 100644 100644 aaa bbb src/store.js\n`
+    await bash($, "sed -i 's/a/b/' src/store.js")
+    expect(await progress($, { action: 'status' })).toContain('alignment PENDING')
+  })
+
+  test('where git cannot answer, only Edit, Write and Bash edit diffs are seen: the documented gap', options, async ($, on) => {
+    const w = world(on); w.gitStatus = null; await done($)
+    await $.tool.call({ tool: 'NotebookEdit', notebook_path: '/work/example/a.ipynb', new_source: 'x', tool_use_id: 'nb-gap' } as never)
+    expect(await progress($, { action: 'status' })).toStartWith('DONE 100%')
+    await $.tool.call({ tool: 'Edit', file_path: '/work/example/src/api.js', old_string: 'a', new_string: 'b', tool_use_id: 'edit-still-seen' } as never)
+    expect(await progress($, { action: 'status' })).toContain('alignment PENDING')
+  })
+
+  test('/cockpit discovery auto cannot lower the level or waive the check', options, async ($, on) => {
+    world(on); await done($)
+    const level = (text: string) => /Discovery (LIGHT|STANDARD|DEEP)/.exec(text)?.[1]
+    const before = level(await progress($, { action: 'status' }))
+    await command($, 'discovery auto')
+    expect(level(await progress($, { action: 'status' }))).toBe(before)
   })
 })

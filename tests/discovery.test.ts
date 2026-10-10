@@ -480,6 +480,18 @@ describe('the acceptance-criteria invariant', () => {
     const risky = withDiscovery(stage('Migrate the payments schema to the new ledger'), null)
     expect(unpin(withDiscovery(risky, 'LIGHT')).discovery!.level).toBe('DEEP')
   })
+  test('returning to automatic classification never lowers a level the task reached', () => {
+    const base = withDiscovery(stage('Fix the typo in the README heading'), null, { prompt: 'Add booking cancellation to the API and the UI', files: [], milestones: 0, grounds: [] })
+    expect(base.discovery!.level).toBe('STANDARD')
+    // the stored prompt was clipped to something that reads as trivial; the rules alone would say LIGHT
+    const clipped = { ...base, lastPrompt: 'Fix the typo' }
+    expect(unpin(clipped).discovery!.level).toBe('STANDARD')
+    expect(unpin(clipped).discovery!.source).toBe('auto')
+    // a pin does not erase the floor either, and the pin itself stays distinguishable
+    const pinned = withDiscovery(clipped, 'LIGHT')
+    expect(pinned.discovery!.source).toBe('operator')
+    expect(unpin(pinned).discovery!.level).toBe('STANDARD')
+  })
   test('LIGHT tasks and read-only questions are not asked for criteria', () => {
     const light = drive(stage('Fix the typo in the README heading'), run)
     expect(light).toMatchObject({ percent: 100, status: 'done' })
