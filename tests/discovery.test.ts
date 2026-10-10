@@ -349,6 +349,15 @@ describe('the acceptance-criteria invariant', () => {
     expect(done.milestones[4]!.state).toBe('active')
     expect(summaryOf(done)).toContain('CRITERIA MISSING')
   })
+  test('ALIGNED before any plan is refused as an error and records nothing, with or without criteria', () => {
+    for (const first of [[], [{ action: 'discover', criteria: ['A booking can be cancelled'] }]]) {
+      const task = drive(stage(goal), first)
+      const out = claim(task, [{ id: 'c1', evidence: EV }])
+      expect(out.error).toContain('no plan exists yet')
+      expect(out.task).toBe(task)
+      expect(out.task.alignment).toBeUndefined()
+    }
+  })
   test('the completion predicate itself refuses an ALIGNED mark that has no criteria behind it', () => {
     // a hand-built or stored task claiming ALIGNED with an empty criteria set is not "all criteria met"
     const forged = { ...ready([]), alignment: { state: 'ALIGNED' as const, demonstrated: [{ id: 'e1', evidence: EV }], missing: [], assumptions: [], note: null, at: 1 } }

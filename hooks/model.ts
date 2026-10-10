@@ -515,7 +515,7 @@ export const summaryOf = (task: Task | null): string => {
         ? open.length === 0
           ? !isReviewSatisfied(task)
             ? `UNVERIFIED: not done until the ${reviewNote(task)} is adjudicated.`
-            : `UNVERIFIED: not done until ${alignmentNote(task)} is ALIGNED (action "align").`
+            : `UNVERIFIED: ${alignmentNote(task)}; not done until alignment is ALIGNED (action "align").`
           : `UNVERIFIED: not done until ${open.join(', ')} ${open.length === 1 ? 'is' : 'are'} pass or na.`
         : task.status === 'blocked'
           ? `BLOCKED: ${task.blocker ?? 'a milestone is blocked'}.`

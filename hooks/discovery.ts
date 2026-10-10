@@ -383,7 +383,8 @@ export const align = (task: Task, input: AlignInput, now: number, open: readonly
   let say: string | undefined
   if (state === 'ALIGNED') {
     const problems: string[] = []
-    if (task.milestones.length === 0) problems.push('no plan exists yet, so nothing was built to check')
+    // Before a plan nothing was built to check: refused outright, not recorded as BLOCKED, whatever else is missing.
+    if (task.milestones.length === 0) return { task, error: 'ALIGNED refused: no plan exists yet, so nothing was built to check. Plan the work first. Nothing was recorded' }
     if (strict && declared.length === 0) {
       // Nothing to check against: the claim is recorded as BLOCKED, never accepted and never silently dropped.
       recorded = 'BLOCKED'
