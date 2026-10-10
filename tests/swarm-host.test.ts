@@ -3,7 +3,7 @@ import { addAgent, checkpointOf, emptyLedger, jsonBytes, startRun, storageLedger
 import { admitTask, bindAgent, emptySwarm, finishTask, reportResult, submitTask } from '../hooks/swarm'
 import { replayTimeline } from '../hooks/replay'
 import type { Ledger } from '../types'
-import { fieldRowsOf, hostState, mountHud, mountPane, rowsOf, start, world } from './world'
+import { fieldRowsOf, hostState, mountHud, mountPane, passAllGates, planAndComplete, progress, prompt, rowsOf, start, world } from './world'
 
 type Engine = Parameters<typeof start>[0]
 const SWARM = 'mcp__cobalt-cockpit__swarm'
@@ -361,4 +361,37 @@ test('an observed pre-v0.2 running agent resumes only after explicit safe owners
   expect(task(held,'legacy-scope').agentId).toBe('legacy-live')
   expect(current(held).swarm!.events.at(-1)?.kind).toBe('adopt')
   expect(w.spawns).toHaveLength(0)
+})
+
+describe('a helper edit after the goal check', () => {
+  const editAs = ($: Engine, agentId: string, file_path: string, id: string) => $.tool.call({ tool: 'Edit', agentId, file_path, old_string: 'a', new_string: 'b', tool_use_id: id } as never)
+  const aligned = { action: 'align', alignment: { state: 'ALIGNED', demonstrated: [{ id: 'c1', evidence: 'cancel test passes' }] } }
+
+  test('a worker\'s successful edit takes ALIGNED back; a denied or failed one does not; renewed evidence restores DONE', options, async ($, on) => {
+    const w = world(on); await start($)
+    await prompt($, 'Add booking cancellation to the API and the UI')
+    await progress($, { action: 'discover', criteria: ['A booking can be cancelled'] })
+    await planAndComplete($, 4)
+    await passAllGates($)
+    expect(await progress($, aligned)).toContain('alignment ALIGNED')
+    await assign($, 'writer', ['/work/owned.ts'], 'write')
+    const a = (await spawn($, 'writer')).agentId!
+    // outside what the worker owns: refused, so nothing changed
+    expect((await editAs($, a, '/work/other.ts', 'e-denied')).deny).toContain('outside owned')
+    expect(await progress($, { action: 'status' })).toContain('alignment ALIGNED')
+    // the tool itself failed: not a change either
+    w.failingTools.push('Edit')
+    await editAs($, a, '/work/owned.ts', 'e-failed')
+    w.failingTools.length = 0
+    expect(await progress($, { action: 'status' })).toContain('alignment ALIGNED')
+    // a real edit of an owned file: the earlier check no longer describes the code
+    expect((await editAs($, a, '/work/owned.ts', 'e-ok')).deny).toBeUndefined()
+    expect(await progress($, { action: 'status' })).toContain('alignment PENDING')
+    const held = await progress($, { action: 'complete', milestone: 'm5' })
+    expect(held).toContain('HELD')
+    expect(held).not.toContain('DONE')
+    // renewed verification, with its own evidence, is what finishes it
+    expect(await progress($, aligned)).toContain('alignment ALIGNED')
+    expect(await progress($, { action: 'complete', milestone: 'm5' })).toStartWith('DONE 100%')
+  })
 })
