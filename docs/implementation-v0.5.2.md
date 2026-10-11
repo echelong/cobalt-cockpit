@@ -130,13 +130,24 @@ Twenty-six mutations in a disposable worktree, one protection removed at a time.
 
 ## Live acceptance (Claude Code 2.1.296, `--permission-mode auto`, disposable fixtures under /tmp/accept)
 
-A OBSERVE: failing test appears in the Ledger as a failed Bash call; no block, no alert, nothing verified. B ENFORCE: first check exit 1 (stop refused), repair, second check exit 0; TEST pass, the other gates unset. C always-failing script: two attempts then BLOCKED, TEST fail, never DONE. D pin mismatch: script never executed (no marker file), BLOCKED, no loop; missing script: BLOCKED, no loop. E alert: one `security-failure` alert across repeated status calls; headless `-p` has no terminal surface, so the host reported `no-surface` and the Ledger records `failed (no-surface)`; SECURITY stays fail. A real SENT could not be produced headlessly and an interactive run needed a trust-folder write to the user's config, which was declined; SENT is covered by host-level tests against a mocked channel only. F review holds, NO-GO, restart: deterministic host-level tests (`tests/alerts-holds.test.ts`); no live Opus call was made for them.
+A OBSERVE: failing test appears in the Ledger as a failed Bash call; no block, no alert, nothing verified. B ENFORCE: first check exit 1 (stop refused), repair, second check exit 0; TEST pass, the other gates unset. C always-failing script: two attempts then BLOCKED, TEST fail, never DONE. D pin mismatch: script never executed (no marker file), BLOCKED, no loop; missing script: BLOCKED, no loop. E alert: one `security-failure` alert across repeated status calls; headless `-p` has no terminal surface, so the host reported `no-surface` and the Ledger records `failed (no-surface)`; SECURITY stays fail. A real SENT cannot be produced headlessly (`-p` has no terminal surface), and at this point an interactive run had been declined because it needed a trust-folder write to the user's configuration, so SENT was then covered by host-level tests against a mocked channel only. It was produced interactively afterwards; see [Interactive SENT acceptance](#interactive-sent-acceptance-claude-code-21296-2026-10-11) below. F review holds, NO-GO, restart: deterministic host-level tests (`tests/alerts-holds.test.ts`); no live Opus call was made for them.
 
 ### Live re-check of the two review findings (Claude Code 2.1.296, `--permission-mode auto`, snapshot of the remediated commit, /tmp/accept2)
 
 - Loop: ENFORCE with a script that exits 0, budget 2, a model told to end with the single word "Done." Result: two checks recorded, neither complete, then the stop was allowed with the task BLOCKED; never DONE. (A first run showed a check that leaves an untracked cache directory moving the tree; it is now run once more from that tree.)
 - Trust across sessions: a person enrolled the script with `/cockpit guard trust <12 hex>` (accepted live; hash equals `sha256sum`). The agent then rewrote the script. Session 1 and a separate session 2 each recorded `untrusted: changed since it was enrolled`, never a pass, and the task ended BLOCKED. (The marker file the edited script touches exists because the model itself ran it, not the guard; the Ledger holds no pass record.)
-- The interactive terminal notification test is still pending the owner's terminal; SENT has not been observed live.
+- The interactive terminal notification test was still pending at this point. It was completed afterwards (next section).
+
+### Interactive SENT acceptance (Claude Code 2.1.296, 2026-10-11)
+
+Run by the owner in a terminal, in a disposable working directory that was not a git repository, with `--permission-mode auto`, a separate Claude Code configuration directory, and `--plugin-dir` pointing at a snapshot whose tracked files are byte-identical to f42fa58c2cdc9ae7da9ba58fe575b45001ac032d (the only other files in the snapshot were the host-written declarations under `.claude-plugin/types/`, which are not shipped). Options: `guardAlerts: true` with a 30 s cooldown (the `/cockpit guard` line read `ARMED · 0 of 5 alerts used this session · at most one every 30s`), profile `SONNET_LED` with orchestration, Sonnet 5.5 as the main model at medium effort. The prompt asked the model to plan one milestone with the progress tool, start it and block it, and nothing else; the blocked task raised one `run-blocked` alert for task 1.
+
+- Host result: `$.ui.notify` answered `isSent: true` with channel `terminal_bell`. The Run Ledger of each session records the alert as `run-blocked · task 1 · sent via terminal_bell`, attempts 1. Two sessions produced the same record, at 13:00:01 and 13:26:13 UTC; `/cockpit guard` showed `ARMED` before the alert in both.
+- Owner observation, separate from the host's report: the terminal's bell, flash and popup were seen at the moment of the alert. The plugin itself still cannot confirm that a notification was seen; SENT is only the host's report that it wrote the notification. The observation is the owner's and is recorded here as the acceptance of the interactive gate.
+- Earlier attempts the same afternoon are recorded as what they were: headless `-p` runs ended `failed (no-surface)`, and one interactive session whose terminal offered no notification channel ended `failed (no-channel)`. Neither counts as SENT.
+- The same sessions wrote their telemetry segments under `~/.local/state/cobalt-cockpit/telemetry/`, and on inspection afterwards the directory carries mode 0700 and the segments 0600, so the telemetry maintenance calls also ran under Auto mode without a classifier prompt.
+
+The documentation-only commit after f42fa58 changes no hook, script, test, type, manifest or configuration, so this acceptance is carried as evidence for it rather than repeated; a commit that changes `hooks/alerts.ts` or the notify call in `hooks/register.tsx` needs it again.
 
 ## Cobalt Guard (`hooks/alerts.ts`)
 
@@ -146,8 +157,8 @@ Policy over observed state, evaluated after each progress/swarm tool call and at
 
 - No true append and no mode API; permissions are known only by stat read-back.
 - The plugin load order means duplicate-Cockpit detection is partial.
-- Whether Auto mode restricts the plugin's own file/process calls must be confirmed in the live acceptance run.
-- A notification cannot be confirmed as seen.
+- In the live acceptance runs (`--permission-mode auto`, Claude Code 2.1.296) Auto mode did not restrict the plugin's own file and process calls: the verification script and the telemetry maintenance ran without a classifier prompt. A host version that changes this is not verified; a refusal is recorded as unverified and not worked around.
+- A notification cannot be confirmed as seen by the plugin; SENT is the host's report that it wrote it. The owner's own observation during the interactive acceptance is recorded above.
 - The Stop guard cannot judge a script's quality; the owner owns the check.
 
 

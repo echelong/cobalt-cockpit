@@ -1,17 +1,17 @@
 # Privacy
 
-This policy describes what Cobalt Cockpit v0.5.2 observes, what it keeps, where it keeps it, how long it stays, how to remove it, and what can reach a model. It is written from the plugin's source. Where the plugin gives no guarantee, this page says so rather than implying one. Last updated 2026-10-08.
+This policy describes what Cobalt Cockpit v0.5.2 observes, what it keeps, where it keeps it, how long it stays, how to remove it, and what can reach a model. It is written from the plugin's source. Where the plugin gives no guarantee, this page says so rather than implying one. Last updated 2026-10-11.
 
 [SECURITY.md](SECURITY.md) covers the guards, process access and vulnerability reporting. This page covers data.
 
 ## Summary
 
 - Cobalt Cockpit is a Claude Code mod that runs on your machine, inside Claude Code, with your user privileges.
-- It has no server, no account, no analytics and no telemetry backend of its own. Nobody operating Cobalt Cockpit receives anything from your sessions, because nothing is sent to them.
+- It has no server, no account, no analytics and no telemetry backend of its own. Nobody operating Cobalt Cockpit receives anything from your sessions, because nothing is sent to them. The local model telemetry described below is a set of files on your machine, read only by `/cockpit stats` and `/cockpit doctor`.
 - It makes no network request of its own: no HTTP fetch, no model call, no MCP call. One thing it can start does: if you select the JEV router for a session (`/cockpit router jev`), the local decision router sends fixed-vocabulary keywords derived from a new task's prompt (never the prompt text) to the TypeSafe JEV API. That is off in every new session and is described under [The session router](#the-session-router).
-- It keeps session state in Claude Code's memory and saves a bounded record of each session, the Run Ledger, to one local file that Claude Code manages.
+- It keeps session state in Claude Code's memory and saves two kinds of record on disk: a bounded record of each session, the Run Ledger, in the key-value store file that Claude Code manages for the plugin, and, with `telemetry` on (the default), a small local usage record in files of its own under your state directory (`~/.local/state/cobalt-cockpit/telemetry/` unless `XDG_STATE_HOME` is set). The two are bounded, kept and deleted under different rules; see [What is kept, and where](#what-is-kept-and-where) and [Retention](#retention).
 - Some of what it observes is added to the request Claude Code already sends to your model provider. Apart from the JEV router you may select for a session, that is the only route by which anything Cockpit observed leaves your machine, and it is listed below.
-- There is no command that erases the saved ledgers. Removing them is a manual step, described under [Deleting your data](#deleting-your-data).
+- There is no command that erases the saved ledgers or the telemetry files. Removing them is a manual step, described under [Deleting your data](#deleting-your-data).
 
 ## What Cockpit observes
 
@@ -25,8 +25,10 @@ While a session runs, Cockpit's hooks see the events Claude Code raises. From th
 - **Model requests.** The model and reasoning level requested and observed, and token counts (input, output, cache read, cache write) where Claude Code reports them. Not the content of a request or a response.
 - **Context usage**: tokens used, window size and percent, from Claude Code's own meter.
 - **Git state**: branch name, HEAD and starting commit ids, the repository's folder name, and counts of changed files, from `git status` and `git rev-parse`.
-- **Working-tree fingerprint** (v0.5.1): once a goal check is accepted, Cockpit runs `git diff <commit> --name-only`, `git ls-files -o` and `git hash-object` over the changed and untracked files (up to 2000), reduces them in memory to one short hash, and keeps only that hash with the commit id it was measured against, in the task state. From v0.5.2 the same fingerprint also covers ignored files and watched paths: their names are listed and their size, inode and timestamps (not contents) are read with `git ls-files -o -i` and `stat` (up to 100,000 files). File names and contents are read by git for this and are neither stored nor sent anywhere.
+- **Working-tree fingerprint** (v0.5.1): once a goal check is accepted, Cockpit runs `git diff <commit> --name-only`, `git ls-files -o` and `git hash-object` over the changed and untracked files (up to 2000), reduces them in memory to one short hash, and keeps only that hash with the commit id it was measured against, in the task state. From v0.5.2 the same fingerprint is also taken when a prompt starts a task (the task's baseline) and, while the Stop-hook verification guard enforces, at each Stop it checks; it then also covers ignored files and watched paths: their names are listed and their size, inode and timestamps (not contents) are read with `git ls-files -o -i`, `find` and `stat` (up to 100,000 files). File names and contents are read by git for this and are neither stored nor sent anywhere.
 - **Release-review record** (v0.5.1): for each release consultation, the commit id it was for, the consultation id, a time and whether it returned (newest 32), in the plugin store, so a restart cannot reset the budget. Commit ids only; no file content.
+- **Verification-script runs** (v0.5.2, only with `stopGuard: ENFORCE` and a script you enrolled): the script's exit code, how long it ran, a short hash of the working-tree fingerprint before and after it, and the last six lines of its output on one line (600 characters at most, passed through the credential patterns), in the Run Ledger and the plugin store. The script's own files, arguments and environment are not recorded.
+- **Claude Code's installed-plugin record**: `/cockpit doctor` reads `plugins/installed_plugins.json` in your Claude Code configuration directory and keeps, in memory and for that command only, the name, version and install path of each Cockpit entry.
 - **Discovery, criteria and decisions** (v0.5.1): the objective, acceptance criteria, unknowns, risks, the evidence the model reports for each criterion, and recorded decisions (problem, choice, alternatives, evidence), each clipped and redacted for credentials on entry. They stay in the task state; the Run Ledger holds a short entry per task (level, counts, alignment state) and the decision records, redacted again on write and on export. Nothing is written to a project and nothing is sent to a model beyond what the model itself wrote.
 - **Authentication, by kind only.** Whether eight authentication-related environment variables are set (never their values), the names of the settings sources that configure authentication, and the credential kind Claude Code reports (`bearer`, `api-key`, `none` or `unknown`). The handle Claude Code returns is dropped at once.
 - **Claude Code settings**: the configured model and advisor names (to apply the optional Fable and advisor rules), the names of the settings entries that configure authentication, and the saved reasoning level and its cap.
@@ -41,17 +43,20 @@ The current task, the activity tape, the HUD's state, guard findings, policy and
 
 The task held here contains the 160-character prompt excerpts described above, so in-session task state can contain your own words.
 
-### On disk (Claude Code's plugin store)
+### On disk, first place: Claude Code's plugin store
 
-Cockpit saves to one place: the key-value store Claude Code gives each plugin, a JSON file of the plugin's own under the `plugins/store/` folder of your Claude Code configuration directory (`~/.claude` by default). The file's name begins with `cobalt-cockpit_`. Cockpit writes no other file and creates none outside that store.
+Cockpit saves to two places. The first is the key-value store Claude Code gives each plugin, a JSON file of the plugin's own under the `plugins/store/` folder of your Claude Code configuration directory (`~/.claude` by default). The file's name begins with `cobalt-cockpit_`. The second, with `telemetry` on (the default), is a directory of Cockpit's own under your state directory, described under [Local model telemetry](#local-model-telemetry-052). Apart from those two places Cockpit writes no file: nothing into a project, nothing into Claude Code's settings.
 
-It holds three kinds of entry:
+The store holds six kinds of entry:
 
 | Entry | Contents |
 | --- | --- |
 | `prefs` | Two switches: whether cues are muted, and whether the HUD is hidden |
 | `ledger-index` | The ids of up to eight sessions whose ledgers are kept |
 | `ledger:<session id>` | One Run Ledger for that session |
+| `release-reviews` | For each release consultation (v0.5.1): the commit id it was for, the consultation id, a time and whether it returned; newest 32 |
+| `stop-checks` | The Stop-hook verification guard's check records (v0.5.2): the task's number and identity, a 12-character digest that names the project and script, the script's file name, outcome, exit code, duration, a short fingerprint hash and the output excerpt described above; newest 24 |
+| `stop-trust` | Script enrollments made with `/cockpit guard trust` (v0.5.2), keyed by the project's path and the script's absolute path, each holding the sha-256 of the script's bytes and the time of enrollment; newest 32 |
 
 A Run Ledger contains:
 
@@ -66,6 +71,7 @@ A Run Ledger contains:
 - Opus consultations (`SONNET_LED`): the ground, and the evidence packet the main session wrote for it (objective, architecture, file locations, alternatives, failures, risk and question), with credential-shaped spans replaced by `[redacted]` before it is kept or briefed. `/ledger export json` passes it through the credential patterns again.
 - Session router decisions, as described under [The session router](#the-session-router).
 - Warnings Cockpit raised.
+- Stop-guard check records (v0.5.2, the same records as `stop-checks`, kept with their session) and, with `guardAlerts` on, alert outcomes: kind, task number, time, sent or failed, the channel name the host reported; newest 32.
 - A checkpoint, rewritten when a turn completes, when you run `/park` or `/ledger`, and when a session ends: the phase, completed and remaining milestone titles, gate states, the task's explicit goal if a plan named one (a prompt excerpt is not used as the goal), any blocker text, the branch, commit ids, repository folder name, changed-file count and the ids of running background agents.
 
 **Treat the store as private.** It can contain file paths, branch names, milestone and task wording, and fragments of source code in replay snapshots.
@@ -81,11 +87,16 @@ These filters are heuristics. They recognise common key formats and file names. 
 
 ## Retention
 
-Cockpit applies no time limit of its own. Nothing it saves expires after a number of days because of Cockpit.
+The plugin store and the telemetry files are kept under different rules.
 
-- Ledgers are kept for the eight most recently written sessions. Writing a ninth deletes the oldest. That is the only deletion Cockpit performs.
+**Plugin store.** Cockpit applies no time limit to it; nothing in it expires after a number of days because of Cockpit.
+
+- Ledgers are kept for the eight most recently written sessions. Writing a ninth deletes the oldest.
+- Release-review records keep the newest 32, Stop-guard check records the newest 24 and script enrollments the newest 32; an older entry is dropped when a new one is written.
 - Preferences stay until you change them.
 - Claude Code may remove the whole store file itself: its documentation says a plugin's store lasts until the plugin deletes it or no session reads or writes it for the period set by Claude Code's `cleanupPeriodDays` setting. That is Claude Code's behaviour and setting, not Cockpit's.
+
+**Telemetry files.** Cockpit itself deletes these, by age and by size, on a best-effort basis. When a process records its first telemetry event it lists its telemetry directory and removes, with `rm -f`, every file whose month is older than the current month and the twelve before it (13 months in all), and then, oldest file name first, enough files to bring the directory under 4 MiB. Only names of the telemetry file form (`YYYY-MM-<8 hex>-<n>.jsonl`, or `YYYY-MM.jsonl` from an earlier build) are ever listed for removal or removed, and only inside that directory. A removal that fails is not retried another way; it is attempted again the next time a process writes. `/cockpit doctor` shows how many files the current session removed. A session with `telemetry` off, or one that records no event, performs no cleanup, so the limits are enforced by the next session that writes rather than continuously.
 
 Cockpit has no control over Claude Code's own transcripts, logs or history, which follow Claude Code's settings.
 
@@ -96,18 +107,44 @@ What Cockpit provides:
 - `/cockpit reset` clears the current task from the session.
 - `/clear` in Claude Code ends the conversation; Cockpit then clears the task, activity, guard findings, HUD state and orchestration counters for the session.
 - Setting `localControl` to false stops the NobodyWho reads.
+- Setting `telemetry` to false stops the local model telemetry from being written (restart Claude Code to apply it). It deletes nothing, and `/cockpit stats` still reads what exists.
 
-What it does not provide: **there is no command that erases saved Run Ledgers or the store**, and no setting that stops the ledger from being written while the plugin is enabled.
+What it does not provide: **there is no command that erases saved Run Ledgers, the store or the telemetry files**, and no setting that stops the ledger from being written while the plugin is enabled. The deletions Cockpit performs by itself are the two described under [Retention](#retention): the oldest ledger when a ninth is written, and expired or excess telemetry files when a process first writes telemetry.
 
-To remove what is saved, quit Claude Code and delete the `cobalt-cockpit_…` JSON file in the `plugins/store/` folder of your Claude Code configuration directory. That removes every saved ledger, checkpoint and both preferences. A session that is still running holds its own ledger in memory and will write it again, which is why Claude Code should be closed first. Disabling or uninstalling the plugin stops further writes; this page does not promise that doing so removes the file, so check the folder.
+To remove what is saved in the store, quit Claude Code and delete the `cobalt-cockpit_…` JSON file in the `plugins/store/` folder of your Claude Code configuration directory. That removes every saved ledger, checkpoint, release-review record, Stop-guard check record, script enrollment and both preferences; an enrolled script has to be enrolled again afterwards. A session that is still running holds its own ledger in memory and will write it again, which is why Claude Code should be closed first.
+
+To remove the telemetry, quit Claude Code and delete the `cobalt-cockpit/telemetry` directory under your state directory (`$XDG_STATE_HOME/cobalt-cockpit/telemetry/`, or `~/.local/state/cobalt-cockpit/telemetry/` when that variable is unset). The next session with `telemetry` on creates it again, empty.
+
+Disabling or uninstalling the plugin stops further writes to both places; this page does not promise that doing so removes either, so check both folders.
 
 ## Local model telemetry (0.5.2)
 
-With `telemetry` on (the default) Cockpit keeps a small local record of what it observed: for each model request the tier (Haiku, Sonnet, Opus, other), whether it was a subagent, token counts and latency when the host reported them, the subagent role, the cache policy in force, and the kind and ground of a consultation. It never stores a prompt, code, file path, command, credential or any text from your task, and nothing is sent anywhere. Files live under `~/.local/state/cobalt-cockpit/telemetry/` (or `$XDG_STATE_HOME`), are capped at 4 MiB and 13 months, and each process writes only its own segment. The plugin API has no file-mode argument, so Cockpit asks for 0700/0600 and says "restricted" only after reading the mode back. To delete it, quit Claude Code and remove that directory; set `telemetry` to false to stop recording.
+**It is on by default.** The `telemetry` option defaults to `true`; set it to `false` and restart Claude Code to stop recording. This is the one thing Cockpit writes outside Claude Code's plugin store.
+
+**What is recorded.** One line per observed event, every field an enumeration, a boolean or a number, rebuilt from a fixed list of fields both when written and when read, so nothing outside that list can enter a file or be read back from one:
+
+- a model request: the tier (Haiku, Sonnet, Opus, other), whether it was a subagent's, input and output token counts and cache read and write counts when the host reported them, and the subagent prompt-cache policy in force;
+- a subagent that ended: its tier, its role as one of seven fixed words or `other`, whether it succeeded, and its duration;
+- a session-router decision: the mode, whether the rules or the router decided, the provider's name, how many requests were made and answered, the outcome and the latency;
+- a NobodyWho receipt: the operation (decision or prune), the tier and the latency;
+- an Opus consultation: its ground, what happened (refused, admitted, returned, verified), whether it was mandatory, pass or fail, GO or NO-GO for a release, and the latency;
+- a finished task: whether Opus took part.
+
+It never stores a prompt, code, diff, file path, command, session id, agent name, model id, credential or any free text, and nothing is sent anywhere.
+
+**Where.** `$XDG_STATE_HOME/cobalt-cockpit/telemetry/` when that variable holds an absolute path, otherwise `$HOME/.local/state/cobalt-cockpit/telemetry/`. When neither is known nothing is recorded and `/cockpit doctor` says so. Cockpit creates the `cobalt-cockpit` directory and the `telemetry` directory under it with `mkdir -p -m 700`; a state directory missing above them is created by that same call with the default mode. It creates nothing else.
+
+**Files.** Each process writes only files of its own, named `YYYY-MM-<8 hex id>-<n>.jsonl` (the month, a random id chosen when the process first writes, a running number): a segment is rewritten whole, from memory, by its one writer until it holds 64 KiB or the month changes, then sealed and never written again. No file is ever written by two processes, and a torn write can damage at most one segment, whose damaged lines the reader skips and counts. The directory is bounded at 4 MiB and 13 months by the cleanup described under [Retention](#retention).
+
+**Permissions.** The plugin API writes a file but has no file-mode argument. Cockpit asks for the modes it wants (`mkdir -p -m 700` for the two directories, `chmod 600` for each segment after its first write), reads them back with `stat`, and reports them as verified only when the read-back shows 0700 and 0600; an existing directory is left with the mode it has and reported unverified. Between the host's write and the `chmod` a new segment briefly carries the host's default mode. `/cockpit doctor` prints the result. This is a request and a check, not a guarantee.
+
+**Who reads it.** `/cockpit stats 7d|30d|all [--json|--csv]` reads the files of the window and prints the figures in your terminal, and `/cockpit doctor` lists the file count, size and this session's write, failure and cleanup counts. Nothing else reads the files, nothing is added to a model request from them, and nothing is uploaded; the printed output goes into the Claude Code transcript like any command's.
+
+**Deleting.** Described under [Deleting your data](#deleting-your-data): manual removal of the directory, plus the age and size cleanup Cockpit performs. `COBALT_TELEMETRY_SEGMENT_BYTES`, read only to let a test seal a segment early, can lower the 64 KiB segment size and never raise it.
 
 ## Owner alerts (0.5.2)
 
-With `guardAlerts` on (off by default) Cockpit asks Claude Code to raise a terminal notification whose text is one fixed sentence and a task number. It contains no prompt, path or code. Alert outcomes (kind, task number, time, sent/failed, channel name) are kept in the Run Ledger. Nothing leaves your machine; the terminal decides what to show.
+With `guardAlerts` on (off by default) Cockpit asks Claude Code to raise a terminal notification whose text is one fixed sentence and a task number. It contains no prompt, path or code. Alert outcomes (kind, task number, time, sent/failed, channel name) are kept in the Run Ledger. SENT means the host reported that it wrote the notification to the channel it names (for example `terminal_bell`); Cockpit cannot tell whether you saw it. Nothing leaves your machine; the terminal decides what to show.
 
 ## What can reach a model
 
@@ -145,7 +182,7 @@ A router recommends. It cannot start an agent, admit or skip an Opus consultatio
 
 ## Local processes, files and environment
 
-Cockpit starts a small set of local programs (`git`, `realpath`, `tail`, one audio player for the optional cues, and, only while a session router is selected, the local `decision` router) and reads environment variables by name. Apart from the JEV router described above, none of this sends data anywhere. The full list, with the reason for each, is in [SECURITY.md](SECURITY.md) and the README's section on what Cockpit runs, reads and sends.
+Cockpit starts a small set of local programs: `git` (read-only commands for the HUD, the release-review commit check and the working-tree fingerprint), `realpath`, `tail`, `find` and `stat` (the fingerprint's ignored and watched entries), `mkdir`, `chmod`, `stat` and `rm` (creating, restricting and trimming its own telemetry directory, and nothing outside it), one audio player for the optional cues, only while a session router is selected the local `decision` router, and, only with `stopGuard: ENFORCE`, the verification script you enrolled, run by its path with no shell. It reads environment variables by name. Apart from the JEV router described above, none of this sends data anywhere. The full list, with the reason for each, is in [SECURITY.md](SECURITY.md) and the README's section on what Cockpit runs, reads and sends.
 
 ## Exports and sharing
 
@@ -154,10 +191,10 @@ Cockpit starts a small set of local programs (`git`, `realpath`, `tail`, one aud
 ## What Cockpit does not do
 
 - It does not send data to its authors. It sends nothing to any third party either, with one exception you control: the JEV router, when you select it for a session, sends a short list of fixed-vocabulary keywords to TypeSafe through your own decision router and key.
-- It does not collect analytics, usage statistics or crash reports.
+- It does not collect analytics, usage statistics or crash reports for its authors or for anyone else. The local model telemetry is a usage record that stays in files on your machine, is read only by `/cockpit stats` and `/cockpit doctor`, and can be switched off.
 - It does not create accounts, set cookies or track you across machines.
 - It does not store, log, export or transmit credential values. The eight authentication variables are read only to test whether each is set.
-- It does not write outside Claude Code's plugin store.
+- It does not write outside two places: Claude Code's plugin store, and its own telemetry directory under your state directory. It writes nothing into a project and nothing into Claude Code's settings.
 - It does not sell or share data, because it holds none outside your machine.
 
 ## Changes and contact
