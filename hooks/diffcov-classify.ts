@@ -1,0 +1,573 @@
+// Diff coverage (v0.7.0, Phase 1: not registered, nothing calls it yet). Every changed line of a change gets exactly
+// one category with one reason, and the result is rendered for a person to review. It is evidence of a limited kind:
+// a coverage tool's claim about which lines ran, checked against what Cockpit observed, never against what the tests
+// assert. It changes no gate, no DONE, no review and no release, and it says so.
+//
+// Line entries mean "the tool reported this line", not "this line is executable": the measured producers disagree
+// (Node, c8 and Jest's v8 provider give every line an entry; Vitest and Jest's babel provider give statements only, and
+// leave the continuation lines of a statement that never ran with no entry at all). So a missing entry is never read as
+// "not executable": such a line is UNAVAILABLE, listed for review. Only a whitespace-only line is NON-EXECUTABLE, as a
+// fact about the text.
+
+import type { BindingNote, BindingRefusal, CaptureLabel } from './diffcov-capture'
+import { isUtf8, LCOV_LIMITS } from './diffcov-lcov'
+import type { LcovRefusal, ParsedLcov } from './diffcov-lcov'
+import { displayText, isUnderPrefix } from './diffcov-paths'
+import type { SfRefusal } from './diffcov-paths'
+
+export const SOURCE_EXTENSIONS = ['.js', '.mjs', '.cjs', '.jsx', '.ts', '.mts', '.cts', '.tsx'] as const
+
+/** Facts about a changed file's text, by Git's line numbering (`\n` ends a line). */
+export type SourceFacts = {
+  lineCount: number
+  /** Lines that are whitespace only. */
+  blank: ReadonlySet<number>
+  /** Lines that hold a coverage-ignore comment. */
+  pragma: ReadonlySet<number>
+  /** The line of a generated-file marker among the first five, or null. */
+  generatedLine: number | null
+  /** A carriage return not followed by a line feed, U+2028 or U+2029: Git and JavaScript number lines differently. */
+  lineTableAmbiguous: boolean
+}
+
+/** Why a changed file's text could not be used: Git reported a binary, or the bounded reader refused it. */
+export type SourceRefusal = 'BINARY' | 'SOURCE_IS_LINK' | 'SOURCE_NOT_A_REGULAR_FILE' | 'SOURCE_TOO_LARGE' | 'SOURCE_UNREADABLE' | 'SOURCE_GREW' | 'SOURCE_MISSING'
+
+// Comments that make a coverage tool leave lines out, matched in a bounded slice; one added by the change is listed
+const PRAGMA = /(?:c8|v8|istanbul)\s+ignore|node:coverage\s+(?:ignore|disable)|deno-coverage-ignore/
+const BLANK = /^[ \t\f\v\u00a0\ufeff]*$/
+const DECODER = new TextDecoder('utf-8')
+
+/**
+ * The facts of one changed file from its bytes (read through a bounded reader that refused links and anything not an
+ * ordinary file). Text checks are substring tests or patterns over bounded slices, never over a whole long line.
+ */
+export const sourceFactsOf = (bytes: Uint8Array): SourceFacts | { refuse: SourceRefusal } => {
+  if (bytes.length > LCOV_LIMITS.maxBytes) return { refuse: 'SOURCE_TOO_LARGE' }
+  if (bytes.subarray(0, 8000).includes(0) || !isUtf8(bytes, 0, bytes.length)) return { refuse: 'BINARY' }
+  const text = DECODER.decode(bytes)
+  const lines = text.split('\n')
+  if (lines[lines.length - 1] === '') lines.pop()
+  const blank = new Set<number>(), pragma = new Set<number>()
+  let generatedLine: number | null = null
+  let lineTableAmbiguous = false
+  lines.forEach((raw, k) => {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw
+    if (line.includes('\r') || line.includes('\u2028') || line.includes('\u2029')) lineTableAmbiguous = true
+    if (line.length <= 4096 ? BLANK.test(line) : false) blank.add(k + 1)
+    if (PRAGMA.test(line.slice(0, 512))) pragma.add(k + 1)
+    if (k < 5 && generatedLine === null) {
+      const head = line.slice(0, 256)
+      if (head.includes('@generated') || (head.includes('Code generated ') && head.includes('DO NOT EDIT'))) generatedLine = k + 1
+    }
+  })
+
+  return { lineCount: lines.length, blank, pragma, generatedLine, lineTableAmbiguous }
+}
+
+/** One changed path as the Git selection (Phase 2) will describe it. */
+export type ChangedFile = {
+  /** Repository-relative, as Git listed it. */
+  path: string
+  status: 'added' | 'modified' | 'deleted' | 'type-changed' | 'untracked'
+  /** What the path is now. */
+  kind: 'file' | 'symlink' | 'submodule' | 'embedded-repository' | 'none'
+  /** A mode change and nothing else. */
+  modeOnly: boolean
+  /** Git printed a binary patch for it. */
+  binaryPatch: boolean
+  /** New-side line numbers of added and modified lines (`-U0` hunks); an untracked file's lines are all added. */
+  added: readonly number[]
+  modified: readonly number[]
+  /** Old-side lines removed. They have nothing to measure. */
+  deletedLines: number
+  /** `check-attr` reported `linguist-generated` set. */
+  generatedByAttribute: boolean
+  /** The text facts, the reader's refusal, or null where nothing was read (deleted, a link, a submodule). */
+  source: SourceFacts | { refuse: SourceRefusal } | null
+}
+
+/** The report's standing for this change: bound to an observed run, not used (with why), or refused by the parser. */
+export type Evidence =
+  | { state: 'BOUND'; report: ParsedLcov; notes: readonly BindingNote[] }
+  | { state: 'UNBOUND'; why: BindingRefusal }
+  | { state: 'REJECTED'; code: LcovRefusal; line: number }
+
+export type Category = 'COVERED' | 'UNCOVERED' | 'EXCLUDED' | 'NON_EXECUTABLE' | 'UNAVAILABLE' | 'UNTRUSTED'
+export type FileReason =
+  | 'CLASSIFIED' | 'DELETED' | 'EMBEDDED_REPOSITORY' | 'SUBMODULE' | 'SYMLINK' | 'MODE_ONLY' | 'BINARY_BY_ATTRIBUTE'
+  | 'FILE_TYPE_OUT_OF_SCOPE' | 'CONFIGURED_EXCLUSION' | 'GENERATED_ATTRIBUTE' | 'GENERATED_MARKER' | 'LINE_TABLE_AMBIGUOUS'
+  | SourceRefusal
+export type LineReason =
+  | 'REPORTED_RUN' | 'REPORTED_NOT_RUN' | 'BLANK_LINE' | 'NO_LINE_ENTRY' | 'FILE_TYPE_OUT_OF_SCOPE' | 'CONFIGURED_EXCLUSION'
+  | 'GENERATED_ATTRIBUTE' | 'GENERATED_MARKER' | 'LINE_TABLE_AMBIGUOUS' | 'FILE_NOT_IN_REPORT' | 'RECORD_EMPTY'
+  | 'SF_CONFLICTING_IDENTITY' | 'SF_CASE_MISMATCH' | 'RECORD_BEYOND_END_OF_FILE' | 'REPORT_REJECTED' | BindingRefusal
+
+export type LineVerdict = { path: string; line: number; kind: 'added' | 'modified'; category: Category; reason: LineReason }
+export type FileRow = { path: string; reason: FileReason; generatedLine?: number }
+export type ReviewNote = { path: string; line: number; note: 'IGNORE_COMMENT_ADDED' } | { path: string; note: 'BINARY_BY_ATTRIBUTE' }
+export type Classification = { lines: LineVerdict[]; files: FileRow[]; deletedLines: number; notes: ReviewNote[]; blankWithEntry: boolean }
+
+const extensionOf = (path: string): string => {
+  const name = path.slice(path.lastIndexOf('/') + 1)
+  const dot = name.lastIndexOf('.')
+
+  return dot <= 0 ? '' : name.slice(dot).toLowerCase()
+}
+
+/**
+ * Classifies every changed line. The file rules (F1 to F5) apply to all changed lines of a file; then, for a classified
+ * file, the line rules in order, the first that applies deciding: L1 blank, L2 not bound, L3 refused, L4 no record,
+ * L5 conflicting records, L6 entries past the end, L7 an empty record, L8 run, L9 not run, and no entry: UNAVAILABLE.
+ */
+export const classifyChange = (files: readonly ChangedFile[], evidence: Evidence, exclude: readonly string[]): Classification => {
+  const out: Classification = { lines: [], files: [], deletedLines: 0, notes: [], blankWithEntry: false }
+  for (const f of files) {
+    out.deletedLines += f.deletedLines
+    const row = (reason: FileReason, generatedLine?: number) => out.files.push(generatedLine === undefined ? { path: f.path, reason } : { path: f.path, reason, generatedLine })
+    // files without line evidence: each has its row, and none of its lines is counted
+    if (f.status === 'deleted') { row('DELETED'); continue }
+    if (f.kind === 'embedded-repository') { row('EMBEDDED_REPOSITORY'); continue }
+    if (f.kind === 'submodule') { row('SUBMODULE'); continue }
+    if (f.kind === 'symlink') { row('SYMLINK'); continue }
+    if (f.modeOnly) { row('MODE_ONLY'); continue }
+    const source = f.source
+    if (f.binaryPatch && source !== null && !('refuse' in source)) {
+      // text that an attribute makes Git treat as binary: its changed lines are hidden from this report, so it is shown
+      row('BINARY_BY_ATTRIBUTE')
+      out.notes.push({ path: f.path, note: 'BINARY_BY_ATTRIBUTE' })
+      continue
+    }
+    if (f.binaryPatch) { row('BINARY'); continue }
+    if (source === null) { row('SOURCE_UNREADABLE'); continue }
+    if ('refuse' in source) { row(source.refuse); continue }
+    const changed = f.status === 'untracked' ? Array.from({ length: source.lineCount }, (_, k) => k + 1) : [...new Set([...f.added, ...f.modified])].sort((a, b) => a - b)
+    const added = new Set(f.status === 'untracked' ? changed : f.added)
+    const push = (line: number, category: Category, reason: LineReason) => out.lines.push({ path: f.path, line, kind: added.has(line) ? 'added' : 'modified', category, reason })
+    const all = (category: Category, reason: LineReason) => { for (const line of changed) push(line, category, reason) }
+    for (const line of changed) if (source.pragma.has(line)) out.notes.push({ path: f.path, line, note: 'IGNORE_COMMENT_ADDED' })
+    if (!(SOURCE_EXTENSIONS as readonly string[]).includes(extensionOf(f.path))) { row('FILE_TYPE_OUT_OF_SCOPE'); all('EXCLUDED', 'FILE_TYPE_OUT_OF_SCOPE'); continue }
+    if (exclude.some(prefix => isUnderPrefix(f.path, prefix))) { row('CONFIGURED_EXCLUSION'); all('EXCLUDED', 'CONFIGURED_EXCLUSION'); continue }
+    if (f.generatedByAttribute) { row('GENERATED_ATTRIBUTE'); all('EXCLUDED', 'GENERATED_ATTRIBUTE'); continue }
+    if (source.generatedLine !== null) { row('GENERATED_MARKER', source.generatedLine); all('EXCLUDED', 'GENERATED_MARKER'); continue }
+    if (source.lineTableAmbiguous) { row('LINE_TABLE_AMBIGUOUS'); all('UNAVAILABLE', 'LINE_TABLE_AMBIGUOUS'); continue }
+    row('CLASSIFIED')
+    const record = evidence.state === 'BOUND' ? evidence.report.files.get(f.path) : undefined
+    for (const line of changed) {
+      // L1 first: a fact about the text, whatever the report says (Node gives blank lines a count of 1)
+      if (source.blank.has(line)) {
+        if (record !== undefined && record.lines.has(line)) out.blankWithEntry = true
+        push(line, 'NON_EXECUTABLE', 'BLANK_LINE')
+        continue
+      }
+      if (evidence.state === 'UNBOUND') { push(line, 'UNAVAILABLE', evidence.why); continue }
+      if (evidence.state === 'REJECTED') { push(line, 'UNAVAILABLE', 'REPORT_REJECTED'); continue }
+      if (record === undefined) { push(line, 'UNAVAILABLE', 'FILE_NOT_IN_REPORT'); continue }
+      if (record.conflict !== null) { push(line, 'UNTRUSTED', record.conflict); continue }
+      if (record.maxLine > source.lineCount) { push(line, 'UNTRUSTED', 'RECORD_BEYOND_END_OF_FILE'); continue }
+      if (record.entries === 0) { push(line, 'UNAVAILABLE', 'RECORD_EMPTY'); continue }
+      const run = record.lines.get(line)
+      if (run === true) push(line, 'COVERED', 'REPORTED_RUN')
+      else if (run === false) push(line, 'UNCOVERED', 'REPORTED_NOT_RUN')
+      else push(line, 'UNAVAILABLE', 'NO_LINE_ENTRY')
+    }
+  }
+
+  return out
+}
+
+export type Counts = { covered: number; uncovered: number; excluded: number; nonExecutable: number; unavailable: number; untrusted: number }
+
+export const countsOf = (lines: readonly LineVerdict[]): Counts => {
+  const c: Counts = { covered: 0, uncovered: 0, excluded: 0, nonExecutable: 0, unavailable: 0, untrusted: 0 }
+  for (const v of lines) {
+    if (v.category === 'COVERED') c.covered++
+    else if (v.category === 'UNCOVERED') c.uncovered++
+    else if (v.category === 'EXCLUDED') c.excluded++
+    else if (v.category === 'NON_EXECUTABLE') c.nonExecutable++
+    else if (v.category === 'UNAVAILABLE') c.unavailable++
+    else c.untrusted++
+  }
+
+  return c
+}
+
+/** Line numbers collapsed into ranges, `7-8`, `10`. */
+export const rangesOf = (lines: readonly number[]): string[] => {
+  const sorted = [...new Set(lines)].sort((a, b) => a - b)
+  const out: string[] = []
+  for (let i = 0; i < sorted.length;) {
+    let j = i
+    while (j + 1 < sorted.length && sorted[j + 1] === sorted[j]! + 1) j++
+    out.push(sorted[i] === sorted[j] ? `${sorted[i]}` : `${sorted[i]}-${sorted[j]}`)
+    i = j + 1
+  }
+
+  return out
+}
+
+/** Why no change could be reported at all (Phase 2's Git selection and identity refusals, and the layer's own). */
+export type ReportUnavailable =
+  | 'LAYER_OFF' | 'REPORT_PATH_UNSET' | 'REPORT_PATH_REFUSED' | 'EXCLUDE_REFUSED' | 'MEMORY_LIMIT_NOT_ENFORCED' | 'PLATFORM_UNSUPPORTED'
+  | 'NOT_A_VERIFIED_ROOT' | 'PATH_UNSAFE' | 'GIT_TOO_OLD' | 'PATH_NOT_UTF8' | 'FILTER_CONFIGURED' | 'PARTIAL_CLONE'
+  | 'ATTRIBUTES_UNREADABLE' | 'CONFIG_UNREADABLE' | 'BASE_NOT_HEX' | 'BASE_UNRESOLVED' | 'BASE_AMBIGUOUS'
+  | 'DIFF_FAILED' | 'DIFF_TIMEOUT' | 'DIFF_TOO_LARGE' | 'DIFF_MALFORMED' | 'DIFF_INCONSISTENT' | 'TOO_MANY_FILES' | 'TOO_MANY_LINES' | 'TOO_MUCH_CHANGED'
+
+/** The value the report is rendered from, and that tests check. */
+export type DiffEvidence = {
+  v: 1
+  state: 'REPORTED' | 'UNAVAILABLE'
+  why?: ReportUnavailable
+  source: { head: string; identity: string | null; tracked: number; untracked: number }
+  base: { sha: string; how: 'given' | 'task-start'; given?: string; ancestor: boolean }
+  coverage: null | { path: string; sha256: string | null; run: { at: number; label: CaptureLabel } | null }
+  evidence: { state: 'MATCHED' | 'NOT_USED'; why?: BindingRefusal | 'REPORT_REJECTED'; parser?: { code: LcovRefusal; line: number }; notes: BindingNote[] }
+  lines: { added: number; modified: number; deleted: number }
+  counts: Counts
+  /** Changed lines by reason, every category: the words beside each group's count. */
+  byReason: Partial<Record<LineReason, number>>
+  review: { path: string; ranges: string[]; category: 'UNCOVERED' | 'UNTRUSTED' | 'UNAVAILABLE' | 'NOTE'; reason: LineReason | ReviewNote['note'] }[]
+  files: FileRow[]
+  refusedRecords: Partial<Record<SfRefusal, number>>
+  toolListsNonExecutable: boolean
+}
+
+const REVIEW_ORDER = ['UNCOVERED', 'UNTRUSTED', 'UNAVAILABLE', 'NOTE'] as const
+
+/** The data contract from a classification. Exactly one category per changed line of a classified file, every path a row. */
+export const diffEvidenceOf = (input: {
+  source: DiffEvidence['source']
+  base: DiffEvidence['base']
+  coverage: DiffEvidence['coverage']
+  evidence: Evidence
+  classification: Classification
+}): DiffEvidence => {
+  const { classification: c, evidence } = input
+  const review: DiffEvidence['review'] = []
+  const group = new Map<string, { path: string; category: DiffEvidence['review'][number]['category']; reason: DiffEvidence['review'][number]['reason']; lines: number[] }>()
+  const order = new Map(c.files.map((f, k) => [f.path, k]))
+  for (const v of c.lines) {
+    if (v.category !== 'UNCOVERED' && v.category !== 'UNTRUSTED' && v.category !== 'UNAVAILABLE') continue
+    const key = `${v.category}\u0000${v.path}\u0000${v.reason}`
+    const g = group.get(key) ?? { path: v.path, category: v.category, reason: v.reason, lines: [] }
+    g.lines.push(v.line)
+    group.set(key, g)
+  }
+  for (const n of c.notes) {
+    const key = `NOTE\u0000${n.path}\u0000${n.note}`
+    const g = group.get(key) ?? { path: n.path, category: 'NOTE' as const, reason: n.note, lines: [] }
+    if ('line' in n) g.lines.push(n.line)
+    group.set(key, g)
+  }
+  const sorted = [...group.values()].sort((a, b) => REVIEW_ORDER.indexOf(a.category) - REVIEW_ORDER.indexOf(b.category) || (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0) || String(a.reason).localeCompare(String(b.reason)))
+  for (const g of sorted) review.push({ path: g.path, ranges: rangesOf(g.lines), category: g.category, reason: g.reason })
+  const counts = countsOf(c.lines)
+  const byReason: Partial<Record<LineReason, number>> = {}
+  for (const v of c.lines) byReason[v.reason] = (byReason[v.reason] ?? 0) + 1
+
+  return {
+    v: 1,
+    state: 'REPORTED',
+    source: input.source,
+    base: input.base,
+    coverage: input.coverage,
+    evidence: evidence.state === 'BOUND' ? { state: 'MATCHED', notes: [...evidence.notes] }
+      : evidence.state === 'UNBOUND' ? { state: 'NOT_USED', why: evidence.why, notes: [] }
+      : { state: 'NOT_USED', why: 'REPORT_REJECTED', parser: { code: evidence.code, line: evidence.line }, notes: [] },
+    lines: { added: c.lines.filter(v => v.kind === 'added').length, modified: c.lines.filter(v => v.kind === 'modified').length, deleted: c.deletedLines },
+    counts,
+    byReason,
+    review,
+    files: c.files,
+    refusedRecords: evidence.state === 'BOUND' ? { ...evidence.report.refused } : {},
+    toolListsNonExecutable: evidence.state === 'BOUND' && c.blankWithEntry,
+  }
+}
+
+// --- Words. Every code a report can show has its words here; the types make the tables complete.
+
+const LINE_WORDS: Record<LineReason, string> = {
+  REPORTED_RUN: 'reported as run',
+  REPORTED_NOT_RUN: 'reported as not run',
+  BLANK_LINE: 'blank',
+  NO_LINE_ENTRY: 'the coverage tool gave this line no entry (a statement continued from another line, a declaration, a comment, or an excluded line)',
+  FILE_TYPE_OUT_OF_SCOPE: 'not JS/TS',
+  CONFIGURED_EXCLUSION: 'excluded by coverageDiffExclude',
+  GENERATED_ATTRIBUTE: 'generated: attribute',
+  GENERATED_MARKER: 'generated: marker',
+  LINE_TABLE_AMBIGUOUS: 'line numbering differs between Git and JavaScript in this file',
+  FILE_NOT_IN_REPORT: 'no record for this file in the report',
+  RECORD_EMPTY: 'the report has no lines for this file',
+  SF_CONFLICTING_IDENTITY: 'the report names this file two ways',
+  SF_CASE_MISMATCH: 'the report names this file with different letter case',
+  RECORD_BEYOND_END_OF_FILE: 'the report has lines this file does not have',
+  REPORT_REJECTED: 'the report was refused',
+  RUN_NOT_OBSERVED: 'no observed test run changed this report',
+  REPORT_NOT_REFRESHED_BY_RUN: 'the latest observed run did not write this report',
+  REPORT_CHANGED_SINCE_RUN: 'the report changed after the run',
+  SOURCE_IDENTITY_UNKNOWN: 'the source could not be measured',
+  SOURCE_CHANGED_SINCE_RUN: 'the source changed after the run',
+  SOURCE_CHANGED_DURING_REPORT: 'the source changed while this report was made',
+  REPORT_MISSING: 'there is no report at the configured path',
+  REPORT_NOT_A_REGULAR_FILE: 'the report is a link or not an ordinary file',
+  REPORT_LINKED_DIRECTORY: 'a directory on the way to the report is a link',
+  REPORT_HARD_LINKED: 'the report has another hard link',
+  REPORT_EMPTY: 'the report is empty',
+  REPORT_TOO_LARGE: 'the report is over 4 MiB',
+  REPORT_UNREADABLE: 'the report could not be read',
+  REPORT_CHANGED_WHILE_READ: 'the report changed while it was read',
+}
+
+/** Shorter words beside a group's count, where the full words are a sentence (the review list keeps the full ones). */
+const SHORT_WORDS: Partial<Record<LineReason, string>> = {
+  GENERATED_ATTRIBUTE: 'generated (attribute)',
+  GENERATED_MARKER: 'generated (marker)',
+  NO_LINE_ENTRY: 'no line entry',
+}
+
+const WHAT_TO_DO: Partial<Record<BindingRefusal | 'REPORT_REJECTED', string>> = {
+  RUN_NOT_OBSERVED: 'Run the tests in this session, from the repository root, to measure the current source.',
+  REPORT_NOT_REFRESHED_BY_RUN: 'Run the tests with coverage written to the configured report path.',
+  REPORT_CHANGED_SINCE_RUN: 'Run the tests again in this session to measure the current source.',
+  SOURCE_CHANGED_SINCE_RUN: 'Run the tests again in this session to measure the current source.',
+  SOURCE_CHANGED_DURING_REPORT: 'Ask for the report again when nothing is changing the files.',
+  SOURCE_IDENTITY_UNKNOWN: 'Ask for the report again; if it stays unknown, the working tree cannot be measured here.',
+  REPORT_MISSING: 'Check the coverageDiffReport path, or run the tests with coverage.',
+  REPORT_TOO_LARGE: 'Reports over 4 MiB are not read.',
+  REPORT_REJECTED: 'The report is damaged or not LCOV; run the tests again to write a new one.',
+}
+
+const FILE_WORDS: Record<FileReason, string> = {
+  CLASSIFIED: 'classified',
+  DELETED: 'deleted',
+  EMBEDDED_REPOSITORY: 'embedded repository',
+  SUBMODULE: 'submodule',
+  SYMLINK: 'link',
+  MODE_ONLY: 'mode change only',
+  BINARY_BY_ATTRIBUTE: 'Git treats this text file as binary (an attribute), so its changed lines are not shown',
+  BINARY: 'binary',
+  FILE_TYPE_OUT_OF_SCOPE: 'not JS/TS',
+  CONFIGURED_EXCLUSION: 'excluded by coverageDiffExclude',
+  GENERATED_ATTRIBUTE: 'generated: attribute',
+  GENERATED_MARKER: 'generated: marker',
+  LINE_TABLE_AMBIGUOUS: 'line numbering differs between Git and JavaScript',
+  SOURCE_IS_LINK: 'not read: a link',
+  SOURCE_NOT_A_REGULAR_FILE: 'not read: not an ordinary file',
+  SOURCE_TOO_LARGE: 'not read: over 4 MiB',
+  SOURCE_UNREADABLE: 'not read: unreadable',
+  SOURCE_GREW: 'not read: it changed while read',
+  SOURCE_MISSING: 'not read: gone',
+}
+
+const PARSER_WORDS: Record<LcovRefusal, string> = {
+  REPORT_EMPTY: 'it is empty',
+  REPORT_TOO_LARGE: 'it is over 4 MiB',
+  NO_RECORDS: 'it names no file',
+  NOT_UTF8: 'it is not valid UTF-8',
+  MALFORMED: 'a malformed line',
+  BAD_DA: 'a malformed line entry',
+  BAD_SF: 'a malformed file path',
+  UNTERMINATED_RECORD: 'a record that does not end',
+  STRAY_END: 'a record end with no record',
+  LINE_TOO_LONG: 'a line over 8 KiB',
+  TOO_MANY_RECORDS: 'over 50,000 records',
+  TOO_MANY_DA: 'too many line entries',
+  DEADLINE: 'it took over 2 s to read',
+}
+
+const RECORD_WORDS: Record<SfRefusal, string> = {
+  SF_URL_NOT_LOCAL: 'a URL of another host',
+  SF_URL_ENCODED_SEPARATOR: 'an encoded separator',
+  SF_URL_MALFORMED: 'a malformed URL',
+  SF_WINDOWS_PATH: 'a Windows or network path',
+  SF_SCHEME: 'a URL scheme',
+  SF_BACKSLASH: 'a backslash',
+  SF_CONTROL_CHARACTER: 'a control character',
+  SF_OUTSIDE_REPOSITORY: 'outside the repository',
+  SF_IN_GIT_DIRECTORY: 'inside .git',
+}
+
+const UNAVAILABLE_WORDS: Record<ReportUnavailable, string> = {
+  LAYER_OFF: 'the coverage layer is off',
+  REPORT_PATH_UNSET: 'no report path is configured (coverageDiffReport)',
+  REPORT_PATH_REFUSED: 'the configured report path is not a plain repository-relative path',
+  EXCLUDE_REFUSED: 'coverageDiffExclude holds an entry that is not a plain repository-relative prefix',
+  MEMORY_LIMIT_NOT_ENFORCED: 'this platform does not enforce the memory limit measurement needs',
+  PLATFORM_UNSUPPORTED: 'this platform is not supported yet',
+  NOT_A_VERIFIED_ROOT: 'the session is not in a verified Git repository',
+  PATH_UNSAFE: 'PATH has an entry that is relative or inside the repository',
+  GIT_TOO_OLD: 'Git is older than 2.32',
+  PATH_NOT_UTF8: 'a file name is not valid UTF-8',
+  FILTER_CONFIGURED: 'the repository configures a filter program',
+  PARTIAL_CLONE: 'the repository is a partial clone',
+  ATTRIBUTES_UNREADABLE: 'attributes could not be read',
+  CONFIG_UNREADABLE: 'the repository configuration could not be read',
+  BASE_NOT_HEX: 'give a commit id of 12 to 64 hex digits',
+  BASE_UNRESOLVED: 'no such commit here',
+  BASE_AMBIGUOUS: 'a branch has that name: give the full id',
+  DIFF_FAILED: 'Git could not produce the change',
+  DIFF_TIMEOUT: 'Git took too long',
+  DIFF_TOO_LARGE: 'the change is too large to report',
+  DIFF_MALFORMED: 'Git output could not be read',
+  DIFF_INCONSISTENT: 'Git listings disagree',
+  TOO_MANY_FILES: 'over 20,000 changed paths',
+  TOO_MANY_LINES: 'over 2,000,000 changed lines',
+  TOO_MUCH_CHANGED: 'over 64 MiB of changed files to read',
+}
+
+const NOTE_WORDS: Record<BindingNote, string> = {
+  BYTES_UNCHANGED_BY_RUN: 'The run left the report\'s bytes as they were although the source changed since they were written: a rerun that measured the same counts, or a command that only touched the file.',
+  BYTES_OF_ANOTHER_SOURCE: 'These bytes are identical to an earlier observed measurement of a different source: a rerun that measured the same counts, or a copy.',
+}
+
+const REVIEW_NOTE_WORDS: Record<ReviewNote['note'], string> = {
+  IGNORE_COMMENT_ADDED: 'coverage-ignore comment added',
+  BINARY_BY_ATTRIBUTE: FILE_WORDS.BINARY_BY_ATTRIBUTE,
+}
+
+/** Every code's words, for a test that no reason is ever shown without them (W5). */
+export const wordsOf = (code: string): string | undefined =>
+  (LINE_WORDS as Record<string, string>)[code] ?? (FILE_WORDS as Record<string, string>)[code] ?? (UNAVAILABLE_WORDS as Record<string, string>)[code] ?? (RECORD_WORDS as Record<string, string>)[code] ?? (REVIEW_NOTE_WORDS as Record<string, string>)[code]
+
+// --- Rendering. Counts, never percentages: a percentage invites a threshold, and a threshold is a gate.
+
+/** 50 columns, the narrowest width rendered. */
+export const TITLE = 'COBALT / COVERAGE DIFF  advisory: approves nothing'
+/** The closing sentences, word for word in every state; each is one line from 76 columns, wrapped below that. */
+export const CLOSING = ['ADVISORY ONLY. Execution coverage does not prove assertions or correctness.', 'Nothing here changes a gate, DONE, a review or a release.'] as const
+export const PAGE_SIZE = 20
+const LABEL = 12
+
+const width = (text: string) => Array.from(text).length
+
+/**
+ * Words wrapped to `limit` code points, the first line after `first`, the rest after `rest`. A word longer than a
+ * line is cut; a first prefix too wide to hold a word stands alone. No line is ever wider than `limit`.
+ */
+const wrap = (text: string, limit: number, first: string, rest: string): string[] => {
+  const out: string[] = []
+  let line = first
+  let empty = true
+  const flush = () => { out.push(line); line = rest; empty = true }
+  for (const whole of text.split(' ').filter(Boolean)) {
+    let word = whole
+    while (word !== '') {
+      const gap = empty ? 0 : 1
+      if (width(line) + gap + width(word) <= limit) { line += (empty ? '' : ' ') + word; empty = false; break }
+      if (!empty) { flush(); continue }
+      const room = limit - width(line)
+      if (room < 8 && line !== rest) { flush(); continue }
+      const cut = Array.from(word)
+      line += cut.slice(0, Math.max(1, room)).join('')
+      word = cut.slice(Math.max(1, room)).join('')
+      empty = false
+      flush()
+    }
+  }
+  if (!empty || out.length === 0) out.push(line)
+
+  return out
+}
+
+/** A path (or any text that must be shown exactly) cut into lines of at most `limit`, never split at its spaces. */
+const cut = (text: string, limit: number, first: string, rest: string): string[] => {
+  const out: string[] = []
+  let points = Array.from(text)
+  let prefix = first
+  do {
+    const room = Math.max(1, limit - width(prefix))
+    out.push(prefix + points.slice(0, room).join(''))
+    points = points.slice(room)
+    prefix = rest
+  } while (points.length > 0)
+
+  return out
+}
+
+const field = (name: string) => `${name}:`.padEnd(LABEL)
+const pad = ' '.repeat(LABEL)
+const timeOf = (at: number) => `${new Date(at).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+
+/** The report in words, `columns` wide (50 to 120), one page of the review list and the file rows. */
+export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1): string => {
+  const limit = Math.min(120, Math.max(50, Math.floor(columns)))
+  const out: string[] = [TITLE, '']
+  const say = (name: string, text: string) => out.push(...wrap(text, limit, field(name), pad))
+  if (view.state === 'UNAVAILABLE') {
+    say('Coverage', `UNAVAILABLE: ${UNAVAILABLE_WORDS[view.why ?? 'DIFF_FAILED']}.`)
+    out.push('', ...closing(limit))
+
+    return out.join('\n')
+  }
+  const head = view.source.head.slice(0, 12)
+  say('Source', `working tree on ${head} (HEAD), ${view.source.tracked} tracked changed, ${view.source.untracked} untracked`)
+  if (view.source.identity !== null) out.push(`${pad}identity ${view.source.identity.slice(0, 16)}`)
+  say('Diff base', `${view.base.sha} (${view.base.how === 'task-start' ? 'task start' : `given as ${view.base.given ?? view.base.sha}`})${view.base.ancestor ? '' : ', not an ancestor of HEAD'}`)
+  const matched = view.evidence.state === 'MATCHED'
+  if (view.coverage === null) say('Coverage', 'no report path configured')
+  else {
+    out.push(...cut(displayText(view.coverage.path, limit - LABEL), limit, field('Coverage'), pad))
+    if (view.coverage.sha256 !== null) out.push(`${pad}sha256:${view.coverage.sha256.slice(0, 16)}`)
+    const run = view.coverage.run
+    if (run !== null) out.push(...wrap(`${matched ? 'changed during an observed run' : 'last observed run'} at ${timeOf(run.at)}: ${run.label} (ok)`, limit, pad, pad))
+  }
+  if (matched) {
+    say('Evidence', 'MATCHED: the report changed during an observed test run on this source.')
+    out.push(...wrap('Repository code wrote it; Cockpit checked when and on what source, not what it claims.', limit, pad, pad))
+    for (const note of view.evidence.notes) out.push(...wrap(`Note: ${NOTE_WORDS[note]}`, limit, pad, pad))
+  } else {
+    const why = view.evidence.why ?? 'RUN_NOT_OBSERVED'
+    const parser = view.evidence.parser
+    say('Evidence', `NOT USED: ${why === 'REPORT_REJECTED' && parser !== undefined ? `the report was refused (${PARSER_WORDS[parser.code]}, line ${parser.line})` : LINE_WORDS[why]}`)
+    const todo = WHAT_TO_DO[why]
+    if (todo !== undefined) out.push(...wrap(todo, limit, pad, pad))
+  }
+  out.push('')
+  say('Changed', `${view.lines.added} added, ${view.lines.modified} modified, ${view.lines.deleted} deleted (deleted lines have nothing to measure)`)
+  out.push('')
+
+  // the four groups, each count with its reasons in words; the label and the count take the first 34 columns
+  const reasons = (codes: readonly LineReason[]) => codes.filter(code => (view.byReason[code] ?? 0) > 0).map(code => `${SHORT_WORDS[code] ?? LINE_WORDS[code]} ${view.byReason[code]}`).join(' · ') || 'none'
+  const group = (name: string, count: number, text: string) => out.push(...wrap(text, limit, `${name.padEnd(27)}${String(count).padStart(5)}  `, ' '.repeat(34)))
+  const c = view.counts
+  group('COVERED', c.covered, 'changed lines the coverage tool reported as run')
+  group('UNCOVERED', c.uncovered, 'changed lines the coverage tool reported as not run')
+  group('EXCLUDED / NON-EXECUTABLE', c.excluded + c.nonExecutable, reasons(['FILE_TYPE_OUT_OF_SCOPE', 'CONFIGURED_EXCLUSION', 'GENERATED_ATTRIBUTE', 'GENERATED_MARKER', 'BLANK_LINE']))
+  group('UNAVAILABLE / UNTRUSTED', c.unavailable + c.untrusted, reasons((Object.keys(LINE_WORDS) as LineReason[]).filter(code => !['REPORTED_RUN', 'REPORTED_NOT_RUN', 'FILE_TYPE_OUT_OF_SCOPE', 'CONFIGURED_EXCLUSION', 'GENERATED_ATTRIBUTE', 'GENERATED_MARKER', 'BLANK_LINE'].includes(code))))
+
+  const pages = Math.max(1, Math.ceil(view.review.length / PAGE_SIZE), Math.ceil(view.files.length / PAGE_SIZE))
+  const shown = Math.min(Math.max(1, Math.floor(page)), pages)
+  const slice = <T>(list: readonly T[]) => list.slice((shown - 1) * PAGE_SIZE, shown * PAGE_SIZE)
+  if (view.review.length > 0) {
+    out.push('', `REVIEW REQUIRED: ${view.review.length} ${view.review.length === 1 ? 'entry' : 'entries'}, page ${shown} of ${pages}`)
+    for (const r of slice(view.review)) {
+      const ranges = r.ranges.join(',')
+      const where = ranges === '' ? '' : `:${ranges}`
+      out.push(...cut(`${displayText(r.path, Math.max(8, limit - 2 - Math.min(width(where), Math.floor(limit / 2))))}${where}`, limit, '  ', '    '))
+      const words = r.category === 'NOTE' ? REVIEW_NOTE_WORDS[r.reason as ReviewNote['note']] : wordsOf(String(r.reason)) ?? String(r.reason)
+      out.push(...wrap(`${r.category.padEnd(12)}${words}`, limit, '    ', '                '))
+    }
+  }
+  out.push('', `Files: ${view.files.length}, page ${shown} of ${pages}`)
+  for (const f of slice(view.files)) {
+    const words = f.reason === 'GENERATED_MARKER' ? `generated: marker on line ${f.generatedLine ?? 1}` : FILE_WORDS[f.reason]
+    out.push(...cut(displayText(f.path, limit - 4), limit, '  ', '    '), ...wrap(words, limit, '    ', '    '))
+  }
+  const refused = Object.entries(view.refusedRecords) as [SfRefusal, number][]
+  if (refused.length > 0) out.push(...wrap(`Records not used: ${refused.map(([code, n]) => `${RECORD_WORDS[code]} ${n}`).join(' · ')}`, limit, '', '  '))
+  if (view.toolListsNonExecutable) out.push(...wrap('Note: the tool lists lines that cannot execute (a blank changed line has an entry), so comments and declarations may appear as run.', limit, '', '      '))
+  if (matched) out.push(...wrap('Line attribution, including any source mapping, is the coverage tool\'s.', limit, '', ''))
+  out.push('', ...closing(limit))
+
+  return out.join('\n')
+}
+
+/** The one line shown while the layer is off, with the closing lines (W1 holds in every state). */
+export const renderOff = (columns = 80): string => {
+  const limit = Math.min(120, Math.max(50, Math.floor(columns)))
+
+  return [TITLE, '', ...wrap('The coverage layer is off. A person turns it on with coverageDiff in /config.', limit, '', ''), '', ...closing(limit)].join('\n')
+}
+
+/** The closing sentences at a width. */
+const closing = (limit: number): string[] => CLOSING.flatMap(sentence => wrap(sentence, limit, '', ''))
