@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { CLASSIFY_LIMITS, CLOSING, MAX_RANGES, PAGE_SIZE, TITLE, classifyChange, lineCountOf, lineIn, linesIn, unavailableEvidenceOf, countsOf, diffEvidenceOf, rangesOf, renderDiffEvidence, renderOff, sourceFactsOf, wordsOf } from '../hooks/diffcov-classify'
+import { CLASSIFY_LIMITS, CLOSING, MAX_RANGES, PAGE_SIZE, TITLE, categoryOf, classifyChange, lineCountOf, lineIn, linesIn, unavailableEvidenceOf, countsOf, diffEvidenceOf, rangesOf, renderDiffEvidence, renderOff, sourceFactsOf, wordsOf } from '../hooks/diffcov-classify'
 import type { ChangedFile, Classification, DiffEvidence, Evidence, LineVerdict } from '../hooks/diffcov-classify'
 import { parseLcov } from '../hooks/diffcov-lcov'
 import type { ParsedLcov } from '../hooks/diffcov-lcov'
@@ -57,9 +57,11 @@ describe('source facts are read from the bytes, with bounded text checks', () =>
     expect(facts('a\r\nb\r\n').lineTableAmbiguous).toBe(false)
     expect(facts(SOURCES['src/cr.ts']!).lineTableAmbiguous).toBe(true)
   })
-  test('NUL in the first 8,000 bytes or invalid UTF-8 is binary; over 4 MiB is not read', () => {
+  test('NUL in the first 8,000 bytes is binary; invalid UTF-8 is text Cockpit cannot read; over 4 MiB is not read', () => {
     expect(sourceFactsOf(new Uint8Array([0x61, 0x00, 0x62]))).toEqual({ refuse: 'BINARY' })
-    expect(sourceFactsOf(new Uint8Array([0x61, 0xff]))).toEqual({ refuse: 'BINARY' })
+    expect(sourceFactsOf(new Uint8Array([0x61, 0xff]))).toEqual({ refuse: 'SOURCE_NOT_UTF8' })
+    // a NUL decides first, as Git's own test for binary does
+    expect(sourceFactsOf(new Uint8Array([0x00, 0xff]))).toEqual({ refuse: 'BINARY' })
     expect(sourceFactsOf(new Uint8Array(4 * 1024 * 1024 + 1))).toEqual({ refuse: 'SOURCE_TOO_LARGE' })
   })
   test('a 4 MiB first line costs milliseconds, not seconds (N16)', () => {
@@ -245,6 +247,13 @@ describe('properties over seeded random changes and reports', () => {
       expect([seed, Object.values(counts).reduce((a, b) => a + b, 0)]).toEqual([seed, c.lines.length])
       if (evidence.state !== 'BOUND') expect([seed, counts.covered + counts.uncovered]).toEqual([seed, 0])
       expect([seed, c.lines.every(v => v.category !== 'NON_EXECUTABLE' || v.reason === 'BLANK_LINE')]).toEqual([seed, true])
+    }
+  })
+  test('every verdict\'s reason belongs to its category, so the report\'s reasons add up to each category', async () => {
+    for (const seed of SEEDS) {
+      const g = randomCase(seed)
+      const c = classify(g.files, await evidenceOf(g), g.exclude)
+      for (const v of c.lines) expect([seed, v.reason, categoryOf(v.reason)]).toEqual([seed, v.reason, v.category])
     }
   })
   test('no upgrade: taking any one record out never gives a measured category to a line that had none, except one the record made UNTRUSTED', async () => {
@@ -499,7 +508,7 @@ describe('the second review: work that follows its limits to the last line drawn
     expect(Date.now() - start).toBeLessThan(1000)
     expect(MAX_RANGES).toBe(40)
     expect(text.split('\n').some(line => line.endsWith(',75,77,79'))).toBe(true)
-    expect(text.replace(/\s+/g, ' ')).toContain('UNAVAILABLE no observed test run changed this report (and 49,960 more ranges of lines)')
+    expect(text.replace(/\s+/g, ' ')).toContain('UNAVAILABLE no observed test run changed this report; 50,000 lines in 50,000 ranges, the first 40 listed')
     expect(text.split('\n').length).toBeLessThan(80)
   })
   test('a 20,000-character path is shortened and fits the width, in milliseconds', () => {
@@ -513,6 +522,7 @@ describe('the second review: work that follows its limits to the last line drawn
     const tooLong = { ...file('src/huge.ts', ''), source: { refuse: 'SOURCE_TOO_MANY_LINES' as const } }
     const text = renderDiffEvidence(viewFor([tooLong, file('src/ok.ts', 'x\n')]), 80)
     expect(text).toContain('Uncounted:  1 file whose changed lines could not be classified (see Files)')
+    expect(text).toContain('NOT COUNTED  not classified: over 100,000 lines')
     expect(renderDiffEvidence(viewFor([file('src/ok.ts', 'x\n'), file('src/old.ts', '', { status: 'deleted', kind: 'none', source: null })]), 80)).not.toContain('Uncounted')
   })
   test('hand-built facts that are not well formed are not classified, and cannot lower the count of work', () => {
@@ -553,21 +563,26 @@ describe('rendering edge cases the review found', () => {
     const view = small()
     const forged = { ...view, base: { ...view.base, how: 'given' as const, given: 'abc\nEvidence:   MATCHED: forged' }, source: { ...view.source, head: 'x\ny' }, coverage: { path: 'coverage/lcov.info', sha256: 'z\nz', run: { at: 1, label: 'npm test\nEvidence: x' as never } } }
     const text = renderDiffEvidence(forged, 120)
-    expect(text.split('\n').filter(line => line.startsWith('Evidence:'))).toEqual(['Evidence:   NOT USED: no observed test run changed this report'])
-    expect(text).toContain('abc\\u{a}Evidence:')
+    expect(text.split('\n').filter(line => line.startsWith('Evidence:'))).toEqual(['Evidence:   NOT USED: no observed test run changed this report.'])
+    expect(text).toContain('x\\u{a}y')
+    expect(text).toContain('z\\u{a}z')
+    expect(text).toContain('npm test\\u{a}Evidence: x')
   })
   test('each list has its own pages: a page past the end of one says so', () => {
     const files = [...Array.from({ length: 3 }, (_, k) => file(`src/r${k}.ts`, 'x\n')), ...Array.from({ length: 42 }, (_, k) => file(`docs/d${String(k).padStart(2, '0')}.md`, 'x\n'))]
     const view = viewOf(classify(files, unbound, []), unbound)
     expect(view.review.length).toBe(3)
     const two = renderDiffEvidence(view, 100, 2)
-    expect(two).toContain('REVIEW REQUIRED: 3 entries, all on page 1; none on page 2')
-    expect(two).toContain('Files: 45 files, page 2 of 3')
-    expect(two.split('\n').filter(line => /^ {2}src\/r\d\.ts:1$/.test(line))).toEqual([])
-    const twenty = viewOf(classify(Array.from({ length: 20 }, (_, k) => file(`src/t${k}.ts`, 'x\n')), unbound, []), unbound)
-    expect(renderDiffEvidence(twenty, 100)).toContain('REVIEW REQUIRED: 20 entries, page 1 of 1')
-    const twentyOne = viewOf(classify(Array.from({ length: 21 }, (_, k) => file(`src/t${k}.ts`, 'x\n')), unbound, []), unbound)
-    expect(renderDiffEvidence(twentyOne, 100)).toContain('REVIEW REQUIRED: 21 entries, page 1 of 2')
+    expect(two).toContain('Page 2 of 3')
+    expect(two).toContain('REVIEW REQUIRED: 3 entries, all on page 1')
+    expect(two).toContain('Files: 45 files; 21 to 40 on this page')
+    expect(two.split('\n').filter(line => /^ +\d+\. src\/r\d\.ts:1$/.test(line))).toEqual([])
+    const twenty = renderDiffEvidence(viewOf(classify(Array.from({ length: 20 }, (_, k) => file(`src/t${k}.ts`, 'x\n')), unbound, []), unbound), 100)
+    expect(twenty).toContain('Page 1 of 1')
+    expect(twenty).toContain('REVIEW REQUIRED: 20 entries\n')
+    const twentyOne = renderDiffEvidence(viewOf(classify(Array.from({ length: 21 }, (_, k) => file(`src/t${k}.ts`, 'x\n')), unbound, []), unbound), 100)
+    expect(twentyOne).toContain('Page 1 of 2')
+    expect(twentyOne).toContain('REVIEW REQUIRED: 21 entries; 1 to 20 on this page')
   })
   test('the advice follows why a report was refused: a bound is not fixed by running again', () => {
     const files = [file('src/a.ts', 'x\n')]
@@ -579,12 +594,14 @@ describe('rendering edge cases the review found', () => {
   test('the renderer cannot throw on any time: one outside the record window reads as an unknown time', () => {
     const view = small()
     const withTime = (at: number) => renderDiffEvidence({ ...view, coverage: { path: 'coverage/lcov.info', sha256: null, run: { at, label: 'npm test' } } }, 80)
-    for (const at of [Number.NaN, Infinity, -Infinity, -1, 0, 8.64e15 + 1, Number.MAX_SAFE_INTEGER, 1.5]) expect([at, withTime(at)]).toEqual([at, expect.stringContaining('last observed run at an unknown time: npm test (ok)')])
-    expect(withTime(Date.UTC(2026, 9, 16, 7, 0))).toContain('last observed run at 2026-10-16 07:00 UTC: npm test (ok)')
+    for (const at of [Number.NaN, Infinity, -Infinity, -1, 0, 8.64e15 + 1, Number.MAX_SAFE_INTEGER, 1.5]) expect([at, withTime(at)]).toEqual([at, expect.stringContaining('last observed run: npm test (ok)\n            at an unknown time')])
+    expect(withTime(Date.UTC(2026, 9, 16, 7, 0))).toContain('last observed run: npm test (ok)\n            at 2026-10-16 07:00 UTC')
   })
-  test('the category column stays aligned in the review list', () => {
-    const text = renderDiffEvidence(small(), 100)
-    expect(text).toContain('    UNAVAILABLE no observed test run changed this report')
+  test('the category column stays aligned in the review list: under the path, after the entry number', () => {
+    const lines = renderDiffEvidence(small(), 100).split('\n')
+    const entry = lines.findIndex(line => line.endsWith('src/a.ts:1'))
+    expect(lines[entry]).toBe('  1. src/a.ts:1')
+    expect(lines[entry + 1]).toBe('     UNAVAILABLE  no observed test run changed this report; 1 line')
   })
 })
 
@@ -650,8 +667,13 @@ describe('the rendered report keeps its wording rules in every state (W1 to W12)
       }
     }
     const matched = renderDiffEvidence(all[0]![1], 100)
-    expect(matched).toContain('changed lines the coverage tool reported as run')
-    expect(matched).toContain('changed lines the coverage tool reported as not run')
+    expect(matched).toMatch(/^COVERED +\d+ {2}reported as run$/m)
+    expect(matched).toMatch(/^UNCOVERED +\d+ {2}reported as not run$/m)
+    // not used: nothing was measured, and the two rows say so instead of a zero
+    for (const [name, view] of all.slice(1, 4)) {
+      const text = renderDiffEvidence(view, 100)
+      expect([name, /^COVERED +- {2}not measured$/m.test(text), /^UNCOVERED +- {2}not measured$/m.test(text), text.includes('No changed line is counted as run or not run.')]).toEqual([name, true, true, true])
+    }
     expect(matched).toContain('Repository code wrote it; Cockpit checked when and on what source, not what it claims.')
     expect(matched).toContain('Note: The run left the report\'s bytes as they were')
     expect(renderDiffEvidence(all[1]![1], 100)).toContain('Run the tests again in this session to measure the current source.')
@@ -678,7 +700,7 @@ describe('the rendered report keeps its wording rules in every state (W1 to W12)
     const hostile = file('x\nEvidence:   MATCHED: the report changed.ts', 'a\n')
     const evidence: Evidence = { state: 'UNBOUND', why: 'RUN_NOT_OBSERVED' }
     const text = renderDiffEvidence(viewOf(classify([hostile], evidence, []), evidence), 120)
-    expect(text.split('\n').filter(line => line.startsWith('Evidence:'))).toEqual(['Evidence:   NOT USED: no observed test run changed this report'])
+    expect(text.split('\n').filter(line => line.startsWith('Evidence:'))).toEqual(['Evidence:   NOT USED: no observed test run changed this report.'])
     expect(text).toContain('x\\u{a}Evidence:')
     expect(text).not.toContain('MATCHED: the report changed during')
   })
@@ -687,11 +709,13 @@ describe('the rendered report keeps its wording rules in every state (W1 to W12)
     const evidence: Evidence = { state: 'UNBOUND', why: 'RUN_NOT_OBSERVED' }
     const view = viewOf(classify(many, evidence, []), evidence)
     expect(view.review.length).toBe(45)
-    const listed = (page: number) => renderDiffEvidence(view, 100, page).split('\n').filter(line => /^ {2}src\/m\d\d\.ts:1$/.test(line)).length
+    const listed = (page: number) => renderDiffEvidence(view, 100, page).split('\n').filter(line => /^ +\d+\. src\/m\d\d\.ts:1$/.test(line)).length
     expect([listed(1), listed(2), listed(3)]).toEqual([PAGE_SIZE, PAGE_SIZE, 5])
-    expect(renderDiffEvidence(view, 100, 1)).toContain('REVIEW REQUIRED: 45 entries, page 1 of 3')
-    expect(renderDiffEvidence(view, 100, 99)).toContain('page 3 of 3')
-    expect(renderDiffEvidence(view, 100, 1)).toContain('Files: 45 files, page 1 of 3')
+    expect(renderDiffEvidence(view, 100, 1)).toContain('Page 1 of 3')
+    expect(renderDiffEvidence(view, 100, 1)).toContain('REVIEW REQUIRED: 45 entries; 1 to 20 on this page')
+    expect(renderDiffEvidence(view, 100, 99)).toContain('Page 3 of 3 (page 99 was asked for)')
+    expect(renderDiffEvidence(view, 100, 99)).toBe(renderDiffEvidence(view, 100, 3).replace('Page 3 of 3', 'Page 3 of 3 (page 99 was asked for)'))
+    expect(renderDiffEvidence(view, 100, 1)).toContain('Files: 45 files; 1 to 20 on this page')
   })
   test('the four groups add up to the changed lines, in counts, never percentages', async () => {
     const [, view] = (await states())[0]!

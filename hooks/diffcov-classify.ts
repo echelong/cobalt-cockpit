@@ -13,7 +13,7 @@ import { isRecordTime } from './diffcov-capture'
 import type { BindingNote, BindingRefusal, CaptureLabel } from './diffcov-capture'
 import { isUtf8, LCOV_LIMITS } from './diffcov-lcov'
 import type { LcovRefusal, ParsedLcov } from './diffcov-lcov'
-import { displayText, isUnderPrefix } from './diffcov-paths'
+import { charColumns, displayText, isUnderPrefix, textColumns } from './diffcov-paths'
 import type { SfRefusal } from './diffcov-paths'
 
 export const SOURCE_EXTENSIONS = ['.js', '.mjs', '.cjs', '.jsx', '.ts', '.mts', '.cts', '.tsx'] as const
@@ -68,8 +68,12 @@ export type SourceFacts = {
   lineTableAmbiguous: boolean
 }
 
-/** Why a changed file's text could not be used: Git reported a binary, the bounded reader refused it, or it has too many lines. */
-export type SourceRefusal = 'BINARY' | 'SOURCE_IS_LINK' | 'SOURCE_NOT_A_REGULAR_FILE' | 'SOURCE_TOO_LARGE' | 'SOURCE_TOO_MANY_LINES' | 'SOURCE_UNREADABLE' | 'SOURCE_GREW' | 'SOURCE_MISSING'
+/**
+ * Why a changed file's text could not be used: a NUL byte in its first 8,000 bytes (Git's own test for binary), bytes
+ * that are not UTF-8 (text in another encoding: Git numbers its lines, Cockpit cannot read them), the bounded reader
+ * refused it, or it has too many lines.
+ */
+export type SourceRefusal = 'BINARY' | 'SOURCE_NOT_UTF8' | 'SOURCE_IS_LINK' | 'SOURCE_NOT_A_REGULAR_FILE' | 'SOURCE_TOO_LARGE' | 'SOURCE_TOO_MANY_LINES' | 'SOURCE_UNREADABLE' | 'SOURCE_GREW' | 'SOURCE_MISSING'
 
 // Comments that make a coverage tool leave lines out, matched in a bounded slice; one added by the change is listed
 const PRAGMA = /(?:c8|v8|istanbul)\s+ignore|node:coverage\s+(?:ignore|disable)|deno-coverage-ignore/
@@ -96,7 +100,8 @@ const isBlank = (bytes: Uint8Array, from: number, to: number): boolean => {
  */
 export const sourceFactsOf = (bytes: Uint8Array, limits: ClassifyLimits = CLASSIFY_LIMITS): SourceFacts | { refuse: SourceRefusal } => {
   if (bytes.length > LCOV_LIMITS.maxBytes) return { refuse: 'SOURCE_TOO_LARGE' }
-  if (bytes.subarray(0, 8000).includes(0) || !isUtf8(bytes, 0, bytes.length)) return { refuse: 'BINARY' }
+  if (bytes.subarray(0, 8000).includes(0)) return { refuse: 'BINARY' }
+  if (!isUtf8(bytes, 0, bytes.length)) return { refuse: 'SOURCE_NOT_UTF8' }
   const lineCount = lineCountOf(bytes, limits.maxSourceLines)
   if (lineCount > limits.maxSourceLines) return { refuse: 'SOURCE_TOO_MANY_LINES' }
   const blank: LineBits = new Uint8Array(Math.ceil(lineCount / 8))
@@ -159,7 +164,7 @@ export type Category = 'COVERED' | 'UNCOVERED' | 'EXCLUDED' | 'NON_EXECUTABLE' |
 export type FileReason =
   | 'CLASSIFIED' | 'DELETED' | 'EMBEDDED_REPOSITORY' | 'SUBMODULE' | 'SYMLINK' | 'MODE_ONLY' | 'BINARY_BY_ATTRIBUTE'
   | 'FILE_TYPE_OUT_OF_SCOPE' | 'CONFIGURED_EXCLUSION' | 'GENERATED_ATTRIBUTE' | 'GENERATED_MARKER' | 'LINE_TABLE_AMBIGUOUS'
-  | 'CHANGE_OUTSIDE_FILE' | SourceRefusal
+  | 'CHANGE_OUTSIDE_FILE' | 'SOURCE_HAS_NUL' | SourceRefusal
 export type LineReason =
   | 'REPORTED_RUN' | 'REPORTED_NOT_RUN' | 'BLANK_LINE' | 'NO_LINE_ENTRY' | 'FILE_TYPE_OUT_OF_SCOPE' | 'CONFIGURED_EXCLUSION'
   | 'GENERATED_ATTRIBUTE' | 'GENERATED_MARKER' | 'LINE_TABLE_AMBIGUOUS' | 'FILE_NOT_IN_REPORT' | 'RECORD_EMPTY'
@@ -240,6 +245,9 @@ export const classifyChange = (files: readonly ChangedFile[], evidence: Evidence
     }
     if (f.binaryPatch) { row('BINARY'); continue }
     if (source === null) { row('SOURCE_UNREADABLE'); continue }
+    // a NUL byte in a tracked file Git compared as text (an attribute told it to) and named changed lines in: those
+    // lines exist, and none is classified, so the row says so rather than calling the file binary
+    if ('refuse' in source && source.refuse === 'BINARY' && f.status !== 'untracked' && Array.isArray(f.added) && Array.isArray(f.modified) && f.added.length + f.modified.length > 0) { row('SOURCE_HAS_NUL'); continue }
     if ('refuse' in source) { row(source.refuse); continue }
     if (!isWellFormed(f, source, limits)) { row('SOURCE_UNREADABLE'); continue }
     // changed lines Git named that the text read does not have: the file changed between the diff and the read (an
@@ -341,7 +349,8 @@ export type DiffEvidence = {
   counts: Counts
   /** Changed lines by reason, every category: the words beside each group's count. */
   byReason: Partial<Record<LineReason, number>>
-  review: { path: string; ranges: string[]; category: 'UNCOVERED' | 'UNTRUSTED' | 'UNAVAILABLE' | 'NOTE'; reason: LineReason | ReviewNote['note'] }[]
+  /** Entries to look at, by path, category and reason: the line ranges and how many lines they hold (0 for a note on a whole file). */
+  review: { path: string; ranges: string[]; lines: number; category: 'UNCOVERED' | 'UNTRUSTED' | 'UNAVAILABLE' | 'NOTE'; reason: LineReason | ReviewNote['note'] }[]
   files: FileRow[]
   refusedRecords: Partial<Record<SfRefusal, number>>
   toolListsNonExecutable: boolean
@@ -403,7 +412,7 @@ export const diffEvidenceOf = (input: {
     if ('line' in n) g.lines.push(n.line)
   }
   const sorted = [...groups].sort((a, b) => REVIEW_ORDER.indexOf(a.category) - REVIEW_ORDER.indexOf(b.category) || (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0) || (String(a.reason) < String(b.reason) ? -1 : String(a.reason) > String(b.reason) ? 1 : 0))
-  for (const g of sorted) review.push({ path: g.path, ranges: rangesOf(g.lines), category: g.category, reason: g.reason })
+  for (const g of sorted) review.push({ path: g.path, ranges: rangesOf(g.lines), lines: new Set(g.lines).size, category: g.category, reason: g.reason })
   const counts = countsOf(c.lines)
   const byReason: Partial<Record<LineReason, number>> = {}
   for (const v of c.lines) byReason[v.reason] = (byReason[v.reason] ?? 0) + 1
@@ -461,12 +470,47 @@ const LINE_WORDS: Record<LineReason, string> = {
   REPORT_CHANGED_WHILE_READ: 'the report changed while it was read',
 }
 
-/** Shorter words beside a group's count, where the full words are a sentence (the review list keeps the full ones). */
+/** Shorter words beside a reason's count, where the full words are a sentence (the review list keeps the full ones). */
 const SHORT_WORDS: Partial<Record<LineReason, string>> = {
   GENERATED_ATTRIBUTE: 'generated (attribute)',
   GENERATED_MARKER: 'generated (marker)',
   NO_LINE_ENTRY: 'no line entry',
 }
+
+/** The one category each line reason gives (classifyChange's rules); the report counts every reason under it. */
+const CATEGORY_OF: Record<LineReason, Category> = {
+  REPORTED_RUN: 'COVERED',
+  REPORTED_NOT_RUN: 'UNCOVERED',
+  BLANK_LINE: 'NON_EXECUTABLE',
+  FILE_TYPE_OUT_OF_SCOPE: 'EXCLUDED',
+  CONFIGURED_EXCLUSION: 'EXCLUDED',
+  GENERATED_ATTRIBUTE: 'EXCLUDED',
+  GENERATED_MARKER: 'EXCLUDED',
+  SF_CONFLICTING_IDENTITY: 'UNTRUSTED',
+  SF_CASE_MISMATCH: 'UNTRUSTED',
+  RECORD_BEYOND_END_OF_FILE: 'UNTRUSTED',
+  NO_LINE_ENTRY: 'UNAVAILABLE',
+  LINE_TABLE_AMBIGUOUS: 'UNAVAILABLE',
+  FILE_NOT_IN_REPORT: 'UNAVAILABLE',
+  RECORD_EMPTY: 'UNAVAILABLE',
+  REPORT_REJECTED: 'UNAVAILABLE',
+  RUN_NOT_OBSERVED: 'UNAVAILABLE',
+  REPORT_NOT_REFRESHED_BY_RUN: 'UNAVAILABLE',
+  REPORT_CHANGED_SINCE_RUN: 'UNAVAILABLE',
+  SOURCE_IDENTITY_UNKNOWN: 'UNAVAILABLE',
+  SOURCE_CHANGED_SINCE_RUN: 'UNAVAILABLE',
+  SOURCE_CHANGED_DURING_REPORT: 'UNAVAILABLE',
+  REPORT_MISSING: 'UNAVAILABLE',
+  REPORT_NOT_A_REGULAR_FILE: 'UNAVAILABLE',
+  REPORT_LINKED_DIRECTORY: 'UNAVAILABLE',
+  REPORT_HARD_LINKED: 'UNAVAILABLE',
+  REPORT_EMPTY: 'UNAVAILABLE',
+  REPORT_TOO_LARGE: 'UNAVAILABLE',
+  REPORT_UNREADABLE: 'UNAVAILABLE',
+  REPORT_CHANGED_WHILE_READ: 'UNAVAILABLE',
+}
+/** The category a line reason gives, for the test that the report's sub-counts follow classifyChange. */
+export const categoryOf = (reason: LineReason): Category => CATEGORY_OF[reason]
 
 const WHAT_TO_DO: Partial<Record<BindingRefusal | 'REPORT_REJECTED', string>> = {
   RUN_NOT_OBSERVED: 'Run the tests in this session, from the repository root, to measure the current source.',
@@ -511,6 +555,8 @@ const FILE_WORDS: Record<FileReason, string> = {
   GENERATED_MARKER: 'generated: marker',
   LINE_TABLE_AMBIGUOUS: 'line numbering differs between Git and JavaScript',
   CHANGE_OUTSIDE_FILE: 'not classified: Git named changed lines this file\'s text does not have (it changed while read)',
+  SOURCE_HAS_NUL: 'not read: it holds a NUL byte, though Git compared it as text',
+  SOURCE_NOT_UTF8: 'not read: not UTF-8 text (another encoding, or damaged)',
   SOURCE_IS_LINK: 'not read: a link',
   SOURCE_NOT_A_REGULAR_FILE: 'not read: not an ordinary file',
   SOURCE_TOO_LARGE: 'not read: over 4 MiB',
@@ -576,6 +622,18 @@ const UNAVAILABLE_WORDS: Record<ReportUnavailable, string> = {
   TOO_MUCH_CHANGED: 'over 64 MiB of changed files to read',
 }
 
+/** What a person can do when no change could be reported, where the words alone do not say it. */
+const UNAVAILABLE_TO_DO: Partial<Record<ReportUnavailable, string>> = {
+  LAYER_OFF: 'A person turns it on with coverageDiff in /config.',
+  REPORT_PATH_UNSET: 'A person sets coverageDiffReport in /config to the LCOV file the tests write.',
+  REPORT_PATH_REFUSED: 'Give a plain repository-relative file path: no glob, "..", leading "/" or "-", backslash or .git.',
+  EXCLUDE_REFUSED: 'Give comma-separated repository-relative prefixes: whole folders, not globs.',
+  DIFF_TOO_LARGE: 'A later diff base, or fewer untracked files, makes the change smaller.',
+  TOO_MANY_FILES: 'A later diff base, or fewer untracked files, makes the change smaller.',
+  TOO_MANY_LINES: 'A later diff base, or fewer untracked files, makes the change smaller.',
+  TOO_MUCH_CHANGED: 'A later diff base, or fewer untracked files, makes the change smaller.',
+}
+
 const NOTE_WORDS: Record<BindingNote, string> = {
   BYTES_UNCHANGED_BY_RUN: 'The run left the report\'s bytes as they were although the source changed since they were written: a rerun that measured the same counts, or a command that only touched the file.',
   BYTES_OF_ANOTHER_SOURCE: 'These bytes are identical to an earlier observed measurement of a different source: a rerun that measured the same counts, or a copy.',
@@ -601,53 +659,69 @@ export const CLOSING = ['ADVISORY ONLY. Execution coverage does not prove assert
 export const PAGE_SIZE = 20
 /** Ranges listed per review entry; the rest are counted. */
 export const MAX_RANGES = 40
-/** File rows whose changed lines exist but could not be classified. */
-const NOT_COUNTED = new Set<FileReason>(['BINARY_BY_ATTRIBUTE', 'CHANGE_OUTSIDE_FILE', 'SOURCE_IS_LINK', 'SOURCE_NOT_A_REGULAR_FILE', 'SOURCE_TOO_LARGE', 'SOURCE_TOO_MANY_LINES', 'SOURCE_UNREADABLE', 'SOURCE_GREW', 'SOURCE_MISSING'])
+/** File rows whose changed lines exist but could not be classified: the header's Uncounted line, NOT COUNTED in Files. */
+const NOT_COUNTED = new Set<FileReason>(['BINARY_BY_ATTRIBUTE', 'CHANGE_OUTSIDE_FILE', 'SOURCE_HAS_NUL', 'SOURCE_NOT_UTF8', 'SOURCE_IS_LINK', 'SOURCE_NOT_A_REGULAR_FILE', 'SOURCE_TOO_LARGE', 'SOURCE_TOO_MANY_LINES', 'SOURCE_UNREADABLE', 'SOURCE_GREW', 'SOURCE_MISSING'])
 const LABEL = 12
+/** A category's name and count take this many columns, its words the rest: 25 for the longest name, 7 for `200,000`. */
+const NAME = 25
+const COUNT = 7
 
-const width = (text: string) => Array.from(text).length
 /** A width the report can be drawn at: 50 to 120, and 80 for anything that is not a finite number (no width, NaN). */
 const columnsOf = (columns: number): number => Math.min(120, Math.max(50, Number.isFinite(columns) ? Math.floor(columns) : 80))
 
 /**
- * Words wrapped to `limit` code points, the first line after `first`, the rest after `rest`. A word longer than a
- * line is cut; a first prefix too wide to hold a word stands alone. No line is ever wider than `limit`, and every
- * pass takes at least one code point, so it always ends.
+ * How many code points from `at` fit in `room` columns, and at least one, so every pass takes something and ends.
+ * Every prefix a line starts with leaves at least 16 columns, so the one taken always fits.
+ */
+const fitting = (points: readonly string[], at: number, room: number): number => {
+  let k = at
+  for (let used = 0; k < points.length; k++) {
+    used += charColumns(points[k]!.codePointAt(0)!)
+    if (used > room) break
+  }
+
+  return Math.max(1, k - at)
+}
+
+/**
+ * Words wrapped to `limit` terminal columns (`textColumns`: a wide character takes two), the first line after
+ * `first`, the rest after `rest`. A word longer than a line is cut by columns; a first prefix too wide to leave 8
+ * columns stands alone. No line is ever wider than `limit` columns, and so no longer than `limit` code points.
  */
 const wrap = (text: string, given: number, first: string, rest: string): string[] => {
   const limit = columnsOf(given)
   const out: string[] = []
+  const restColumns = textColumns(rest)
   let line = first
+  let used = textColumns(first)
   let empty = true
-  const flush = () => { out.push(line); line = rest; empty = true }
-  for (const whole of text.split(' ').filter(Boolean)) {
-    let word = whole
-    while (word !== '') {
-      const gap = empty ? 0 : 1
-      if (width(line) + gap + width(word) <= limit) { line += (empty ? '' : ' ') + word; empty = false; break }
-      if (!empty) { flush(); continue }
-      const room = limit - width(line)
-      if (room < 8 && line !== rest) { flush(); continue }
-      // a word longer than a line: split once into code points and taken by index, so a long word costs its length
-      const points = Array.from(word)
-      let at = 0
-      let take = Math.max(1, room)
-      while (points.length - at > take) {
-        line += points.slice(at, at + take).join('')
-        at += take
-        empty = false
-        flush()
-        take = Math.max(1, limit - width(rest))
-      }
-      word = points.slice(at).join('')
+  const flush = () => { out.push(line.replaceAll(GLUE, ' ')); line = rest; used = restColumns; empty = true }
+  for (const word of text.split(' ').filter(Boolean)) {
+    const size = textColumns(word)
+    if (!empty && used + 1 + size <= limit) { line += ` ${word}`; used += 1 + size; continue }
+    if (!empty) flush()
+    if (used + size <= limit) { line += word; used += size; empty = false; continue }
+    if (limit - used < 8 && line !== rest) flush()
+    if (used + size <= limit) { line += word; used += size; empty = false; continue }
+    // a word longer than a line: split once into code points and taken by index, so a long word costs its length
+    const points = Array.from(word)
+    let at = 0
+    while (at < points.length) {
+      const n = fitting(points, at, limit - used)
+      const piece = points.slice(at, at + n).join('')
+      at += n
+      line += piece
+      used += textColumns(piece)
+      empty = false
+      if (at < points.length) flush()
     }
   }
-  if (!empty || out.length === 0) out.push(line)
+  if (!empty || out.length === 0) out.push(line.replaceAll(GLUE, ' '))
 
   return out
 }
 
-/** A path (or any text that must be shown exactly) cut into lines of at most `limit`, never split at its spaces. */
+/** A path (or any text that must be shown exactly) cut by columns into lines of at most `limit`, never split at its spaces. */
 const cut = (text: string, given: number, first: string, rest: string): string[] => {
   const limit = columnsOf(given)
   const out: string[] = []
@@ -656,9 +730,9 @@ const cut = (text: string, given: number, first: string, rest: string): string[]
   let at = 0
   let prefix = first
   do {
-    const room = Math.max(1, limit - width(prefix))
-    out.push(prefix + points.slice(at, at + room).join(''))
-    at += room
+    const n = fitting(points, at, Math.max(1, limit - textColumns(prefix)))
+    out.push(prefix + points.slice(at, at + n).join(''))
+    at += n
     prefix = rest
   } while (at < points.length)
 
@@ -669,84 +743,172 @@ const field = (name: string) => `${name}:`.padEnd(LABEL)
 const pad = ' '.repeat(LABEL)
 /** A record's time in words; any value outside the window a record may hold reads as unknown, and nothing here can throw. */
 const timeOf = (at: number): string => isRecordTime(at) ? `${new Date(at).toISOString().slice(0, 16).replace('T', ' ')} UTC` : 'an unknown time'
+/** Joins a count to its word so a wrap never parts them; `wrap` draws it as a plain space. Shown text never holds one: `displayText` escapes U+00A0. */
+const GLUE = '\u00a0'
+const plural = (n: number, one: string, many: string) => `${grouped(n)}${GLUE}${n === 1 ? one : many}`
 
-/** The report in words, `columns` wide (50 to 120), one page of the review list and the file rows. */
+/** What each category in the review list asks of a person, shown once above the entries of a page that has it. */
+const REVIEW_LEGEND: Record<DiffEvidence['review'][number]['category'], string> = {
+  UNCOVERED: 'the coverage tool reported these changed lines as not run',
+  UNTRUSTED: 'the report\'s records for this file are in doubt, so none of its figures for it is used',
+  UNAVAILABLE: 'no usable figure for these lines: nothing is known either way',
+  NOTE: 'a fact to look at; it changes no line\'s category',
+}
+
+/**
+ * The report in words, `columns` wide (50 to 120), one page of the review list and the file rows. The sections, in
+ * order: what was measured (source, diff base, coverage, evidence), how much changed, the changed lines by category
+ * with every reason counted, the page, the review list, the files, and the closing lines.
+ */
 export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1): string => {
   const limit = columnsOf(columns)
   const out: string[] = [TITLE, '']
   const say = (name: string, text: string) => out.push(...wrap(text, limit, field(name), pad))
+  const more = (text: string) => out.push(...wrap(text, limit, pad, pad))
   if (view.state === 'UNAVAILABLE') {
-    say('Coverage', `UNAVAILABLE: ${UNAVAILABLE_WORDS[view.why ?? 'DIFF_FAILED']}.`)
+    const why = view.why ?? 'DIFF_FAILED'
+    say('Coverage', `UNAVAILABLE: ${UNAVAILABLE_WORDS[why]}.`)
+    more('No changed line is counted or listed.')
+    const todo = UNAVAILABLE_TO_DO[why]
+    if (todo !== undefined) more(todo)
     out.push('', ...closing(limit))
 
     return out.join('\n')
   }
   // every value in the header is escaped too: the contract's producer is meant to give hex and closed labels, and a
-  // value that is not cannot add a line of its own
+  // value that is not cannot add a line of its own. Commit ids are shown at 12 hex digits, so none is split by a wrap.
   const shown = (text: string, max = 64) => displayText(text, max)
-  say('Source', `working tree on ${shown(view.source.head.slice(0, 12))} (HEAD), ${view.source.tracked} tracked changed, ${view.source.untracked} untracked`)
-  if (view.source.identity !== null) out.push(...cut(`identity ${shown(view.source.identity.slice(0, 16))}`, limit, pad, pad))
-  say('Diff base', `${shown(view.base.sha)} (${view.base.how === 'task-start' ? 'task start' : `given as ${shown(view.base.given ?? view.base.sha)}`})${view.base.ancestor ? '' : ', not an ancestor of HEAD'}`)
+  say('Source', `working tree on HEAD ${shown(view.source.head.slice(0, 12))}`)
+  more(`changed paths: ${grouped(view.source.tracked)} tracked, ${grouped(view.source.untracked)} untracked`)
+  if (view.source.identity !== null) out.push(...cut(`source identity ${shown(view.source.identity.slice(0, 16))}`, limit, pad, pad))
+  else more('source identity unknown')
+  say('Diff base', `${shown(view.base.sha.slice(0, 12))} (${view.base.how === 'task-start' ? 'the task\'s start' : 'given'})`)
+  if (!view.base.ancestor) more('not an ancestor of HEAD')
   const matched = view.evidence.state === 'MATCHED'
   if (view.coverage === null) say('Coverage', 'no report path configured')
   else {
     out.push(...cut(displayText(view.coverage.path, limit - LABEL), limit, field('Coverage'), pad))
     if (view.coverage.sha256 !== null) out.push(...cut(`sha256:${shown(view.coverage.sha256.slice(0, 16))}`, limit, pad, pad))
     const run = view.coverage.run
-    if (run !== null) out.push(...wrap(`${matched ? 'changed during an observed run' : 'last observed run'} at ${timeOf(run.at)}: ${shown(run.label)} (ok)`, limit, pad, pad))
+    if (run !== null) {
+      more(`${matched ? 'changed during an observed run' : 'last observed run'}: ${shown(run.label)} (ok)`)
+      more(`at ${timeOf(run.at)}`)
+    }
   }
   if (matched) {
-    say('Evidence', 'MATCHED: the report changed during an observed test run on this source.')
-    out.push(...wrap('Repository code wrote it; Cockpit checked when and on what source, not what it claims.', limit, pad, pad))
-    for (const note of view.evidence.notes) out.push(...wrap(`Note: ${NOTE_WORDS[note]}`, limit, pad, pad))
+    say('Evidence', 'MATCHED: an observed test run on this source changed the report.')
+    more('Repository code wrote it; Cockpit checked when and on what source, not what it claims.')
+    for (const note of view.evidence.notes) more(`Note: ${NOTE_WORDS[note]}`)
   } else {
     const why = view.evidence.why ?? 'RUN_NOT_OBSERVED'
     const parser = view.evidence.parser
-    say('Evidence', `NOT USED: ${why === 'REPORT_REJECTED' && parser !== undefined ? `the report was refused (${PARSER_WORDS[parser.code]}, line ${parser.line})` : LINE_WORDS[why]}`)
+    say('Evidence', `NOT USED: ${why === 'REPORT_REJECTED' && parser !== undefined ? `the report was refused (${PARSER_WORDS[parser.code]}, line${GLUE}${grouped(parser.line)})` : LINE_WORDS[why]}.`)
+    more('No changed line is counted as run or not run.')
     const todo = why === 'REPORT_REJECTED' && parser !== undefined ? PARSER_TO_DO[parser.code] : WHAT_TO_DO[why]
-    if (todo !== undefined) out.push(...wrap(todo, limit, pad, pad))
+    if (todo !== undefined) more(todo)
   }
   out.push('')
-  say('Changed', `${view.lines.added} added, ${view.lines.modified} modified, ${view.lines.deleted} deleted (deleted lines have nothing to measure)`)
-  // a file whose changed lines could not be classified is counted nowhere above: say so here, not only in its row
+  say('Changed', `${grouped(view.lines.added)} added, ${grouped(view.lines.modified)} modified, ${grouped(view.lines.deleted)} deleted (deleted lines: nothing to measure)`)
+  // a file whose changed lines could not be classified is counted nowhere below: say so here, not only in its row
   const unread = view.files.filter(f => NOT_COUNTED.has(f.reason)).length
-  if (unread > 0) say('Uncounted', `${unread} ${unread === 1 ? 'file' : 'files'} whose changed lines could not be classified (see Files)`)
-  out.push('')
+  if (unread > 0) say('Uncounted', `${plural(unread, 'file', 'files')} whose changed lines could not be classified (see Files)`)
 
-  // the four groups, each count with its reasons in words; the label and the count take the first 34 columns
-  const reasons = (codes: readonly LineReason[]) => codes.filter(code => (view.byReason[code] ?? 0) > 0).map(code => `${SHORT_WORDS[code] ?? LINE_WORDS[code]} ${view.byReason[code]}`).join(' · ') || 'none'
-  const group = (name: string, count: number, text: string) => out.push(...wrap(text, limit, `${name.padEnd(27)}${String(count).padStart(5)}  `, ' '.repeat(34)))
+  // the four groups, each with its count; a group of two its two parts; every reason on a line of its own, with its
+  // count, most first. COVERED and UNCOVERED read "-" when the report is not used: nothing was measured, not zero lines
+  out.push('', 'Changed lines by category')
   const c = view.counts
-  group('COVERED', c.covered, 'changed lines the coverage tool reported as run')
-  group('UNCOVERED', c.uncovered, 'changed lines the coverage tool reported as not run')
-  group('EXCLUDED / NON-EXECUTABLE', c.excluded + c.nonExecutable, reasons(['FILE_TYPE_OUT_OF_SCOPE', 'CONFIGURED_EXCLUSION', 'GENERATED_ATTRIBUTE', 'GENERATED_MARKER', 'BLANK_LINE']))
-  group('UNAVAILABLE / UNTRUSTED', c.unavailable + c.untrusted, reasons((Object.keys(LINE_WORDS) as LineReason[]).filter(code => !['REPORTED_RUN', 'REPORTED_NOT_RUN', 'FILE_TYPE_OUT_OF_SCOPE', 'CONFIGURED_EXCLUSION', 'GENERATED_ATTRIBUTE', 'GENERATED_MARKER', 'BLANK_LINE'].includes(code))))
-
-  // the two lists are paged together, each with its own count of pages; a page past the end of one says so
-  const pagesOf = (n: number) => Math.max(1, Math.ceil(n / PAGE_SIZE))
-  const at = Math.min(Math.max(1, Number.isFinite(page) ? Math.floor(page) : 1), Math.max(pagesOf(view.review.length), pagesOf(view.files.length)))
-  const slice = <T>(list: readonly T[]) => list.slice((at - 1) * PAGE_SIZE, at * PAGE_SIZE)
-  const header = (name: string, n: number, one: string, many: string) => at <= pagesOf(n) ? `${name}: ${n} ${n === 1 ? one : many}, page ${at} of ${pagesOf(n)}` : `${name}: ${n} ${n === 1 ? one : many}, all on page${pagesOf(n) === 1 ? ' 1' : `s 1 to ${pagesOf(n)}`}; none on page ${at}`
-  if (view.review.length > 0) {
-    out.push('', ...wrap(header('REVIEW REQUIRED', view.review.length, 'entry', 'entries'), limit, '', '  '))
-    for (const r of slice(view.review)) {
-      // at most MAX_RANGES ranges per entry, and how many more there are: a change of every other line in a long file
-      // would otherwise fill thousands of lines (the data contract keeps them all)
-      const more = r.ranges.length - MAX_RANGES
-      const ranges = r.ranges.slice(0, MAX_RANGES).join(',')
-      const where = ranges === '' ? '' : `:${ranges}`
-      out.push(...cut(`${displayText(r.path, Math.max(8, limit - 2 - Math.min(width(where), Math.floor(limit / 2))))}${where}`, limit, '  ', '    '))
-      const words = r.category === 'NOTE' ? REVIEW_NOTE_WORDS[r.reason as ReviewNote['note']] : wordsOf(String(r.reason)) ?? String(r.reason)
-      out.push(...wrap(more > 0 ? `${words} (and ${grouped(more)} more ${more === 1 ? 'range' : 'ranges'} of lines)` : words, limit, `    ${r.category.padEnd(12)}`, ' '.repeat(16)))
+  // a category's words follow its count where they fit, and take the next line where they do not (at 50 columns)
+  const row = (name: string, count: string, text = '') => {
+    const head = `${name.padEnd(NAME)}${count.padStart(COUNT)}`
+    if (text === '') out.push(head)
+    else if (NAME + COUNT + 2 + textColumns(text) <= limit) out.push(`${head}  ${text}`)
+    else out.push(head, ...wrap(text, limit, '    ', '    '))
+  }
+  const reasons = (category: Category) => {
+    const codes = (Object.keys(CATEGORY_OF) as LineReason[]).filter(code => CATEGORY_OF[code] === category && (view.byReason[code] ?? 0) > 0)
+    codes.sort((a, b) => view.byReason[b]! - view.byReason[a]!)
+    const size = Math.max(0, ...codes.map(code => grouped(view.byReason[code]!).length))
+    for (const code of codes) {
+      const head = `    ${grouped(view.byReason[code]!).padStart(size)}  `
+      out.push(...wrap(SHORT_WORDS[code] ?? LINE_WORDS[code], limit, head, ' '.repeat(head.length)))
     }
   }
-  out.push('', ...wrap(header('Files', view.files.length, 'file', 'files'), limit, '', '  '))
-  for (const f of slice(view.files)) {
-    const words = f.reason === 'GENERATED_MARKER' ? `generated: marker on line ${f.generatedLine ?? 1}` : FILE_WORDS[f.reason]
-    out.push(...cut(displayText(f.path, limit - 4), limit, '  ', '    '), ...wrap(words, limit, '    ', '    '))
+  if (matched) {
+    row('COVERED', grouped(c.covered), 'reported as run')
+    row('UNCOVERED', grouped(c.uncovered), 'reported as not run')
+  } else {
+    row('COVERED', '-', 'not measured')
+    row('UNCOVERED', '-', 'not measured')
   }
+  row('EXCLUDED / NON-EXECUTABLE', grouped(c.excluded + c.nonExecutable))
+  row('  excluded', grouped(c.excluded))
+  reasons('EXCLUDED')
+  row('  non-executable', grouped(c.nonExecutable))
+  reasons('NON_EXECUTABLE')
+  row('UNAVAILABLE / UNTRUSTED', grouped(c.unavailable + c.untrusted))
+  row('  unavailable', grouped(c.unavailable))
+  reasons('UNAVAILABLE')
+  row('  untrusted', grouped(c.untrusted))
+  reasons('UNTRUSTED')
+
+  // one page count for the report: each list shows its own twenty of this page, says which, and where it ends
+  const pagesOf = (n: number) => Math.max(1, Math.ceil(n / PAGE_SIZE))
+  const pages = Math.max(pagesOf(view.review.length), pagesOf(view.files.length))
+  const asked = Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1
+  const at = Math.min(asked, pages)
+  const slice = <T>(list: readonly T[]) => list.slice((at - 1) * PAGE_SIZE, at * PAGE_SIZE)
+  const header = (name: string, n: number, one: string, many: string): string => {
+    if (n === 0) return `${name}: none`
+    const own = pagesOf(n)
+    if (at > own) return `${name}: ${plural(n, one, many)}, all on page${own === 1 ? ' 1' : `s 1 to ${own}`}`
+    return own === 1 ? `${name}: ${plural(n, one, many)}` : `${name}: ${plural(n, one, many)}; ${grouped((at - 1) * PAGE_SIZE + 1)} to ${grouped(Math.min(n, at * PAGE_SIZE))} on this page`
+  }
+  // entries are numbered across pages, the numbers right-aligned to the widest
+  const numbered = (n: number) => { const size = grouped(n).length; return (k: number) => `  ${grouped(k).padStart(size)}. ` }
+  out.push('', ...wrap(`Page ${grouped(at)} of ${grouped(pages)}${asked > pages ? ` (page ${grouped(asked)} was asked for)` : ''}`, limit, '', '  '))
+
+  out.push('', ...wrap(header('REVIEW REQUIRED', view.review.length, 'entry', 'entries'), limit, '', '  '))
+  const entries = slice(view.review)
+  if (entries.length > 0) {
+    for (const category of REVIEW_ORDER) if (entries.some(r => r.category === category)) out.push(...wrap(REVIEW_LEGEND[category], limit, `  ${category.padEnd(13)}`, ' '.repeat(15)))
+    out.push('')
+    const number = numbered(view.review.length)
+    entries.forEach((r, k) => {
+      const first = number((at - 1) * PAGE_SIZE + k + 1)
+      const indent = ' '.repeat(first.length)
+      // at most MAX_RANGES ranges per entry, and how many more there are: a change of every other line in a long file
+      // would otherwise fill thousands of lines (the data contract keeps them all)
+      const ranges = r.ranges.slice(0, MAX_RANGES)
+      const where = ranges.length === 0 ? '' : `:${ranges.join(',')}`
+      // the path is cut anywhere (it has no place to break), then the ranges follow it, a new line only after a comma
+      const lines = cut(`${displayText(r.path, Math.max(8, limit - first.length - Math.min(textColumns(where), Math.floor(limit / 2))))}${ranges.length === 0 ? '' : ':'}`, limit, first, `${indent}  `)
+      ranges.forEach((range, i) => {
+        // escaped and bounded like any other value, so a hand-built range can neither add a line nor overflow one
+        const piece = `${displayText(range, 24)}${i < ranges.length - 1 ? ',' : ''}`
+        if (textColumns(lines[lines.length - 1]!) + textColumns(piece) <= limit) lines[lines.length - 1] += piece
+        else lines.push(`${indent}  ${piece}`)
+      })
+      out.push(...lines)
+      const words = r.category === 'NOTE' ? REVIEW_NOTE_WORDS[r.reason as ReviewNote['note']] : wordsOf(String(r.reason)) ?? String(r.reason)
+      const count = r.ranges.length > MAX_RANGES ? `; ${plural(r.lines, 'line', 'lines')} in ${grouped(r.ranges.length)} ranges, the first ${MAX_RANGES} listed`
+        : r.lines > 0 ? `; ${plural(r.lines, 'line', 'lines')}` : ''
+      out.push(...wrap(`${words}${count}`, limit, `${indent}${r.category.padEnd(13)}`, ' '.repeat(indent.length + 13)))
+    })
+  }
+
+  out.push('', ...wrap(header('Files', view.files.length, 'file', 'files'), limit, '', '  '))
+  const number = numbered(view.files.length)
+  slice(view.files).forEach((f, k) => {
+    const first = number((at - 1) * PAGE_SIZE + k + 1)
+    const indent = ' '.repeat(first.length)
+    const words = f.reason === 'GENERATED_MARKER' ? `generated: marker on line ${grouped(f.generatedLine ?? 1)}` : FILE_WORDS[f.reason]
+    out.push(...cut(displayText(f.path, limit - first.length), limit, first, `${indent}  `))
+    out.push(...wrap(words, limit, NOT_COUNTED.has(f.reason) ? `${indent}NOT COUNTED  ` : indent, ' '.repeat(indent.length + (NOT_COUNTED.has(f.reason) ? 13 : 0))))
+  })
+  if (at < pages) out.push('', ...wrap(`Continued on page ${grouped(at + 1)} of ${grouped(pages)}.`, limit, '', ''))
   const refused = Object.entries(view.refusedRecords) as [SfRefusal, number][]
-  if (refused.length > 0) out.push(...wrap(`Records not used: ${refused.map(([code, n]) => `${RECORD_WORDS[code]} ${n}`).join(' · ')}`, limit, '', '  '))
+  if (refused.length > 0 || view.toolListsNonExecutable || matched) out.push('')
+  if (refused.length > 0) out.push(...wrap(`Records not used: ${refused.map(([code, n]) => `${RECORD_WORDS[code]} ${grouped(n)}`).join(' · ')}`, limit, '', '  '))
   if (view.toolListsNonExecutable) out.push(...wrap('Note: the tool lists lines that cannot execute (a blank changed line has an entry), so comments and declarations may appear as run.', limit, '', '      '))
   if (matched) out.push(...wrap('Line attribution, including any source mapping, is the coverage tool\'s.', limit, '', ''))
   out.push('', ...closing(limit))
