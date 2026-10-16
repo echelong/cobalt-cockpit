@@ -259,6 +259,21 @@ const VERDICT_WORDS = /\b(?:tested|verified|correct|correctness|safe|proven|pass
 const GATE_WORDS = /\b(?:CODE|TEST|TYPE|BUILD|SECURITY|GIT|DONE|gate|release)\b/g
 const lines = (text: string) => text.split('\n')
 
+// An oracle for P10 that shares nothing with the renderer's table: a character a terminal draws two columns wide, by the
+// runtime's own Unicode properties (wide-presentation emoji, Han, kana, Hangul syllables), the fullwidth forms, and
+// anything above the BMP. It is a lower bound of what terminals draw for the text the report shows.
+const WIDE = /^(?:\p{Emoji_Presentation}|\p{Script=Han}|\p{Script=Hiragana})$/u
+const KATAKANA = /^\p{Script=Katakana}$/u
+const drawnColumns = (text: string): number => {
+  let n = 0
+  for (const char of text) {
+    const code = char.codePointAt(0)!
+    const wide = code > 0xffff || WIDE.test(char) || (KATAKANA.test(char) && !(code >= 0xff61 && code <= 0xff9f)) || (code >= 0xac00 && code <= 0xd7a3) || (code >= 0xff01 && code <= 0xff60)
+    n += wide ? 2 : 1
+  }
+  return n
+}
+
 export const violations = async (o: Outcome): Promise<string[]> => {
   const found: string[] = []
   const fail = (rule: string, detail: unknown = '') => found.push(`${rule}${detail === '' ? '' : `: ${JSON.stringify(detail)}`}`)
@@ -279,6 +294,8 @@ export const violations = async (o: Outcome): Promise<string[]> => {
   // P2: the counts are the classified lines, by category and by reason
   if (c !== null) {
     if (JSON.stringify(o.view.counts) !== JSON.stringify(countsOf(c.lines))) fail('P2 counts differ from the verdicts')
+    // and without the production counter: the six counts together are exactly the classified lines
+    if (Object.values(o.view.counts).reduce((a, n) => a + n, 0) !== c.lines.length) fail('P2 the counts do not add up to the lines')
     const byReason = Object.entries(o.view.byReason) as [LineReason, number][]
     if (byReason.reduce((a, [, n]) => a + n, 0) !== c.lines.length) fail('P2 reasons do not add up to the lines')
     for (const v of c.lines) if (categoryOf(v.reason) !== v.category) fail('P2 a reason under another category', v)
@@ -326,10 +343,11 @@ export const violations = async (o: Outcome): Promise<string[]> => {
   if (lines(o.text)[0] !== TITLE || !folded.endsWith(closing)) fail('P9 the advisory title or closing lines are missing')
   const own = folded.slice(0, folded.length - closing.length)
   if (own.match(VERDICT_WORDS) !== null || own.match(GATE_WORDS) !== null || own.includes('%')) fail('P8 a claim or a gate word', [own.match(VERDICT_WORDS), own.match(GATE_WORDS)])
-  // P10: within the width in terminal columns and in code points, at this width and at the narrowest and widest
+  // P10: within the width, at this width and at the narrowest and widest: in the renderer's own columns, in code points,
+  // and in an independent count from the runtime's Unicode data, so a regression in `textColumns` cannot pass unseen
   for (const columns of [o.columns, 50, 120]) {
     const text = columns === o.columns ? o.text : renderDiffEvidence(o.view, columns, o.page)
-    const over = lines(text).filter(line => textColumns(line) > columns || Array.from(line).length > columns)
+    const over = lines(text).filter(line => textColumns(line) > columns || Array.from(line).length > columns || drawnColumns(line) > columns)
     if (over.length > 0) fail('P10 a line wider than the width', { columns, over })
   }
 

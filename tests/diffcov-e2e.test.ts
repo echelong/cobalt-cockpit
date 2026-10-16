@@ -46,6 +46,10 @@ type Expected = {
   notes?: string[]
   /** Words the rendered report must hold, each read with its whitespace folded. */
   says?: string[]
+  /** Text the rendered report must not hold (a path too wide to show whole, say). */
+  absent?: string[]
+  /** How many records the store gives back after the runs. */
+  kept?: number
 }
 
 type Case = Scenario & { expected: Expected }
@@ -128,11 +132,11 @@ const SCENARIOS: Case[] = [
   },
   {
     name: 'a flood of runs pushes the matching record out',
-    about: `Nine recorded runs, each leaving different bytes; then the first run's bytes are written back. Only ${CAPTURES_KEPT} records are kept, so none holds them.`,
+    about: `${CAPTURES_KEPT + 1} recorded runs, each leaving different bytes; then the first run's bytes are written back. Only ${CAPTURES_KEPT} records are kept, so none holds them.`,
     tree: [price()],
-    runs: Array.from({ length: 9 }, (_, k) => npmTest(`# run ${k}\n${PRICE_LCOV}`)),
+    runs: Array.from({ length: CAPTURES_KEPT + 1 }, (_, k) => npmTest(`# run ${k}\n${PRICE_LCOV}`)),
     after: { rewriteReport: `# run 0\n${PRICE_LCOV}` },
-    expected: { evidence: 'UNBOUND', why: 'REPORT_CHANGED_SINCE_RUN' },
+    expected: { evidence: 'UNBOUND', why: 'REPORT_CHANGED_SINCE_RUN', kept: CAPTURES_KEPT },
   },
   // --- Runs that are never recorded
   {
@@ -306,7 +310,7 @@ const SCENARIOS: Case[] = [
     tree: [price()],
     runs: [npmTest(`# first\n${PRICE_LCOV}`), npmTest()],
     after: { tamperStore: s => { s.captures[1]!['command'] = 'npm test'; return s } },
-    expected: { evidence: 'BOUND', calls: ['npm test', 'npm test'] },
+    expected: { evidence: 'BOUND', calls: ['npm test', 'npm test'], kept: 1 },
   },
   // --- Output bounds and limits
   {
@@ -317,6 +321,14 @@ const SCENARIOS: Case[] = [
     columns: 50,
     page: 2,
     expected: { evidence: 'BOUND', counts: { covered: 12, uncovered: 13 }, says: ['Page 2 of 2', 'Files: 25 files; 21 to 25 on this page', 'REVIEW REQUIRED: 13 entries, all on page 1'] },
+  },
+  {
+    name: 'a wide path wider than the terminal',
+    about: 'A path of sixty columns of CJK characters, drawn at 50 columns: shortened in the middle in the review list and in Files, never past the edge.',
+    tree: [{ path: `src/${'\u{6df1}\u{5c42}'.repeat(15)}/\u{1F680}.ts`, status: 'untracked', text: 'export const deep = 1\n' }],
+    runs: [npmTest(record(`src/${'\u{6df1}\u{5c42}'.repeat(15)}/\u{1F680}.ts`, '1,0'))],
+    columns: 50,
+    expected: { evidence: 'BOUND', counts: { uncovered: 1 }, says: ['\u{2026}', 'UNCOVERED reported as not run; 1 line'], absent: [`src/${'\u{6df1}\u{5c42}'.repeat(15)}`] },
   },
   {
     name: 'workload past the changed-line limit',
@@ -379,6 +391,8 @@ describe('every scenario, step by step: what each call came to, how the report b
       if (e.refused !== undefined) expect([s.name, o.view.refusedRecords]).toEqual([s.name, e.refused])
       if (e.notes !== undefined) expect([s.name, o.binding.state === 'BOUND' ? o.binding.notes : null]).toEqual([s.name, e.notes])
       for (const words of e.says ?? []) expect([s.name, fold(o.text).includes(words)]).toEqual([s.name, true])
+      for (const words of e.absent ?? []) expect([s.name, o.text.includes(words)]).toEqual([s.name, false])
+      if (e.kept !== undefined) expect([s.name, o.kept.length]).toEqual([s.name, e.kept])
     })
   }
 })
@@ -431,9 +445,6 @@ const PINNED: Record<string, string> = {
   'wide-page-2-50': 'wide characters, a narrow terminal, page 2',
   'workload-80': 'workload past the changed-line limit',
 }
-/** For regenerating the fixture after a deliberate change: each pinned key with its scenario. */
-export const SCENARIOS_FOR_GOLDEN = (): [string, Scenario][] => Object.entries(PINNED).map(([key, name]) => [key, SCENARIOS.find(s => s.name === name)!])
-
 describe('golden end-to-end renderings: the whole report of a few lifecycles, line for line', () => {
   const pinned = PINNED
   test('each pinned lifecycle renders exactly as pinned', async () => {
@@ -447,7 +458,8 @@ describe('golden end-to-end renderings: the whole report of a few lifecycles, li
 })
 
 describe('the advisory layer stays outside the runtime', () => {
-  // Cockpit's own registration, against a stub `on`, as tests/compliance.test.ts reads it
+  // Cockpit's own registration, against a stub `on`, as tests/compliance.test.ts reads it. A deliberate tripwire: the day
+  // Phase 3 registers the layer (or anything else names coverage), this test must change with it, by decision
   const registered = (options: Record<string, unknown>): string[] => {
     const seen: string[] = []
     const on = ((pattern: string, arg2?: unknown) => {

@@ -2,6 +2,8 @@
 // tests/diffcov-e2e.test.ts produces end to end, line for line, from the observed calls to the rendered text. Generated
 // from the harness and read by a person before it was pinned; the source identities and report hashes are SHA-256 of
 // the synthetic bytes, so a change to a fixture changes them on purpose. Escaped ASCII: no raw wide or format character.
+// To regenerate after a deliberate change, print `(await runLifecycle(scenario)).text` for each scenario PINNED names,
+// escape every character outside ASCII, and read the result before pinning it.
 
 export const E2E_GOLDEN: Record<string, string> = {
   'observed-run-80': [
