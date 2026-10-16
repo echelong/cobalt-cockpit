@@ -1,6 +1,6 @@
 # Planned for v0.7.0: Diff-Aware Verification
 
-Status: in development, not released. The investigation below was done and its answers are in [design-v0.7.0-diff-aware-verification.md](design-v0.7.0-diff-aware-verification.md). Phase 1 implements four pure modules that nothing registers or calls; no behaviour of Cockpit has changed, and no option, hook or command exists yet. It is a milestone of its own, separate from [Persistent Attention](roadmap-v0.6.2-persistent-attention.md).
+Status: in development, not released. The investigation below was done and its answers are in [design-v0.7.0-diff-aware-verification.md](design-v0.7.0-diff-aware-verification.md). Phase 1 implements four pure modules that nothing registers or calls, and Phase 1.5 revised the report they render; no behaviour of Cockpit has changed, and no option, hook or command exists yet. It is a milestone of its own, separate from [Persistent Attention](roadmap-v0.6.2-persistent-attention.md).
 
 ## Objective
 
