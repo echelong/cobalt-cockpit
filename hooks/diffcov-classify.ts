@@ -37,7 +37,7 @@ const grouped = (n: number): string => String(n).replace(/\B(?=(\d{3})+(?!\d))/g
 
 /** One bit per line, line 1 first: a fact about lines costs an eighth of a byte a line, never an entry or a string. */
 export type LineBits = Uint8Array
-export const lineIn = (bits: LineBits, line: number): boolean => Number.isInteger(line) && line >= 1 && ((bits[(line - 1) >> 3] ?? 0) & (1 << ((line - 1) & 7))) !== 0
+export const lineIn = (bits: LineBits, line: number): boolean => Number.isInteger(line) && line >= 1 && line <= bits.length * 8 && ((bits[(line - 1) >> 3] ?? 0) & (1 << ((line - 1) & 7))) !== 0
 /** The lines a set holds, in order (for tests and display; classification only asks `lineIn`). */
 export const linesIn = (bits: LineBits): number[] => {
   const out: number[] = []
@@ -184,10 +184,21 @@ const extensionOf = (path: string): string => {
   return dot <= 0 ? '' : name.slice(dot).toLowerCase()
 }
 
+/**
+ * Facts and change lists as `sourceFactsOf` and the Git selection make them: a line count within the limit, bit sets
+ * that cover it, and dense arrays. Anything else (a hand-built value, a NaN count) is not classified, so it cannot
+ * make the work's count wrong.
+ */
+const isWellFormed = (f: ChangedFile, facts: SourceFacts, limits: ClassifyLimits): boolean =>
+  Number.isSafeInteger(facts.lineCount) && facts.lineCount >= 0 && facts.lineCount <= limits.maxSourceLines &&
+  facts.blank instanceof Uint8Array && facts.pragma instanceof Uint8Array && facts.blank.length * 8 >= facts.lineCount && facts.pragma.length * 8 >= facts.lineCount &&
+  Array.isArray(f.added) && Array.isArray(f.modified)
+
 /** The text facts of a file whose lines will be classified, or null for a file that only has a row. */
-const linesFactsOf = (f: ChangedFile): SourceFacts | null => {
+const linesFactsOf = (f: ChangedFile, limits: ClassifyLimits): SourceFacts | null => {
   if (f.status === 'deleted' || f.kind === 'embedded-repository' || f.kind === 'submodule' || f.kind === 'symlink' || f.modeOnly || f.binaryPatch) return null
-  return f.source === null || 'refuse' in f.source ? null : f.source
+  if (f.source === null || 'refuse' in f.source) return null
+  return isWellFormed(f, f.source, limits) ? f.source : null
 }
 
 /** Why a change is too large to classify at all: past a limit, no part of it is reported. */
@@ -204,7 +215,7 @@ export const classifyChange = (files: readonly ChangedFile[], evidence: Evidence
   if (files.length > limits.maxFiles) return { refuse: 'TOO_MANY_FILES' }
   let planned = 0
   for (const f of files) {
-    const facts = linesFactsOf(f)
+    const facts = linesFactsOf(f, limits)
     if (facts === null) continue
     // an upper bound, counted from lengths alone: duplicates between added and modified are counted twice
     planned += f.status === 'untracked' ? facts.lineCount : f.added.length + f.modified.length
@@ -230,9 +241,11 @@ export const classifyChange = (files: readonly ChangedFile[], evidence: Evidence
     if (f.binaryPatch) { row('BINARY'); continue }
     if (source === null) { row('SOURCE_UNREADABLE'); continue }
     if ('refuse' in source) { row(source.refuse); continue }
-    // changed lines Git named that the text read does not have: the file changed between the diff and the read
-    const fits = (line: number) => Number.isInteger(line) && line >= 1 && line <= source.lineCount
-    if (f.status !== 'untracked' && !(f.added.every(fits) && f.modified.every(fits))) { row('CHANGE_OUTSIDE_FILE'); continue }
+    if (!isWellFormed(f, source, limits)) { row('SOURCE_UNREADABLE'); continue }
+    // changed lines Git named that the text read does not have: the file changed between the diff and the read (an
+    // index loop, so a hole in an array is a line that does not fit, not one skipped)
+    const fits = (lines: readonly number[]) => { for (let k = 0; k < lines.length; k++) { const n = lines[k]; if (!(Number.isInteger(n) && n! >= 1 && n! <= source.lineCount)) return false } return true }
+    if (f.status !== 'untracked' && !(fits(f.added) && fits(f.modified))) { row('CHANGE_OUTSIDE_FILE'); continue }
     const changed = f.status === 'untracked' ? Array.from({ length: source.lineCount }, (_, k) => k + 1) : [...new Set([...f.added, ...f.modified])].sort((a, b) => a - b)
     const added = new Set(f.status === 'untracked' ? changed : f.added)
     const push = (line: number, category: Category, reason: LineReason) => out.lines.push({ path: f.path, line, kind: added.has(line) ? 'added' : 'modified', category, reason })
@@ -367,22 +380,29 @@ export const diffEvidenceOf = (input: {
 }): DiffEvidence => {
   const { classification: c, evidence } = input
   const review: DiffEvidence['review'] = []
-  const group = new Map<string, { path: string; category: DiffEvidence['review'][number]['category']; reason: DiffEvidence['review'][number]['reason']; lines: number[] }>()
+  type Group = { path: string; category: DiffEvidence['review'][number]['category']; reason: DiffEvidence['review'][number]['reason']; lines: number[] }
+  // grouped per path, then by category and reason: no key is built from a path, and a run of lines with the same
+  // verdict, the common case, reuses the group it is in
+  const groups: Group[] = []
+  const byPath = new Map<string, Map<string, Group>>()
+  let last: Group | null = null
+  const groupOf = (path: string, category: Group['category'], reason: Group['reason']): Group => {
+    if (last !== null && last.path === path && last.category === category && last.reason === reason) return last
+    let inner = byPath.get(path)
+    if (inner === undefined) { inner = new Map(); byPath.set(path, inner) }
+    const key = `${category}:${reason}`
+    let g = inner.get(key)
+    if (g === undefined) { g = { path, category, reason, lines: [] }; inner.set(key, g); groups.push(g) }
+    last = g
+    return g
+  }
   const order = new Map(c.files.map((f, k) => [f.path, k]))
-  for (const v of c.lines) {
-    if (v.category !== 'UNCOVERED' && v.category !== 'UNTRUSTED' && v.category !== 'UNAVAILABLE') continue
-    const key = `${v.category}\u0000${v.path}\u0000${v.reason}`
-    const g = group.get(key) ?? { path: v.path, category: v.category, reason: v.reason, lines: [] }
-    g.lines.push(v.line)
-    group.set(key, g)
-  }
+  for (const v of c.lines) if (v.category === 'UNCOVERED' || v.category === 'UNTRUSTED' || v.category === 'UNAVAILABLE') groupOf(v.path, v.category, v.reason).lines.push(v.line)
   for (const n of c.notes) {
-    const key = `NOTE\u0000${n.path}\u0000${n.note}`
-    const g = group.get(key) ?? { path: n.path, category: 'NOTE' as const, reason: n.note, lines: [] }
+    const g = groupOf(n.path, 'NOTE', n.note)
     if ('line' in n) g.lines.push(n.line)
-    group.set(key, g)
   }
-  const sorted = [...group.values()].sort((a, b) => REVIEW_ORDER.indexOf(a.category) - REVIEW_ORDER.indexOf(b.category) || (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0) || (String(a.reason) < String(b.reason) ? -1 : String(a.reason) > String(b.reason) ? 1 : 0))
+  const sorted = [...groups].sort((a, b) => REVIEW_ORDER.indexOf(a.category) - REVIEW_ORDER.indexOf(b.category) || (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0) || (String(a.reason) < String(b.reason) ? -1 : String(a.reason) > String(b.reason) ? 1 : 0))
   for (const g of sorted) review.push({ path: g.path, ranges: rangesOf(g.lines), category: g.category, reason: g.reason })
   const counts = countsOf(c.lines)
   const byReason: Partial<Record<LineReason, number>> = {}
@@ -494,7 +514,7 @@ const FILE_WORDS: Record<FileReason, string> = {
   SOURCE_IS_LINK: 'not read: a link',
   SOURCE_NOT_A_REGULAR_FILE: 'not read: not an ordinary file',
   SOURCE_TOO_LARGE: 'not read: over 4 MiB',
-  SOURCE_TOO_MANY_LINES: `not read: over ${grouped(CLASSIFY_LIMITS.maxSourceLines)} lines`,
+  SOURCE_TOO_MANY_LINES: `not classified: over ${grouped(CLASSIFY_LIMITS.maxSourceLines)} lines`,
   SOURCE_UNREADABLE: 'not read: unreadable',
   SOURCE_GREW: 'not read: it changed while read',
   SOURCE_MISSING: 'not read: gone',
@@ -579,6 +599,10 @@ export const TITLE = 'COBALT / COVERAGE DIFF  advisory: approves nothing'
 /** The closing sentences, word for word in every state; each is one line from 76 columns, wrapped below that. */
 export const CLOSING = ['ADVISORY ONLY. Execution coverage does not prove assertions or correctness.', 'Nothing here changes a gate, DONE, a review or a release.'] as const
 export const PAGE_SIZE = 20
+/** Ranges listed per review entry; the rest are counted. */
+export const MAX_RANGES = 40
+/** File rows whose changed lines exist but could not be classified. */
+const NOT_COUNTED = new Set<FileReason>(['BINARY_BY_ATTRIBUTE', 'CHANGE_OUTSIDE_FILE', 'SOURCE_IS_LINK', 'SOURCE_NOT_A_REGULAR_FILE', 'SOURCE_TOO_LARGE', 'SOURCE_TOO_MANY_LINES', 'SOURCE_UNREADABLE', 'SOURCE_GREW', 'SOURCE_MISSING'])
 const LABEL = 12
 
 const width = (text: string) => Array.from(text).length
@@ -604,11 +628,18 @@ const wrap = (text: string, given: number, first: string, rest: string): string[
       if (!empty) { flush(); continue }
       const room = limit - width(line)
       if (room < 8 && line !== rest) { flush(); continue }
-      const cut = Array.from(word)
-      line += cut.slice(0, Math.max(1, room)).join('')
-      word = cut.slice(Math.max(1, room)).join('')
-      empty = false
-      flush()
+      // a word longer than a line: split once into code points and taken by index, so a long word costs its length
+      const points = Array.from(word)
+      let at = 0
+      let take = Math.max(1, room)
+      while (points.length - at > take) {
+        line += points.slice(at, at + take).join('')
+        at += take
+        empty = false
+        flush()
+        take = Math.max(1, limit - width(rest))
+      }
+      word = points.slice(at).join('')
     }
   }
   if (!empty || out.length === 0) out.push(line)
@@ -620,14 +651,16 @@ const wrap = (text: string, given: number, first: string, rest: string): string[
 const cut = (text: string, given: number, first: string, rest: string): string[] => {
   const limit = columnsOf(given)
   const out: string[] = []
-  let points = Array.from(text)
+  // taken by index from one array of code points: linear in the text, however many lines it fills
+  const points = Array.from(text)
+  let at = 0
   let prefix = first
   do {
     const room = Math.max(1, limit - width(prefix))
-    out.push(prefix + points.slice(0, room).join(''))
-    points = points.slice(room)
+    out.push(prefix + points.slice(at, at + room).join(''))
+    at += room
     prefix = rest
-  } while (points.length > 0)
+  } while (at < points.length)
 
   return out
 }
@@ -675,6 +708,9 @@ export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1
   }
   out.push('')
   say('Changed', `${view.lines.added} added, ${view.lines.modified} modified, ${view.lines.deleted} deleted (deleted lines have nothing to measure)`)
+  // a file whose changed lines could not be classified is counted nowhere above: say so here, not only in its row
+  const unread = view.files.filter(f => NOT_COUNTED.has(f.reason)).length
+  if (unread > 0) say('Uncounted', `${unread} ${unread === 1 ? 'file' : 'files'} whose changed lines could not be classified (see Files)`)
   out.push('')
 
   // the four groups, each count with its reasons in words; the label and the count take the first 34 columns
@@ -694,11 +730,14 @@ export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1
   if (view.review.length > 0) {
     out.push('', ...wrap(header('REVIEW REQUIRED', view.review.length, 'entry', 'entries'), limit, '', '  '))
     for (const r of slice(view.review)) {
-      const ranges = r.ranges.join(',')
+      // at most MAX_RANGES ranges per entry, and how many more there are: a change of every other line in a long file
+      // would otherwise fill thousands of lines (the data contract keeps them all)
+      const more = r.ranges.length - MAX_RANGES
+      const ranges = r.ranges.slice(0, MAX_RANGES).join(',')
       const where = ranges === '' ? '' : `:${ranges}`
       out.push(...cut(`${displayText(r.path, Math.max(8, limit - 2 - Math.min(width(where), Math.floor(limit / 2))))}${where}`, limit, '  ', '    '))
       const words = r.category === 'NOTE' ? REVIEW_NOTE_WORDS[r.reason as ReviewNote['note']] : wordsOf(String(r.reason)) ?? String(r.reason)
-      out.push(...wrap(words, limit, `    ${r.category.padEnd(12)}`, ' '.repeat(16)))
+      out.push(...wrap(more > 0 ? `${words} (and ${grouped(more)} more ${more === 1 ? 'range' : 'ranges'} of lines)` : words, limit, `    ${r.category.padEnd(12)}`, ' '.repeat(16)))
     }
   }
   out.push('', ...wrap(header('Files', view.files.length, 'file', 'files'), limit, '', '  '))
