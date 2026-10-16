@@ -86,6 +86,7 @@ describe('damaged reports are refused whole, with the line (N3 to N8)', () => {
     ['21-digit count', record(`DA:1,${'9'.repeat(21)}\n`), 'BAD_DA'],
     ['no count', record('DA:1,\n'), 'BAD_DA'],
     ['a checksum with other bytes', record('DA:1,1,ab-c\n'), 'BAD_DA'],
+    ['an empty checksum', record('DA:1,1,\n'), 'BAD_DA'],
     ['non-ASCII digits', record('DA:\u0661,1\n'), 'BAD_DA'],
   ]))
   test('paths: NUL, empty, too long (N6)', () => cases([

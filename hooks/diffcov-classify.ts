@@ -52,7 +52,8 @@ export const sourceFactsOf = (bytes: Uint8Array): SourceFacts | { refuse: Source
   let generatedLine: number | null = null
   let lineTableAmbiguous = false
   lines.forEach((raw, k) => {
-    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw
+    // a carriage return ends a CRLF only when a line feed followed it: one at the very end of the file stays, and is ambiguous
+    const line = raw.endsWith('\r') && (k < lines.length - 1 || text.endsWith('\n')) ? raw.slice(0, -1) : raw
     if (line.includes('\r') || line.includes('\u2028') || line.includes('\u2029')) lineTableAmbiguous = true
     if (line.length <= 4096 ? BLANK.test(line) : false) blank.add(k + 1)
     if (PRAGMA.test(line.slice(0, 512))) pragma.add(k + 1)
@@ -105,7 +106,14 @@ export type LineReason =
 
 export type LineVerdict = { path: string; line: number; kind: 'added' | 'modified'; category: Category; reason: LineReason }
 export type FileRow = { path: string; reason: FileReason; generatedLine?: number }
-export type ReviewNote = { path: string; line: number; note: 'IGNORE_COMMENT_ADDED' } | { path: string; note: 'BINARY_BY_ATTRIBUTE' }
+/**
+ * Facts listed for review without changing a category: an ignore comment the change adds (on a classified file), a
+ * text file an attribute makes Git treat as binary, and a file excluded as generated, whose lines the report then
+ * does not count (a marker in a hand-written file would otherwise hide all of it).
+ */
+export type ReviewNote =
+  | { path: string; line: number; note: 'IGNORE_COMMENT_ADDED' | 'GENERATED_BY_MARKER' }
+  | { path: string; note: 'BINARY_BY_ATTRIBUTE' | 'GENERATED_BY_ATTRIBUTE' }
 export type Classification = { lines: LineVerdict[]; files: FileRow[]; deletedLines: number; notes: ReviewNote[]; blankWithEntry: boolean }
 
 const extensionOf = (path: string): string => {
@@ -145,13 +153,23 @@ export const classifyChange = (files: readonly ChangedFile[], evidence: Evidence
     const added = new Set(f.status === 'untracked' ? changed : f.added)
     const push = (line: number, category: Category, reason: LineReason) => out.lines.push({ path: f.path, line, kind: added.has(line) ? 'added' : 'modified', category, reason })
     const all = (category: Category, reason: LineReason) => { for (const line of changed) push(line, category, reason) }
-    for (const line of changed) if (source.pragma.has(line)) out.notes.push({ path: f.path, line, note: 'IGNORE_COMMENT_ADDED' })
     if (!(SOURCE_EXTENSIONS as readonly string[]).includes(extensionOf(f.path))) { row('FILE_TYPE_OUT_OF_SCOPE'); all('EXCLUDED', 'FILE_TYPE_OUT_OF_SCOPE'); continue }
     if (exclude.some(prefix => isUnderPrefix(f.path, prefix))) { row('CONFIGURED_EXCLUSION'); all('EXCLUDED', 'CONFIGURED_EXCLUSION'); continue }
-    if (f.generatedByAttribute) { row('GENERATED_ATTRIBUTE'); all('EXCLUDED', 'GENERATED_ATTRIBUTE'); continue }
-    if (source.generatedLine !== null) { row('GENERATED_MARKER', source.generatedLine); all('EXCLUDED', 'GENERATED_MARKER'); continue }
+    if (f.generatedByAttribute) {
+      row('GENERATED_ATTRIBUTE')
+      all('EXCLUDED', 'GENERATED_ATTRIBUTE')
+      out.notes.push({ path: f.path, note: 'GENERATED_BY_ATTRIBUTE' })
+      continue
+    }
+    if (source.generatedLine !== null) {
+      row('GENERATED_MARKER', source.generatedLine)
+      all('EXCLUDED', 'GENERATED_MARKER')
+      out.notes.push({ path: f.path, line: source.generatedLine, note: 'GENERATED_BY_MARKER' })
+      continue
+    }
     if (source.lineTableAmbiguous) { row('LINE_TABLE_AMBIGUOUS'); all('UNAVAILABLE', 'LINE_TABLE_AMBIGUOUS'); continue }
     row('CLASSIFIED')
+    for (const line of changed) if (source.pragma.has(line)) out.notes.push({ path: f.path, line, note: 'IGNORE_COMMENT_ADDED' })
     const record = evidence.state === 'BOUND' ? evidence.report.files.get(f.path) : undefined
     for (const line of changed) {
       // L1 first: a fact about the text, whatever the report says (Node gives blank lines a count of 1)
@@ -259,7 +277,7 @@ export const diffEvidenceOf = (input: {
     if ('line' in n) g.lines.push(n.line)
     group.set(key, g)
   }
-  const sorted = [...group.values()].sort((a, b) => REVIEW_ORDER.indexOf(a.category) - REVIEW_ORDER.indexOf(b.category) || (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0) || String(a.reason).localeCompare(String(b.reason)))
+  const sorted = [...group.values()].sort((a, b) => REVIEW_ORDER.indexOf(a.category) - REVIEW_ORDER.indexOf(b.category) || (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0) || (String(a.reason) < String(b.reason) ? -1 : String(a.reason) > String(b.reason) ? 1 : 0))
   for (const g of sorted) review.push({ path: g.path, ranges: rangesOf(g.lines), category: g.category, reason: g.reason })
   const counts = countsOf(c.lines)
   const byReason: Partial<Record<LineReason, number>> = {}
@@ -334,7 +352,23 @@ const WHAT_TO_DO: Partial<Record<BindingRefusal | 'REPORT_REJECTED', string>> = 
   SOURCE_IDENTITY_UNKNOWN: 'Ask for the report again; if it stays unknown, the working tree cannot be measured here.',
   REPORT_MISSING: 'Check the coverageDiffReport path, or run the tests with coverage.',
   REPORT_TOO_LARGE: 'Reports over 4 MiB are not read.',
-  REPORT_REJECTED: 'The report is damaged or not LCOV; run the tests again to write a new one.',
+}
+
+/** What to do about a refused report depends on why: a damaged one can be written again; one past a bound cannot be read at all. */
+const PARSER_TO_DO: Record<LcovRefusal, string> = {
+  REPORT_EMPTY: 'Run the tests with coverage written to the configured report path.',
+  NO_RECORDS: 'Run the tests with coverage written to the configured report path.',
+  REPORT_TOO_LARGE: 'Reports over 4 MiB are not read.',
+  LINE_TOO_LONG: 'A report with a line over 8 KiB is not read (a report written with bare carriage returns reads as one line).',
+  TOO_MANY_RECORDS: 'Reports with more than 50,000 records are not read.',
+  TOO_MANY_DA: 'Reports with this many line entries are not read.',
+  DEADLINE: 'Reports that take more than 2 s to read are not read.',
+  NOT_UTF8: 'The report is not well-formed LCOV; run the tests again to write a new one.',
+  MALFORMED: 'The report is not well-formed LCOV; run the tests again to write a new one.',
+  BAD_DA: 'The report is not well-formed LCOV; run the tests again to write a new one.',
+  BAD_SF: 'The report is not well-formed LCOV; run the tests again to write a new one.',
+  UNTERMINATED_RECORD: 'The report ends inside a record (it may have been cut short); run the tests again to write a new one.',
+  STRAY_END: 'The report is not well-formed LCOV; run the tests again to write a new one.',
 }
 
 const FILE_WORDS: Record<FileReason, string> = {
@@ -423,6 +457,8 @@ const NOTE_WORDS: Record<BindingNote, string> = {
 const REVIEW_NOTE_WORDS: Record<ReviewNote['note'], string> = {
   IGNORE_COMMENT_ADDED: 'coverage-ignore comment added',
   BINARY_BY_ATTRIBUTE: FILE_WORDS.BINARY_BY_ATTRIBUTE,
+  GENERATED_BY_MARKER: 'a generated-file marker on this line excludes every changed line of the file',
+  GENERATED_BY_ATTRIBUTE: 'a generated attribute excludes every changed line of the file',
 }
 
 /** Every code's words, for a test that no reason is ever shown without them (W5). */
@@ -439,12 +475,16 @@ export const PAGE_SIZE = 20
 const LABEL = 12
 
 const width = (text: string) => Array.from(text).length
+/** A width the report can be drawn at: 50 to 120, and 80 for anything that is not a finite number (no width, NaN). */
+const columnsOf = (columns: number): number => Math.min(120, Math.max(50, Number.isFinite(columns) ? Math.floor(columns) : 80))
 
 /**
  * Words wrapped to `limit` code points, the first line after `first`, the rest after `rest`. A word longer than a
- * line is cut; a first prefix too wide to hold a word stands alone. No line is ever wider than `limit`.
+ * line is cut; a first prefix too wide to hold a word stands alone. No line is ever wider than `limit`, and every
+ * pass takes at least one code point, so it always ends.
  */
-const wrap = (text: string, limit: number, first: string, rest: string): string[] => {
+const wrap = (text: string, given: number, first: string, rest: string): string[] => {
+  const limit = columnsOf(given)
   const out: string[] = []
   let line = first
   let empty = true
@@ -470,7 +510,8 @@ const wrap = (text: string, limit: number, first: string, rest: string): string[
 }
 
 /** A path (or any text that must be shown exactly) cut into lines of at most `limit`, never split at its spaces. */
-const cut = (text: string, limit: number, first: string, rest: string): string[] => {
+const cut = (text: string, given: number, first: string, rest: string): string[] => {
+  const limit = columnsOf(given)
   const out: string[] = []
   let points = Array.from(text)
   let prefix = first
@@ -490,7 +531,7 @@ const timeOf = (at: number) => `${new Date(at).toISOString().slice(0, 16).replac
 
 /** The report in words, `columns` wide (50 to 120), one page of the review list and the file rows. */
 export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1): string => {
-  const limit = Math.min(120, Math.max(50, Math.floor(columns)))
+  const limit = columnsOf(columns)
   const out: string[] = [TITLE, '']
   const say = (name: string, text: string) => out.push(...wrap(text, limit, field(name), pad))
   if (view.state === 'UNAVAILABLE') {
@@ -499,17 +540,19 @@ export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1
 
     return out.join('\n')
   }
-  const head = view.source.head.slice(0, 12)
-  say('Source', `working tree on ${head} (HEAD), ${view.source.tracked} tracked changed, ${view.source.untracked} untracked`)
-  if (view.source.identity !== null) out.push(`${pad}identity ${view.source.identity.slice(0, 16)}`)
-  say('Diff base', `${view.base.sha} (${view.base.how === 'task-start' ? 'task start' : `given as ${view.base.given ?? view.base.sha}`})${view.base.ancestor ? '' : ', not an ancestor of HEAD'}`)
+  // every value in the header is escaped too: the contract's producer is meant to give hex and closed labels, and a
+  // value that is not cannot add a line of its own
+  const shown = (text: string, max = 64) => displayText(text, max)
+  say('Source', `working tree on ${shown(view.source.head.slice(0, 12))} (HEAD), ${view.source.tracked} tracked changed, ${view.source.untracked} untracked`)
+  if (view.source.identity !== null) out.push(...cut(`identity ${shown(view.source.identity.slice(0, 16))}`, limit, pad, pad))
+  say('Diff base', `${shown(view.base.sha)} (${view.base.how === 'task-start' ? 'task start' : `given as ${shown(view.base.given ?? view.base.sha)}`})${view.base.ancestor ? '' : ', not an ancestor of HEAD'}`)
   const matched = view.evidence.state === 'MATCHED'
   if (view.coverage === null) say('Coverage', 'no report path configured')
   else {
     out.push(...cut(displayText(view.coverage.path, limit - LABEL), limit, field('Coverage'), pad))
-    if (view.coverage.sha256 !== null) out.push(`${pad}sha256:${view.coverage.sha256.slice(0, 16)}`)
+    if (view.coverage.sha256 !== null) out.push(...cut(`sha256:${shown(view.coverage.sha256.slice(0, 16))}`, limit, pad, pad))
     const run = view.coverage.run
-    if (run !== null) out.push(...wrap(`${matched ? 'changed during an observed run' : 'last observed run'} at ${timeOf(run.at)}: ${run.label} (ok)`, limit, pad, pad))
+    if (run !== null) out.push(...wrap(`${matched ? 'changed during an observed run' : 'last observed run'} at ${timeOf(run.at)}: ${shown(run.label)} (ok)`, limit, pad, pad))
   }
   if (matched) {
     say('Evidence', 'MATCHED: the report changed during an observed test run on this source.')
@@ -519,7 +562,7 @@ export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1
     const why = view.evidence.why ?? 'RUN_NOT_OBSERVED'
     const parser = view.evidence.parser
     say('Evidence', `NOT USED: ${why === 'REPORT_REJECTED' && parser !== undefined ? `the report was refused (${PARSER_WORDS[parser.code]}, line ${parser.line})` : LINE_WORDS[why]}`)
-    const todo = WHAT_TO_DO[why]
+    const todo = why === 'REPORT_REJECTED' && parser !== undefined ? PARSER_TO_DO[parser.code] : WHAT_TO_DO[why]
     if (todo !== undefined) out.push(...wrap(todo, limit, pad, pad))
   }
   out.push('')
@@ -535,20 +578,22 @@ export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1
   group('EXCLUDED / NON-EXECUTABLE', c.excluded + c.nonExecutable, reasons(['FILE_TYPE_OUT_OF_SCOPE', 'CONFIGURED_EXCLUSION', 'GENERATED_ATTRIBUTE', 'GENERATED_MARKER', 'BLANK_LINE']))
   group('UNAVAILABLE / UNTRUSTED', c.unavailable + c.untrusted, reasons((Object.keys(LINE_WORDS) as LineReason[]).filter(code => !['REPORTED_RUN', 'REPORTED_NOT_RUN', 'FILE_TYPE_OUT_OF_SCOPE', 'CONFIGURED_EXCLUSION', 'GENERATED_ATTRIBUTE', 'GENERATED_MARKER', 'BLANK_LINE'].includes(code))))
 
-  const pages = Math.max(1, Math.ceil(view.review.length / PAGE_SIZE), Math.ceil(view.files.length / PAGE_SIZE))
-  const shown = Math.min(Math.max(1, Math.floor(page)), pages)
-  const slice = <T>(list: readonly T[]) => list.slice((shown - 1) * PAGE_SIZE, shown * PAGE_SIZE)
+  // the two lists are paged together, each with its own count of pages; a page past the end of one says so
+  const pagesOf = (n: number) => Math.max(1, Math.ceil(n / PAGE_SIZE))
+  const at = Math.min(Math.max(1, Number.isFinite(page) ? Math.floor(page) : 1), Math.max(pagesOf(view.review.length), pagesOf(view.files.length)))
+  const slice = <T>(list: readonly T[]) => list.slice((at - 1) * PAGE_SIZE, at * PAGE_SIZE)
+  const header = (name: string, n: number, one: string, many: string) => at <= pagesOf(n) ? `${name}: ${n} ${n === 1 ? one : many}, page ${at} of ${pagesOf(n)}` : `${name}: ${n} ${n === 1 ? one : many}, all on page${pagesOf(n) === 1 ? ' 1' : `s 1 to ${pagesOf(n)}`}; none on page ${at}`
   if (view.review.length > 0) {
-    out.push('', `REVIEW REQUIRED: ${view.review.length} ${view.review.length === 1 ? 'entry' : 'entries'}, page ${shown} of ${pages}`)
+    out.push('', ...wrap(header('REVIEW REQUIRED', view.review.length, 'entry', 'entries'), limit, '', '  '))
     for (const r of slice(view.review)) {
       const ranges = r.ranges.join(',')
       const where = ranges === '' ? '' : `:${ranges}`
       out.push(...cut(`${displayText(r.path, Math.max(8, limit - 2 - Math.min(width(where), Math.floor(limit / 2))))}${where}`, limit, '  ', '    '))
       const words = r.category === 'NOTE' ? REVIEW_NOTE_WORDS[r.reason as ReviewNote['note']] : wordsOf(String(r.reason)) ?? String(r.reason)
-      out.push(...wrap(`${r.category.padEnd(12)}${words}`, limit, '    ', '                '))
+      out.push(...wrap(words, limit, `    ${r.category.padEnd(12)}`, ' '.repeat(16)))
     }
   }
-  out.push('', `Files: ${view.files.length}, page ${shown} of ${pages}`)
+  out.push('', ...wrap(header('Files', view.files.length, 'file', 'files'), limit, '', '  '))
   for (const f of slice(view.files)) {
     const words = f.reason === 'GENERATED_MARKER' ? `generated: marker on line ${f.generatedLine ?? 1}` : FILE_WORDS[f.reason]
     out.push(...cut(displayText(f.path, limit - 4), limit, '  ', '    '), ...wrap(words, limit, '    ', '    '))
@@ -564,7 +609,7 @@ export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1
 
 /** The one line shown while the layer is off, with the closing lines (W1 holds in every state). */
 export const renderOff = (columns = 80): string => {
-  const limit = Math.min(120, Math.max(50, Math.floor(columns)))
+  const limit = columnsOf(columns)
 
   return [TITLE, '', ...wrap('The coverage layer is off. A person turns it on with coverageDiff in /config.', limit, '', ''), '', ...closing(limit)].join('\n')
 }

@@ -167,20 +167,36 @@ describe('real producer reports: what each tool says, classified', () => {
   })
 })
 
-// a small seeded generator, so a failure names its seed and can be replayed
-const rng = (seed: number) => () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff)
+// a seeded generator (mulberry32), so a failure names its seed and can be replayed
+const rng = (seed: number) => () => {
+  seed = (seed + 0x6d2b79f5) | 0
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+}
+const CR = String.fromCharCode(13)
 const randomCase = (seed: number) => {
   const r = rng(seed)
   const n = (k: number) => Math.floor(r() * k)
   const files: ChangedFile[] = []
   const records: string[] = []
+  const exclude = r() < 0.5 ? ['gen/'] : []
   for (let k = 0; k < 1 + n(6); k++) {
-    const ext = ['.ts', '.js', '.md', '.tsx'][n(4)]!
-    const lines = Array.from({ length: 1 + n(15) }, () => (r() < 0.2 ? '' : r() < 0.1 ? '  ' : 'x = 1'))
-    const path = `src/f${k}${ext}`
-    const status = (['untracked', 'modified', 'added', 'deleted'] as const)[n(4)]!
+    const ext = ['.ts', '.js', '.md', '.tsx', '.ts'][n(5)]!
+    const lines: string[] = Array.from({ length: 1 + n(15) }, () => {
+      const p = r()
+      return p < 0.2 ? '' : p < 0.28 ? '  ' : p < 0.32 ? '// c8 ignore next' : 'x = 1'
+    })
+    if (r() < 0.08) lines[0] = '// @generated'
+    if (r() < 0.06) lines[lines.length - 1] = `x${CR}y`
+    const text = lines.join(r() < 0.2 ? '\r\n' : '\n') + '\n'
+    const path = `${r() < 0.25 ? 'gen' : 'src'}/f${k}${ext}`
+    const status = (['untracked', 'modified', 'added', 'deleted', 'type-changed'] as const)[n(5)]!
     const changed = Array.from({ length: lines.length }, (_, i) => i + 1).filter(() => r() < 0.6)
-    files.push(file(path, lines.join('\n') + '\n', status === 'deleted' ? { status, kind: 'none', source: null, deletedLines: 1 + n(5) } : { status, added: changed.filter(() => r() < 0.5), modified: changed }))
+    const kind = r() < 0.06 ? 'symlink' : r() < 0.04 ? 'submodule' : 'file'
+    files.push(file(path, text, status === 'deleted'
+      ? { status, kind: 'none', source: null, deletedLines: 1 + n(5) }
+      : { status, kind, modeOnly: r() < 0.04, binaryPatch: r() < 0.04, generatedByAttribute: r() < 0.05, added: changed.filter(() => r() < 0.5), modified: changed, deletedLines: n(3) }))
     if (r() < 0.7) {
       const spelling = r() < 0.1 ? `/work/repo/${path}` : r() < 0.05 ? path.toUpperCase() : path
       const da = Array.from({ length: lines.length + (r() < 0.1 ? 3 : 0) }, (_, i) => i + 1).filter(() => r() < 0.7).map(i => `DA:${i},${n(3)}`)
@@ -190,63 +206,175 @@ const randomCase = (seed: number) => {
   }
   if (records.length === 0) records.push('TN:\nSF:unrelated.ts\nDA:1,1\nend_of_record\n')
 
-  return { files, report: records.join(''), state: n(3) }
+  return { files, records, report: records.join(''), state: n(3), exclude }
 }
+const MEASURED = new Set(['COVERED', 'UNCOVERED'])
 
 describe('properties over seeded random changes and reports', () => {
-  const SEEDS = Array.from({ length: 120 }, (_, k) => 7919 * (k + 1))
+  const SEEDS = Array.from({ length: 200 }, (_, k) => 7919 * (k + 1))
   const evidenceOf = async (c: ReturnType<typeof randomCase>): Promise<Evidence> =>
     c.state === 0 ? { state: 'UNBOUND', why: 'SOURCE_CHANGED_SINCE_RUN' } : c.state === 1 ? { state: 'REJECTED', code: 'MALFORMED', line: 1 } : bound(c.report, c.files)
+  test('the generator reaches every file rule', async () => {
+    const reasons = new Set<string>()
+    for (const seed of SEEDS) {
+      const g = randomCase(seed)
+      for (const row of classifyChange(g.files, await evidenceOf(g), g.exclude).files) reasons.add(row.reason)
+    }
+    for (const reason of ['CLASSIFIED', 'DELETED', 'SYMLINK', 'SUBMODULE', 'MODE_ONLY', 'BINARY_BY_ATTRIBUTE', 'FILE_TYPE_OUT_OF_SCOPE', 'CONFIGURED_EXCLUSION', 'GENERATED_ATTRIBUTE', 'GENERATED_MARKER', 'LINE_TABLE_AMBIGUOUS']) expect([reason, reasons.has(reason)]).toEqual([reason, true])
+  })
   test('exactly one category per changed line, every path a row, nothing measured without binding', async () => {
     for (const seed of SEEDS) {
       const g = randomCase(seed)
       const evidence = await evidenceOf(g)
-      const c = classifyChange(g.files, evidence, [])
+      const c = classifyChange(g.files, evidence, g.exclude)
       const keys = c.lines.map(v => `${v.path}:${v.line}`)
       expect([seed, new Set(keys).size]).toEqual([seed, keys.length])
       expect([seed, c.files.length]).toEqual([seed, g.files.length])
-      const expected = g.files.filter(f => f.status !== 'deleted').reduce((n, f) => n + new Set(changedLines(f)).size, 0)
+      // lines are counted for exactly the files whose text could be used and that have line evidence at all
+      const withLines = new Set(c.files.filter(f => ['CLASSIFIED', 'FILE_TYPE_OUT_OF_SCOPE', 'CONFIGURED_EXCLUSION', 'GENERATED_ATTRIBUTE', 'GENERATED_MARKER', 'LINE_TABLE_AMBIGUOUS'].includes(f.reason)).map(f => f.path))
+      const expected = g.files.filter(f => withLines.has(f.path)).reduce((sum, f) => sum + new Set(changedLines(f)).size, 0)
       expect([seed, c.lines.length]).toEqual([seed, expected])
+      expect([seed, c.lines.every(v => withLines.has(v.path))]).toEqual([seed, true])
       const counts = countsOf(c.lines)
       expect([seed, Object.values(counts).reduce((a, b) => a + b, 0)]).toEqual([seed, c.lines.length])
       if (evidence.state !== 'BOUND') expect([seed, counts.covered + counts.uncovered]).toEqual([seed, 0])
+      expect([seed, c.lines.every(v => v.category !== 'NON_EXECUTABLE' || v.reason === 'BLANK_LINE')]).toEqual([seed, true])
     }
   })
-  test('no upgrade: taking a file\'s records out moves its lines only to UNAVAILABLE (blank lines stay blank)', async () => {
-    for (const seed of SEEDS) {
+  test('no upgrade: taking any one record out never gives a measured category to a line that had none, except one the record made UNTRUSTED', async () => {
+    for (const seed of SEEDS.slice(0, 120)) {
       const g = randomCase(seed)
-      const full = classifyChange(g.files, await bound(g.report, g.files), [])
-      for (const f of g.files) {
-        const without = g.report.split('end_of_record\n').filter(r => r !== '' && !r.toLowerCase().includes(`sf:${f.path.toLowerCase()}\n`) && !r.includes(`SF:/work/repo/${f.path}\n`)).map(r => `${r}end_of_record\n`).join('') || 'TN:\nSF:unrelated.ts\nDA:1,1\nend_of_record\n'
-        const less = classifyChange(g.files, await bound(without, g.files), [])
-        // with its records gone a file's lines have no measured category left: blank, excluded or UNAVAILABLE
-        for (const v of less.lines.filter(v => v.path === f.path)) {
-          expect([seed, v.path, v.line, v.category === 'COVERED' || v.category === 'UNCOVERED']).toEqual([seed, v.path, v.line, false])
-          if (at(full, v.path, v.line)!.category === 'NON_EXECUTABLE') expect([seed, v.path, v.line, v.category]).toEqual([seed, v.path, v.line, 'NON_EXECUTABLE'])
+      const full = classifyChange(g.files, await bound(g.report, g.files), g.exclude)
+      for (let k = 0; k < g.records.length; k++) {
+        const rest = g.records.filter((_, j) => j !== k).join('') || 'TN:\nSF:unrelated.ts\nDA:1,1\nend_of_record\n'
+        const less = classifyChange(g.files, await bound(rest, g.files), g.exclude)
+        for (const v of less.lines) {
+          const before = at(full, v.path, v.line)!
+          // the only lines that may gain a measurement are those a doubt about the removed record held back
+          if (MEASURED.has(v.category)) expect([seed, k, v.path, v.line, MEASURED.has(before.category) || before.category === 'UNTRUSTED']).toEqual([seed, k, v.path, v.line, true])
+          if (before.category === 'NON_EXECUTABLE' || before.category === 'EXCLUDED') expect([seed, k, v.path, v.line, v.category]).toEqual([seed, k, v.path, v.line, before.category])
         }
       }
     }
   })
-  test('monotone in damage: a truncated or appended report is refused, and every non-blank changed line is UNAVAILABLE', async () => {
-    for (const seed of SEEDS.slice(0, 40)) {
+  test('taking one of two conflicting records out uses the one left: the conflict was the only doubt', async () => {
+    const files = [file('src/a.ts', 'a\nb\n')]
+    const both = await bound('TN:\nSF:src/a.ts\nDA:1,1\nDA:2,0\nend_of_record\nTN:\nSF:/work/repo/src/a.ts\nDA:1,0\nend_of_record\n', files)
+    expect(classifyChange(files, both, []).lines.map(v => v.category)).toEqual(['UNTRUSTED', 'UNTRUSTED'])
+    const one = await bound('TN:\nSF:src/a.ts\nDA:1,1\nDA:2,0\nend_of_record\n', files)
+    expect(classifyChange(files, one, []).lines.map(v => v.category)).toEqual(['COVERED', 'UNCOVERED'])
+  })
+  test('damaged reports are refused, and then every non-blank changed line of a classified file is UNAVAILABLE', async () => {
+    for (const seed of SEEDS.slice(0, 60)) {
       const g = randomCase(seed)
       for (const damaged of [g.report.slice(0, -3), `${g.report}DA:1,1\n`, `${g.report}garbage\n`]) {
         const r = await parseLcov(encode(damaged), () => null, clock)
         expect([seed, r.ok]).toEqual([seed, false])
-        const c = classifyChange(g.files, { state: 'REJECTED', code: r.ok ? 'MALFORMED' : r.code, line: r.ok ? 0 : r.line }, [])
-        expect([seed, c.lines.filter(v => v.category === 'COVERED' || v.category === 'UNCOVERED').length]).toEqual([seed, 0])
+        if (r.ok) continue
+        const c = classifyChange(g.files, { state: 'REJECTED', code: r.code, line: r.line }, g.exclude)
+        const classified = new Set(c.files.filter(f => f.reason === 'CLASSIFIED').map(f => f.path))
+        for (const v of c.lines.filter(v => classified.has(v.path))) expect([seed, v.path, v.line, `${v.category}:${v.reason}`]).toEqual([seed, v.path, v.line, v.reason === 'BLANK_LINE' ? 'NON_EXECUTABLE:BLANK_LINE' : 'UNAVAILABLE:REPORT_REJECTED'])
       }
     }
   })
   test('stable: the same change and report give the same value and the same text', async () => {
-    for (const seed of SEEDS.slice(0, 30)) {
+    for (const seed of SEEDS.slice(0, 40)) {
       const g = randomCase(seed)
-      const one = classifyChange(g.files, await bound(g.report, g.files), [])
-      const two = classifyChange(g.files, await bound(g.report, g.files), [])
-      expect(two).toEqual(one)
-      const view = (c: Classification) => renderDiffEvidence(viewOf(c, { state: 'BOUND', report: { ok: true, files: new Map(), refused: {}, unmatched: 0, stats: { records: 0, entries: 0, keptLines: 0, unknownTags: 0, comments: 0, totalsDisagree: 0 } }, notes: [] }), 80)
-      expect(view(two)).toBe(view(one))
+      const make = async () => {
+        const evidence = await bound(g.report, g.files)
+        const c = classifyChange(g.files, evidence, g.exclude)
+        return { c, text: renderDiffEvidence(viewOf(c, evidence), 80) + renderDiffEvidence(viewOf(c, evidence), 50, 2) }
+      }
+      const one = await make(), two = await make()
+      expect(two.c).toEqual(one.c)
+      expect(two.text).toBe(one.text)
     }
+  })
+})
+
+describe('rule order, and the cases the review asked for', () => {
+  const unbound: Evidence = { state: 'UNBOUND', why: 'RUN_NOT_OBSERVED' }
+  const reasonOf = (f: ChangedFile, exclude: readonly string[] = []) => classifyChange([f], unbound, exclude).files[0]!.reason
+  test('when two file rules apply, the earlier one decides', () => {
+    expect(reasonOf(file('src/old.ts', '', { status: 'deleted', kind: 'symlink', source: null, modeOnly: true }))).toBe('DELETED')
+    expect(reasonOf(file('src/link.ts', 'x\n', { kind: 'symlink', modeOnly: true, binaryPatch: true }))).toBe('SYMLINK')
+    expect(reasonOf(file('bin/x.ts', 'x\n', { modeOnly: true, binaryPatch: true }))).toBe('MODE_ONLY')
+    expect(reasonOf(file('test/notes.md', 'x\n'), ['test/'])).toBe('FILE_TYPE_OUT_OF_SCOPE')
+    expect(reasonOf(file('test/schema.ts', '// @generated\nx\n', { generatedByAttribute: true }), ['test/'])).toBe('CONFIGURED_EXCLUSION')
+    expect(reasonOf(file('src/schema.ts', '// @generated\nx\n', { generatedByAttribute: true }))).toBe('GENERATED_ATTRIBUTE')
+    expect(reasonOf(file('src/schema.ts', `// @generated\nx${CR}y\n`))).toBe('GENERATED_MARKER')
+    expect(reasonOf(file('src/cr.ts', `x${CR}y\n`))).toBe('LINE_TABLE_AMBIGUOUS')
+  })
+  test('a blank line is NON-EXECUTABLE under every evidence state', async () => {
+    const files = [file('src/a.ts', 'a\n\nb\n')]
+    for (const evidence of [unbound, { state: 'REJECTED', code: 'BAD_DA', line: 1 } as Evidence, await bound('TN:\nSF:src/other.ts\nDA:1,1\nend_of_record\n', files), await bound('TN:\nSF:src/A.ts\nDA:1,1\nend_of_record\n', files)]) {
+      expect(at(classifyChange(files, evidence, []), 'src/a.ts', 2)).toMatchObject({ category: 'NON_EXECUTABLE', reason: 'BLANK_LINE' })
+    }
+  })
+  test('a conflict is named before entries past the end and before an empty record (L5 before L6 and L7)', async () => {
+    const files = [file('src/a.ts', 'a\n')]
+    const reason = async (report: string) => at(classifyChange(files, await bound(report, files), []), 'src/a.ts', 1)!.reason
+    expect(await reason('TN:\nSF:src/a.ts\nDA:9,1\nend_of_record\nTN:\nSF:/work/repo/src/a.ts\nDA:1,1\nend_of_record\n')).toBe('SF_CONFLICTING_IDENTITY')
+    expect(await reason('TN:\nSF:src/a.ts\nend_of_record\nTN:\nSF:src/A.ts\nDA:1,1\nend_of_record\n')).toBe('SF_CASE_MISMATCH')
+    expect(await reason('TN:\nSF:src/a.ts\nDA:9,1\nend_of_record\n')).toBe('RECORD_BEYOND_END_OF_FILE')
+  })
+  test('a carriage return at the very end of a file is a lone one; before a line feed it is a CRLF', () => {
+    expect(facts(`a${CR}`).lineTableAmbiguous).toBe(true)
+    expect(facts(`x\n${CR}`).lineTableAmbiguous).toBe(true)
+    expect(facts(`a${CR}\n`).lineTableAmbiguous).toBe(false)
+  })
+  test('ignore-comment notes only for classified files; a generated file is listed for review with its marker line', () => {
+    const c = classifyChange([
+      file('README.md', '// c8 ignore next\n'), file('test/a.ts', '// c8 ignore next\n'), file('src/cr.ts', `// c8 ignore next\nx${CR}y\n`),
+      file('src/ok.ts', 'x\n// c8 ignore next\n'), file('src/schema.ts', 'x\n// Code generated by tool. DO NOT EDIT.\n'), file('src/attr.ts', 'x\n', { generatedByAttribute: true }),
+    ], unbound, ['test/'])
+    expect(c.notes).toEqual([{ path: 'src/ok.ts', line: 2, note: 'IGNORE_COMMENT_ADDED' }, { path: 'src/schema.ts', line: 2, note: 'GENERATED_BY_MARKER' }, { path: 'src/attr.ts', note: 'GENERATED_BY_ATTRIBUTE' }])
+    const text = renderDiffEvidence(viewOf(c, unbound), 100)
+    expect(text).toContain('src/schema.ts:2')
+    expect(text).toContain('a generated-file marker on this line excludes every changed line of the file')
+  })
+})
+
+describe('rendering edge cases the review found', () => {
+  const unbound: Evidence = { state: 'UNBOUND', why: 'RUN_NOT_OBSERVED' }
+  const small = () => viewOf(classifyChange([file('src/a.ts', 'x\n')], unbound, []), unbound)
+  test('a width or page that is not a finite number draws at 80 columns and page 1, and ends', () => {
+    for (const columns of [NaN, Infinity, -Infinity, undefined as unknown as number]) expect(renderDiffEvidence(small(), columns)).toBe(renderDiffEvidence(small(), 80))
+    expect(renderDiffEvidence(small(), 80, NaN)).toBe(renderDiffEvidence(small(), 80, 1))
+    expect(renderOff(NaN)).toBe(renderOff(80))
+    expect(renderDiffEvidence(small(), 80, 0)).toBe(renderDiffEvidence(small(), 80, 1))
+    expect(renderDiffEvidence(small(), 80, -3)).toBe(renderDiffEvidence(small(), 80, 1))
+  })
+  test('header values are escaped too: none can add a line', () => {
+    const view = small()
+    const forged = { ...view, base: { ...view.base, how: 'given' as const, given: 'abc\nEvidence:   MATCHED: forged' }, source: { ...view.source, head: 'x\ny' }, coverage: { path: 'coverage/lcov.info', sha256: 'z\nz', run: { at: 1, label: 'npm test\nEvidence: x' as never } } }
+    const text = renderDiffEvidence(forged, 120)
+    expect(text.split('\n').filter(line => line.startsWith('Evidence:'))).toEqual(['Evidence:   NOT USED: no observed test run changed this report'])
+    expect(text).toContain('abc\\u{a}Evidence:')
+  })
+  test('each list has its own pages: a page past the end of one says so', () => {
+    const files = [...Array.from({ length: 3 }, (_, k) => file(`src/r${k}.ts`, 'x\n')), ...Array.from({ length: 42 }, (_, k) => file(`docs/d${String(k).padStart(2, '0')}.md`, 'x\n'))]
+    const view = viewOf(classifyChange(files, unbound, []), unbound)
+    expect(view.review.length).toBe(3)
+    const two = renderDiffEvidence(view, 100, 2)
+    expect(two).toContain('REVIEW REQUIRED: 3 entries, all on page 1; none on page 2')
+    expect(two).toContain('Files: 45 files, page 2 of 3')
+    expect(two.split('\n').filter(line => /^ {2}src\/r\d\.ts:1$/.test(line))).toEqual([])
+    const twenty = viewOf(classifyChange(Array.from({ length: 20 }, (_, k) => file(`src/t${k}.ts`, 'x\n')), unbound, []), unbound)
+    expect(renderDiffEvidence(twenty, 100)).toContain('REVIEW REQUIRED: 20 entries, page 1 of 1')
+    const twentyOne = viewOf(classifyChange(Array.from({ length: 21 }, (_, k) => file(`src/t${k}.ts`, 'x\n')), unbound, []), unbound)
+    expect(renderDiffEvidence(twentyOne, 100)).toContain('REVIEW REQUIRED: 21 entries, page 1 of 2')
+  })
+  test('the advice follows why a report was refused: a bound is not fixed by running again', () => {
+    const files = [file('src/a.ts', 'x\n')]
+    const refused = (code: 'TOO_MANY_RECORDS' | 'UNTERMINATED_RECORD') => { const e: Evidence = { state: 'REJECTED', code, line: 4 }; return renderDiffEvidence(viewOf(classifyChange(files, e, []), e), 100) }
+    expect(refused('TOO_MANY_RECORDS')).toContain('Reports with more than 50,000 records are not read.')
+    expect(refused('TOO_MANY_RECORDS')).not.toContain('run the tests again')
+    expect(refused('UNTERMINATED_RECORD')).toContain('it may have been cut short')
+  })
+  test('the category column stays aligned in the review list', () => {
+    const text = renderDiffEvidence(small(), 100)
+    expect(text).toContain('    UNAVAILABLE no observed test run changed this report')
   })
 })
 
@@ -352,7 +480,7 @@ describe('the rendered report keeps its wording rules in every state (W1 to W12)
     expect([listed(1), listed(2), listed(3)]).toEqual([PAGE_SIZE, PAGE_SIZE, 5])
     expect(renderDiffEvidence(view, 100, 1)).toContain('REVIEW REQUIRED: 45 entries, page 1 of 3')
     expect(renderDiffEvidence(view, 100, 99)).toContain('page 3 of 3')
-    expect(renderDiffEvidence(view, 100, 1)).toContain('Files: 45, page 1 of 3')
+    expect(renderDiffEvidence(view, 100, 1)).toContain('Files: 45 files, page 1 of 3')
   })
   test('the four groups add up to the changed lines, in counts, never percentages', async () => {
     const [, view] = (await states())[0]!

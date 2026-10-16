@@ -186,6 +186,7 @@ export const parseLcov = async (bytes: Uint8Array, match: (sf: string) => SfMatc
       if (countLength === 0 || countLength > 20 || (countLength > 1 && bytes[countStart] === 0x30)) return reject('BAD_DA', 'a malformed count', lineNo)
       if (k < end) {
         if (bytes[k] !== 0x2c) return reject('BAD_DA', 'bytes after the count', lineNo)
+        if (k + 1 === end) return reject('BAD_DA', 'an empty checksum', lineNo)
         for (let m = k + 1; m < end; m++) {
           const c = bytes[m]!
           const isChecksum = (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x2b || c === 0x2f || c === 0x3d

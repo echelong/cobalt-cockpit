@@ -58,6 +58,16 @@ describe('SF values resolve to repository-relative keys or are refused', () => {
     for (const root of ['', '/', 'work/repo', '/work/repo/', '/work/./repo', '/work/x/../repo']) expect(resolveSf('src/a.ts', { root })).toEqual({ refuse: 'SF_OUTSIDE_REPOSITORY' })
     expect(resolveSf('src/a.ts', { root: ROOT, aliases: ['relative'] })).toEqual({ refuse: 'SF_OUTSIDE_REPOSITORY' })
   })
+  test('aliases nested in the root, or the root in an alias, resolve nothing: they would map one directory onto another', () => {
+    expect(resolveSf('/a/c/x.ts', { root: '/a/b', aliases: ['/a'] })).toEqual({ refuse: 'SF_OUTSIDE_REPOSITORY' })
+    expect(resolveSf('src/x.ts', { root: '/a/b', aliases: ['/a/b/c'] })).toEqual({ refuse: 'SF_OUTSIDE_REPOSITORY' })
+    expect(resolveSf('/a/b/src/x.ts', { root: '/a/b', aliases: ['/a/b'] })).toEqual({ rel: 'src/x.ts' })
+  })
+  test('C1 controls, NEL and the line and paragraph separators are refused, raw or percent-encoded', () => {
+    for (const code of [0x80, 0x85, 0x9f, 0x2028, 0x2029]) expect(resolveSf(`src/a${String.fromCodePoint(code)}.ts`, place)).toEqual({ refuse: 'SF_CONTROL_CHARACTER' })
+    expect(resolveSf('file:///work/repo/a%C2%85.ts', place)).toEqual({ refuse: 'SF_CONTROL_CHARACTER' })
+    expect(resolveSf('file:///work/repo/a%E2%80%A8.ts', place)).toEqual({ refuse: 'SF_CONTROL_CHARACTER' })
+  })
   test('lexical normalisation never climbs above the root of the file system', () => {
     expect(normalizeAbsolute('/../../a')).toBe('/a')
     expect(normalizeAbsolute('/a/b/../../..')).toBe('/')
@@ -83,7 +93,7 @@ describe('the person-only options take repository-relative paths only', () => {
   test('the report path: unset is none, and anything but a plain relative path is refused, never repaired', () => {
     expect(reportPathOf('')).toEqual({ refuse: 'PATH_UNSET' })
     expect(reportPathOf('coverage/lcov.info')).toEqual({ rel: 'coverage/lcov.info' })
-    for (const bad of ['/abs/lcov.info', '../lcov.info', 'coverage/../lcov.info', './coverage/lcov.info', 'coverage//lcov.info', 'coverage/', 'coverage\\lcov.info', 'coverage/*.info', 'cov?.info', 'cov[1].info', '{a,b}.info', '.git/lcov.info', 'x/.Git/y', ' coverage/lcov.info', 'file:lcov.info', 'a\u0007b', 'x'.repeat(4097)]) expect([bad, reportPathOf(bad)]).toEqual([bad, { refuse: 'PATH_REFUSED' }])
+    for (const bad of ['-coverage.info', '--output=x', '/abs/lcov.info', '../lcov.info', 'coverage/../lcov.info', './coverage/lcov.info', 'coverage//lcov.info', 'coverage/', 'coverage\\lcov.info', 'coverage/*.info', 'cov?.info', 'cov[1].info', '{a,b}.info', '.git/lcov.info', 'x/.Git/y', ' coverage/lcov.info', 'file:lcov.info', 'a\u0007b', 'x'.repeat(4097)]) expect([bad, reportPathOf(bad)]).toEqual([bad, { refuse: 'PATH_REFUSED' }])
   })
   test('the exclusion prefixes: comma-separated, whole segments, one bad entry refuses the option', () => {
     expect(excludePrefixesOf('')).toEqual({ prefixes: [] })
@@ -119,6 +129,14 @@ describe('repository-chosen text is escaped before it is shown (W11)', () => {
     expect(displayText('lone\uD800x')).toBe('lone\\u{d800}x')
     // a literal escape in a name cannot pass for one Cockpit made
     expect(displayText('a\\u{1b}b')).toBe('a\\u{5c}u{1b}b')
+  })
+  test('right-to-left letters are escaped, so a path:line reads as stored; and U+180F', () => {
+    const he = String.fromCodePoint(0x5d0), ar = String.fromCodePoint(0x627), presentation = String.fromCodePoint(0xfb1d)
+    expect(displayText(`a${he}.ts:12`)).toBe('a\\u{5d0}.ts:12')
+    expect(displayText(`${ar}${ar}/x.ts`)).toBe('\\u{627}\\u{627}/x.ts')
+    expect(displayText(`x${presentation}`)).toBe('x\\u{fb1d}')
+    expect(displayText(`a${String.fromCodePoint(0x180f)}b`)).toBe('a\\u{180f}b')
+    expect(displayText(String.fromCodePoint(0x10800))).toBe('\\u{10800}')
   })
   test('long text is shortened in the middle by code point, never inside a surrogate pair or an escape', () => {
     const emoji = '\u{1F600}'.repeat(200)

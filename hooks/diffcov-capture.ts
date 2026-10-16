@@ -46,6 +46,18 @@ const WORD = /^[A-Za-z0-9_./=:@+,-]+$/
 // Flags that make a tool resolve paths against another directory, long forms with or without a value, short forms with
 // or without an attached one (`-Csub`).
 const MOVES_ROOT = /^(?:--prefix|--root|--rootDir|--root-dir|--dir|--cwd|--workspace|--workspaces|--filter|--config|--project|--projects|--recursive)(?:=.*)?$|^-[CwFcr]/
+const ROOT_FLAGS = ['prefix', 'root', 'rootdir', 'root-dir', 'dir', 'cwd', 'workspace', 'workspaces', 'filter', 'config', 'project', 'projects', 'recursive']
+/**
+ * A long flag that may stand for a root-moving one: npm accepts any unambiguous abbreviation (`npm test --prefi=sub`
+ * ran its script in `sub`: measured on npm 10.9.9), so a prefix of three letters or more of a listed flag is refused too.
+ */
+const movesRoot = (word: string): boolean => {
+  if (MOVES_ROOT.test(word)) return true
+  if (!word.startsWith('--')) return false
+  const name = word.slice(2).split('=')[0]!.toLowerCase()
+
+  return name.length >= 3 && ROOT_FLAGS.some(flag => flag.startsWith(name))
+}
 const RUNNERS = new Set(['vitest', 'jest'])
 // `bun run` runs a file as readily as a script, so of bun only `bun test` is accepted
 const MANAGERS = new Set(['npm', 'pnpm', 'yarn'])
@@ -72,7 +84,12 @@ export const captureLabelOf = (command: string): { label: CaptureLabel } | { ski
   else if (program !== undefined && MANAGERS.has(program) && first === 'test') label = `${program} test` as CaptureLabel
   else if (program !== undefined && MANAGERS.has(program) && first === 'run' && second !== undefined) label = `${program} run (a script)` as CaptureLabel
   if (label === null) return { skip: 'NOT_A_LISTED_TEST_PROGRAM' }
-  if (words.slice(1).some(word => MOVES_ROOT.test(word))) return { skip: 'MOVES_THE_TOOL_ROOT' }
+  if (words.slice(1).some(movesRoot)) return { skip: 'MOVES_THE_TOOL_ROOT' }
+  // a package manager's own options come before `--`, and any of them could change where it runs: none is accepted
+  if (program !== undefined && MANAGERS.has(program)) {
+    const end = words.indexOf('--')
+    if ((end === -1 ? words : words.slice(0, end)).slice(1).some(word => word.startsWith('-'))) return { skip: 'MOVES_THE_TOOL_ROOT' }
+  }
   // read-only use of the gate classifier: nothing here records or changes a gate
   if (!readBash(command).gates.includes('TEST')) return { skip: 'NOT_A_TEST_COMMAND' }
 
@@ -95,6 +112,16 @@ export const captureBefore = (call: { tool?: unknown; command?: unknown; run_in_
 
 const isAbsent = (value: unknown): boolean => value === undefined || value === null || value === false || value === ''
 
+/** What a tool answer may carry beside the result (`ToolCallResult`); anything else is a shape not recognised. */
+const ANSWER_KEYS = new Set(['ref', 'result', 'text', 'isReadOnly', 'context', 'isError', 'deny'])
+/** Every field the host declares for a Bash result (Claude Code 2.1.296's declarations; 2.1.301 sent a subset: measured). */
+const RESULT_KEYS = new Set([
+  'stdout', 'stderr', 'rawOutputPath', 'interrupted', 'isImage', 'backgroundTaskId', 'backgroundedByUser', 'backgroundedByTurnAbort',
+  'backgroundedToDeliverMessage', 'timedOutAfterMs', 'backgroundCwdHint', 'backgroundEndsWithFinalResponse', 'dangerouslyDisableSandbox',
+  'returnCodeInterpretation', 'noOutputExpected', 'structuredContent', 'persistedOutputPath', 'persistedOutputSize', 'staleReadFileStateHint',
+  'ghRateLimitHint', 'gitOperation', 'bashEditDiff',
+])
+
 /**
  * After a call: `'ok'` only when the host's answer shows, field by field, a command that finished in the foreground
  * and succeeded. A failing command and one ended by its own timeout both come back as `isError` with a text result
@@ -105,9 +132,12 @@ export const captureAfter = (ran: unknown): { outcome: 'ok' } | { skip: CaptureS
   const answer = ran as Record<string, unknown>
   if (answer['deny'] !== undefined) return { skip: 'REFUSED' }
   if (answer['isError'] !== undefined) return { skip: 'DID_NOT_SUCCEED' }
+  // a field the host adds later (an exit code, say) could mean failure: an answer holding one is not read at all
+  if (Object.keys(answer).some(key => !ANSWER_KEYS.has(key))) return { skip: 'RESULT_UNRECOGNISED' }
   const result = answer['result']
-  if (result === null || typeof result !== 'object') return { skip: 'RESULT_UNRECOGNISED' }
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return { skip: 'RESULT_UNRECOGNISED' }
   const r = result as Record<string, unknown>
+  if (Object.keys(r).some(key => !RESULT_KEYS.has(key))) return { skip: 'RESULT_UNRECOGNISED' }
   if (typeof r['stdout'] !== 'string' || typeof r['stderr'] !== 'string' || r['interrupted'] === undefined) return { skip: 'RESULT_UNRECOGNISED' }
   if (r['interrupted'] !== false) return { skip: 'INTERRUPTED' }
   if (!isAbsent(r['timedOutAfterMs'])) return { skip: 'TIMED_OUT' }
@@ -215,7 +245,8 @@ export const capturesOf = (stored: unknown, project: string): CaptureRecord[] =>
     if ('record' in again) out.push(again.record)
   }
 
-  return out
+  // binding takes the newest record that matches, so the order is Cockpit's own, not whatever the store held
+  return out.sort((a, b) => b.at - a.at)
 }
 
 /** Why a report's figures are not used. The reader's refusals come first; then the binding conditions, in order. */

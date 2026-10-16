@@ -47,8 +47,11 @@ export const normalizeAbsolute = (path: string): string => {
 /** A root a place can hold: absolute, already normalised, not `/` itself. */
 const isRoot = (path: string): boolean => path.startsWith('/') && path !== '/' && normalizeAbsolute(path) === path
 
-const CONTROL = /[\u0000-\u001f\u007f]/
+// C0 and C1 controls, and the line and paragraph separators: none belongs in a path a tool wrote
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/
 const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/
+/** Two spellings of one place nested in each other would map one directory's files onto another's. */
+const isNested = (roots: readonly string[]): boolean => roots.some((a, i) => roots.some((b, j) => i !== j && a !== b && (a.startsWith(`${b}/`) || b.startsWith(`${a}/`))))
 
 /**
  * One `SF:` value as a repository-relative path, or why it is refused. The rules apply in order and the first that
@@ -57,7 +60,7 @@ const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/
 export const resolveSf = (sf: string, place: Place): { rel: string } | { refuse: SfRefusal } => {
   const roots = [place.root, ...(place.aliases ?? [])]
   // a place that is not a clean absolute root resolves nothing: every record is refused, never matched by accident
-  if (!roots.every(isRoot)) return { refuse: 'SF_OUTSIDE_REPOSITORY' }
+  if (!roots.every(isRoot) || isNested(roots)) return { refuse: 'SF_OUTSIDE_REPOSITORY' }
   let path = sf
   if (/^file:/i.test(path)) {
     if (!path.startsWith('file:///')) return { refuse: 'SF_URL_NOT_LOCAL' }
@@ -138,7 +141,8 @@ const MAX_PATH_BYTES = 4096
  */
 const optionPath = (value: string, isPrefix: boolean): { rel: string } | { refuse: OptionPathRefusal } => {
   if (value === '') return { refuse: 'PATH_UNSET' }
-  if (utf8Length(value) > MAX_PATH_BYTES || value.startsWith('/') || value.includes('\\') || CONTROL.test(value) || /[*?[\]{}]/.test(value)) return { refuse: 'PATH_REFUSED' }
+  // a leading `-` could read as an option to the tools that will be given the path
+  if (utf8Length(value) > MAX_PATH_BYTES || value.startsWith('/') || value.startsWith('-') || value.includes('\\') || CONTROL.test(value) || /[*?[\]{}]/.test(value)) return { refuse: 'PATH_REFUSED' }
   if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) || value !== value.trim()) return { refuse: 'PATH_REFUSED' }
   const parts = (isPrefix && value.endsWith('/') ? value.slice(0, -1) : value).split('/')
   if (parts.some(part => part === '' || part === '.' || part === '..' || part.toLowerCase() === '.git')) return { refuse: 'PATH_REFUSED' }
@@ -173,16 +177,20 @@ export const isUnderPrefix = (path: string, prefix: string): boolean => {
 // ones below are invisible or blank, and are escaped too (variation selectors, tag characters, the combining grapheme
 // joiner, Khmer inherent vowels, the braille blank, the Hangul fillers).
 const SHOWN = /^[\p{L}\p{M}\p{N}\p{P}\p{S} ]$/u
-const HIDDEN = /^[\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}\u{FE00}-\u{FE0F}\u{180B}-\u{180D}\u{034F}\u{17B4}\u{17B5}\u{2800}\u{3164}\u{115F}\u{1160}\u{FFA0}]$/u
+const HIDDEN = /^[\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}\u{FE00}-\u{FE0F}\u{180B}-\u{180F}\u{034F}\u{17B4}\u{17B5}\u{2800}\u{3164}\u{115F}\u{1160}\u{FFA0}]$/u
+// right-to-left scripts (Hebrew, Arabic, Syriac, Thaana, NKo and the rest, with their presentation forms): their
+// letters reorder neighbouring digits and punctuation on screen, so `a<letter>.ts:12` need not read as it is stored
+const RIGHT_TO_LEFT = /^[\u{0590}-\u{08FF}\u{FB1D}-\u{FDFF}\u{FE70}-\u{FEFE}\u{10800}-\u{10FFF}\u{1E800}-\u{1EFFF}]$/u
 
 /**
  * Repository-chosen text made safe to print, on one line: everything outside the shown classes becomes `\u{…}`, and so
  * does the backslash itself, so an escape cannot be forged. That covers controls, ESC, bidirectional controls,
- * zero-width and tag characters, U+2028/U+2029 and lone surrogates. Text longer than `max` code points is shortened in
+ * zero-width and tag characters, U+2028/U+2029, lone surrogates, and right-to-left letters, which would reorder the
+ * digits and punctuation beside them (a `path:line` must read as stored). Text longer than `max` code points is shortened in
  * the middle, by code point, never inside a surrogate pair or an escape.
  */
 export const displayText = (text: string, max = 160): string => {
-  const pieces = Array.from(text, char => (SHOWN.test(char) && char !== '\\' && !HIDDEN.test(char) ? char : `\\u{${char.codePointAt(0)!.toString(16)}}`))
+  const pieces = Array.from(text, char => (SHOWN.test(char) && char !== '\\' && !HIDDEN.test(char) && !RIGHT_TO_LEFT.test(char) ? char : `\\u{${char.codePointAt(0)!.toString(16)}}`))
   const length = pieces.reduce((sum, piece) => sum + Array.from(piece).length, 0)
   if (length <= max) return pieces.join('')
   // whole pieces from each end, so no escape is cut: the front half first, then as much of the end as still fits

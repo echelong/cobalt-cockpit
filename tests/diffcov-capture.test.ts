@@ -40,6 +40,12 @@ describe('a command is recorded only when its raw text is one plain, listed test
     // placed before the subcommand, the same flags leave the command off the list altogether
     for (const command of ['npm --prefix sub test', 'pnpm -C sub test', 'pnpm --filter x test', 'yarn --cwd sub test']) expect([command, label(command)]).toEqual([command, 'NOT_A_LISTED_TEST_PROGRAM'])
   })
+  test('an abbreviated root-moving flag is refused: npm ran `npm test --prefi=sub` in sub (measured, npm 10.9.9)', () => {
+    for (const command of ['npm test --prefi=sub', 'npm test --pre=sub', 'vitest --roo sub', 'jest --proj a', 'vitest --worksp x', 'jest --rootdi src', 'vitest --confi=x']) expect([command, label(command)]).toEqual([command, 'MOVES_THE_TOOL_ROOT'])
+    // a package manager's own options never pass, whatever they are; after `--` they belong to the script's runner
+    for (const command of ['npm test --silent', 'yarn test --frozen', 'pnpm test -s']) expect([command, label(command)]).toEqual([command, 'MOVES_THE_TOOL_ROOT'])
+    for (const [command, want] of [['npm test -- --coverage', 'npm test'], ['npm run test:unit -- --run', 'npm run (a script)'], ['npm test -- --prefix=sub', 'MOVES_THE_TOOL_ROOT'], ['vitest --run --reporter=dot', 'vitest'], ['vitest --re x', 'vitest']] as const) expect([command, label(command)]).toEqual([command, want])
+  })
   test('programs off the list, including those the classifier does not read as TEST (measured: c8, nyc, bun run)', () => {
     for (const command of ['c8 node --test', 'nyc mocha', 'bun run x.ts', 'node x.js --test', 'npx c8 vitest', 'make test', 'pytest', 'mocha', 'npm t', 'npx', 'npm run', 'CI=1 npm test']) {
       expect([command, label(command)]).toEqual([command, 'NOT_A_LISTED_TEST_PROGRAM'])
@@ -86,6 +92,13 @@ describe('after the call: only an answer that shows a foreground success, field 
     for (const key of ['backgroundedByUser', 'backgroundedByTurnAbort', 'backgroundedToDeliverMessage', 'backgroundEndsWithFinalResponse']) expect(captureAfter(success({ [key]: true }))).toEqual({ skip: 'BACKGROUNDED' })
     expect(captureAfter(success({ timedOutAfterMs: 2000 }))).toEqual({ skip: 'TIMED_OUT' })
     expect(captureAfter(success({ returnCodeInterpretation: 'No matches found' }))).toEqual({ skip: 'DID_NOT_SUCCEED' })
+  })
+  test('the exact success shape measured on 2.1.301 is ok; any field the host does not declare is refused, not guessed at', () => {
+    const measured = Object.fromEntries(['backgroundCwdHint', 'backgroundEndsWithFinalResponse', 'backgroundTaskId', 'backgroundedByTurnAbort', 'backgroundedByUser', 'backgroundedToDeliverMessage', 'bashEditDiff', 'dangerouslyDisableSandbox', 'ghRateLimitHint', 'gitOperation', 'interrupted', 'isImage', 'noOutputExpected', 'persistedOutputPath', 'persistedOutputSize', 'returnCodeInterpretation', 'staleReadFileStateHint', 'stderr', 'stdout', 'timedOutAfterMs'].map(k => [k, k === 'stdout' || k === 'stderr' ? '' : k === 'interrupted' ? false : undefined]))
+    expect(captureAfter({ ref: 'r', isReadOnly: false, text: 'ok', result: measured })).toEqual({ outcome: 'ok' })
+    expect(captureAfter(success({ exitCode: 1 }))).toEqual({ skip: 'RESULT_UNRECOGNISED' })
+    expect(captureAfter({ ...success(), exitCode: 1 })).toEqual({ skip: 'RESULT_UNRECOGNISED' })
+    expect(captureAfter({ ref: 'r', text: 'ok', result: ['ok'] })).toEqual({ skip: 'RESULT_UNRECOGNISED' })
   })
   test('any shape not recognised is refused', () => {
     for (const ran of [null, undefined, 7, 'ok', {}, { result: null }, { result: 'text' }, success({ interrupted: undefined }), success({ stdout: 1 }), { result: { stdout: '', interrupted: false } }]) expect(captureAfter(ran)).toEqual({ skip: 'RESULT_UNRECOGNISED' })
@@ -144,6 +157,8 @@ describe('a record holds only sanitised fields', () => {
     expect(capturesOf({ v: 1, captures: [{ ...make(), report: { ...make().report, content: 'TN:' } }] }, PROJECT)).toEqual([])
     expect(capturesOf({ v: 1, captures: [{ ...make(), label: 'npm run deploy' }] }, PROJECT)).toEqual([])
     expect(capturesOf({ v: 1, captures: [...Array.from({ length: 12 }, (_, k) => make({ at: 2000 + k }))] }, PROJECT).length).toBe(CAPTURES_KEPT)
+    // the order is Cockpit's own, newest first, whatever order the store held
+    expect(capturesOf({ v: 1, captures: [...kept].reverse() }, PROJECT).map(c => c.at)).toEqual(kept.map(c => c.at))
   })
 })
 
