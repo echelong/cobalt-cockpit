@@ -662,9 +662,9 @@ export const MAX_RANGES = 40
 /** File rows whose changed lines exist but could not be classified: the header's Uncounted line, NOT COUNTED in Files. */
 const NOT_COUNTED = new Set<FileReason>(['BINARY_BY_ATTRIBUTE', 'CHANGE_OUTSIDE_FILE', 'SOURCE_HAS_NUL', 'SOURCE_NOT_UTF8', 'SOURCE_IS_LINK', 'SOURCE_NOT_A_REGULAR_FILE', 'SOURCE_TOO_LARGE', 'SOURCE_TOO_MANY_LINES', 'SOURCE_UNREADABLE', 'SOURCE_GREW', 'SOURCE_MISSING'])
 const LABEL = 12
-/** A category's name and count take this many columns, its words the rest: 25 for the longest name, 7 for `200,000`. */
+/** A category's name and count take this many columns, its words the rest: 25 for the longest name, and a space and 7 for `200,000`. */
 const NAME = 25
-const COUNT = 7
+const COUNT = 8
 
 /** A width the report can be drawn at: 50 to 120, and 80 for anything that is not a finite number (no width, NaN). */
 const columnsOf = (columns: number): number => Math.min(120, Math.max(50, Number.isFinite(columns) ? Math.floor(columns) : 80))
@@ -865,7 +865,9 @@ export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1
   }
   // entries are numbered across pages, the numbers right-aligned to the widest
   const numbered = (n: number) => { const size = grouped(n).length; return (k: number) => `  ${grouped(k).padStart(size)}. ` }
-  out.push('', ...wrap(`Page ${grouped(at)} of ${grouped(pages)}${asked > pages ? ` (page ${grouped(asked)} was asked for)` : ''}`, limit, '', '  '))
+  // a page too large to be a whole number in words (1e308) is named by where it is, not by digits
+  const askedFor = asked <= pages ? '' : Number.isSafeInteger(asked) ? ` (page ${grouped(asked)} was asked for)` : ' (a later page was asked for)'
+  out.push('', ...wrap(`Page ${grouped(at)} of ${grouped(pages)}${askedFor}`, limit, '', '  '))
 
   out.push('', ...wrap(header('REVIEW REQUIRED', view.review.length, 'entry', 'entries'), limit, '', '  '))
   const entries = slice(view.review)
@@ -889,7 +891,8 @@ export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1
         else lines.push(`${indent}  ${piece}`)
       })
       out.push(...lines)
-      const words = r.category === 'NOTE' ? REVIEW_NOTE_WORDS[r.reason as ReviewNote['note']] : wordsOf(String(r.reason)) ?? String(r.reason)
+      // a reason without words (only a hand-built one) is shown escaped, like any other value
+      const words = r.category === 'NOTE' ? REVIEW_NOTE_WORDS[r.reason as ReviewNote['note']] : wordsOf(String(r.reason)) ?? displayText(String(r.reason), 64)
       const count = r.ranges.length > MAX_RANGES ? `; ${plural(r.lines, 'line', 'lines')} in ${grouped(r.ranges.length)} ranges, the first ${MAX_RANGES} listed`
         : r.lines > 0 ? `; ${plural(r.lines, 'line', 'lines')}` : ''
       out.push(...wrap(`${words}${count}`, limit, `${indent}${r.category.padEnd(13)}`, ' '.repeat(indent.length + 13)))

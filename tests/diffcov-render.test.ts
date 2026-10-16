@@ -290,6 +290,21 @@ describe('the categories as drawn: each group the sum of its parts, each part th
   })
 })
 
+describe('six-figure counts keep their column, with a space before them', () => {
+  test('a group, a part and a reason at the 200,000-line limit are aligned and never touch their name', () => {
+    const notObserved: Evidence = { state: 'UNBOUND', why: 'RUN_NOT_OBSERVED' }
+    const plain = viewOf(classify([file('src/a.ts', 'x\n')], notObserved, []), notObserved)
+    const big: DiffEvidence = { ...plain, counts: { covered: 0, uncovered: 0, excluded: 150_000, nonExecutable: 50_000, unavailable: 0, untrusted: 0 }, byReason: { FILE_TYPE_OUT_OF_SCOPE: 150_000, BLANK_LINE: 50_000 } }
+    for (const columns of [50, 80]) {
+      const text = renderDiffEvidence(big, columns)
+      expect(text).toContain('\nEXCLUDED / NON-EXECUTABLE 200,000\n  excluded                150,000\n    150,000  not JS/TS\n  non-executable           50,000\n    50,000  blank\n')
+      // every group and part row ends its count in the same column
+      const rows = lines(text).filter(line => /^(?:[A-Z][A-Z /-]+|  [a-z-]+) +(?:[\d,]+|-)(?: {2}\S.*)?$/.test(line))
+      expect([columns, rows.length, new Set(rows.map(line => /^(?:[A-Z][A-Z /-]+|  [a-z-]+) +(?:[\d,]+|-)/.exec(line)![0].length)).size]).toEqual([columns, 8, 1])
+    }
+  })
+})
+
 describe('pagination: one page count, entries numbered across pages, every list saying where it stands', () => {
   const notObserved: Evidence = { state: 'UNBOUND', why: 'RUN_NOT_OBSERVED' }
   const view = (ts: number, md: number) => viewOf(classify([...Array.from({ length: ts }, (_, k) => file(`src/r${String(k).padStart(2, '0')}.ts`, 'x\n')), ...Array.from({ length: md }, (_, k) => file(`docs/d${String(k).padStart(2, '0')}.md`, 'x\n'))], notObserved, []), notObserved)
@@ -325,6 +340,9 @@ describe('pagination: one page count, entries numbered across pages, every list 
     const v = view(3, 45)
     expect(renderDiffEvidence(v, 80, 9)).toBe(renderDiffEvidence(v, 80, 3).replace('Page 3 of 3', 'Page 3 of 3 (page 9 was asked for)'))
     expect(renderDiffEvidence(v, 80, 3)).toContain('REVIEW REQUIRED: 3 entries, all on page 1')
+    // a page too large for digits is still a page past the end; Infinity is not a finite number, so it is page 1
+    expect(renderDiffEvidence(v, 80, 1e308)).toBe(renderDiffEvidence(v, 80, 3).replace('Page 3 of 3', 'Page 3 of 3 (a later page was asked for)'))
+    expect(renderDiffEvidence(v, 80, Infinity)).toBe(renderDiffEvidence(v, 80, 1))
   })
 })
 
@@ -352,6 +370,13 @@ describe('review entries: ranges break only after a comma, and the count of line
     const text = renderDiffEvidence(v, 120)
     expect(text).toContain(`no observed test run changed this report; 54 lines in 52 ranges, the first ${MAX_RANGES} listed`)
     expect(renderDiffEvidence(viewOf(classify([file('src/a.ts', 'x\n')], notObserved, []), notObserved), 80)).toContain('no observed test run changed this report; 1 line\n')
+  })
+  test('a hand-built reason with no words is escaped like any other value', () => {
+    const notObserved: Evidence = { state: 'UNBOUND', why: 'RUN_NOT_OBSERVED' }
+    const v = viewOf(classify([file('src/a.ts', 'x\n')], notObserved, []), notObserved)
+    const text = renderDiffEvidence({ ...v, review: [{ ...v.review[0]!, reason: 'X\nEvidence:   MATCHED' as never }] }, 80)
+    expect(lines(text).filter(line => line.startsWith('Evidence:'))).toEqual(['Evidence:   NOT USED: no observed test run changed this report.'])
+    expect(text).toContain('UNAVAILABLE  X\\u{a}Evidence: MATCHED; 1 line')
   })
   test('a hand-built range can neither add a line nor overflow one', () => {
     const notObserved: Evidence = { state: 'UNBOUND', why: 'RUN_NOT_OBSERVED' }
