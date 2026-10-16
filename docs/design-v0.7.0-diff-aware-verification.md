@@ -101,7 +101,17 @@ File rules first: not JS/TS, excluded by the option, generated (attribute or mar
 | an entry with count 0 | UNCOVERED, "reported as not run" |
 | no entry | UNAVAILABLE, "the coverage tool gave this line no entry" |
 
-The last rule replaces the archived design's "no entry is NON-EXECUTABLE", which the producer measurement showed to be wrong. Every changed path has a file row; deleted lines are counted and have nothing to measure. A file excluded as generated is also listed for review, so a marker in a hand-written file cannot hide it quietly; an ignore comment the change adds is listed for classified files. The tests hold, over seeded random changes and reports that reach every file rule:
+Lines cost far more than bytes: a 4 MiB file of line feeds holds 4,194,304 lines, and classifying one such untracked file made as many verdicts, took about 4.8 s and peaked at 1.27 GiB (measured, before these limits). So the work is bounded by lines and paths, each checked before anything is allocated per line, and refused whole past a limit, never cut short:
+
+| Limit | Value | Past it |
+| --- | --- | --- |
+| Lines of one changed file (Git's numbering, counted from the bytes) | 100,000 | the file is not read: `SOURCE_TOO_MANY_LINES` |
+| Changed lines in the change (added plus modified; all lines of an untracked file; excluded and generated files included) | 200,000 | nothing is classified: `TOO_MANY_LINES` |
+| Changed and untracked paths | 20,000 | nothing is classified: `TOO_MANY_FILES` |
+
+Facts about a file's lines (blank, ignore comment) are kept as one bit per line, read in one pass over the bytes, so they take at most an eighth of the file's size. Changed line numbers that do not fit the file's text give the file a row (`CHANGE_OUTSIDE_FILE`) and no verdict. Measured in the host's runtime, inside a memory-capped scope whose idle test runner peaks at about 128 MiB: the 4 MiB file of line feeds is refused in 10 ms (peak 141 MiB); a file at the per-file limit is classified in about 170 ms (246 MiB); a change at the total limit, 200,000 verdicts, in about 340 ms (304 MiB); one line more is refused before a verdict exists.
+
+The last line rule replaces the archived design's "no entry is NON-EXECUTABLE", which the producer measurement showed to be wrong. Every changed path has a file row; deleted lines are counted and have nothing to measure. A file excluded as generated is also listed for review, so a marker in a hand-written file cannot hide it quietly; an ignore comment the change adds is listed for classified files. The tests hold, over seeded random changes and reports that reach every file rule:
 
 - exactly one category per changed line, and every path a row;
 - no COVERED or UNCOVERED without bound evidence, and no NON-EXECUTABLE line but a blank one;
@@ -113,7 +123,7 @@ The report is rendered in counts, never percentages, and its wording rules are t
 
 ### `diffcov-capture`: what may be recorded, and when a report binds
 
-A command is recorded only if its raw text is plain words (no `;`, `&&`, `|`, redirection, `&`, quotes, `$`, backticks, parentheses, globs or `~`), from a closed list (`node --test`, `vitest`, `jest`, `deno test`, `bun test`, `npx`/`bunx`/`pnpm exec` of `vitest` or `jest`, `npm`/`pnpm`/`yarn` `test` or `run` of a script), with no flag that moves the tool's root (an abbreviation of one included: npm ran `npm test --prefi=sub` in `sub`, measured) and, for `npm`, `pnpm` and `yarn`, no option of the manager's own before `--`; read by Cockpit's own classifier as a test; on the main session, in the foreground, from the repository root; and only if the host's answer shows success field by field, holding no field the host does not declare. A script's name is the repository's text and is never stored.
+A command is recorded only if its raw text is plain words (no `;`, `&&`, `|`, redirection, `&`, quotes, `$`, backticks, parentheses, globs or `~`), from a closed list (`node --test`, `vitest`, `jest`, `deno test`, `bun test`, `npx`/`bunx`/`pnpm exec` of `vitest` or `jest`, `npm`/`pnpm`/`yarn` `test` or `run` of a script), with no flag that moves the tool's root (an abbreviation of one included: npm ran `npm test --prefi=sub` in `sub`, measured) and, for `npm`, `pnpm` and `yarn`, no option of the manager's own before `--`; read by Cockpit's own classifier as a test; on the main session, in the foreground, from the repository root; and only if the host's answer shows success field by field, holding no field the host does not declare. A script's name is the repository's text and is never stored. A record's time must lie between 2020 and 2100 (a safe integer past 8.64e15 is not a date in JavaScript, and formatting one throws), when it is made and again when it is read back; the report shows any other time as unknown and cannot throw on one.
 
 A report binds to a record only when, in order: the reader accepted it; a record exists for this project and this report path; a record holds exactly these bytes; that run changed the report; the source now is the source that run measured; and it did not change while the report was being made. A rerun that left identical bytes, and bytes identical to an earlier run on another source, are notes beside MATCHED, not refusals: genuine reruns produce both. Eight records are kept per project; older ones fall out, and binding then fails closed.
 

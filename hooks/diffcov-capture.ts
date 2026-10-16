@@ -178,6 +178,13 @@ export type CaptureRecord = {
   }
 }
 
+/**
+ * The window a record's time may lie in: 2020 to 2100, by the host clock in milliseconds. Well inside JavaScript's
+ * date range (a safe integer past 8.64e15 is not a date, and `toISOString` throws on it: measured), and plausible.
+ */
+export const RECORD_TIME = Object.freeze({ from: Date.UTC(2020, 0, 1), until: Date.UTC(2100, 0, 1) })
+export const isRecordTime = (at: unknown): at is number => typeof at === 'number' && Number.isSafeInteger(at) && at >= RECORD_TIME.from && at < RECORD_TIME.until
+
 /** Why an observed, successful run still leaves no record: revision evidence that is missing or stale. */
 export type RecordSkip = 'RECORD_INVALID' | 'SOURCE_IDENTITY_UNKNOWN' | 'SOURCE_CHANGED_DURING_RUN' | 'REVISION_UNKNOWN' | 'REPORT_MISSING'
 
@@ -204,7 +211,7 @@ export const captureRecordOf = (input: {
   if (input.head === null) return { skip: 'REVISION_UNKNOWN' }
   if (report.sha256 === null || report.stampAfter === 'absent') return { skip: 'REPORT_MISSING' }
   const path = reportPathOf(report.path)
-  const valid = Number.isSafeInteger(input.at) && input.at > 0 && (CAPTURE_LABELS as readonly string[]).includes(input.label) &&
+  const valid = isRecordTime(input.at) && (CAPTURE_LABELS as readonly string[]).includes(input.label) &&
     PROJECT.test(input.project) && COMMIT.test(input.head) && 'rel' in path && HEX64.test(report.sha256) &&
     Number.isSafeInteger(report.size) && report.size > 0 && STAMP.test(report.stampAfter) &&
     (report.stampBefore === 'absent' || STAMP.test(report.stampBefore)) && (report.shaBefore === 'absent' || HEX64.test(report.shaBefore))

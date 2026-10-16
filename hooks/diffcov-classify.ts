@@ -9,6 +9,7 @@
 // "not executable": such a line is UNAVAILABLE, listed for review. Only a whitespace-only line is NON-EXECUTABLE, as a
 // fact about the text.
 
+import { isRecordTime } from './diffcov-capture'
 import type { BindingNote, BindingRefusal, CaptureLabel } from './diffcov-capture'
 import { isUtf8, LCOV_LIMITS } from './diffcov-lcov'
 import type { LcovRefusal, ParsedLcov } from './diffcov-lcov'
@@ -17,53 +18,113 @@ import type { SfRefusal } from './diffcov-paths'
 
 export const SOURCE_EXTENSIONS = ['.js', '.mjs', '.cjs', '.jsx', '.ts', '.mts', '.cts', '.tsx'] as const
 
+/**
+ * The work a change may ask of classification. Lines cost far more than bytes (a 4 MiB file of line feeds holds
+ * 4,194,304 lines; classifying it made 4.2 million verdicts and peaked at 1.27 GiB: measured), so each limit is on
+ * lines or paths, checked before anything is allocated per line. Past any of them the work is refused, never cut short.
+ */
+export const CLASSIFY_LIMITS = Object.freeze({
+  /** Lines of one changed file, by Git's numbering. */
+  maxSourceLines: 100_000,
+  /** Changed lines across the whole change, counted as added plus modified (all lines of an untracked file): the verdicts made. */
+  maxChangedLines: 200_000,
+  /** Changed and untracked paths. */
+  maxFiles: 20_000,
+})
+export type ClassifyLimits = { readonly [K in keyof typeof CLASSIFY_LIMITS]: number }
+/** A whole number with its thousands grouped by commas, the same in every locale. */
+const grouped = (n: number): string => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+
+/** One bit per line, line 1 first: a fact about lines costs an eighth of a byte a line, never an entry or a string. */
+export type LineBits = Uint8Array
+export const lineIn = (bits: LineBits, line: number): boolean => Number.isInteger(line) && line >= 1 && ((bits[(line - 1) >> 3] ?? 0) & (1 << ((line - 1) & 7))) !== 0
+/** The lines a set holds, in order (for tests and display; classification only asks `lineIn`). */
+export const linesIn = (bits: LineBits): number[] => {
+  const out: number[] = []
+  for (let k = 0; k < bits.length * 8; k++) if (((bits[k >> 3] ?? 0) & (1 << (k & 7))) !== 0) out.push(k + 1)
+
+  return out
+}
+const mark = (bits: LineBits, line: number) => { bits[(line - 1) >> 3] = (bits[(line - 1) >> 3] ?? 0) | (1 << ((line - 1) & 7)) }
+
+/** Lines by Git's numbering (line feeds, and one more for an unterminated last line), from the bytes alone; stops past `stopAfter`. */
+export const lineCountOf = (bytes: Uint8Array, stopAfter = Infinity): number => {
+  let n = 0
+  for (let k = bytes.indexOf(0x0a); k !== -1 && n <= stopAfter; k = bytes.indexOf(0x0a, k + 1)) n++
+
+  return n <= stopAfter && bytes.length > 0 && bytes[bytes.length - 1] !== 0x0a ? n + 1 : n
+}
+
 /** Facts about a changed file's text, by Git's line numbering (`\n` ends a line). */
 export type SourceFacts = {
   lineCount: number
   /** Lines that are whitespace only. */
-  blank: ReadonlySet<number>
+  blank: LineBits
   /** Lines that hold a coverage-ignore comment. */
-  pragma: ReadonlySet<number>
+  pragma: LineBits
   /** The line of a generated-file marker among the first five, or null. */
   generatedLine: number | null
   /** A carriage return not followed by a line feed, U+2028 or U+2029: Git and JavaScript number lines differently. */
   lineTableAmbiguous: boolean
 }
 
-/** Why a changed file's text could not be used: Git reported a binary, or the bounded reader refused it. */
-export type SourceRefusal = 'BINARY' | 'SOURCE_IS_LINK' | 'SOURCE_NOT_A_REGULAR_FILE' | 'SOURCE_TOO_LARGE' | 'SOURCE_UNREADABLE' | 'SOURCE_GREW' | 'SOURCE_MISSING'
+/** Why a changed file's text could not be used: Git reported a binary, the bounded reader refused it, or it has too many lines. */
+export type SourceRefusal = 'BINARY' | 'SOURCE_IS_LINK' | 'SOURCE_NOT_A_REGULAR_FILE' | 'SOURCE_TOO_LARGE' | 'SOURCE_TOO_MANY_LINES' | 'SOURCE_UNREADABLE' | 'SOURCE_GREW' | 'SOURCE_MISSING'
 
 // Comments that make a coverage tool leave lines out, matched in a bounded slice; one added by the change is listed
 const PRAGMA = /(?:c8|v8|istanbul)\s+ignore|node:coverage\s+(?:ignore|disable)|deno-coverage-ignore/
-const BLANK = /^[ \t\f\v\u00a0\ufeff]*$/
 const DECODER = new TextDecoder('utf-8')
+
+/** Whitespace only, read off the bytes: space, tab, vertical tab, form feed, U+00A0 (C2 A0) and U+FEFF (EF BB BF). */
+const isBlank = (bytes: Uint8Array, from: number, to: number): boolean => {
+  for (let k = from; k < to;) {
+    const b = bytes[k]!
+    if (b === 0x20 || b === 0x09 || b === 0x0b || b === 0x0c) k++
+    else if (b === 0xc2 && k + 1 < to && bytes[k + 1] === 0xa0) k += 2
+    else if (b === 0xef && k + 2 < to && bytes[k + 1] === 0xbb && bytes[k + 2] === 0xbf) k += 3
+    else return false
+  }
+
+  return true
+}
 
 /**
  * The facts of one changed file from its bytes (read through a bounded reader that refused links and anything not an
- * ordinary file). Text checks are substring tests or patterns over bounded slices, never over a whole long line.
+ * ordinary file). The lines are counted first, before anything is allocated per line, and a file with more than the
+ * limit is refused. The facts are then read in one pass over the bytes: no line is copied into a string of its own, and
+ * text checks decode at most a bounded slice of a line, so time and memory follow the bytes.
  */
-export const sourceFactsOf = (bytes: Uint8Array): SourceFacts | { refuse: SourceRefusal } => {
+export const sourceFactsOf = (bytes: Uint8Array, limits: ClassifyLimits = CLASSIFY_LIMITS): SourceFacts | { refuse: SourceRefusal } => {
   if (bytes.length > LCOV_LIMITS.maxBytes) return { refuse: 'SOURCE_TOO_LARGE' }
   if (bytes.subarray(0, 8000).includes(0) || !isUtf8(bytes, 0, bytes.length)) return { refuse: 'BINARY' }
-  const text = DECODER.decode(bytes)
-  const lines = text.split('\n')
-  if (lines[lines.length - 1] === '') lines.pop()
-  const blank = new Set<number>(), pragma = new Set<number>()
+  const lineCount = lineCountOf(bytes, limits.maxSourceLines)
+  if (lineCount > limits.maxSourceLines) return { refuse: 'SOURCE_TOO_MANY_LINES' }
+  const blank: LineBits = new Uint8Array(Math.ceil(lineCount / 8))
+  const pragma: LineBits = new Uint8Array(Math.ceil(lineCount / 8))
   let generatedLine: number | null = null
+  // a carriage return not followed by a line feed (one at the very end of the file included), U+2028 (E2 80 A8), U+2029 (E2 80 A9)
   let lineTableAmbiguous = false
-  lines.forEach((raw, k) => {
-    // a carriage return ends a CRLF only when a line feed followed it: one at the very end of the file stays, and is ambiguous
-    const line = raw.endsWith('\r') && (k < lines.length - 1 || text.endsWith('\n')) ? raw.slice(0, -1) : raw
-    if (line.includes('\r') || line.includes('\u2028') || line.includes('\u2029')) lineTableAmbiguous = true
-    if (line.length <= 4096 ? BLANK.test(line) : false) blank.add(k + 1)
-    if (PRAGMA.test(line.slice(0, 512))) pragma.add(k + 1)
-    if (k < 5 && generatedLine === null) {
-      const head = line.slice(0, 256)
-      if (head.includes('@generated') || (head.includes('Code generated ') && head.includes('DO NOT EDIT'))) generatedLine = k + 1
+  for (let k = 0; k < bytes.length && !lineTableAmbiguous; k++) {
+    const b = bytes[k]
+    if ((b === 0x0d && bytes[k + 1] !== 0x0a) || (b === 0xe2 && bytes[k + 1] === 0x80 && (bytes[k + 2] === 0xa8 || bytes[k + 2] === 0xa9))) lineTableAmbiguous = true
+  }
+  let start = 0
+  for (let line = 1; line <= lineCount; line++) {
+    let end = bytes.indexOf(0x0a, start)
+    if (end === -1) end = bytes.length
+    // a carriage return just before the line feed is the line's end (CRLF), not part of it
+    const stop = end < bytes.length && end > start && bytes[end - 1] === 0x0d ? end - 1 : end
+    if (isBlank(bytes, start, stop)) mark(blank, line)
+    // at most 2,048 bytes of a line are decoded for the 512 characters the pattern sees (a cut character only ends the slice)
+    if (PRAGMA.test(DECODER.decode(bytes.subarray(start, Math.min(stop, start + 2048))).slice(0, 512))) mark(pragma, line)
+    if (line <= 5 && generatedLine === null) {
+      const head = DECODER.decode(bytes.subarray(start, Math.min(stop, start + 1024))).slice(0, 256)
+      if (head.includes('@generated') || (head.includes('Code generated ') && head.includes('DO NOT EDIT'))) generatedLine = line
     }
-  })
+    start = end + 1
+  }
 
-  return { lineCount: lines.length, blank, pragma, generatedLine, lineTableAmbiguous }
+  return { lineCount, blank, pragma, generatedLine, lineTableAmbiguous }
 }
 
 /** One changed path as the Git selection (Phase 2) will describe it. */
@@ -98,7 +159,7 @@ export type Category = 'COVERED' | 'UNCOVERED' | 'EXCLUDED' | 'NON_EXECUTABLE' |
 export type FileReason =
   | 'CLASSIFIED' | 'DELETED' | 'EMBEDDED_REPOSITORY' | 'SUBMODULE' | 'SYMLINK' | 'MODE_ONLY' | 'BINARY_BY_ATTRIBUTE'
   | 'FILE_TYPE_OUT_OF_SCOPE' | 'CONFIGURED_EXCLUSION' | 'GENERATED_ATTRIBUTE' | 'GENERATED_MARKER' | 'LINE_TABLE_AMBIGUOUS'
-  | SourceRefusal
+  | 'CHANGE_OUTSIDE_FILE' | SourceRefusal
 export type LineReason =
   | 'REPORTED_RUN' | 'REPORTED_NOT_RUN' | 'BLANK_LINE' | 'NO_LINE_ENTRY' | 'FILE_TYPE_OUT_OF_SCOPE' | 'CONFIGURED_EXCLUSION'
   | 'GENERATED_ATTRIBUTE' | 'GENERATED_MARKER' | 'LINE_TABLE_AMBIGUOUS' | 'FILE_NOT_IN_REPORT' | 'RECORD_EMPTY'
@@ -123,12 +184,32 @@ const extensionOf = (path: string): string => {
   return dot <= 0 ? '' : name.slice(dot).toLowerCase()
 }
 
+/** The text facts of a file whose lines will be classified, or null for a file that only has a row. */
+const linesFactsOf = (f: ChangedFile): SourceFacts | null => {
+  if (f.status === 'deleted' || f.kind === 'embedded-repository' || f.kind === 'submodule' || f.kind === 'symlink' || f.modeOnly || f.binaryPatch) return null
+  return f.source === null || 'refuse' in f.source ? null : f.source
+}
+
+/** Why a change is too large to classify at all: past a limit, no part of it is reported. */
+export type WorkloadRefusal = 'TOO_MANY_FILES' | 'TOO_MANY_LINES'
+
 /**
- * Classifies every changed line. The file rules (F1 to F5) apply to all changed lines of a file; then, for a classified
- * file, the line rules in order, the first that applies deciding: L1 blank, L2 not bound, L3 refused, L4 no record,
- * L5 conflicting records, L6 entries past the end, L7 an empty record, L8 run, L9 not run, and no entry: UNAVAILABLE.
+ * Classifies every changed line. Before anything is allocated per line, the work is counted: more paths or more
+ * changed lines than the limits refuse the whole change (no partial classification is ever returned). Then the file
+ * rules (F1 to F5) apply to all changed lines of a file, and for a classified file the line rules in order, the first
+ * that applies deciding: L1 blank, L2 not bound, L3 refused, L4 no record, L5 conflicting records, L6 entries past the
+ * end, L7 an empty record, L8 run, L9 not run, and no entry: UNAVAILABLE.
  */
-export const classifyChange = (files: readonly ChangedFile[], evidence: Evidence, exclude: readonly string[]): Classification => {
+export const classifyChange = (files: readonly ChangedFile[], evidence: Evidence, exclude: readonly string[], limits: ClassifyLimits = CLASSIFY_LIMITS): Classification | { refuse: WorkloadRefusal } => {
+  if (files.length > limits.maxFiles) return { refuse: 'TOO_MANY_FILES' }
+  let planned = 0
+  for (const f of files) {
+    const facts = linesFactsOf(f)
+    if (facts === null) continue
+    // an upper bound, counted from lengths alone: duplicates between added and modified are counted twice
+    planned += f.status === 'untracked' ? facts.lineCount : f.added.length + f.modified.length
+    if (planned > limits.maxChangedLines) return { refuse: 'TOO_MANY_LINES' }
+  }
   const out: Classification = { lines: [], files: [], deletedLines: 0, notes: [], blankWithEntry: false }
   for (const f of files) {
     out.deletedLines += f.deletedLines
@@ -149,6 +230,9 @@ export const classifyChange = (files: readonly ChangedFile[], evidence: Evidence
     if (f.binaryPatch) { row('BINARY'); continue }
     if (source === null) { row('SOURCE_UNREADABLE'); continue }
     if ('refuse' in source) { row(source.refuse); continue }
+    // changed lines Git named that the text read does not have: the file changed between the diff and the read
+    const fits = (line: number) => Number.isInteger(line) && line >= 1 && line <= source.lineCount
+    if (f.status !== 'untracked' && !(f.added.every(fits) && f.modified.every(fits))) { row('CHANGE_OUTSIDE_FILE'); continue }
     const changed = f.status === 'untracked' ? Array.from({ length: source.lineCount }, (_, k) => k + 1) : [...new Set([...f.added, ...f.modified])].sort((a, b) => a - b)
     const added = new Set(f.status === 'untracked' ? changed : f.added)
     const push = (line: number, category: Category, reason: LineReason) => out.lines.push({ path: f.path, line, kind: added.has(line) ? 'added' : 'modified', category, reason })
@@ -169,11 +253,11 @@ export const classifyChange = (files: readonly ChangedFile[], evidence: Evidence
     }
     if (source.lineTableAmbiguous) { row('LINE_TABLE_AMBIGUOUS'); all('UNAVAILABLE', 'LINE_TABLE_AMBIGUOUS'); continue }
     row('CLASSIFIED')
-    for (const line of changed) if (source.pragma.has(line)) out.notes.push({ path: f.path, line, note: 'IGNORE_COMMENT_ADDED' })
+    for (const line of changed) if (lineIn(source.pragma, line)) out.notes.push({ path: f.path, line, note: 'IGNORE_COMMENT_ADDED' })
     const record = evidence.state === 'BOUND' ? evidence.report.files.get(f.path) : undefined
     for (const line of changed) {
       // L1 first: a fact about the text, whatever the report says (Node gives blank lines a count of 1)
-      if (source.blank.has(line)) {
+      if (lineIn(source.blank, line)) {
         if (record !== undefined && record.lines.has(line)) out.blankWithEntry = true
         push(line, 'NON_EXECUTABLE', 'BLANK_LINE')
         continue
@@ -251,6 +335,27 @@ export type DiffEvidence = {
 }
 
 const REVIEW_ORDER = ['UNCOVERED', 'UNTRUSTED', 'UNAVAILABLE', 'NOTE'] as const
+
+/**
+ * The data contract when no change could be reported: a workload past the limits, or a refusal before classification.
+ * Every count is zero and no line, file or record is listed: the report says why and nothing else.
+ */
+export const unavailableEvidenceOf = (input: { source: DiffEvidence['source']; base: DiffEvidence['base']; coverage: DiffEvidence['coverage']; why: ReportUnavailable }): DiffEvidence => ({
+  v: 1,
+  state: 'UNAVAILABLE',
+  why: input.why,
+  source: input.source,
+  base: input.base,
+  coverage: input.coverage,
+  evidence: { state: 'NOT_USED', notes: [] },
+  lines: { added: 0, modified: 0, deleted: 0 },
+  counts: { covered: 0, uncovered: 0, excluded: 0, nonExecutable: 0, unavailable: 0, untrusted: 0 },
+  byReason: {},
+  review: [],
+  files: [],
+  refusedRecords: {},
+  toolListsNonExecutable: false,
+})
 
 /** The data contract from a classification. Exactly one category per changed line of a classified file, every path a row. */
 export const diffEvidenceOf = (input: {
@@ -385,9 +490,11 @@ const FILE_WORDS: Record<FileReason, string> = {
   GENERATED_ATTRIBUTE: 'generated: attribute',
   GENERATED_MARKER: 'generated: marker',
   LINE_TABLE_AMBIGUOUS: 'line numbering differs between Git and JavaScript',
+  CHANGE_OUTSIDE_FILE: 'not classified: Git named changed lines this file\'s text does not have (it changed while read)',
   SOURCE_IS_LINK: 'not read: a link',
   SOURCE_NOT_A_REGULAR_FILE: 'not read: not an ordinary file',
   SOURCE_TOO_LARGE: 'not read: over 4 MiB',
+  SOURCE_TOO_MANY_LINES: `not read: over ${grouped(CLASSIFY_LIMITS.maxSourceLines)} lines`,
   SOURCE_UNREADABLE: 'not read: unreadable',
   SOURCE_GREW: 'not read: it changed while read',
   SOURCE_MISSING: 'not read: gone',
@@ -444,8 +551,8 @@ const UNAVAILABLE_WORDS: Record<ReportUnavailable, string> = {
   DIFF_TOO_LARGE: 'the change is too large to report',
   DIFF_MALFORMED: 'Git output could not be read',
   DIFF_INCONSISTENT: 'Git listings disagree',
-  TOO_MANY_FILES: 'over 20,000 changed paths',
-  TOO_MANY_LINES: 'over 2,000,000 changed lines',
+  TOO_MANY_FILES: `over ${grouped(CLASSIFY_LIMITS.maxFiles)} changed paths`,
+  TOO_MANY_LINES: `over ${grouped(CLASSIFY_LIMITS.maxChangedLines)} changed lines`,
   TOO_MUCH_CHANGED: 'over 64 MiB of changed files to read',
 }
 
@@ -527,7 +634,8 @@ const cut = (text: string, given: number, first: string, rest: string): string[]
 
 const field = (name: string) => `${name}:`.padEnd(LABEL)
 const pad = ' '.repeat(LABEL)
-const timeOf = (at: number) => `${new Date(at).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+/** A record's time in words; any value outside the window a record may hold reads as unknown, and nothing here can throw. */
+const timeOf = (at: number): string => isRecordTime(at) ? `${new Date(at).toISOString().slice(0, 16).replace('T', ' ')} UTC` : 'an unknown time'
 
 /** The report in words, `columns` wide (50 to 120), one page of the review list and the file rows. */
 export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1): string => {

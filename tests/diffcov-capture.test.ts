@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { CAPTURES_KEPT, bindEvidence, captureAfter, captureBefore, captureLabelOf, captureRecordOf, capturesOf, keepCapture } from '../hooks/diffcov-capture'
+import { CAPTURES_KEPT, RECORD_TIME, bindEvidence, captureAfter, captureBefore, captureLabelOf, captureRecordOf, capturesOf, isRecordTime, keepCapture } from '../hooks/diffcov-capture'
 import type { CaptureRecord } from '../hooks/diffcov-capture'
 
 // Diff coverage, Phase 1: which observed test runs may later stand as evidence, what a record of one holds, and when a
@@ -108,9 +108,11 @@ describe('after the call: only an answer that shows a foreground success, field 
 const A = 'a'.repeat(64), B = 'b'.repeat(64), C = 'c'.repeat(64), H1 = '1'.repeat(64), H2 = '2'.repeat(64), H3 = '3'.repeat(64)
 const PROJECT = 'f'.repeat(32), HEAD = 'e'.repeat(40)
 const stamp = (n: number) => `81a4 ${100 + n} 1 ${7 + n} 1.5 ${n}.25`
+// a realistic time; `at` given to `make` is an offset from it, so scenarios keep their order
+const T0 = Date.UTC(2026, 9, 16, 7, 0)
 const make = (over: { at?: number; identity?: string; sha?: string; shaBefore?: string; before?: string; after?: string; path?: string; project?: string } = {}): CaptureRecord => {
   const r = captureRecordOf({
-    at: over.at ?? 1_792_134_000_000, label: 'npm test', project: over.project ?? PROJECT, head: HEAD, identityBefore: over.identity ?? A, identityAfter: over.identity ?? A,
+    at: T0 + (over.at ?? 0), label: 'npm test', project: over.project ?? PROJECT, head: HEAD, identityBefore: over.identity ?? A, identityAfter: over.identity ?? A,
     report: { path: over.path ?? 'coverage/lcov.info', sha256: over.sha ?? H1, size: 900, stampBefore: over.before ?? stamp(0), stampAfter: over.after ?? stamp(1), shaBefore: over.shaBefore ?? 'absent' },
   })
   if (!('record' in r)) throw new Error(r.skip)
@@ -127,7 +129,7 @@ describe('a record holds only sanitised fields', () => {
     expect(r.provenance).toBe('main')
   })
   test('missing or stale revision evidence leaves no record', () => {
-    const base = { at: 1, label: 'npm test' as const, project: PROJECT, head: HEAD, identityBefore: A, identityAfter: A, report: { path: 'coverage/lcov.info', sha256: H1, size: 9, stampBefore: 'absent', stampAfter: stamp(1), shaBefore: 'absent' } }
+    const base = { at: T0, label: 'npm test' as const, project: PROJECT, head: HEAD, identityBefore: A, identityAfter: A, report: { path: 'coverage/lcov.info', sha256: H1, size: 9, stampBefore: 'absent', stampAfter: stamp(1), shaBefore: 'absent' } }
     expect(captureRecordOf({ ...base, identityBefore: null })).toEqual({ skip: 'SOURCE_IDENTITY_UNKNOWN' })
     expect(captureRecordOf({ ...base, identityAfter: null })).toEqual({ skip: 'SOURCE_IDENTITY_UNKNOWN' })
     expect(captureRecordOf({ ...base, identityAfter: B })).toEqual({ skip: 'SOURCE_CHANGED_DURING_RUN' })
@@ -136,7 +138,7 @@ describe('a record holds only sanitised fields', () => {
     expect(captureRecordOf({ ...base, report: { ...base.report, stampAfter: 'absent' } })).toEqual({ skip: 'REPORT_MISSING' })
   })
   test('every field is checked against its closed shape', () => {
-    const base = { at: 1, label: 'npm test' as const, project: PROJECT, head: HEAD, identityBefore: A, identityAfter: A, report: { path: 'coverage/lcov.info', sha256: H1, size: 9, stampBefore: 'absent', stampAfter: stamp(1), shaBefore: 'absent' } }
+    const base = { at: T0, label: 'npm test' as const, project: PROJECT, head: HEAD, identityBefore: A, identityAfter: A, report: { path: 'coverage/lcov.info', sha256: H1, size: 9, stampBefore: 'absent', stampAfter: stamp(1), shaBefore: 'absent' } }
     for (const bad of [
       { ...base, at: 0 }, { ...base, at: 1.5 }, { ...base, label: 'npm run build' as never }, { ...base, project: 'short' }, { ...base, head: 'HEAD' },
       { ...base, identityBefore: 'x', identityAfter: 'x' }, { ...base, report: { ...base.report, path: '../x' } }, { ...base, report: { ...base.report, path: '' } },
@@ -148,7 +150,7 @@ describe('a record holds only sanitised fields', () => {
     let kept: CaptureRecord[] = []
     for (let k = 0; k < 10; k++) kept = keepCapture(kept, make({ at: 1000 + k }))
     expect(kept.length).toBe(CAPTURES_KEPT)
-    expect(kept[0]!.at).toBe(1009)
+    expect(kept[0]!.at).toBe(T0 + 1009)
     expect(capturesOf({ v: 1, captures: kept }, PROJECT)).toEqual(kept)
     expect(capturesOf({ v: 1, captures: kept }, '0'.repeat(32))).toEqual([])
     expect(capturesOf({ v: 2, captures: kept }, PROJECT)).toEqual([])
@@ -187,7 +189,7 @@ describe('binding: the report is used only when every condition holds (B1 to B8,
     expect(now({ identityAfterReads: null })).toMatchObject({ why: 'SOURCE_IDENTITY_UNKNOWN' })
   })
   test('a run that changed the source while it ran has no record at all, so it cannot bind', () => {
-    expect(captureRecordOf({ at: 1, label: 'npm test', project: PROJECT, head: HEAD, identityBefore: A, identityAfter: B, report: { path: 'coverage/lcov.info', sha256: H1, size: 9, stampBefore: 'absent', stampAfter: stamp(1), shaBefore: 'absent' } })).toEqual({ skip: 'SOURCE_CHANGED_DURING_RUN' })
+    expect(captureRecordOf({ at: T0, label: 'npm test', project: PROJECT, head: HEAD, identityBefore: A, identityAfter: B, report: { path: 'coverage/lcov.info', sha256: H1, size: 9, stampBefore: 'absent', stampAfter: stamp(1), shaBefore: 'absent' } })).toEqual({ skip: 'SOURCE_CHANGED_DURING_RUN' })
   })
   test('8: a rerun that left identical bytes after an edit no test reaches is MATCHED with a note', () => {
     const rerun = make({ at: 2, identity: B, before: stamp(1), after: stamp(2), shaBefore: H1 })
@@ -206,5 +208,20 @@ describe('binding: the report is used only when every condition holds (B1 to B8,
     let kept: CaptureRecord[] = [make({ at: 1 })]
     for (let k = 0; k < CAPTURES_KEPT; k++) kept = keepCapture(kept, make({ at: 10 + k, sha: H3, before: stamp(10 + k), after: stamp(11 + k) }))
     expect(now({ captures: kept })).toMatchObject({ state: 'UNBOUND', why: 'REPORT_CHANGED_SINCE_RUN' })
+  })
+})
+
+describe('a record\'s time is a real date in a plausible window, at the capture and when read back', () => {
+  const base = { label: 'npm test' as const, project: PROJECT, head: HEAD, identityBefore: A, identityAfter: A, report: { path: 'coverage/lcov.info', sha256: H1, size: 9, stampBefore: 'absent', stampAfter: stamp(1), shaBefore: 'absent' } }
+  test('inside 2020 to 2100 a time is accepted; outside it, or not a safe whole number, the record is refused', () => {
+    for (const at of [RECORD_TIME.from, T0, RECORD_TIME.until - 1]) expect([at, 'record' in captureRecordOf({ ...base, at })]).toEqual([at, true])
+    // past 8.64e15 a safe integer is no date at all, and toISOString throws on it (measured)
+    for (const at of [RECORD_TIME.from - 1, RECORD_TIME.until, 1, 0, -1, 8.64e15 + 1, Number.MAX_SAFE_INTEGER, Number.NaN, Infinity, T0 + 0.5]) expect([at, captureRecordOf({ ...base, at })]).toEqual([at, { skip: 'RECORD_INVALID' }])
+    expect(isRecordTime('1792134000000')).toBe(false)
+  })
+  test('a stored record with a time outside the window is dropped when read back', () => {
+    const good = make()
+    for (const at of [8.64e15 + 1, Number.MAX_SAFE_INTEGER, 1, -5, '2026-10-16']) expect([at, capturesOf({ v: 1, captures: [{ ...good, at }] }, PROJECT)]).toEqual([at, []])
+    expect(capturesOf({ v: 1, captures: [good] }, PROJECT)).toEqual([good])
   })
 })
