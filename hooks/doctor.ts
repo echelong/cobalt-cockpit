@@ -96,7 +96,8 @@ export const doctorText = (f: DoctorFacts): string => {
   out.push(line(f.hostSupported === false ? 'WARN' : 'INFO', `Claude Code ${f.host ?? 'version UNKNOWN'}${f.hostSupported === false ? ' is older than this build supports; Cockpit stands by' : ''}`))
   out.push(line('INFO', `permission mode ${f.permissionMode ?? 'UNKNOWN (not yet seen on a tool call)'} · Cockpit never changes it`))
   if (f.measurement !== undefined) out.push(line(f.measurement.enforced ? 'OK' : 'WARN', f.measurement.text))
-  if (f.gitVersion !== undefined) out.push(line('INFO', gitVersionText(f.gitVersion)))
+  // older or unknown Git: the partial-clone refusal and the protocol allow-list stand without Git's own lazy-fetch switch
+  if (f.gitVersion !== undefined) out.push(line(f.gitVersion?.lazyFetchSwitch === true ? 'INFO' : 'WARN', gitVersionText(f.gitVersion)))
   out.push(line('INFO', 'Auto mode: the host classifier decides tool permissions. Cockpit adds no bypass; its own file and process calls are the plugin API\'s, and a refusal is recorded as unverified and not retried another way.'))
   out.push('', 'TELEMETRY')
   const t = f.telemetry

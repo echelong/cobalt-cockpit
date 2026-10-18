@@ -134,16 +134,30 @@ export const inspectedOf = (record: string, gnu: boolean): Inspected | null => {
 
 /** The only programs a measurement process may be; anything else is refused before it starts. */
 export const BOUND_PROGRAMS: readonly string[] = ['git', 'stat', 'find', 'readlink', 'realpath']
+/**
+ * Whether a measurement process that is not Git has a form Cockpit writes. `stat`, `readlink` and `realpath` take options and
+ * paths and run nothing; `find` could (`-exec`, `-delete`, `-fprint`), so only its two forms are admitted: the listing of a
+ * directory's files and links, and the listing of promisor pack markers.
+ */
+export const nonGitAdmitted = (argv: readonly string[]): boolean => {
+  if (argv[0] === 'stat' || argv[0] === 'readlink' || argv[0] === 'realpath') return true
+  if (argv[0] !== 'find' || argv[1] !== '-H' || argv[2] === undefined || argv[2] === '' || argv[2].startsWith('-')) return false
+  const rest = argv.slice(3).join('\0')
+
+  return rest === ['(', '-type', 'f', '-o', '-type', 'l', ')', '-print0'].join('\0') || rest === ['-maxdepth', '1', '-name', '*.promisor', '-print0'].join('\0')
+}
 /** A commit a preflight listing may name: HEAD or a full object id. */
 const COMMIT_NAME = /^(?:HEAD|[0-9a-f]{40}|[0-9a-f]{64})$/
-/** One `-c` setting as Cockpit writes them: a plain dotted key, then its value. */
-const SETTING = /^[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)+=/
+/** The `-c` settings a measurement may carry: exactly those of GIT_SAFE (GIT_BOUNDED's are added by the runner itself, after admission). */
+const SAFE_SETTINGS: ReadonlySet<string> = new Set(GIT_SAFE.filter((_, i) => GIT_SAFE[i - 1] === '-c'))
+/** The Git subcommands a measurement may run with the repository-state check's pass; any other is refused, pass or not. */
+const STATE_SUBCOMMANDS: ReadonlySet<string> = new Set(['status', 'diff', 'ls-files', 'ls-tree', 'hash-object', 'check-attr'])
 /** A Git command as the runner sees it: the subcommand, its arguments, and the directory given with `-C`. */
 export type GitCall = { sub: string; args: readonly string[]; dir: string | null }
 /**
- * Reads the words before the subcommand. Only Cockpit's own forms are accepted: the three safe flags, `-c <key=value>` and at
- * most one `-C <dir>`. Any other word there (another global option, a second `-C`, a setting that is not `key=value`) is no Git
- * call the runner knows, and is refused.
+ * Reads the words before the subcommand. Only Cockpit's own forms are accepted: the three safe flags, a `-c` setting of GIT_SAFE
+ * and at most one `-C <dir>`. Any other word there (another global option, a second `-C`, any other setting) is no Git call the
+ * runner knows, and is refused.
  */
 export const gitCallOf = (argv: readonly string[]): GitCall | null => {
   if (argv[0] !== 'git') return null
@@ -154,7 +168,7 @@ export const gitCallOf = (argv: readonly string[]): GitCall | null => {
     if (word === undefined) return null
     if (word === '-c') {
       const setting = argv[at + 1]
-      if (setting === undefined || !SETTING.test(setting)) return null
+      if (setting === undefined || !SAFE_SETTINGS.has(setting)) return null
       at += 2
     } else if (word === '-C') {
       const named = argv[at + 1]
@@ -172,24 +186,26 @@ export const gitCallOf = (argv: readonly string[]): GitCall | null => {
 /**
  * What a Git command reads, for admission. `discovery`: where the repository and its files are, and configuration (read without
  * running any program, fetching or entering a submodule). `listing`: the two listings the refusal check itself makes, the index's
- * stage entries and one commit's tree. `state`: everything else, which reads the index, the work tree or objects and needs the
- * check's authorisation. `rev-parse --verify HEAD` resolves a reference and reads no object; a peel (`<name>^{commit}`) is state.
+ * stage entries and one commit's tree. `state`: the reads of the index, the work tree or objects Cockpit makes (STATE_SUBCOMMANDS,
+ * and a peel `rev-parse --verify --quiet <name>^{commit}`), which need the check's pass. `refused`: anything else, which no pass
+ * admits (a fetch, a write, another configuration form). `rev-parse --verify HEAD` resolves a reference and reads no object.
  */
-export type GitAccess = 'discovery' | 'listing' | 'state'
+export type GitAccess = 'discovery' | 'listing' | 'state' | 'refused'
 export const gitAccessOf = (call: GitCall): GitAccess => {
   const { sub, args } = call
-  if (sub === '--version') return args.length === 0 ? 'discovery' : 'state'
+  if (sub === '--version') return args.length === 0 ? 'discovery' : 'refused'
   if (sub === 'rev-parse') {
     if (args.length === 2 && args[0] === '--verify' && args[1] === 'HEAD') return 'discovery'
+    if (args.length === 3 && args[0] === '--verify' && args[1] === '--quiet' && /^[A-Za-z0-9@][^\s]*\^\{commit\}$/.test(args[2] as string)) return 'state'
     let i = 0
     while (i < args.length) {
       const word = args[i] as string
       const next = args[i + 1]
       if (word === '--show-toplevel' || word === '--show-prefix') i += 1
       else if (word === '--git-path' && next !== undefined && next !== '' && !next.startsWith('-')) i += 2
-      else return 'state'
+      else return 'refused'
     }
-    return args.length > 0 ? 'discovery' : 'state'
+    return args.length > 0 ? 'discovery' : 'refused'
   }
   if (sub === 'config') {
     let form: string | null = null
@@ -200,15 +216,22 @@ export const gitAccessOf = (call: GitCall): GitAccess => {
       if (word === '--null' || word === '--type=path' || word === '--bool') i += 1
       else if (form === null && (word === '--get' || word === '--get-regexp') && next !== undefined && next !== '' && !next.startsWith('-') && i + 2 === args.length) { form = word; i += 2 }
       else if (form === null && word === '--list' && i + 1 === args.length) { form = word; i += 1 }
-      else return 'state'
+      else return 'refused'
     }
-    return form === null ? 'state' : 'discovery'
+    return form === null ? 'refused' : 'discovery'
   }
   if (sub === 'ls-files' && args.length === 2 && args[0] === '-z' && args[1] === '--stage') return 'listing'
   if (sub === 'ls-tree' && args.length === 4 && args[0] === '-r' && args[1] === '-z' && args[2] === '--full-tree' && COMMIT_NAME.test(args[3] as string)) return 'listing'
 
-  return 'state'
+  return STATE_SUBCOMMANDS.has(sub) ? 'state' : 'refused'
 }
+/**
+ * The filter-driver entries of a `config --null --list` answer, in the form `config --null --get-regexp` gives them, for
+ * `filterCommands`: the check's one complete read of the configuration also decides the filter check, so no second read can
+ * answer "no filter" from an exit status that a signal could have produced.
+ */
+export const filterRecordsOf = (configList: string): string =>
+  configList === '' ? '' : configList.slice(0, -1).split('\0').filter(record => /^filter\..+\.(?:clean|process)$/.test((record.includes('\n') ? record.slice(0, record.indexOf('\n')) : record).toLowerCase())).map(record => `${record}\0`).join('')
 
 /** The values Git reads as false for a boolean; anything else, a key with no value included, is read as true here. */
 const FALSE_WORDS: ReadonlySet<string> = new Set(['false', 'no', 'off', '0'])
@@ -231,16 +254,32 @@ export const partialCloneOf = (text: string): boolean | null => {
 
   return false
 }
-/** How many gitlinks (mode 160000) `git ls-files -z --stage` lists; null for output that does not parse or is past the tracked-file limit. */
+/**
+ * How many gitlinks (mode 160000) `git ls-files -z --stage` lists; null for output that does not parse or is past the tracked-file
+ * limit. Every record must be six octal digits, a space, a 40- or 64-digit lowercase hex object id, a space, a stage 0-3, a tab and
+ * a non-empty path. One pass over the text, without splitting it or a pattern per record: the listing of a large index is read
+ * several times per measurement (measured: 3.3 MB for 45,000 paths took 15 ms per call with a pattern per record).
+ */
 export const stageGitlinks = (text: string): number | null => {
-  if (text !== '' && !text.endsWith('\0')) return null
-  const records = text === '' ? [] : text.slice(0, -1).split('\0')
-  if (records.length > TRACKED_LIMIT) return null
+  if (text === '') return 0
+  if (!text.endsWith('\0')) return null
+  const isHex = (c: number) => (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
   let gitlinks = 0
-  for (const record of records) {
-    const match = /^([0-7]{6}) (?:[0-9a-f]{40}|[0-9a-f]{64}) [0-3]\t[\s\S]+$/.exec(record)
-    if (match === null) return null
-    if (match[1] === '160000') gitlinks += 1
+  let records = 0
+  for (let at = 0; at < text.length;) {
+    const end = text.indexOf('\0', at)
+    for (let k = 0; k < 6; k++) { const c = text.charCodeAt(at + k); if (!(c >= 48 && c <= 55)) return null }
+    if (text.charCodeAt(at + 6) !== 32) return null
+    let o = at + 7
+    let digits = 0
+    while (digits < 65 && isHex(text.charCodeAt(o + digits))) digits++
+    if (digits !== 40 && digits !== 64) return null
+    o += digits
+    const stage = text.charCodeAt(o + 1)
+    if (text.charCodeAt(o) !== 32 || !(stage >= 48 && stage <= 51) || text.charCodeAt(o + 2) !== 9 || o + 3 >= end) return null
+    if (text.startsWith('160000', at)) gitlinks += 1
+    if (++records > TRACKED_LIMIT) return null
+    at = end + 1
   }
 
   return gitlinks
@@ -273,13 +312,16 @@ export const HELPER_PINS: readonly string[] = ['-c', 'diff.submodule=short', '-c
 /**
  * Variables that move where Git looks, what configuration it reads, what it runs or where it writes. A helper's inspection runs
  * in the host's Bash tool with the host's environment; where Cockpit's own environment sets any of these, it is refused rather
- * than trusted (register.tsx reads each by its literal name, and only whether it is set).
+ * than trusted (register.tsx reads each by its literal name, and only whether it is set). This is a list of known names, not a
+ * sanitised environment: the plugin interface reads a variable only by a name written in the source and cannot list the rest,
+ * and the Bash tool's own shell start-up is not visible to Cockpit (docs/implementation-v0.6.6.md).
  */
 export const GIT_ENV_REFUSED: readonly string[] = [
   'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE',
   'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
   'GIT_EXEC_PATH', 'GIT_EXTERNAL_DIFF', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'GIT_PROXY_COMMAND', 'GIT_ALLOW_PROTOCOL',
   'GIT_ATTR_SOURCE', 'GIT_REPLACE_REF_BASE', 'GIT_SHALLOW_FILE', 'GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF',
+  'GIT_TRACE_PACKET', 'GIT_TRACE_PACKFILE', 'GIT_TRACE_PERFORMANCE', 'GIT_TRACE_SETUP', 'GIT_TRACE_SHALLOW', 'GIT_TRACE_CURL', 'GIT_TRACE_REFS', 'GIT_TRACE_FSMONITOR',
 ]
 
 /** `git --version` read strictly; `lazyFetchSwitch` where Git documents its own switch for lazy fetching (2.45.0 and later). */

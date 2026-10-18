@@ -79,7 +79,8 @@ describe('what a scoped inspection costs the host', () => {
       const before = w.runs.length
       await git($, agentId, command)
 
-      return w.runs.slice(before).map(argv => argv[0] === 'git' ? `git ${argv.find(a => ['rev-parse', 'config', 'check-attr', 'ls-files', 'ls-tree'].includes(a))}${argv.includes('--verify') ? ' --verify' : ''}` : String(argv[0]))
+      // a revision proof (a peel) reads `--verify`; v0.6.6's check of whether HEAD is a commit reads `HEAD`
+      return w.runs.slice(before).map(argv => argv[0] === 'git' ? `git ${argv.find(a => ['rev-parse', 'config', 'check-attr', 'ls-files', 'ls-tree'].includes(a))}${argv.some(a => a.endsWith('^{commit}')) ? ' --verify' : argv.includes('--verify') ? ' HEAD' : ''}` : String(argv[0]))
     }
     const wildcard = await cost(wide, 'git diff main...HEAD -- hooks/swarm.ts')
     const scoped = await cost(narrow, 'git diff main...HEAD -- hooks/swarm.ts')
@@ -87,12 +88,13 @@ describe('what a scoped inspection costs the host', () => {
     // rev-parse, two config and one stat, which also answers for the absent attributes and alternates files) and the filter check
     // are what a wildcard inspection already paid
     const inputs = ['git rev-parse', 'git config', 'git config', 'stat']
-    // v0.6.6: then the repository-state check (configuration, where the packs are, the promisor pack listing, the index's stage
-    // entries and HEAD's tree), which both kinds pay before anything is read; a scoped one checks it first, then its paths and
-    // revisions, and lists the tree of each distinct commit they name (here both names are one commit)
-    const state = ['git config', 'git rev-parse', 'find', 'git ls-files', 'git ls-tree']
-    expect(wildcard).toEqual(['git rev-parse', 'git rev-parse', 'realpath', 'realpath', ...inputs, ...state, 'git config'])
-    expect(scoped).toEqual(['git rev-parse', 'git rev-parse', 'realpath', 'realpath', ...inputs, ...state, 'git config', 'realpath', 'git rev-parse --verify', 'git rev-parse --verify', 'git ls-tree'])
+    // v0.6.6: then whether HEAD is a commit, and the repository-state check (configuration, which also answers the filter check,
+    // where the packs are, the promisor pack listing, the index's stage entries and HEAD's tree), which both kinds pay before
+    // anything is read; a scoped one checks it first, then its paths and revisions, and lists the tree of each distinct commit
+    // they name (here both names are one commit)
+    const state = ['git rev-parse HEAD', 'git config', 'git rev-parse', 'find', 'git ls-files', 'git ls-tree']
+    expect(wildcard).toEqual(['git rev-parse', 'git rev-parse', 'realpath', 'realpath', ...inputs, ...state])
+    expect(scoped).toEqual(['git rev-parse', 'git rev-parse', 'realpath', 'realpath', ...inputs, ...state, 'realpath', 'git rev-parse --verify', 'git rev-parse --verify', 'git ls-tree'])
     // a command refused for its shape, or for a path outside the scope, runs no revision proof at all
     expect(await cost(narrow, 'git log --full-diff -- hooks/swarm.ts')).toEqual([])
     expect((await cost(narrow, 'git diff main...HEAD -- README.md')).filter(run => run.includes('--verify'))).toEqual([])

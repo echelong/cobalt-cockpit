@@ -8,6 +8,7 @@
 //     listing capability, never a value built from a string;
 //   - the helper's environment check reads exactly GIT_ENV_REFUSED, by literal name, in order.
 // Plugin tests cannot read source files (the test runtime imports only the plugin's own modules), so this is a script, run by CI.
+// It reads text, not a syntax tree: it is a tripwire for review, and the runtime admission in `bounded` is the guard.
 // Usage: node scripts/check-git-callers.mjs [--write]. Exit 0: matches. Exit 1: differences or a broken invariant. Exit 2: could not run.
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -29,15 +30,21 @@ const owners = lines => {
 }
 const firstLiteral = text => { const m = /^\s*(?:[^'`[]*\?\s*)?\[\s*'([^']+)'/.exec(text); return m ? m[1] : null }
 
-const hooks = readdirSync(resolve(root, 'hooks')).filter(f => /\.tsx?$/.test(f)).map(f => `hooks/${f}`)
+const hooks = readdirSync(resolve(root, 'hooks'), { recursive: true }).map(String).filter(f => /\.(?:tsx?|mjs|cjs|js)$/.test(f)).map(f => `hooks/${f}`)
 const processSites = []
 for (const file of hooks) {
-  const lines = read(file).split('\n'), who = owners(lines)
+  const text = read(file), lines = text.split('\n'), who = owners(lines)
   lines.forEach((line, i) => {
-    for (const m of line.matchAll(/\$\.process\.(run|spawn)\(/g)) {
-      if (m[1] === 'spawn') problems.push(`${file}:${i + 1}: $.process.spawn is not used anywhere in Cockpit`)
+    // every mention of the process capability must be a direct call of `$.process.run(`: no alias, no optional or computed member,
+    // no `.spawn`, no line break before the call
+    for (const m of line.matchAll(/\$\s*\.\s*process\b(\s*\??\.\s*(\w+)\s*(<[^>]*>)?\s*(\()?)?/g)) {
+      if (m[2] !== 'run' || m[3] !== undefined || m[4] === undefined || !line.includes('$.process.run(', m.index)) { problems.push(`${file}:${i + 1}: the process capability is used other than as a direct $.process.run( call`); continue }
       const after = line.slice(m.index + m[0].length)
       processSites.push({ file, function: who[i], program: firstLiteral(after) ?? after.slice(0, after.search(/[(,\]]/)).replace(/^\[/, '').trim() })
+    }
+    // other routes to a process or to code: none is used, and none may be
+    for (const [pattern, what] of [[/\bchild_process\b|\bBun\.spawn|\bDeno\.(?:run|Command)\b/, 'a process API other than $.process'], [/\beval\s*\(|\bnew\s+Function\s*\(/, 'eval or new Function'], [/\bimport\s*\(/, 'a dynamic import()']]) {
+      if (pattern.test(line.replace(/\/\/.*$/, '').replace(/'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, "''"))) problems.push(`${file}:${i + 1}: ${what}`)
     }
   })
 }
@@ -51,12 +58,18 @@ const text = read('hooks/register.tsx'), lines = text.split('\n'), who = owners(
 // `bounded` calls, and the closures over `bounded` each function defines (a `const` whose line, or the next two, call it)
 const bounded = [], closures = new Map()
 lines.forEach((line, i) => {
-  const call = line.indexOf('bounded($,')
-  if (call < 0) return
-  const program = firstLiteral(line.slice(call + 'bounded($,'.length))
-  if (program === null || !PROGRAMS.includes(program)) problems.push(`hooks/register.tsx:${i + 1}: bounded() starts ${program ?? 'a program not given as a literal'}, not one of ${PROGRAMS.join(', ')}`)
-  const sub = program === 'git' ? (/'-C', [^,]+, '([^']+)'/.exec(line) ?? /\.\.\.GIT_SAFE, '([^']+)'/.exec(line) ?? /\['git', '([^']+)'/.exec(line))?.[1] ?? '(closure)' : '-'
+  if (/\bbounded\b/.test(line) && !/\bbounded\(\$,|\bconst bounded = |`bounded`|\bbounded\b[^(]*\/\/|^\s*(?:\/\/|\*|\/\*)/.test(line) && /\bbounded\s*\(/.test(line)) problems.push(`hooks/register.tsx:${i + 1}: bounded() called other than as bounded($, …)`)
+  for (const callAt of [...line.matchAll(/\bbounded\(\$,/g)].map(m => m.index)) {
+  const args = line.slice(callAt + 'bounded($,'.length)
+  const head = args.slice(0, Math.max(0, args.search(/\],\s*\{|\]\)/)) + 1) || args
+  const programs = [...head.matchAll(/\[\s*'([^']+)'/g)].map(m => m[1])
+  if (programs.length === 0 || programs.some(p => !PROGRAMS.includes(p))) problems.push(`hooks/register.tsx:${i + 1}: bounded() starts ${programs.join(' or ') || 'a program not given as a literal'}, not one of ${PROGRAMS.join(', ')}`)
+  const program = programs[0] ?? null
+  const segment = line.slice(callAt)
+  const sub = program === 'git' ? (/'-C', [^,]+, '([^']+)'/.exec(segment) ?? /\.\.\.GIT_SAFE, '([^']+)'/.exec(segment) ?? /\['git', '([^']+)'/.exec(segment))?.[1] ?? '(closure)' : '-'
   bounded.push({ function: who[i], program, sub })
+  }
+  if (!/\bbounded\(\$,/.test(line)) return
   for (let k = i; k >= Math.max(0, i - 2); k--) {
     const def = /const (\w+) = (?:async )?\(/.exec(lines[k])
     if (def && def[1] !== 'r') { const set = closures.get(who[i]) ?? new Set(); set.add(def[1]); closures.set(who[i], set); break }
@@ -69,16 +82,18 @@ for (let grew = true; grew;) {
     const names = closures.get(who[i])
     const def = /const (\w+) = (?:async )?\(/.exec(line)
     if (names === undefined || def === null || names.has(def[1])) return
-    const body = lines.slice(i, i + 3).join('\n')
-    if ([...names].some(n => new RegExp(`(?<![\\w.])${n}\\(`).test(body.slice(body.indexOf('=>'))))) { names.add(def[1]); grew = true }
+    // a one-line closure whose body calls a known one (multi-line closures over `bounded` are found by the first pass)
+    if (!line.includes('=>')) return
+    if ([...names].some(n => new RegExp(`(?<![\\w.])${n}\\(`).test(line.slice(line.indexOf('=>'))))) { names.add(def[1]); grew = true }
   })
 }
 const closureCalls = []
 lines.forEach((line, i) => {
   const names = closures.get(who[i])
   if (names === undefined) return
-  for (const name of names) for (const m of line.matchAll(new RegExp(`(?<![\\w.])${name}\\((\\[)?\\s*'([^']+)'(?:, '([^']+)')?`, 'g'))) {
+  for (const name of names) for (const m of line.matchAll(new RegExp(`(?<![\\w.])${name}\\((\\[)?\\s*(?:'([^']+)'(?:, '([^']+)')?)?`, 'g'))) {
     if (line.includes(`const ${name} =`)) continue
+    if (m[2] === undefined) { closureCalls.push({ function: who[i], closure: name, sub: '(computed arguments)' }); continue }
     let words = [m[2], m[3]].filter(Boolean)
     if (words[0] === '-C') { const after = /'-C', [^,]+, '([^']+)'(?:, '([^']+)')?/.exec(line.slice(m.index)); words = after ? [after[1], after[2]].filter(Boolean) : ['(after -C)'] }
     closureCalls.push({ function: who[i], closure: name, sub: words.join(' ') })
@@ -94,8 +109,10 @@ lines.forEach((l, i) => {
   // a type annotation (`auth: RepoPass | …`) is not a value
   for (const m of l.matchAll(/\bauth: ([^,}\s)]+)/g)) if (!/^[A-Z]/.test(m[1]) && !['pass', 'checked.pass', 'place.pass', 'state.pass'].includes(m[1]) && !(who[i] === 'RunInit' || who[i] === 'repoState')) problems.push(`hooks/register.tsx:${i + 1}: auth is ${m[1]}, not a pass`)
 })
+lines.forEach((l, i) => { if (/[{,]\s*auth\s*[,}]/.test(l) && !/\bauth\?:|auth: (?:Repo|Pre)/.test(l) && who[i] !== 'repoState' && who[i] !== 'bounded') problems.push(`hooks/register.tsx:${i + 1}: auth passed by shorthand outside repoState`) })
 const envStart = lines.findIndex(l => l.startsWith('const gitEnvironmentSet'))
-const envNames = envStart < 0 ? [] : [...lines.slice(envStart, envStart + 12).join('\n').matchAll(/\$\.env\.get\('([A-Z0-9_]+)'\)/g)].map(m => m[1])
+const envEnd = envStart < 0 ? -1 : lines.findIndex((l, k) => k > envStart && /^\s*\]\.map\(/.test(l))
+const envNames = envStart < 0 || envEnd < 0 ? [] : [...lines.slice(envStart, envEnd + 1).join('\n').matchAll(/\$\.env\.get\('([A-Z0-9_]+)'\)/g)].map(m => m[1])
 if (JSON.stringify(envNames) !== JSON.stringify(ENV_REFUSED)) problems.push(`gitEnvironmentSet reads ${envNames.join(',')}; GIT_ENV_REFUSED is ${ENV_REFUSED.join(',')}`)
 
 const count = rows => Object.entries(rows.reduce((m, r) => { const k = JSON.stringify(r); m[k] = (m[k] ?? 0) + 1; return m }, {})).map(([k, n]) => ({ ...JSON.parse(k), count: n })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))

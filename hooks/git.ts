@@ -93,7 +93,7 @@ export const filterCommands = (stdout: string): Set<string> | null => {
   return new Set([...effective].filter(([, command]) => command.trim() !== '').map(([key]) => key.slice(7, key.lastIndexOf('.'))))
 }
 /** A malformed/incomplete attributes response is no proof; true means an active external clean/process filter. */
-export const activeFilter = (stdout: string, drivers: Set<string>, paths: string): boolean | null => {
+export const activeFilter = (stdout: string, drivers: ReadonlySet<string>, paths: string): boolean | null => {
   if (stdout !== '' && !stdout.endsWith('\0')) return null
   const fields = stdout.split('\0'); fields.pop()
   const expected = paths.split('\0'); expected.pop()

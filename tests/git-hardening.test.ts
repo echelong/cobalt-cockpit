@@ -5,7 +5,9 @@
 // of repository state only with the check's pass, every Git process carries the lazy-fetch and protocol pins, and fingerprints of
 // ordinary repositories are the ones v0.6.5 took. What real Git does with these argv is for the approved real-Git acceptance.
 import { describe, expect, test } from 'claude-code/testing'
-import { BOUND_PINS, BOUND_PROGRAMS, GIT_ENV_REFUSED, GIT_SAFE, HELPER_PINS, REPO_REFUSAL_SHORT, REPO_REFUSAL_WORDS, TRACKED_LIMIT, gitAccessOf, gitCallOf, gitVersionOf, partialCloneOf, promisorPacksOf, stageGitlinks } from '../hooks/git-integrity'
+import { BOUND_PINS, BOUND_PROGRAMS, GIT_ENV_REFUSED, GIT_SAFE, HELPER_PINS, REPO_REFUSAL_SHORT, REPO_REFUSAL_WORDS, TRACKED_LIMIT, filterRecordsOf, gitAccessOf, gitCallOf, gitVersionOf, nonGitAdmitted, partialCloneOf, promisorPacksOf, stageGitlinks } from '../hooks/git-integrity'
+import { checkpointOf, emptyLedger, UNKNOWN } from '../hooks/ledger'
+import { filterCommands } from '../hooks/git'
 import type { RepoRefusal } from '../hooks/git-integrity'
 import { dirtyLabel, refusedReason, treeNeedsAttention } from '../hooks/git'
 import { gitVersionText } from '../hooks/doctor'
@@ -47,7 +49,10 @@ describe('the runner admits Git commands by form', () => {
       ['git'], ['env', 'git', 'status'], ['/usr/bin/git', 'status'],
       ['git', '--git-dir=/x', 'status'], ['git', '--exec-path=/x', 'status'], ['git', '-C', '/a', '-C', '/b', 'status'], ['git', '-C', '', 'status'],
       ['git', '-c', 'nokey', 'status'], ['git', '-c', 'core.fsmonitor', 'status'], ['git', '-c'], ['git', '--no-pager', 'status'],
+      // only GIT_SAFE's own settings: no other value, and no setting that names a program
+      ['git', '-c', 'core.fsmonitor=true', 'status'], ['git', '-c', 'alias.x=!sh', 'x'], ['git', '-c', 'diff.ignoreSubmodules=none', 'diff'], ['git', '-c', 'core.sshCommand=sh', 'status'],
     ]) expect([argv, gitCallOf(argv)]).toEqual([argv, null])
+    expect(gitCallOf(['git', '-c', 'diff.ignoreSubmodules=all', '-C', '/r', 'diff'])).toEqual({ sub: 'diff', args: [], dir: '/r' })
   })
   test('the discovery list is closed: where things are, configuration, and HEAD without a peel', () => {
     const access = (...args: string[]) => gitAccessOf(gitCallOf(['git', '-C', '/r', ...args])!)
@@ -57,12 +62,24 @@ describe('the runner admits Git commands by form', () => {
     ]) expect([args, access(...args)]).toEqual([args, 'discovery'])
     expect(gitAccessOf(gitCallOf(['git', '--version'])!)).toBe('discovery')
     for (const args of [['ls-files', '-z', '--stage'], ['ls-tree', '-r', '-z', '--full-tree', 'HEAD'], ['ls-tree', '-r', '-z', '--full-tree', 'a'.repeat(40)]]) expect([args, access(...args)]).toEqual([args, 'listing'])
+    // what reads repository state: admitted only with the check's pass for that root
     for (const args of [
-      ['rev-parse', '--verify', '--quiet', 'main^{commit}'], ['rev-parse', '--verify', 'HEAD^{commit}'], ['rev-parse', '--verify', 'main'], ['rev-parse'], ['rev-parse', '--git-path'], ['rev-parse', '--git-path', '--x'],
-      ['config', '--get'], ['config', '--get', 'a', 'b'], ['config', '--add', 'a', 'b'], ['config', '--file', '/x', '--get', 'a'], ['config', '--list', '--get', 'a'], ['config', '--unset', 'a'], ['config', '--get', '-a'],
-      ['ls-files', '-z'], ['ls-files', '-z', '--stage', '--', 'x'], ['ls-tree', '-r', '-z', '--full-tree', 'main'], ['ls-tree', '-r', '-z', '--full-tree', 'HEAD~1'],
-      ['status', '--porcelain'], ['diff', 'HEAD'], ['hash-object', '--', 'a'], ['check-attr', '-z', '--stdin', 'filter'], ['cat-file', '--batch-check'], ['fetch'], ['--version', 'x'],
+      ['rev-parse', '--verify', '--quiet', 'main^{commit}'],
+      ['ls-files', '-z'], ['ls-files', '-z', '--stage', '--', 'x'], ['ls-files', '-v', '-z'], ['ls-tree', '-r', '-z', '--full-tree', 'main'], ['ls-tree', '-r', '-z', '--full-tree', 'HEAD~1'],
+      ['status', '--porcelain'], ['diff', 'HEAD'], ['hash-object', '--', 'a'], ['check-attr', '-z', '--stdin', 'filter'],
     ]) expect([args, access(...args)]).toEqual([args, 'state'])
+    // everything else: no pass admits it
+    for (const args of [
+      ['rev-parse', '--verify', 'HEAD^{commit}'], ['rev-parse', '--verify', 'main'], ['rev-parse'], ['rev-parse', '--git-path'], ['rev-parse', '--git-path', '--x'], ['rev-parse', '--verify', '--quiet', '-x^{commit}'],
+      ['config', '--get'], ['config', '--get', 'a', 'b'], ['config', '--add', 'a', 'b'], ['config', '--file', '/x', '--get', 'a'], ['config', '--list', '--get', 'a'], ['config', '--unset', 'a'], ['config', '--get', '-a'],
+      ['cat-file', '--batch-check'], ['fetch'], ['submodule', 'update'], ['gc'], ['log', '-p'], ['show', 'HEAD'], ['grep', 'x'], ['--version', 'x'],
+    ]) expect([args, access(...args)]).toEqual([args, 'refused'])
+  })
+  test('the other measurement programs: only the forms Cockpit writes', () => {
+    for (const argv of [['stat', '--printf', '%s', '--', 'a'], ['readlink', '-z', '--', 'a'], ['realpath', '-e', '--', '/a'],
+      ['find', '-H', '/w/dir', '(', '-type', 'f', '-o', '-type', 'l', ')', '-print0'], ['find', '-H', './.git/objects/pack', '-maxdepth', '1', '-name', '*.promisor', '-print0']]) expect([argv, nonGitAdmitted(argv)]).toEqual([argv, true])
+    for (const argv of [['find', '-H', '/w', '-exec', 'sh', '{}', ';'], ['find', '/w', '-print0'], ['find', '-H', '-delete'], ['find', '-H', '/w', '-maxdepth', '1', '-name', '*.promisor', '-fprint', '/tmp/x'],
+      ['find', '-H', '/w', '(', '-type', 'f', '-o', '-type', 'l', ')', '-print0', '-delete'], ['sh', '-c', 'x'], ['tail', '-c', '1', 'a'], ['git', 'status']]) expect([argv, nonGitAdmitted(argv)]).toEqual([argv, false])
   })
   test('the measurement programs are exactly the five that measure', () => {
     expect([...BOUND_PROGRAMS].sort()).toEqual(['find', 'git', 'readlink', 'realpath', 'stat'])
@@ -90,8 +107,16 @@ describe('the refusal check reads strictly', () => {
     expect(stageGitlinks(records(`100644 ${oid} 0\tsrc/a.ts`, `120000 ${oid} 0\tlink`))).toBe(0)
     expect(stageGitlinks(records(`100644 ${oid} 0\tsrc/a.ts`, `160000 ${oid} 0\tvendor/lib`, `160000 ${'b'.repeat(64)} 0\tsub two`))).toBe(2)
     expect(stageGitlinks(`100644 ${oid} 2\tconflict\0`)).toBe(0)
-    for (const bad of [`100644 ${oid} 0\tsrc/a.ts`, `100644 ${oid}\tsrc/a.ts\0`, `10064 ${oid} 0\ta\0`, `100644 ${oid} 0\t\0`, `100644 xyz 0\ta\0`, `100644 ${oid} 4\ta\0`]) expect([bad, stageGitlinks(bad)]).toEqual([bad, null])
+    expect(stageGitlinks(records(`100644 ${oid} 0\tname with spaces\nand a newline`, `160000 ${oid} 3\tx`))).toBe(1)
+    for (const bad of [`100644 ${oid} 0\tsrc/a.ts`, `100644 ${oid}\tsrc/a.ts\0`, `10064 ${oid} 0\ta\0`, `100644 ${oid} 0\t\0`, `100644 xyz 0\ta\0`, `100644 ${oid} 4\ta\0`,
+      `100648 ${oid} 0\ta\0`, `100644 ${oid}a 0\ta\0`, `100644 ${'a'.repeat(39)} 0\ta\0`, `100644 ${'a'.repeat(65)} 0\ta\0`, `100644 ${oid.toUpperCase()} 0\ta\0`, `100644  ${oid} 0\ta\0`, `100644 ${oid} 0 a\0`, `100644 ${oid} 0\ta\0\0`, `\0`]) expect([bad, stageGitlinks(bad)]).toEqual([bad, null])
     expect(stageGitlinks(Array.from({ length: TRACKED_LIMIT + 1 }, (_, i) => `100644 ${oid} 0\tf${i}\0`).join(''))).toBeNull()
+  })
+  test('the filter drivers come from the one configuration listing, in the form the filter check reads', () => {
+    const list = ['core.bare\nfalse', 'filter.lfs.clean\ngit-lfs clean -- %f', 'filter.lfs.process\ngit-lfs filter-process', 'filter.Hide.clean\nprintf x', 'filter.dormant.smudge\ncat', 'filter.empty.clean\n'].map(r => `${r}\0`).join('')
+    expect([...filterCommands(filterRecordsOf(list))!].sort()).toEqual(['Hide', 'lfs'])
+    expect(filterRecordsOf('')).toBe('')
+    expect(filterCommands(filterRecordsOf('filter.x.clean\0'))).toBeNull()                    // a value-less driver: no answer, never "no filter"
   })
   test('promisor pack markers', () => {
     expect(promisorPacksOf('')).toBe(0)
@@ -239,11 +264,15 @@ describe('a refused repository: the HUD says so, and a Stop with no task asks fo
       expect(dirtyLabel(git ?? null)).toBe(`not measured (${SHORT[hostile.refusal]})`)
       expect((await rowsOf(await mountHud($, 'terminal', 160))).join('\n')).toContain(`not measured (${SHORT[hostile.refusal]})`)
       expect(subcommands(w, from)).not.toContain('status')
-      // possibly changed, so a coding task that asks for the check, never an allowed clean stop
+      // possibly changed: a coding task for which the check runs, and whose pass on an unidentifiable tree is not recorded as
+      // verified, so the task is held (the stop itself goes through: a check that cannot be recorded is not asked for again)
       const task = taskOf(h)
       expect(task).toEqual(expect.objectContaining({ edited: true }))
+      expect(w.runs.filter(r => r[0] === SCRIPT)).toHaveLength(1)
+      expect(kept(h).at(-1)?.complete).toBe(false)
       expect(task?.status).not.toBe('done')
-      expect(out.block !== undefined || task?.stopHold !== undefined).toBe(true)
+      expect(task?.stopHold).toBeDefined()
+      expect(out.block).toBeUndefined()
     })
   }
   test('control: an ordinary clean repository with no task stops without a check, and its HUD line is clean', guard(), async ($, on) => {
@@ -262,6 +291,44 @@ describe('a refused repository: the HUD says so, and a Stop with no task asks fo
     await stop($)
     expect(gitOf(h)?.refused).toBe('unreadable')
     expect(taskOf(h)).toEqual(expect.objectContaining({ edited: true }))
+  })
+  test('a status listing cut short by the host is no count: refused, never an undercount', guard(), async ($, on) => {
+    const { w, h } = fixture(on)
+    await start($); await enroll($)
+    w.gitTruncates = 'status'
+    await stop($)
+    expect(gitOf(h)?.refused).toBe('unreadable')
+    expect(taskOf(h)).toEqual(expect.objectContaining({ edited: true }))
+  })
+  test('a Git that does not answer before the repository is even found is no clean tree either', guard(), async ($, on) => {
+    const { w, h } = fixture(on)
+    await start($); await enroll($)
+    w.gitHangs = 'rev-parse'
+    await stop($)
+    const task = taskOf(h)
+    expect(task).toEqual(expect.objectContaining({ edited: true }))
+    expect(w.runs.filter(r => r[0] === SCRIPT)).toHaveLength(1)
+    expect(kept(h).at(-1)?.complete).toBe(false)
+    expect(task?.stopHold).toBeDefined()
+  })
+  test('with no shell to set limits, nothing is measured and a Stop with no task is not allowed through as clean', guard(), async ($, on) => {
+    const { w, h } = fixture(on); w.boundMode = 'none'
+    await start($); await enroll($)
+    await stop($)
+    expect(taskOf(h)).toEqual(expect.objectContaining({ edited: true }))
+    expect(w.runs.filter(r => r[0] === 'git')).toEqual([])
+  })
+  test('control: a session outside every Git repository with no task still stops without a check', guard(), async ($, on) => {
+    const { w, h } = fixture(on); w.gitStatus = null
+    await start($); await enroll($)
+    expect((await stop($)).block).toBeUndefined()
+    expect(taskOf(h) ?? null).toBeNull()
+    expect(w.runs.filter(r => r[0] === SCRIPT)).toEqual([])
+  })
+  test('the Run Ledger\'s checkpoint never records a refused repository as clean', () => {
+    const git: GitState = { isRepo: true, project: 'example', branch: null, isDetached: false, sha: null, startSha: null, dirty: 0, ahead: null, behind: null, refused: 'submodule', at: 0 }
+    expect(checkpointOf(emptyLedger('s'), null, git, 0).dirty).toBe(UNKNOWN)
+    expect(checkpointOf(emptyLedger('s'), null, { ...git, refused: undefined }, 0).dirty).toBe(0)
   })
 })
 
@@ -304,6 +371,14 @@ describe('a refused repository: a helper\'s Git inspection is refused, and nothi
       expect(sent(w)).toEqual([])
     })
   }
+  test('a repository with no commit yet: inspection is allowed (there is no HEAD tree to hold a gitlink), and the index is still checked', options, async ($, on) => {
+    const w = world(on, { headUnborn: true }); const a = await reviewer($, ['*'])
+    expect((await git($, a, 'git status')).deny).toBeUndefined()
+    expect(sent(w)).toHaveLength(1)
+    w.indexGitlinks = ['vendor/lib']
+    expect((await git($, a, 'git status')).deny).toContain(`refused in this repository (${SHORT.submodule})`)
+    expect(sent(w)).toHaveLength(1)
+  })
   test('control: variables the host sets that do not move Git (GIT_EDITOR, GIT_PAGER) refuse nothing', options, async ($, on) => {
     const w = world(on, { env: { GIT_EDITOR: 'true', GIT_PAGER: 'cat' } }); const a = await reviewer($, ['*'])
     expect((await git($, a, 'git status')).deny).toBeUndefined()
@@ -327,7 +402,7 @@ describe('a refused repository: a helper\'s Git inspection is refused, and nothi
 })
 
 describe('a state that appears while the tree is measured', () => {
-  for (const [name, appear] of [['a gitlink staged', (w: World) => { w.indexGitlinks = ['vendor/lib'] }], ['a promisor pack', (w: World) => { w.promisorPacks = ['pack-9.promisor'] }], ['a promisor remote', (w: World) => { w.gitConfig['remote.origin.promisor'] = 'true' }]] as const) {
+  for (const [name, appear] of [['a gitlink staged', (w: World) => { w.indexGitlinks = ['vendor/lib'] }], ['a promisor pack', (w: World) => { w.promisorPacks = ['pack-9.promisor'] }], ['a promisor remote', (w: World) => { w.gitConfig['remote.origin.promisor'] = 'true' }], ['a clean filter driver', (w: World) => { w.gitFilterConfig = 'filter.hide.clean\nprintf x\0' }]] as const) {
     test(`${name} during the measurement: no stamp, with the reason`, guard(), async ($, on) => {
       const { w, h } = fixture(on)
       w.headBlobs['src/a.ts'] = blobOf('a'); w.watched['src/a.ts'] = 'a'

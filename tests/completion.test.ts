@@ -381,8 +381,9 @@ describe('ignored files: relevance, volatility and coverage', () => {
     expect(taskOf(h).status).toBe('done')
     expect(w.statCalls).toBeLessThanOrEqual(2)                                        // 30000 volatile entries were never stat'ed
     // Root identity and effective-filter preflight add bounded reads independent of cache size; v0.6.6 adds the repository-state
-    // check before the measurement and again after it (configuration and the index's stage entries each time, and where the packs are)
-    expect(gitRuns(w) - before).toBeLessThanOrEqual(25)
+    // check before the measurement and again after it (configuration and the index's stage entries each time, and where the packs
+    // are: five Git calls), and the filter check reads its drivers from that configuration instead of two calls of its own
+    expect(gitRuns(w) - before).toBeLessThanOrEqual(23)
   })
   test('volatile does not exclude an untracked file, whatever the prefix', guard({ stopVolatile: 'dist/' }), async ($, on) => {
     const { w, h } = await roTask($, on)
@@ -571,7 +572,7 @@ describe('change detection: UNCHANGED, CHANGED, UNKNOWN', () => {
     await finishAll($)
     const before = gitRuns(w)
     await stop($)
-    expect(gitRuns(w) - before).toBeLessThanOrEqual(25)                               // v0.6.6: +5 for the repository-state check and its repeat
+    expect(gitRuns(w) - before).toBeLessThanOrEqual(23)                               // v0.6.6: +5 for the repository-state check and its repeat, -2 for the filter check
     expect(scriptRuns(w)).toBe(0)
     expect(taskOf(h).status).toBe('done')
   })
@@ -580,7 +581,7 @@ describe('change detection: UNCHANGED, CHANGED, UNKNOWN', () => {
     await finishAll($)
     const before = gitRuns(w)
     await stop($)
-    expect(gitRuns(w) - before).toBeLessThanOrEqual(25)                               // v0.6.6: +5 for the repository-state check and its repeat
+    expect(gitRuns(w) - before).toBeLessThanOrEqual(23)                               // v0.6.6: +5 for the repository-state check and its repeat, -2 for the filter check
     expect(scriptRuns(w)).toBe(0)
     expect(taskOf(h).status).toBe('done')
   })
@@ -599,7 +600,7 @@ describe('change detection: UNCHANGED, CHANGED, UNKNOWN', () => {
     await finishAll($)
     const before = gitRuns(w)
     await stop($)
-    expect(gitRuns(w) - before).toBeLessThanOrEqual(37) // includes authoritative commit-tree enumeration; v0.6.6: +5 for the repository-state check and its repeat
+    expect(gitRuns(w) - before).toBeLessThanOrEqual(35) // includes authoritative commit-tree enumeration; v0.6.6: +5 for the repository-state check and its repeat, -2 for the filter check
     expect(scriptRuns(w)).toBe(0)
     expect(taskOf(h).status).toBe('done')
   })

@@ -83,12 +83,6 @@
     {
       "function": "gitFiltersReliable",
       "program": "git",
-      "sub": "config",
-      "count": 1
-    },
-    {
-      "function": "gitFiltersReliable",
-      "program": "git",
       "sub": "ls-files",
       "count": 1
     },
@@ -114,6 +108,12 @@
       "function": "gitVersionFact",
       "program": "git",
       "sub": "--version",
+      "count": 1
+    },
+    {
+      "function": "helperGitPlace",
+      "program": "git",
+      "sub": "rev-parse",
       "count": 1
     },
     {
@@ -263,6 +263,12 @@
       "count": 1
     },
     {
+      "function": "inspectPaths",
+      "closure": "runStat",
+      "sub": "(computed arguments)",
+      "count": 3
+    },
+    {
       "function": "measureCommit",
       "closure": "git",
       "sub": "config --bool",
@@ -309,6 +315,12 @@
       "closure": "sh",
       "sub": "(after -C)",
       "count": 1
+    },
+    {
+      "function": "measureTree",
+      "closure": "walk",
+      "sub": "(computed arguments)",
+      "count": 2
     },
     {
       "function": "repoState",
