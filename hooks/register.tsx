@@ -573,8 +573,14 @@ const repoMoved = async ($: EngineInterface, top: string, packDir: string, pass:
  * command value wins; dormant filters (for example globally installed LFS) do not make ordinary trees unknown.
  * v0.6.6: the drivers come from the repository-state check's one complete configuration read (the pass), never from an
  * exit status that a signal could have produced. */
-const gitFiltersReliable = async ($: EngineInterface, top: string, pass: RepoPass, committed: string[] = []): Promise<boolean> => {
-  const drivers = pass.filters
+const gitFiltersReliable = async ($: EngineInterface, top: string, pass: RepoPass, committed: string[] = [], reread = false): Promise<boolean> => {
+  // `reread`: the check right before status or diff reads the configuration again (as complete as the first read), so a driver
+  // configured since the repository-state check is seen before the command that would run it, not only by repoMoved afterwards
+  let drivers = pass.filters
+  if (reread) {
+    const config = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'config', '--null', '--list'], { timeoutMs: GIT_TIMEOUT_MS })
+    drivers = gitAnswered(config) && partialCloneOf(config.stdout) === false ? filterCommands(filterRecordsOf(config.stdout)) : null
+  }
   if (drivers === null) return false
   if (drivers.size === 0) return true
   const tree = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'ls-tree', '-r', '-z', '--full-tree', 'HEAD'], { timeoutMs: GIT_TIMEOUT_MS, auth: pass })
@@ -729,7 +735,7 @@ const candidateOf = async ($: EngineInterface): Promise<Candidate> => {
     const sha = head.stdout.trim()
     if (!isCandidate(sha)) return { sha: null, why: 'unknown' }
     const measured = await measureCommit($, top, sha, pass)
-    if ('why' in measured || !(await gitFiltersReliable($, top, pass, measured.entries.map(e => e.path)))) return { sha: null, why: 'unknown' }
+    if ('why' in measured || !(await gitFiltersReliable($, top, pass, measured.entries.map(e => e.path), true))) return { sha: null, why: 'unknown' }
     const matches = await matchesCommit($, top, measured.entries, pass)
     if (matches === null) return { sha: null, why: 'unknown' }
     if (!matches) return { sha: null, why: 'dirty' }
@@ -1026,9 +1032,13 @@ const helperGitPlace = async ($: EngineInterface): Promise<HelperPlace | { deny:
     if (variable !== null) return { deny: `SWARM / read-only Git inspection is refused here: the environment sets ${variable}, which changes where Git looks, what it reads or what it runs, and a helper's command would inherit it. Use the host Read/Grep tools instead` }
     const place = await verifiedGitPlace($)
     if (place === null || 'why' in await gitInputs($, place.root)) return { deny: GIT_IDENTITY_DENY }
-    // HEAD's tree is checked when HEAD is a commit; before the first commit there is no tree to hold a gitlink (the index still is)
-    const head = await bounded($, ['git', ...GIT_SAFE, '-C', place.root, 'rev-parse', '--verify', 'HEAD'], { timeoutMs: GIT_TIMEOUT_MS })
-    const state = await repoState($, place.root, gitAnswered(head) ? ['HEAD'] : [])
+    // HEAD's tree is checked when HEAD is a commit. Before the first commit there is no tree to hold a gitlink (the index still is
+    // checked); that is read only from Git's own words for it (C locale), never from any failure: a timeout, a signal or a limit is
+    // no answer, and refuses
+    const head = await bounded($, ['git', ...GIT_SAFE, '-C', place.root, 'rev-parse', '--verify', 'HEAD'], { timeoutMs: GIT_TIMEOUT_MS, env: { LC_ALL: 'C' } })
+    const unborn = head.exitCode === 128 && head.stdout === '' && !head.isStdoutTruncated && !head.isStderrTruncated && /^fatal: Needed a single revision\n?$/.test(head.stderr)
+    if (!gitAnswered(head) && !unborn) return { deny: GIT_IDENTITY_DENY }
+    const state = await repoState($, place.root, unborn ? [] : ['HEAD'])
     if (!('pass' in state)) return { deny: `SWARM / read-only Git inspection is refused in this repository (${REPO_REFUSAL_SHORT[state.refused]}): Git could enter a submodule or fetch a missing object and run what the repository names. Use the host Read/Grep tools instead` }
     if (!(await gitFiltersReliable($, place.root, state.pass))) return { deny: GIT_IDENTITY_DENY }
 
@@ -2667,7 +2677,7 @@ const measureTree = async ($: EngineInterface, base?: string): Promise<TreeReadi
     }
     const tracked = await measureCommit($, top, head, checked.pass, budget)
     if ('why' in tracked) return unknown(tracked.why, tracked.why === TRACKED_RACE)
-    if (!(await gitFiltersReliable($, top, checked.pass, tracked.entries.map(e => e.path)))) return unknown('active commit-path filters make the working tree unreliable')
+    if (!(await gitFiltersReliable($, top, checked.pass, tracked.entries.map(e => e.path), true))) return unknown('active commit-path filters make the working tree unreliable')
     if (await overdue()) return unknown(late)
     // -O/dev/null: a configured diff.orderFile is read whole (measured: one pointed at a device exhausted memory); no order is needed here.
     // --ignore-submodules=all hides no change here only because a repository with any gitlink was refused above (repoState, and

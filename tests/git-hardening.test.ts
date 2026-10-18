@@ -379,6 +379,13 @@ describe('a refused repository: a helper\'s Git inspection is refused, and nothi
     expect((await git($, a, 'git status')).deny).toContain(`refused in this repository (${SHORT.submodule})`)
     expect(sent(w)).toHaveLength(1)
   })
+  test('a HEAD that fails in any other way is no repository without a commit: refused, and nothing is sent', options, async ($, on) => {
+    const w = world(on, { headUnreadable: true }); const a = await reviewer($, ['*'])
+    const from = w.runs.length
+    expect((await git($, a, 'git status')).deny).toContain('cannot establish safe repository identity')
+    expect(sent(w)).toEqual([])
+    expect(w.runs.slice(from).filter(r => r[0] === 'git' && r.includes('ls-files') && r.includes('--stage'))).toEqual([])   // refused before the check
+  })
   test('control: variables the host sets that do not move Git (GIT_EDITOR, GIT_PAGER) refuse nothing', options, async ($, on) => {
     const w = world(on, { env: { GIT_EDITOR: 'true', GIT_PAGER: 'cat' } }); const a = await reviewer($, ['*'])
     expect((await git($, a, 'git status')).deny).toBeUndefined()
@@ -417,6 +424,21 @@ describe('a state that appears while the tree is measured', () => {
       expect(last?.summary).toContain(REPO_REFUSAL_WORDS.moved)
     })
   }
+})
+
+describe('a filter driver configured after the check is seen before the command that would run it', () => {
+  test('the fingerprint reads the configuration again before its diff: UNKNOWN, and no diff runs', guard(), async ($, on) => {
+    const { w, h } = fixture(on)
+    w.headBlobs['src/a.ts'] = blobOf('a'); w.watched['src/a.ts'] = 'a'
+    await start($); await enroll($); await prompt($, 'tidy it')
+    w.tree['src/a.ts'] = 'b'
+    let from = -1
+    w.duringRun = argv => { if (from < 0 && argv[0] === 'git' && argv.includes('hash-object')) { from = w.runs.length; w.gitFilterConfig = 'filter.hide.clean\nprintf x\0' } }
+    await stop($)
+    expect(from).toBeGreaterThan(0)
+    expect(kept(h).at(-1)?.summary).toContain('active commit-path filters make the working tree unreliable')
+    expect(subcommands(w, from)).not.toContain('diff')
+  })
 })
 
 describe('doctor names the Git it measures with', () => {

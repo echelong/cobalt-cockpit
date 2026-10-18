@@ -83,6 +83,12 @@
     {
       "function": "gitFiltersReliable",
       "program": "git",
+      "sub": "config",
+      "count": 1
+    },
+    {
+      "function": "gitFiltersReliable",
+      "program": "git",
       "sub": "ls-files",
       "count": 1
     },
