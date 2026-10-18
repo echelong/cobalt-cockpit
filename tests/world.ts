@@ -165,8 +165,8 @@ export type World = {
   gitlinkRevisions: string[]
   /** v0.6.6: a repository with no commit yet: `rev-parse --verify HEAD` and any HEAD tree listing fail as real Git does. */
   headUnborn: boolean
-  /** v0.6.6: `rev-parse --verify HEAD` fails in some other way (a damaged HEAD): not Git's words for a repository with no commit. */
-  headUnreadable: boolean
+  /** v0.6.6: what `rev-parse --verify HEAD` answers instead (a damaged HEAD, a kill, a timeout, a cut or noisy answer): never Git's own words for a repository with no commit alone. */
+  headUnreadable: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } | null
   /** The content of .git/info/exclude. */
   excludes: string
   /** The working tree as git sees it against HEAD: path to content. Changing it is a change the fingerprint must notice. */
@@ -332,7 +332,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
     configListFails: false,
     gitlinkRevisions: [],
     headUnborn: false,
-    headUnreadable: false,
+    headUnreadable: null,
     excludes: '',
     tree: {},
     head: 'a'.repeat(40),
@@ -656,7 +656,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
       if (git[0] === 'config') return git.includes('--get-regexp') && w.gitFilterConfig !== '' ? ran(0, w.gitFilterConfig) : w.gitConfig[git.at(-1)!] !== undefined ? ran(0, w.gitConfig[git.at(-1)!] + '\n') : ran(1)
       if (git[0] === 'check-attr') return ran(0, w.gitFilterAttributes)
       if (git[0] === 'rev-parse' && git.includes('--show-prefix')) return ran(0, w.gitPrefix + '\n')
-      if (w.headUnreadable && git[0] === 'rev-parse' && git.includes('--verify') && git.at(-1) === 'HEAD') return { value: { exitCode: 128, stdout: '', stderr: 'fatal: bad object HEAD\n', isStdoutTruncated: false, isStderrTruncated: false } }
+      if (w.headUnreadable !== null && git[0] === 'rev-parse' && git.includes('--verify') && git.at(-1) === 'HEAD') return { value: { ...w.headUnreadable } }
       if (w.headUnborn && ((git[0] === 'rev-parse' && git.includes('--verify') && git.at(-1)?.startsWith('HEAD')) || (git[0] === 'ls-tree' && git.at(-1) === 'HEAD'))) return { value: { exitCode: 128, stdout: '', stderr: git[0] === 'rev-parse' ? 'fatal: Needed a single revision\n' : 'fatal: Not a valid object name HEAD\n', isStdoutTruncated: false, isStderrTruncated: false } }
       if (git[0] === 'rev-parse' && git.includes('--verify') && w.nonCommits.some(name => git.at(-1) === `${name}^{commit}`)) return ran(1)
       if (git[0] === 'rev-parse' && git.includes('--verify') && w.gitlinkRevisions.some(name => git.at(-1) === `${name}^{commit}`)) return ran(0, `${GITLINK_COMMIT}\n`)

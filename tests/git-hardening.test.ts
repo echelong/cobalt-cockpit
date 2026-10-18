@@ -227,11 +227,12 @@ describe('a refused repository: a task begun in it has no baseline, and its goal
 
 const LED = { options: { orchestration: true, profile: 'SONNET_LED' } }
 const PACKET = { action: 'consult', ground: 'release', objective: 'Release v0.6.6', architecture: 'Plugin hooks', locations: ['hooks/register.tsx'], risk: 'Candidate mismatch', question: 'Approve the release?' }
-const admit = async ($: Engine) => {
+const admit = async ($: Engine, beforeConsult?: () => void) => {
   await start($); await prompt($, 'Have Opus review the release candidate')
   await progress($, { action: 'plan', milestones: FIVE })
   for (const milestone of ['m1', 'm2', 'm3', 'm4']) await progress($, { action: 'complete', milestone })
   for (const gate of GATE_NAMES) await progress($, { action: 'gate', gate, state: 'na', evidence: 'fixture' })
+  beforeConsult?.()
   return String((await $.tool.call({ tool: 'mcp__cobalt-cockpit__swarm', ...PACKET } as never)).result)
 }
 
@@ -373,19 +374,39 @@ describe('a refused repository: a helper\'s Git inspection is refused, and nothi
   }
   test('a repository with no commit yet: inspection is allowed (there is no HEAD tree to hold a gitlink), and the index is still checked', options, async ($, on) => {
     const w = world(on, { headUnborn: true }); const a = await reviewer($, ['*'])
+    const from = w.runs.length
     expect((await git($, a, 'git status')).deny).toBeUndefined()
     expect(sent(w)).toHaveLength(1)
+    // Git's words are read in the C locale: elsewhere they could be translated, and would not be recognised (a refusal, never a pass)
+    const heads = w.runs.map((r, i) => ({ r, env: w.runEnvs[i] })).slice(from).filter(x => x.r[0] === 'git' && x.r.includes('--verify') && x.r.at(-1) === 'HEAD')
+    expect(heads.length).toBeGreaterThan(0)
+    for (const x of heads) expect(x.env?.['LC_ALL']).toBe('C')
     w.indexGitlinks = ['vendor/lib']
     expect((await git($, a, 'git status')).deny).toContain(`refused in this repository (${SHORT.submodule})`)
     expect(sent(w)).toHaveLength(1)
   })
-  test('a HEAD that fails in any other way is no repository without a commit: refused, and nothing is sent', options, async ($, on) => {
-    const w = world(on, { headUnreadable: true }); const a = await reviewer($, ['*'])
-    const from = w.runs.length
-    expect((await git($, a, 'git status')).deny).toContain('cannot establish safe repository identity')
-    expect(sent(w)).toEqual([])
-    expect(w.runs.slice(from).filter(r => r[0] === 'git' && r.includes('ls-files') && r.includes('--stage'))).toEqual([])   // refused before the check
-  })
+  const WORDS = 'fatal: Needed a single revision\n'
+  const answer = (exitCode: number, stdout: string, stderr: string, cut: { out?: boolean; err?: boolean } = {}) => ({ exitCode, stdout, stderr, isStdoutTruncated: cut.out === true, isStderrTruncated: cut.err === true })
+  for (const [name, head] of [
+    ['a damaged HEAD (exit 128, other words)', answer(128, '', 'fatal: bad object HEAD\n')],
+    ['a kill by a resource limit (exit 137, nothing printed)', answer(137, '', '')],
+    ['a timeout (exit 124)', answer(124, '', '')],
+    ['a signal (the host reads it as exit 1, nothing printed)', answer(1, '', '')],
+    ["Git's words with another exit status", answer(1, '', WORDS)],
+    ["Git's words after a warning", answer(128, '', `warning: ignoring broken ref refs/heads/x\n${WORDS}`)],
+    ["Git's words with output", answer(128, 'x\n', WORDS)],
+    ["Git's words, its error output cut short", answer(128, '', WORDS, { err: true })],
+    ["Git's words, its output cut short", answer(128, '', WORDS, { out: true })],
+    ['a commit named with a warning', answer(0, `${'a'.repeat(40)}\n`, 'warning: refname is ambiguous\n')],
+  ] as const) {
+    test(`a HEAD that is not Git's own answer for a repository with no commit (${name}): refused, and nothing is sent`, options, async ($, on) => {
+      const w = world(on, { headUnreadable: head }); const a = await reviewer($, ['*'])
+      const from = w.runs.length
+      expect((await git($, a, 'git status')).deny).toContain('cannot establish safe repository identity')
+      expect(sent(w)).toEqual([])
+      expect(w.runs.slice(from).filter(r => r[0] === 'git' && r.includes('ls-files') && r.includes('--stage'))).toEqual([])   // refused before the check
+    })
+  }
   test('control: variables the host sets that do not move Git (GIT_EDITOR, GIT_PAGER) refuse nothing', options, async ($, on) => {
     const w = world(on, { env: { GIT_EDITOR: 'true', GIT_PAGER: 'cat' } }); const a = await reviewer($, ['*'])
     expect((await git($, a, 'git status')).deny).toBeUndefined()
@@ -426,18 +447,46 @@ describe('a state that appears while the tree is measured', () => {
   }
 })
 
-describe('a filter driver configured after the check is seen before the command that would run it', () => {
-  test('the fingerprint reads the configuration again before its diff: UNKNOWN, and no diff runs', guard(), async ($, on) => {
-    const { w, h } = fixture(on)
+describe('a state configured after the check is seen before the command that would run it', () => {
+  // Each appears at the first unfiltered hash, after the repository-state check and its filter check: only the configuration read
+  // again right before status or diff sees it then (repoMoved would see it only after the command ran)
+  const LATE = [
+    ['a filter driver', (w: World) => { w.gitFilterConfig = 'filter.hide.clean\nprintf x\0' }],
+    ['a promisor remote', (w: World) => { w.gitConfig['remote.origin.promisor'] = 'true' }],
+    ['a configuration listing that now exits 1', (w: World) => { w.configListFails = true }],
+  ] as const
+  const at = (w: World, appear: (w: World) => void) => {
+    const seen = { from: -1 }
+    w.duringRun = argv => { if (seen.from < 0 && argv[0] === 'git' && argv.includes('hash-object') && argv.includes('--no-filters')) { seen.from = w.runs.length; appear(w) } }
+    return seen
+  }
+  for (const [name, appear] of LATE) {
+    test(`${name}: the fingerprint reads the configuration again before its diff: UNKNOWN, and no diff runs`, guard(), async ($, on) => {
+      const { w, h } = fixture(on)
+      w.headBlobs['src/a.ts'] = blobOf('a'); w.watched['src/a.ts'] = 'a'
+      await start($); await enroll($); await prompt($, 'tidy it')
+      w.tree['src/a.ts'] = 'b'
+      const seen = at(w, appear)
+      await stop($)
+      expect(seen.from).toBeGreaterThan(0)
+      expect(kept(h).at(-1)?.summary).toContain('active commit-path filters make the working tree unreliable')
+      expect(subcommands(w, seen.from)).not.toContain('diff')
+    })
+    test(`${name}: the release check reads the configuration again before its status: no candidate, and neither status nor a filtering hash runs`, LED, async ($, on) => {
+      const w = world(on); hostState(on, {})
+      w.headBlobs['src/a.ts'] = blobOf('a'); w.watched['src/a.ts'] = 'a'
+      let seen = { from: -1 }
+      const result = await admit($, () => { seen = at(w, appear) })                   // armed only once the task's own baseline is taken
+      expect(seen.from).toBeGreaterThan(0)
+      expect(result).toContain('CANDIDATE UNKNOWN')
+      expect(subcommands(w, seen.from)).not.toContain('status')
+      expect(w.runs.slice(seen.from).filter(r => r[0] === 'git' && r.includes('hash-object') && !r.includes('--no-filters'))).toEqual([])
+    })
+  }
+  test('control: with nothing appearing, the same repository is a candidate', LED, async ($, on) => {
+    const w = world(on); hostState(on, {})
     w.headBlobs['src/a.ts'] = blobOf('a'); w.watched['src/a.ts'] = 'a'
-    await start($); await enroll($); await prompt($, 'tidy it')
-    w.tree['src/a.ts'] = 'b'
-    let from = -1
-    w.duringRun = argv => { if (from < 0 && argv[0] === 'git' && argv.includes('hash-object')) { from = w.runs.length; w.gitFilterConfig = 'filter.hide.clean\nprintf x\0' } }
-    await stop($)
-    expect(from).toBeGreaterThan(0)
-    expect(kept(h).at(-1)?.summary).toContain('active commit-path filters make the working tree unreliable')
-    expect(subcommands(w, from)).not.toContain('diff')
+    expect(await admit($)).toContain('OPUS ADMITTED')
   })
 })
 
