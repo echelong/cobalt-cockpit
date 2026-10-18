@@ -94,7 +94,8 @@ describe('every measurement process is bounded', () => {
     const reading = new Set(['rev-parse', 'config', 'ls-tree', 'ls-files', 'check-attr', 'diff', 'hash-object', 'status'])
     expect(gitSubcommands(w).filter(s => !reading.has(s!))).toEqual([])
     expect(w.runs.some(r => r[0] === 'git' && r.includes('hash-object') && r.includes('-w'))).toBe(false)
-    expect(w.runs.filter(r => r[0] === 'git' && r.includes('config')).every(r => r.some(a => a === '--get' || a === '--get-regexp'))).toBe(true)
+    // v0.6.6: `--list` is the repository-state check's read of every configuration scope; still a read
+    expect(w.runs.filter(r => r[0] === 'git' && r.includes('config')).every(r => r.some(a => a === '--get' || a === '--get-regexp' || a === '--list'))).toBe(true)
     expect(w.runs.filter(r => !MEASURING.includes(r[0]!) && r[0] !== SCRIPT)).toEqual([])
   })
   test('partial: where the memory cap is accepted but not enforced, it is still set, and doctor says it is not enforced', guard(), async ($, on) => {
@@ -259,7 +260,9 @@ describe('vector 2: configuration redirecting an input to an unbounded device', 
 describe('vector 3: FIFOs and other non-regular Git metadata', () => {
   // Real Git blocks on a FIFO .gitignore, .gitattributes, HEAD, index or config until it is killed (reproduced); the host's
   // timeout kills it. Here the timeout is what the plugin sees, and it must read as UNKNOWN.
-  for (const [what, sub] of [['a FIFO .gitignore', 'ls-files'], ['a FIFO HEAD', 'rev-parse'], ['a FIFO .gitattributes', 'check-attr'], ['a FIFO index', 'diff']] as const) {
+  // A FIFO .gitignore blocks the listings that read it, the untracked ones (`ls-files -o`); since v0.6.6 the index's stage listing
+  // runs first, and reads no .gitignore.
+  for (const [what, sub] of [['a FIFO .gitignore', 'ls-files -o'], ['a FIFO HEAD', 'rev-parse'], ['a FIFO .gitattributes', 'check-attr'], ['a FIFO index', 'diff']] as const) {
     test(`${what} blocks git ${sub} until the host's timeout: UNKNOWN, never clean`, guard(), async ($, on) => {
       const { w, h } = fixture(on)
       await begun($); w.gitHangs = sub

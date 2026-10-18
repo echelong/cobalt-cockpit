@@ -29,6 +29,7 @@ The root [README](../README.md) is the front page. These files hold the detail.
 
 | Version | Page |
 | --- | --- |
+| 0.6.6 (Stage A, unreleased) | [Git hardening: submodules, partial clones and the runner's admission](implementation-v0.6.6.md) |
 | 0.6.5 | [v0.6.4 maintenance: CI and the Plugin Directory](implementation-v0.6.4.md#after-publication) |
 | 0.6.4 | [Fingerprint resource hardening (security)](implementation-v0.6.4.md) |
 | 0.6.3 | [Cobalt Guard Calibration](implementation-v0.6.3.md) |

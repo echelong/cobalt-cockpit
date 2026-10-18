@@ -15,8 +15,12 @@
 // Neither rule runs the text the agent typed. `rebuildGit` writes the command again from the parsed words, every one in
 // single quotes, behind `git --no-pager` and the safe flags, so a quoted argument stays data whatever it contains.
 // Nothing here calls a process, reads a file or holds state; the caller canonicalizes paths and applies ownership.
+//
+// v0.6.6: neither rule lets a command examine a submodule (no submodule option is accepted; the rebuilt command ignores them
+// and carries settings that keep any transport from running), and every rebuilt command, wildcard ones too, runs in the
+// directory the caller verified, whatever directory the helper's own shell is in.
 
-import { GIT_OVERRIDES, GIT_SAFE } from './git-integrity'
+import { GIT_OVERRIDES, GIT_SAFE, HELPER_PINS } from './git-integrity'
 import { parseShell, unwrap } from './shell'
 import type { Simple } from './shell'
 
@@ -70,7 +74,8 @@ const isLexicallyPlain = (command: string, quotedLiterals: boolean): boolean => 
 }
 
 // Long options that write a file, run a program, read outside the repository or print through a custom format.
-const REFUSED_LONG: readonly string[] = ['--output', '--open-files-in-pager', '--ext-diff', '--textconv', '--no-index', '--exec', '--help', '--show-signature', '--pretty', '--format']
+// v0.6.6: and any that examines or recurses into a submodule, which could run what the submodule's own configuration names.
+const REFUSED_LONG: readonly string[] = ['--output', '--open-files-in-pager', '--ext-diff', '--textconv', '--no-index', '--exec', '--help', '--show-signature', '--pretty', '--format', '--ignore-submodules', '--submodule', '--recurse-submodules']
 /**
  * An option the wildcard rule refuses: it writes a file, runs a program or prints through a custom format.
  *
@@ -299,22 +304,26 @@ export const scopedGit = (command: string): ScopedVerdict => {
 
 const quote = (word: string): string => `'${word.replace(/'/g, "'\\''")}'`
 const NO_DRIVERS: readonly string[] = ['diff', 'show', 'log']
+/** v0.6.6: subcommands that would otherwise compare a submodule. No helper word can ask for one (REFUSED_LONG), so this one stands. */
+const NO_SUBMODULES: readonly string[] = ['diff', 'show', 'log', 'status']
 const hardened = (sub: string, before: readonly string[], rest: readonly string[]): string =>
-  ['git', '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...before, sub, ...(NO_DRIVERS.includes(sub) ? ['--no-ext-diff', '--no-textconv'] : []), ...rest].map(quote).join(' ')
+  ['git', '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...HELPER_PINS, ...before, sub, ...(NO_DRIVERS.includes(sub) ? ['--no-ext-diff', '--no-textconv'] : []), ...(NO_SUBMODULES.includes(sub) ? ['--ignore-submodules=all'] : []), ...rest].map(quote).join(' ')
 
 /** Where a scoped command runs and what it may read: the verified session directory and the canonical, owned paths. */
 export type ScopedPin = { git: ScopedGit; dir: string; paths: readonly string[] }
 
 /**
  * The command that runs in place of an accepted inspection: every word single-quoted, behind `--no-pager` and the safe
- * flags, external diff and textconv switched off, repository hooks and a configured diff order file overridden (v0.6.4). A scoped command is also pinned to the verified directory with `-C`
- * and given its paths as the canonical absolute ones that were checked, after an explicit `--`.
+ * flags, external diff and textconv switched off, repository hooks and a configured diff order file overridden (v0.6.4),
+ * submodules ignored and no transport allowed (v0.6.6). Every command is pinned with `-C` to `dir`, the directory the caller
+ * verified (v0.6.6; before, only a scoped one was): a passing check of one directory says nothing about another. A scoped
+ * command is given its paths as the canonical absolute ones that were checked, after an explicit `--`.
  */
-export const rebuildGit = (command: string, pin?: ScopedPin): string => {
+export const rebuildGit = (command: string, dir: string, pin?: ScopedPin): string => {
   if (pin !== undefined) return hardened(pin.git.sub, ['-C', pin.dir], [...pin.git.words, '--', ...pin.paths])
 
   return parseShell(command).pipelines.map(p => {
-    const pipeline = p.commands.map(c => hardened(c.argv[1] as string, [], c.argv.slice(2))).join(' | ')
+    const pipeline = p.commands.map(c => hardened(c.argv[1] as string, ['-C', dir], c.argv.slice(2))).join(' | ')
 
     return pipeline + (p.next === null ? '' : ` ${p.next} `)
   }).join('')

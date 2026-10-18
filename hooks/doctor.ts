@@ -32,6 +32,8 @@ export type DoctorFacts = {
   stop: StopFacts
   /** v0.6.4: the limits working-tree measurement processes run under, as probed on this host. */
   measurement?: { enforced: boolean; text: string }
+  /** v0.6.6: the Git measurement runs, and whether it documents its own switch for lazy fetching (2.45.0 and later); null when it could not be read. */
+  gitVersion?: { version: string; lazyFetchSwitch: boolean } | null
   guard: { enabled: boolean; /** v0.5.9: incidents are recorded without being notified. */ recordOnly?: boolean; label: string; used: number; max: number; cooldownSec: number; repeat: boolean; sound: boolean; /** The transport diagnostics, already worded. */ transport: string[]; /** Priorities, notified kinds, quiet hours and active conditions, already worded. */ policy?: string[] }
 }
 
@@ -50,6 +52,14 @@ export type StopFacts = {
 
 type Level = 'OK' | 'WARN' | 'INFO'
 const line = (level: Level, text: string): string => `  ${level.padEnd(4)} ${text}`
+/** v0.6.6: what keeps measurement from fetching, for the Git found here. Informational: nothing depends on the version. */
+export const gitVersionText = (git: { version: string; lazyFetchSwitch: boolean } | null): string => {
+  const common = 'repositories with a submodule or a partial clone are not measured'
+  if (git === null) return `Git version UNKNOWN; measurement never fetches (a protocol allow-list no transport matches), and ${common}`
+  if (git.lazyFetchSwitch) return `Git ${git.version}: measurement never fetches (Git's own switch and a protocol allow-list no transport matches), and ${common}`
+
+  return `Git ${git.version} is older than 2.45, whose own switch against lazy fetching it may lack; measurement never fetches (a protocol allow-list no transport matches), and ${common}`
+}
 
 /** A path for a diagnostic: relative to the session's own home where it is inside it, and otherwise whole but for a personal directory's name. */
 export const shown = (path: string, home: string | null): string => (home !== null && home !== '' && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : withoutHomeName(path))
@@ -86,6 +96,7 @@ export const doctorText = (f: DoctorFacts): string => {
   out.push(line(f.hostSupported === false ? 'WARN' : 'INFO', `Claude Code ${f.host ?? 'version UNKNOWN'}${f.hostSupported === false ? ' is older than this build supports; Cockpit stands by' : ''}`))
   out.push(line('INFO', `permission mode ${f.permissionMode ?? 'UNKNOWN (not yet seen on a tool call)'} · Cockpit never changes it`))
   if (f.measurement !== undefined) out.push(line(f.measurement.enforced ? 'OK' : 'WARN', f.measurement.text))
+  if (f.gitVersion !== undefined) out.push(line('INFO', gitVersionText(f.gitVersion)))
   out.push(line('INFO', 'Auto mode: the host classifier decides tool permissions. Cockpit adds no bypass; its own file and process calls are the plugin API\'s, and a refusal is recorded as unverified and not retried another way.'))
   out.push('', 'TELEMETRY')
   const t = f.telemetry

@@ -4,7 +4,7 @@
 // the session; nothing is estimated.
 
 import type { Activity, Gate, GateName, GitState, Meter, Task } from '../types'
-import { aheadBehindLabel, branchLabel, dirtyLabel, shaLabel } from './git'
+import { aheadBehindLabel, branchLabel, dirtyLabel, shaLabel, treeNeedsAttention } from './git'
 import { GATES, settle } from './model'
 import { GATE_GLYPH, GATE_TONE, MILESTONE_GLYPH, PALETTE, STAGE_LABEL, STAGE_SHORT, STATE_COLOR, STATE_LABEL, label as segLabel } from './theme'
 import type { VisualState } from './theme'
@@ -284,7 +284,7 @@ export const hudRows = (input: HudInput, columns: number, maxRows = 3): Row[] =>
 
   // Two rows: the repository line, then the work.
   if (columns < 60 || maxRows < 3) {
-    const dirty = git !== null && git.isRepo && git.dirty > 0 ? `±${git.dirty}` : ''
+    const dirty = git !== null && git.isRepo && git.refused !== undefined ? '±?' : git !== null && git.isRepo && git.dirty > 0 ? `±${git.dirty}` : ''
 
     return [
       fit(
@@ -328,7 +328,7 @@ export const hudRows = (input: HudInput, columns: number, maxRows = 3): Row[] =>
       [{ text: segLabel('REPO', project || 'COCKPIT'), isBold: true }],
       [{ text: branchLabel(git) }],
       isWide ? [{ text: shaLabel(task?.startSha ?? git?.startSha ?? null, git?.sha ?? null), isDim: true }] : [],
-      [{ text: dirty, ...(git !== null && git.dirty > 0 ? { color: COLORS.warn } : { isDim: true }) }],
+      [{ text: dirty, ...(treeNeedsAttention(git) ? { color: COLORS.warn } : { isDim: true }) }],
       [{ text: aheadBehindLabel(git) }],
     ]),
   ]
@@ -514,7 +514,7 @@ const repoSection = (input: HudInput, columns: number, color: string, repo: stri
       field('Branch', [{ text: branchLabel(git), isBold: true }, { text: `  ${git.project}`, isDim: true }]),
       field('HEAD', [{ text: shaLabel(task?.startSha ?? git.startSha, git.sha) }, { text: '  start → current', isDim: true }]),
       field('Tree', [
-        { text: dirtyLabel(git), ...(git.dirty > 0 ? { color: COLORS.warn } : {}) },
+        { text: dirtyLabel(git), ...(treeNeedsAttention(git) ? { color: COLORS.warn } : {}) },
         {
           text: aheadBehindLabel(git) === '' ? (git.ahead === null ? '  no upstream' : '  level with upstream') : `  ${aheadBehindLabel(git)}`,
           isDim: true,

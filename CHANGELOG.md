@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased (0.6.6, Stage A, not released) — Git hardening: submodules, partial clones and the runner's admission
+
+The reasons, the coverage, what it does and does not protect, compatibility, latency and what remains before a release: [docs/implementation-v0.6.6.md](docs/implementation-v0.6.6.md). The manifest version is unchanged.
+
+- **Security: a repository with a submodule or a partial clone is no longer measured.** A submodule's own configuration can make a superproject's `status` or `diff` run a program, and a lazy fetch in a partial clone runs the remote's transport program. Before any Git command reads a repository's index, work tree or objects, Cockpit now checks it (configuration in every scope, promisor packs, gitlinks in the index and in a commit compared without being measured) and refuses it with the reason; the check runs again after a measurement. A refusal is never a clean tree: the fingerprint and the release check are UNKNOWN, a goal check is recorded UNKNOWN, the HUD says `not measured (…)`, and under `stopGuard: ENFORCE` a Stop with no task asks for the check.
+- **Every measurement process carries `GIT_NO_LAZY_FETCH=1` and `GIT_ALLOW_PROTOCOL=cockpit-none`**, laid over the caller's environment last; `status` and `diff` ignore submodules.
+- **The measurement runner admits by form.** It starts only `git`, `stat`, `find`, `readlink` and `realpath`, only Git commands in the forms Cockpit writes, and a Git command that reads repository state only with the check's pass for that repository: an object the check creates and records, which nothing else can make.
+- **Helper Git inspection** is refused in such a repository (or in a revision a scoped command names that holds a gitlink) and where Cockpit's environment sets a Git variable that redirects Git; every rebuilt command, a `*` one too, runs in the verified session directory, ignores submodules and allows no transport, and submodule options are refused.
+- **Not yet:** the inherited Git environment of Cockpit's own measurement processes is unchanged; v0.6.6 is not released until that is closed and the real-Git acceptance has run.
+- Tests: `tests/git-hardening.test.ts` (99) is new; expectations in five test files changed on purpose (listed on the implementation page). `scripts/check-git-callers.mjs` and its census `scripts/git-callers.json` are new, and CI runs them.
+
 ## Unreleased (0.6.5) — v0.6.4 maintenance: CI and the Plugin Directory
 
 No runtime behaviour changes from 0.6.4. The version moved because `claude plugin update` compares versions: an installation of 0.6.4 (`b9c6d3e`) is told it is up to date and would never receive these commits. The detail: [docs/implementation-v0.6.4.md](docs/implementation-v0.6.4.md#after-publication).

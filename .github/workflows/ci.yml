@@ -73,6 +73,12 @@ jobs:
           set -euo pipefail
           bash scripts/check-capability-shape.sh
 
+      - name: Process and Git caller census (every site recorded; the runner admission's invariants)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/check-git-callers.mjs
+
       - name: TypeScript gate (not automated; separate mandatory release gate)
         shell: bash
         run: |

@@ -293,7 +293,8 @@ describe('L-1: a repository cannot talk the fingerprint out of seeing a change',
     await finishAll($)
     return { w, h }
   }
-  test('every git call ignores replace refs, fsmonitor, submodule ignore settings and the untracked cache', guard(), async ($, on) => {
+  // v0.6.6: submodules are ignored, never examined: a repository that records one is refused before any of these calls
+  test('every git call ignores replace refs, fsmonitor, submodules and the untracked cache', guard(), async ($, on) => {
     const { w } = await roTask($, on)
     await stop($)
     const calls = gitCalls(w)
@@ -302,9 +303,11 @@ describe('L-1: a repository cannot talk the fingerprint out of seeing a change',
       expect(call).toContain('--no-replace-objects')
       expect(call).toContain('core.fsmonitor=false')
       expect(call).toContain('core.untrackedCache=false')
-      expect(call).toContain('diff.ignoreSubmodules=none')
+      expect(call).toContain('diff.ignoreSubmodules=all')
+      expect(call).toContain('submodule.recurse=false')
+      expect(call).not.toContain('diff.ignoreSubmodules=none')
     }
-    for (const call of calls.filter((c: string[]) => c.includes('diff'))) expect(call).toContain('--ignore-submodules=none')
+    for (const call of calls.filter((c: string[]) => c.includes('diff'))) expect(call).toContain('--ignore-submodules=all')
   })
   test('a new file hidden by a self-ignoring .gitignore (or any exclude source) moves into the ignored list: CHANGED', guard(), async ($, on) => {
     const { w, h } = await roTask($, on)
@@ -377,8 +380,9 @@ describe('ignored files: relevance, volatility and coverage', () => {
     expect(scriptRuns(w)).toBe(0)
     expect(taskOf(h).status).toBe('done')
     expect(w.statCalls).toBeLessThanOrEqual(2)                                        // 30000 volatile entries were never stat'ed
-    // Root identity and effective-filter preflight add bounded reads independent of cache size.
-    expect(gitRuns(w) - before).toBeLessThanOrEqual(20)
+    // Root identity and effective-filter preflight add bounded reads independent of cache size; v0.6.6 adds the repository-state
+    // check before the measurement and again after it (configuration and the index's stage entries each time, and where the packs are)
+    expect(gitRuns(w) - before).toBeLessThanOrEqual(25)
   })
   test('volatile does not exclude an untracked file, whatever the prefix', guard({ stopVolatile: 'dist/' }), async ($, on) => {
     const { w, h } = await roTask($, on)
@@ -567,7 +571,7 @@ describe('change detection: UNCHANGED, CHANGED, UNKNOWN', () => {
     await finishAll($)
     const before = gitRuns(w)
     await stop($)
-    expect(gitRuns(w) - before).toBeLessThanOrEqual(20)
+    expect(gitRuns(w) - before).toBeLessThanOrEqual(25)                               // v0.6.6: +5 for the repository-state check and its repeat
     expect(scriptRuns(w)).toBe(0)
     expect(taskOf(h).status).toBe('done')
   })
@@ -576,7 +580,7 @@ describe('change detection: UNCHANGED, CHANGED, UNKNOWN', () => {
     await finishAll($)
     const before = gitRuns(w)
     await stop($)
-    expect(gitRuns(w) - before).toBeLessThanOrEqual(20)
+    expect(gitRuns(w) - before).toBeLessThanOrEqual(25)                               // v0.6.6: +5 for the repository-state check and its repeat
     expect(scriptRuns(w)).toBe(0)
     expect(taskOf(h).status).toBe('done')
   })
@@ -595,7 +599,7 @@ describe('change detection: UNCHANGED, CHANGED, UNKNOWN', () => {
     await finishAll($)
     const before = gitRuns(w)
     await stop($)
-    expect(gitRuns(w) - before).toBeLessThanOrEqual(32) // includes authoritative commit-tree enumeration
+    expect(gitRuns(w) - before).toBeLessThanOrEqual(37) // includes authoritative commit-tree enumeration; v0.6.6: +5 for the repository-state check and its repeat
     expect(scriptRuns(w)).toBe(0)
     expect(taskOf(h).status).toBe('done')
   })

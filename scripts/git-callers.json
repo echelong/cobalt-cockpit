@@ -1,0 +1,338 @@
+{
+  "processSites": [
+    {
+      "file": "hooks/register.tsx",
+      "function": "askRouter",
+      "program": "routerArgv",
+      "count": 1
+    },
+    {
+      "file": "hooks/register.tsx",
+      "function": "attempt",
+      "program": "candidate.argv",
+      "count": 1
+    },
+    {
+      "file": "hooks/register.tsx",
+      "function": "bounded",
+      "program": "sh",
+      "count": 1
+    },
+    {
+      "file": "hooks/register.tsx",
+      "function": "canonicalIn",
+      "program": "realpath",
+      "count": 1
+    },
+    {
+      "file": "hooks/register.tsx",
+      "function": "modeIs",
+      "program": "stat",
+      "count": 1
+    },
+    {
+      "file": "hooks/register.tsx",
+      "function": "pollLedger",
+      "program": "tail",
+      "count": 1
+    },
+    {
+      "file": "hooks/register.tsx",
+      "function": "probeBound",
+      "program": "sh",
+      "count": 1
+    },
+    {
+      "file": "hooks/register.tsx",
+      "function": "pruneTelemetry",
+      "program": "rm",
+      "count": 1
+    },
+    {
+      "file": "hooks/register.tsx",
+      "function": "restrictTelemetry",
+      "program": "mkdir",
+      "count": 1
+    },
+    {
+      "file": "hooks/register.tsx",
+      "function": "runStopCheck",
+      "program": "script",
+      "count": 1
+    },
+    {
+      "file": "hooks/register.tsx",
+      "function": "tele",
+      "program": "chmod",
+      "count": 1
+    }
+  ],
+  "bounded": [
+    {
+      "function": "candidateOf",
+      "program": "git",
+      "sub": "-C",
+      "count": 1
+    },
+    {
+      "function": "gitFiltersReliable",
+      "program": "git",
+      "sub": "check-attr",
+      "count": 1
+    },
+    {
+      "function": "gitFiltersReliable",
+      "program": "git",
+      "sub": "config",
+      "count": 1
+    },
+    {
+      "function": "gitFiltersReliable",
+      "program": "git",
+      "sub": "ls-files",
+      "count": 1
+    },
+    {
+      "function": "gitFiltersReliable",
+      "program": "git",
+      "sub": "ls-tree",
+      "count": 1
+    },
+    {
+      "function": "gitInputs",
+      "program": "git",
+      "sub": "config",
+      "count": 1
+    },
+    {
+      "function": "gitInputs",
+      "program": "git",
+      "sub": "rev-parse",
+      "count": 1
+    },
+    {
+      "function": "gitVersionFact",
+      "program": "git",
+      "sub": "--version",
+      "count": 1
+    },
+    {
+      "function": "inspectPaths",
+      "program": "stat",
+      "sub": "-",
+      "count": 1
+    },
+    {
+      "function": "linkText",
+      "program": "readlink",
+      "sub": "-",
+      "count": 2
+    },
+    {
+      "function": "matchesCommit",
+      "program": "git",
+      "sub": "config",
+      "count": 1
+    },
+    {
+      "function": "matchesCommit",
+      "program": "git",
+      "sub": "hash-object",
+      "count": 1
+    },
+    {
+      "function": "measureCommit",
+      "program": "git",
+      "sub": "-C",
+      "count": 1
+    },
+    {
+      "function": "measureTree",
+      "program": "find",
+      "sub": "-",
+      "count": 1
+    },
+    {
+      "function": "measureTree",
+      "program": "git",
+      "sub": "(closure)",
+      "count": 2
+    },
+    {
+      "function": "measureTree",
+      "program": "git",
+      "sub": "hash-object",
+      "count": 1
+    },
+    {
+      "function": "measureTree",
+      "program": "stat",
+      "sub": "-",
+      "count": 3
+    },
+    {
+      "function": "outsideGit",
+      "program": "git",
+      "sub": "rev-parse",
+      "count": 1
+    },
+    {
+      "function": "outsideGit",
+      "program": "realpath",
+      "sub": "-",
+      "count": 1
+    },
+    {
+      "function": "refreshGit",
+      "program": "git",
+      "sub": "rev-parse",
+      "count": 1
+    },
+    {
+      "function": "refreshGit",
+      "program": "git",
+      "sub": "status",
+      "count": 1
+    },
+    {
+      "function": "repoState",
+      "program": "find",
+      "sub": "-",
+      "count": 1
+    },
+    {
+      "function": "repoState",
+      "program": "git",
+      "sub": "-C",
+      "count": 1
+    },
+    {
+      "function": "scopedGitPlan",
+      "program": "git",
+      "sub": "ls-tree",
+      "count": 1
+    },
+    {
+      "function": "scopedGitPlan",
+      "program": "git",
+      "sub": "rev-parse",
+      "count": 1
+    },
+    {
+      "function": "verifiedGitPlace",
+      "program": "git",
+      "sub": "rev-parse",
+      "count": 2
+    },
+    {
+      "function": "verifiedGitPlace",
+      "program": "realpath",
+      "sub": "-",
+      "count": 2
+    }
+  ],
+  "closureCalls": [
+    {
+      "function": "candidateOf",
+      "closure": "run",
+      "sub": "ls-files -v",
+      "count": 1
+    },
+    {
+      "function": "candidateOf",
+      "closure": "run",
+      "sub": "rev-parse --verify",
+      "count": 2
+    },
+    {
+      "function": "candidateOf",
+      "closure": "run",
+      "sub": "status --porcelain",
+      "count": 1
+    },
+    {
+      "function": "gitInputs",
+      "closure": "setting",
+      "sub": "core.attributesFile",
+      "count": 1
+    },
+    {
+      "function": "gitInputs",
+      "closure": "setting",
+      "sub": "core.excludesFile",
+      "count": 1
+    },
+    {
+      "function": "measureCommit",
+      "closure": "git",
+      "sub": "config --bool",
+      "count": 1
+    },
+    {
+      "function": "measureCommit",
+      "closure": "git",
+      "sub": "hash-object --no-filters",
+      "count": 2
+    },
+    {
+      "function": "measureCommit",
+      "closure": "git",
+      "sub": "ls-tree -r",
+      "count": 1
+    },
+    {
+      "function": "measureTree",
+      "closure": "at",
+      "sub": "diff",
+      "count": 2
+    },
+    {
+      "function": "measureTree",
+      "closure": "at",
+      "sub": "ls-files -v",
+      "count": 1
+    },
+    {
+      "function": "measureTree",
+      "closure": "at",
+      "sub": "rev-parse --verify",
+      "count": 1
+    },
+    {
+      "function": "measureTree",
+      "closure": "listing",
+      "sub": "ls-files -o",
+      "count": 2
+    },
+    {
+      "function": "measureTree",
+      "closure": "sh",
+      "sub": "(after -C)",
+      "count": 1
+    },
+    {
+      "function": "repoState",
+      "closure": "git",
+      "sub": "config --null",
+      "count": 1
+    },
+    {
+      "function": "repoState",
+      "closure": "git",
+      "sub": "ls-files -z",
+      "count": 1
+    },
+    {
+      "function": "repoState",
+      "closure": "git",
+      "sub": "ls-tree -r",
+      "count": 1
+    },
+    {
+      "function": "repoState",
+      "closure": "git",
+      "sub": "rev-parse --git-path",
+      "count": 1
+    }
+  ]
+}

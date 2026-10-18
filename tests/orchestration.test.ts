@@ -153,8 +153,10 @@ describe('no network or provider call is made for a refused request', () => {
     expect(w.requests).toEqual([])
     expect(w.spawns).toEqual([])
     expect(w.ran).toEqual([])
-    // Only read-only Git, canonical directory identity probes and (v0.6.4) the inspection of a path's kind ran, each under the limit script.
-    expect(w.runs.every(argv => argv[0] === 'git' || (argv[0] === 'realpath' && argv[1] === '-e' && argv[2] === '--') || (argv[0] === 'stat' && (argv.includes(INSPECT_GNU) || argv.includes(INSPECT_BSD))))).toBe(true)
+    // Only read-only Git, canonical directory identity probes, (v0.6.4) the inspection of a path's kind and (v0.6.6) the listing of
+    // promisor pack markers ran, each under the limit script.
+    const promisorListing = (argv: readonly string[]) => argv[0] === 'find' && argv.at(-3) === '-name' && argv.at(-2) === '*.promisor' && argv.at(-1) === '-print0'
+    expect(w.runs.every(argv => argv[0] === 'git' || (argv[0] === 'realpath' && argv[1] === '-e' && argv[2] === '--') || (argv[0] === 'stat' && (argv.includes(INSPECT_GNU) || argv.includes(INSPECT_BSD))) || promisorListing(argv))).toBe(true)
     expect(w.wrappers.every(script => script !== null)).toBe(true)
   })
 

@@ -1,0 +1,385 @@
+// v0.6.6 Stage A: Git hardening. A submodule's own configuration can make a superproject's status or diff run a program, and a
+// lazy fetch in a partial clone runs the remote's transport (both recorded on real Git). Here, through the host: such a repository
+// is refused before any Git command that could enter or fetch, at every entry point that measures, and a refusal is never a clean
+// tree, an accepted goal check, a verified Stop check, a release candidate or a helper's inspection. The runner admits a Git read
+// of repository state only with the check's pass, every Git process carries the lazy-fetch and protocol pins, and fingerprints of
+// ordinary repositories are the ones v0.6.5 took. What real Git does with these argv is for the approved real-Git acceptance.
+import { describe, expect, test } from 'claude-code/testing'
+import { BOUND_PINS, BOUND_PROGRAMS, GIT_ENV_REFUSED, GIT_SAFE, HELPER_PINS, REPO_REFUSAL_SHORT, REPO_REFUSAL_WORDS, TRACKED_LIMIT, gitAccessOf, gitCallOf, gitVersionOf, partialCloneOf, promisorPacksOf, stageGitlinks } from '../hooks/git-integrity'
+import type { RepoRefusal } from '../hooks/git-integrity'
+import { dirtyLabel, refusedReason, treeNeedsAttention } from '../hooks/git'
+import { gitVersionText } from '../hooks/doctor'
+import type { GitState, Task } from '../types'
+import { blobOf, command, FIVE, GATE_NAMES, hostState, mountHud, passAllGates, planAndComplete, progress, prompt, rowsOf, start, world } from './world'
+import type { World } from './world'
+
+type Engine = Parameters<typeof start>[0]
+const SCRIPT = '/work/check.sh'
+const guard = (extra: Record<string, unknown> = {}) => ({ options: { stopGuard: 'ENFORCE', verifyScript: SCRIPT, stopMaxContinuations: 3, ...extra } })
+const stop = ($: any) => $.classic.Stop({ stop_hook_active: false, last_assistant_message: 'Changed the parser to reject empty input and added a regression test.' }) as Promise<{ block?: string }>
+const enroll = async ($: any): Promise<void> => {
+  const sha = /sha-256  ([0-9a-f]{64})/.exec(String((await command($, 'guard trust')).text))![1]!
+  await command($, `guard trust ${sha.slice(0, 12)}`)
+}
+const fixture = (on: any) => {
+  const w = world(on); w.files[SCRIPT] = 'exit 0'; w.players[SCRIPT] = 'ok'
+  return { w, h: hostState(on, {}) }
+}
+const taskOf = (h: ReturnType<typeof hostState>) => h.get('task')?.value as Task | null | undefined
+const gitOf = (h: ReturnType<typeof hostState>) => h.get('git')?.value as GitState | null | undefined
+const kept = (h: ReturnType<typeof hostState>) => ((h.get('run-ledger')?.value ?? {}) as { stopChecks?: { complete: boolean; summary: string }[] }).stopChecks ?? []
+/** The Git subcommands run since `from`, after Cockpit's global options. */
+const subcommands = (w: World, from = 0): string[] => w.runs.slice(from).filter(r => r[0] === 'git').map(r => {
+  let at = 1
+  while (r[at] === '-c' || r[at] === '-C' || r[at] === '--no-optional-locks' || r[at] === '--no-replace-objects' || r[at] === '--literal-pathspecs') at += r[at] === '-c' || r[at] === '-C' ? 2 : 1
+  return r[at]!
+})
+/** What reads a repository's work tree, index or objects beyond the refusal check's own listings. */
+const READS_STATE = ['status', 'diff', 'hash-object', 'check-attr', 'ls-tree']
+
+// --- the runner's admission and the refusal check's parsers (pure) ---
+
+describe('the runner admits Git commands by form', () => {
+  test('only Cockpit\'s own pre-subcommand words are accepted', () => {
+    expect(gitCallOf(['git', ...GIT_SAFE, '-C', '/r', 'status'])).toEqual({ sub: 'status', args: [], dir: '/r' })
+    expect(gitCallOf(['git', '--version'])).toEqual({ sub: '--version', args: [], dir: null })
+    for (const argv of [
+      ['git'], ['env', 'git', 'status'], ['/usr/bin/git', 'status'],
+      ['git', '--git-dir=/x', 'status'], ['git', '--exec-path=/x', 'status'], ['git', '-C', '/a', '-C', '/b', 'status'], ['git', '-C', '', 'status'],
+      ['git', '-c', 'nokey', 'status'], ['git', '-c', 'core.fsmonitor', 'status'], ['git', '-c'], ['git', '--no-pager', 'status'],
+    ]) expect([argv, gitCallOf(argv)]).toEqual([argv, null])
+  })
+  test('the discovery list is closed: where things are, configuration, and HEAD without a peel', () => {
+    const access = (...args: string[]) => gitAccessOf(gitCallOf(['git', '-C', '/r', ...args])!)
+    for (const args of [
+      ['rev-parse', '--show-toplevel'], ['rev-parse', '--show-prefix'], ['rev-parse', '--git-path', 'info/exclude', '--git-path', 'objects/pack'], ['rev-parse', '--verify', 'HEAD'],
+      ['config', '--type=path', '--get', 'core.excludesFile'], ['config', '--bool', '--get', 'core.filemode'], ['config', '--null', '--get-regexp', '^filter\\..*\\.(clean|process)$'], ['config', '--null', '--list'],
+    ]) expect([args, access(...args)]).toEqual([args, 'discovery'])
+    expect(gitAccessOf(gitCallOf(['git', '--version'])!)).toBe('discovery')
+    for (const args of [['ls-files', '-z', '--stage'], ['ls-tree', '-r', '-z', '--full-tree', 'HEAD'], ['ls-tree', '-r', '-z', '--full-tree', 'a'.repeat(40)]]) expect([args, access(...args)]).toEqual([args, 'listing'])
+    for (const args of [
+      ['rev-parse', '--verify', '--quiet', 'main^{commit}'], ['rev-parse', '--verify', 'HEAD^{commit}'], ['rev-parse', '--verify', 'main'], ['rev-parse'], ['rev-parse', '--git-path'], ['rev-parse', '--git-path', '--x'],
+      ['config', '--get'], ['config', '--get', 'a', 'b'], ['config', '--add', 'a', 'b'], ['config', '--file', '/x', '--get', 'a'], ['config', '--list', '--get', 'a'], ['config', '--unset', 'a'], ['config', '--get', '-a'],
+      ['ls-files', '-z'], ['ls-files', '-z', '--stage', '--', 'x'], ['ls-tree', '-r', '-z', '--full-tree', 'main'], ['ls-tree', '-r', '-z', '--full-tree', 'HEAD~1'],
+      ['status', '--porcelain'], ['diff', 'HEAD'], ['hash-object', '--', 'a'], ['check-attr', '-z', '--stdin', 'filter'], ['cat-file', '--batch-check'], ['fetch'], ['--version', 'x'],
+    ]) expect([args, access(...args)]).toEqual([args, 'state'])
+  })
+  test('the measurement programs are exactly the five that measure', () => {
+    expect([...BOUND_PROGRAMS].sort()).toEqual(['find', 'git', 'readlink', 'realpath', 'stat'])
+  })
+})
+
+describe('the refusal check reads strictly', () => {
+  test('a partial clone, from every configuration form; doubt counts as partial', () => {
+    const list = (...records: string[]) => records.map(r => `${r}\0`).join('')
+    expect(partialCloneOf('')).toBe(false)
+    expect(partialCloneOf(list('core.bare\nfalse', 'remote.origin.url\nhttps://example.invalid/r.git', 'remote.origin.promisor\nfalse', 'remote.up.promisor\nNo', 'remote.x.promisor\nOFF', 'remote.y.promisor\n0'))).toBe(false)
+    for (const value of ['true', 'yes', 'on', '1', '1k', '', 'TRUE', 'maybe']) expect([value, partialCloneOf(list(`remote.origin.promisor\n${value}`))]).toEqual([value, true])
+    expect(partialCloneOf(list('remote.origin.promisor'))).toBe(true)                                // a key with no value is true
+    expect(partialCloneOf(list('remote.origin.promisor\nfalse', 'remote.origin.promisor\ntrue'))).toBe(true)
+    expect(partialCloneOf(list('extensions.partialclone\norigin'))).toBe(true)
+    expect(partialCloneOf(list('extensions.partialClone'))).toBe(true)
+    expect(partialCloneOf(list('remote.Origin.partialCloneFilter\nblob:none'))).toBe(true)
+    expect(partialCloneOf(list('remote.a.b.c.promisor\ntrue'))).toBe(true)                           // a subsection with dots
+    for (const bad of ['remote.origin.promisor\ntrue', 'core.bare\nfalse\0\0', '\0', 'not a key\nx\0', '.x\ny\0']) expect([bad, partialCloneOf(bad)]).toEqual([bad, null])
+  })
+  test('gitlinks in the index\'s stage entries; anything malformed or past the limit is no answer', () => {
+    const oid = 'a'.repeat(40)
+    expect(stageGitlinks('')).toBe(0)
+    const records = (...r: string[]) => r.map(x => `${x}\0`).join('')
+    expect(stageGitlinks(records(`100644 ${oid} 0\tsrc/a.ts`, `120000 ${oid} 0\tlink`))).toBe(0)
+    expect(stageGitlinks(records(`100644 ${oid} 0\tsrc/a.ts`, `160000 ${oid} 0\tvendor/lib`, `160000 ${'b'.repeat(64)} 0\tsub two`))).toBe(2)
+    expect(stageGitlinks(`100644 ${oid} 2\tconflict\0`)).toBe(0)
+    for (const bad of [`100644 ${oid} 0\tsrc/a.ts`, `100644 ${oid}\tsrc/a.ts\0`, `10064 ${oid} 0\ta\0`, `100644 ${oid} 0\t\0`, `100644 xyz 0\ta\0`, `100644 ${oid} 4\ta\0`]) expect([bad, stageGitlinks(bad)]).toEqual([bad, null])
+    expect(stageGitlinks(Array.from({ length: TRACKED_LIMIT + 1 }, (_, i) => `100644 ${oid} 0\tf${i}\0`).join(''))).toBeNull()
+  })
+  test('promisor pack markers', () => {
+    expect(promisorPacksOf('')).toBe(0)
+    expect(promisorPacksOf('./.git/objects/pack/pack-1.promisor\0./.git/objects/pack/pack-2.promisor\0')).toBe(2)
+    for (const bad of ['./.git/objects/pack/pack-1.promisor', './.git/objects/pack/pack-1.pack\0', '\0']) expect([bad, promisorPacksOf(bad)]).toEqual([bad, null])
+  })
+  test('the Git version, read strictly, and what its doctor line says', () => {
+    expect(gitVersionOf('git version 2.47.3\n')).toEqual({ version: '2.47.3', lazyFetchSwitch: true })
+    expect(gitVersionOf('git version 2.45.0\n')).toEqual({ version: '2.45.0', lazyFetchSwitch: true })
+    expect(gitVersionOf('git version 2.44.1\n')).toEqual({ version: '2.44.1', lazyFetchSwitch: false })
+    expect(gitVersionOf('git version 2.39.5 (Apple Git-154)\n')).toEqual({ version: '2.39.5', lazyFetchSwitch: false })
+    expect(gitVersionOf('git version 3.0\n')).toEqual({ version: '3.0', lazyFetchSwitch: true })
+    for (const bad of ['', 'git 2.47.3', 'git version x\n', 'git version 2.47.3\nextra\n']) expect([bad, gitVersionOf(bad)]).toEqual([bad, null])
+    expect(gitVersionText({ version: '2.47.3', lazyFetchSwitch: true })).toContain('Git 2.47.3: measurement never fetches')
+    expect(gitVersionText({ version: '2.39.5', lazyFetchSwitch: false })).toContain('older than 2.45')
+    expect(gitVersionText(null)).toContain('Git version UNKNOWN')
+    for (const text of [gitVersionText(null), gitVersionText({ version: '2.39.5', lazyFetchSwitch: false })]) expect(text).toContain('repositories with a submodule or a partial clone are not measured')
+  })
+  test('every refusal has words, and the two a person can act on say what can be measured instead', () => {
+    for (const key of ['submodule', 'partial-clone', 'unreadable', 'moved'] as RepoRefusal[]) expect(REPO_REFUSAL_WORDS[key].length).toBeGreaterThan(40)
+    expect(REPO_REFUSAL_WORDS.submodule).toContain('a checkout without submodules can be measured')
+    expect(REPO_REFUSAL_WORDS['partial-clone']).toContain('a full clone, made without --filter, can be measured')
+    for (const key of ['submodule', 'partial-clone'] as RepoRefusal[]) expect(REPO_REFUSAL_WORDS[key]).toContain('goal checks and Stop checks cannot be verified')
+  })
+})
+
+describe('pins on every Git process', () => {
+  test('the settings and variables themselves', () => {
+    expect(BOUND_PINS).toEqual({ GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: 'cockpit-none' })
+    expect(GIT_SAFE).toContain('diff.ignoreSubmodules=all')
+    expect(GIT_SAFE).toContain('submodule.recurse=false')
+    expect(GIT_SAFE).not.toContain('diff.ignoreSubmodules=none')
+    expect(HELPER_PINS).toEqual(['-c', 'diff.submodule=short', '-c', 'protocol.allow=never', ...['ext', 'file', 'ssh', 'git', 'http', 'https'].flatMap(p => ['-c', `protocol.${p}.allow=never`])])
+  })
+  test('every measurement process of a Stop carries both variables, whatever environment its caller gave; every status and diff ignores submodules', guard(), async ($, on) => {
+    const { w } = fixture(on)
+    w.headBlobs['src/a.ts'] = blobOf('a'); w.watched['src/a.ts'] = 'a'; w.untracked = ['notes.md', 'latest']; w.kinds['latest'] = 'link'; w.ignoredEntries = ['.cache/x']
+    await start($); await enroll($); await prompt($, 'tidy it')
+    w.tree['src/a.ts'] = 'b'
+    const from = w.runs.length
+    await stop($)
+    const measuring = w.runs.map((r, i) => ({ r, env: w.runEnvs[i], wrapped: w.wrappers[i] !== null })).slice(from).filter(x => x.wrapped)
+    expect(measuring.length).toBeGreaterThan(20)
+    expect(measuring.some(x => x.env?.['LC_ALL'] === 'C')).toBe(true)                   // callers that set their own variables keep the pins too
+    for (const x of measuring) expect([x.r[0], x.env?.['GIT_NO_LAZY_FETCH'], x.env?.['GIT_ALLOW_PROTOCOL']]).toEqual([x.r[0], '1', 'cockpit-none'])
+    const compares = w.runs.slice(from).filter(r => r[0] === 'git' && (r.includes('status') || r.includes('diff')))
+    expect(compares.length).toBeGreaterThan(0)
+    for (const r of compares) { expect(r).toContain('--ignore-submodules=all'); expect(r).not.toContain('--ignore-submodules=none') }
+  })
+})
+
+// --- hostile repository states, at every entry point that measures ---
+
+type Hostile = { name: string; set: (w: World) => void; refusal: RepoRefusal }
+const HOSTILE: Hostile[] = [
+  { name: 'a gitlink staged in the index only', set: w => { w.indexGitlinks = ['vendor/lib'] }, refusal: 'submodule' },
+  { name: 'a gitlink committed at HEAD', set: w => { w.headBlobs['vendor/lib'] = 'c'.repeat(40); w.headModes['vendor/lib'] = '160000' }, refusal: 'submodule' },
+  { name: 'a promisor remote', set: w => { w.gitConfig['remote.origin.promisor'] = 'true' }, refusal: 'partial-clone' },
+  { name: 'extensions.partialClone', set: w => { w.gitConfig['extensions.partialClone'] = 'origin' }, refusal: 'partial-clone' },
+  { name: 'a partial-clone filter', set: w => { w.gitConfig['remote.origin.partialclonefilter'] = 'blob:none' }, refusal: 'partial-clone' },
+  { name: 'promisor packs with no promisor configuration left', set: w => { w.promisorPacks = ['pack-1.promisor'] }, refusal: 'partial-clone' },
+  { name: 'a configuration listing that exits 1 (never read as "absent")', set: w => { w.configListFails = true }, refusal: 'unreadable' },
+  { name: 'a pack directory that cannot be listed', set: w => { w.packListFails = true }, refusal: 'unreadable' },
+]
+const SHORT = REPO_REFUSAL_SHORT
+
+describe('a refused repository: the Stop guard never verifies it', () => {
+  for (const hostile of HOSTILE) {
+    test(`${hostile.name}: the Stop's measurement is refused before anything is compared, and the passing check is not recorded as verified`, guard(), async ($, on) => {
+      const { w, h } = fixture(on)
+      w.headBlobs['src/a.ts'] = blobOf('a'); w.watched['src/a.ts'] = 'a'
+      await start($); await enroll($); await prompt($, 'tidy it')
+      expect(taskOf(h)?.startTree).toEqual(expect.any(String))                          // begun on a measured tree
+      hostile.set(w)
+      const from = w.runs.length
+      await stop($)
+      const last = kept(h).at(-1)
+      expect(last?.complete).toBe(false)
+      expect(last?.summary).toContain(REPO_REFUSAL_WORDS[hostile.refusal])
+      expect(taskOf(h)?.guardDone).toBeUndefined()
+      expect(taskOf(h)?.status).not.toBe('done')
+      expect(subcommands(w, from).filter(s => READS_STATE.includes(s))).toEqual([])
+    })
+  }
+})
+
+describe('a refused repository: a task begun in it has no baseline, and its goal check is never accepted', () => {
+  for (const hostile of HOSTILE) {
+    test(`${hostile.name}: no baseline, ALIGNED is recorded UNKNOWN with the reason, and the task does not reach DONE`, async ($, on) => {
+      const w = world(on); hostile.set(w); const h = hostState(on, {})
+      await start($)
+      const from = w.runs.length
+      await prompt($, 'Add booking cancellation to the API and the UI')
+      expect(taskOf(h)?.startTree ?? null).toBeNull()
+      expect(subcommands(w, from).filter(s => READS_STATE.includes(s))).toEqual([])
+      await progress($, { action: 'discover', criteria: ['A booking can be cancelled'] })
+      await planAndComplete($, 4)
+      await passAllGates($, { align: false })
+      const answer = await progress($, { action: 'align', alignment: { state: 'ALIGNED', demonstrated: [{ id: 'c1', evidence: "cancel test 'frees the slot' passes in test/api.test.js (4 pass)" }] } })
+      expect(answer).toStartWith('error: ALIGNED not accepted')
+      expect(answer).toContain('recorded as UNKNOWN')
+      expect(answer).toContain(REPO_REFUSAL_WORDS[hostile.refusal].slice(0, 60))
+      expect(await progress($, { action: 'complete', milestone: 'm5' })).not.toStartWith('DONE')
+      expect(await progress($, { action: 'status' })).not.toStartWith('DONE')
+    })
+  }
+})
+
+const LED = { options: { orchestration: true, profile: 'SONNET_LED' } }
+const PACKET = { action: 'consult', ground: 'release', objective: 'Release v0.6.6', architecture: 'Plugin hooks', locations: ['hooks/register.tsx'], risk: 'Candidate mismatch', question: 'Approve the release?' }
+const admit = async ($: Engine) => {
+  await start($); await prompt($, 'Have Opus review the release candidate')
+  await progress($, { action: 'plan', milestones: FIVE })
+  for (const milestone of ['m1', 'm2', 'm3', 'm4']) await progress($, { action: 'complete', milestone })
+  for (const gate of GATE_NAMES) await progress($, { action: 'gate', gate, state: 'na', evidence: 'fixture' })
+  return String((await $.tool.call({ tool: 'mcp__cobalt-cockpit__swarm', ...PACKET } as never)).result)
+}
+
+describe('a refused repository: no release candidate', () => {
+  test('control: a clean, ordinary repository is a candidate', LED, async ($, on) => {
+    world(on); hostState(on, {})
+    expect(await admit($)).toContain('OPUS ADMITTED')
+  })
+  for (const hostile of HOSTILE) {
+    test(`${hostile.name}: the release check never names a candidate, and runs no status`, LED, async ($, on) => {
+      const w = world(on); hostState(on, {}); hostile.set(w)
+      expect(await admit($)).not.toContain('OPUS ADMITTED')
+      expect(subcommands(w)).not.toContain('status')
+    })
+  }
+})
+
+describe('a refused repository: the HUD says so, and a Stop with no task asks for the check', () => {
+  // The Stop with no task refreshes the HUD's Git state and waits for it (a session start does not wait), so it is the probe here.
+  for (const hostile of HOSTILE) {
+    test(`${hostile.name}: the HUD's Git line is refused, never clean; a Stop with no task and nothing owed asks for the check; no status runs`, guard(), async ($, on) => {
+      const { w, h } = fixture(on)
+      await start($); await enroll($)
+      hostile.set(w)
+      const from = w.runs.length
+      const out = await stop($)
+      const git = gitOf(h)
+      expect(git?.isRepo).toBe(true)
+      expect(git?.refused).toBe(hostile.refusal)
+      expect(dirtyLabel(git ?? null)).toBe(`not measured (${SHORT[hostile.refusal]})`)
+      expect((await rowsOf(await mountHud($, 'terminal', 160))).join('\n')).toContain(`not measured (${SHORT[hostile.refusal]})`)
+      expect(subcommands(w, from)).not.toContain('status')
+      // possibly changed, so a coding task that asks for the check, never an allowed clean stop
+      const task = taskOf(h)
+      expect(task).toEqual(expect.objectContaining({ edited: true }))
+      expect(task?.status).not.toBe('done')
+      expect(out.block !== undefined || task?.stopHold !== undefined).toBe(true)
+    })
+  }
+  test('control: an ordinary clean repository with no task stops without a check, and its HUD line is clean', guard(), async ($, on) => {
+    const { w, h } = fixture(on)
+    await start($); await enroll($)
+    expect((await stop($)).block).toBeUndefined()
+    expect(taskOf(h) ?? null).toBeNull()
+    expect(gitOf(h)?.refused).toBeUndefined()
+    expect(dirtyLabel(gitOf(h) ?? null)).toBe('clean')
+    expect(w.runs.filter(r => r[0] === SCRIPT)).toEqual([])
+  })
+  test('a failed status in a verified repository is a refusal too, never a stale or a clean line', guard(), async ($, on) => {
+    const { w, h } = fixture(on)
+    await start($); await enroll($)
+    w.gitHangs = 'status'
+    await stop($)
+    expect(gitOf(h)?.refused).toBe('unreadable')
+    expect(taskOf(h)).toEqual(expect.objectContaining({ edited: true }))
+  })
+})
+
+describe('a refused repository: a helper\'s Git inspection is refused, and nothing is sent', () => {
+  const SWARM = 'mcp__cobalt-cockpit__swarm'
+  const options = { options: { orchestration: true, maxSubagents: 32, maxSonnetAgents: 16, maxHaikuAgents: 24 } }
+  const ROOT = '/work/example'
+  const assign = ($: Engine, id: string, owned: string[]) =>
+    $.tool.call({ tool: SWARM, action: 'assign', task_id: id, tier: 'SONNET', role: 'REVIEW', objective: `Review ${id}`, scope: `Scope ${id}`, owned_resources: owned, mode: 'read', spawn_reason: 'Independent bounded review' } as never)
+  const spawn = ($: Engine, id: string) =>
+    $.agent.spawn({ prompt: `Review ${id}`, description: `[task:${id}] bounded review`, subagentType: 'cobalt-cockpit:reviewer', tool_use_id: `spawn-${id}`, parentModel: 'claude-opus-5-5', provider: { plugin: 'cobalt-cockpit', tier: 'user' }, background: true } as never)
+  const reviewer = async ($: Engine, owned: string[]) => { await start($); await assign($, 'rev', owned); return (await spawn($, 'rev')).agentId! }
+  const git = async ($: Engine, agentId: string, cmd: string) => (await $.tool.call({ tool: 'Bash', agentId, command: cmd } as never)) as { deny?: string }
+  const sent = (w: World) => w.ran.filter(call => call['tool'] === 'Bash')
+  for (const hostile of HOSTILE) {
+    for (const [kind, owned, cmd] of [['wildcard', ['*'], 'git diff main...HEAD -- hooks/swarm.ts'], ['scoped', [`${ROOT}/hooks/swarm.ts`], 'git diff main...HEAD -- hooks/swarm.ts']] as const) {
+      test(`${hostile.name}: a ${kind} inspection is refused with the reason`, options, async ($, on) => {
+        const w = world(on); const a = await reviewer($, [...owned])
+        hostile.set(w)
+        const out = await git($, a, cmd)
+        expect(out.deny).toContain(`refused in this repository (${SHORT[hostile.refusal]})`)
+        expect(sent(w)).toEqual([])
+        expect(w.runs.filter(r => r.includes('--verify') && r.some(x => x.endsWith('^{commit}')))).toEqual([])   // no revision read
+      })
+    }
+  }
+  test('a scoped inspection naming a revision whose tree records a gitlink is refused (HEAD and the index hold none)', options, async ($, on) => {
+    const w = world(on); const a = await reviewer($, [`${ROOT}/hooks/swarm.ts`])
+    w.gitlinkRevisions = ['old']
+    const out = await git($, a, 'git diff old -- hooks/swarm.ts')
+    expect(out.deny).toContain('a revision it names records a submodule')
+    expect(sent(w)).toEqual([])
+    expect((await git($, a, 'git diff main -- hooks/swarm.ts')).deny).toBeUndefined()                 // control
+  })
+  for (const name of GIT_ENV_REFUSED) {
+    test(`an environment that sets ${name} refuses every inspection: the helper's command would inherit it`, options, async ($, on) => {
+      const w = world(on, { env: { [name]: '/elsewhere' } }); const a = await reviewer($, ['*'])
+      const out = await git($, a, 'git status')
+      expect(out.deny).toContain(`the environment sets ${name}`)
+      expect(sent(w)).toEqual([])
+    })
+  }
+  test('control: variables the host sets that do not move Git (GIT_EDITOR, GIT_PAGER) refuse nothing', options, async ($, on) => {
+    const w = world(on, { env: { GIT_EDITOR: 'true', GIT_PAGER: 'cat' } }); const a = await reviewer($, ['*'])
+    expect((await git($, a, 'git status')).deny).toBeUndefined()
+    expect(sent(w)).toHaveLength(1)
+  })
+  test('a wildcard inspection runs in the verified directory, with the pins, whatever the helper typed', options, async ($, on) => {
+    const w = world(on); const a = await reviewer($, ['*'])
+    expect((await git($, a, 'git log --oneline -3')).deny).toBeUndefined()
+    const command = String(sent(w)[0]!['command'])
+    expect(command.startsWith(`'git' '--no-pager'`)).toBe(true)
+    expect(command).toContain(`'-C' '${ROOT}' 'log' '--no-ext-diff' '--no-textconv' '--ignore-submodules=all' '--oneline' '-3'`)
+    for (const pin of HELPER_PINS.filter(p => p !== '-c')) expect(command).toContain(`'${pin}'`)
+  })
+  test('submodule options in any spelling are no inspection: refused, and nothing is sent', options, async ($, on) => {
+    const w = world(on); const a = await reviewer($, ['*'])
+    for (const cmd of ['git diff --submodule=diff', 'git diff --submodule', 'git log -p --submodule=log -1', 'git status --ignore-submodules=none', 'git diff --ignore-submodules=dirty', 'git grep --recurse-submodules -n x', 'git ls-files --recurse-submodules', 'git diff --submod=diff', 'git grep --recurse -n x']) {
+      expect([cmd, (await git($, a, cmd)).deny === undefined]).toEqual([cmd, false])
+    }
+    expect(sent(w)).toEqual([])
+  })
+})
+
+describe('a state that appears while the tree is measured', () => {
+  for (const [name, appear] of [['a gitlink staged', (w: World) => { w.indexGitlinks = ['vendor/lib'] }], ['a promisor pack', (w: World) => { w.promisorPacks = ['pack-9.promisor'] }], ['a promisor remote', (w: World) => { w.gitConfig['remote.origin.promisor'] = 'true' }]] as const) {
+    test(`${name} during the measurement: no stamp, with the reason`, guard(), async ($, on) => {
+      const { w, h } = fixture(on)
+      w.headBlobs['src/a.ts'] = blobOf('a'); w.watched['src/a.ts'] = 'a'
+      await start($); await enroll($); await prompt($, 'tidy it')
+      w.tree['src/a.ts'] = 'b'
+      let fired = false
+      w.duringRun = argv => { if (!fired && argv[0] === 'git' && argv.includes('diff')) { fired = true; appear(w) } }
+      await stop($)
+      expect(fired).toBe(true)
+      const last = kept(h).at(-1)
+      expect(last?.complete).toBe(false)
+      expect(last?.summary).toContain(REPO_REFUSAL_WORDS.moved)
+    })
+  }
+})
+
+describe('doctor names the Git it measures with', () => {
+  test('the version line', async ($, on) => {
+    const w = world(on); await start($)
+    expect(String((await command($, 'doctor')).text)).toContain('Git 2.47.3: measurement never fetches')
+    w.gitVersion = 'git version 2.39.5'
+    expect(String((await command($, 'doctor')).text)).toContain('Git 2.39.5 is older than 2.45')
+  })
+})
+
+describe('the HUD\'s words for a refused repository', () => {
+  const base: GitState = { isRepo: true, project: 'example', branch: 'main', isDetached: false, sha: null, startSha: null, dirty: 0, ahead: null, behind: null, at: 0 }
+  test('never clean, always worth attention, with the reason', () => {
+    for (const [refused, words] of [['inputs', 'unsafe Git inputs'], ['submodule', 'submodule'], ['partial-clone', 'partial clone'], ['unreadable', 'state unreadable'], ['filter', 'active filter']] as const) {
+      const git = { ...base, refused }
+      expect(dirtyLabel(git)).toBe(`not measured (${words})`)
+      expect(refusedReason(git)).toBe(words)
+      expect(treeNeedsAttention(git)).toBe(true)
+    }
+    expect(dirtyLabel(base)).toBe('clean')
+    expect(treeNeedsAttention(base)).toBe(false)
+    expect(refusedReason({ ...base, isRepo: false, refused: 'submodule' })).toBeNull()
+  })
+})
+
+describe('stamp continuity: fingerprints of ordinary repositories are the ones v0.6.5 took', () => {
+  // Recorded by running these scenarios against main 2dbeaf1 (v0.6.5's measurement), so a task that spans the upgrade asks nothing again.
+  const GOLDEN: Record<string, [(w: World) => void, string]> = {
+    clean: [w => { w.headBlobs['src/a.ts'] = blobOf('a'); w.watched['src/a.ts'] = 'a'; w.untracked = ['notes.md', 'latest']; w.kinds['latest'] = 'link'; w.ignoredEntries = ['.cache/x'] }, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:4.caee0fc5c8ad4be58c1e74019b518306@03725b507abeb26707ad4e0bc41c105a'],
+    modified: [w => { w.headBlobs['src/a.ts'] = blobOf('a'); w.headBlobs['src/b.ts'] = blobOf('b'); w.watched['src/a.ts'] = 'a2'; w.tree['src/a.ts'] = 'a2'; w.watched['src/b.ts'] = 'b'; w.untracked = ['n.md'] }, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:3.65398f19f642a560bb7b48edd5c8c14a@03725b507abeb26707ad4e0bc41c105a'],
+    flagged: [w => { w.headBlobs['src/a.ts'] = blobOf('a'); w.watched['src/a.ts'] = 'a'; w.indexFlags = 'h src/a.ts\0'; w.untracked = [] }, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1.1f177c691e43d8c8fb3f0d2dcd46aa2f@03725b507abeb26707ad4e0bc41c105a'],
+  }
+  for (const [name, [set, stamp]] of Object.entries(GOLDEN)) {
+    test(name, async ($, on) => {
+      const w = world(on); const h = hostState(on, {}); set(w)
+      await start($); await prompt($, 'tidy it')
+      expect(taskOf(h)?.startTree).toBe(stamp)
+    })
+  }
+})

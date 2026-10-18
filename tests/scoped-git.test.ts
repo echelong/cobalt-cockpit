@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { GIT_OVERRIDES, GIT_SAFE } from '../hooks/git-integrity'
+import { GIT_OVERRIDES, GIT_SAFE, HELPER_PINS } from '../hooks/git-integrity'
 import { parseShell } from '../hooks/shell'
 import { start, world } from './world'
 
@@ -22,7 +22,9 @@ const reviewer = async ($: Engine, owned: string[] = SCOPE, mode: 'read' | 'writ
   return (await spawn($, 'rev', mode === 'write' ? 'cobalt-cockpit:worker' : 'cobalt-cockpit:reviewer')).agentId!
 }
 const sentOf = (w: ReturnType<typeof world>): string[][] => w.ran.filter(call => call['tool'] === 'Bash').map(call => parseShell(String(call['command'])).pipelines[0]!.commands[0]!.argv)
-const HEAD = ['git', '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, '-C', ROOT]
+// v0.6.6: the helper pins come before the directory; diff, log, show and status also ignore submodules
+const HEAD = ['git', '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...HELPER_PINS, '-C', ROOT]
+const NO_SUB = '--ignore-submodules=all'
 
 describe('a scoped reviewer inspects Git inside its scope', () => {
   test('diff, log, show, status, grep and ls-files reach the host pinned, hardened and with canonical paths', options, async ($, on) => {
@@ -35,11 +37,11 @@ describe('a scoped reviewer inspects Git inside its scope', () => {
     expect((await git($, a, "git grep -n '\\$\\.process' -- tests")).deny).toBeUndefined()
     expect((await git($, a, `git ls-files -- ${ROOT}/tests`)).deny).toBeUndefined()
     expect(sentOf(w)).toEqual([
-      [...HEAD, 'diff', '--no-ext-diff', '--no-textconv', '--stat', 'main...HEAD', '--', `${ROOT}/hooks/swarm.ts`],
-      [...HEAD, 'log', '--no-ext-diff', '--no-textconv', '--oneline', '-5', '--', `${ROOT}/hooks/swarm.ts`, `${ROOT}/tests/swarm.test.ts`],
-      [...HEAD, 'show', '--no-ext-diff', '--no-textconv', 'HEAD~1', '--', `${ROOT}/tests`],
-      [...HEAD, 'show', '--no-ext-diff', '--no-textconv', 'HEAD:hooks/swarm.ts', '--'],
-      [...HEAD, 'status', '--short', '--', `${ROOT}/tests`],
+      [...HEAD, 'diff', '--no-ext-diff', '--no-textconv', NO_SUB, '--stat', 'main...HEAD', '--', `${ROOT}/hooks/swarm.ts`],
+      [...HEAD, 'log', '--no-ext-diff', '--no-textconv', NO_SUB, '--oneline', '-5', '--', `${ROOT}/hooks/swarm.ts`, `${ROOT}/tests/swarm.test.ts`],
+      [...HEAD, 'show', '--no-ext-diff', '--no-textconv', NO_SUB, 'HEAD~1', '--', `${ROOT}/tests`],
+      [...HEAD, 'show', '--no-ext-diff', '--no-textconv', NO_SUB, 'HEAD:hooks/swarm.ts', '--'],
+      [...HEAD, 'status', NO_SUB, '--short', '--', `${ROOT}/tests`],
       [...HEAD, 'grep', '-n', '\\$\\.process', '--', `${ROOT}/tests`],
       [...HEAD, 'ls-files', '--', `${ROOT}/tests`],
     ])
@@ -69,7 +71,7 @@ describe('a scoped reviewer inspects Git inside its scope', () => {
 })
 
 describe('what a scoped inspection costs the host', () => {
-  test('one realpath per path and one rev-parse per revision more than a wildcard inspection, and nothing for a refusal of shape', options, async ($, on) => {
+  test('one realpath per path, one rev-parse per revision and one tree listing per distinct commit more than a wildcard inspection, and nothing for a refusal of shape', options, async ($, on) => {
     const w = world(on); await start($)
     await assign($, 'wide', ['*']); await assign($, 'narrow', SCOPE)
     const wide = (await spawn($, 'wide')).agentId!; const narrow = (await spawn($, 'narrow')).agentId!
@@ -85,8 +87,12 @@ describe('what a scoped inspection costs the host', () => {
     // rev-parse, two config and one stat, which also answers for the absent attributes and alternates files) and the filter check
     // are what a wildcard inspection already paid
     const inputs = ['git rev-parse', 'git config', 'git config', 'stat']
-    expect(wildcard).toEqual(['git rev-parse', 'git rev-parse', 'realpath', 'realpath', ...inputs, 'git config'])
-    expect(scoped).toEqual(['git rev-parse', 'git rev-parse', 'realpath', 'realpath', 'realpath', 'git rev-parse --verify', 'git rev-parse --verify', ...inputs, 'git config'])
+    // v0.6.6: then the repository-state check (configuration, where the packs are, the promisor pack listing, the index's stage
+    // entries and HEAD's tree), which both kinds pay before anything is read; a scoped one checks it first, then its paths and
+    // revisions, and lists the tree of each distinct commit they name (here both names are one commit)
+    const state = ['git config', 'git rev-parse', 'find', 'git ls-files', 'git ls-tree']
+    expect(wildcard).toEqual(['git rev-parse', 'git rev-parse', 'realpath', 'realpath', ...inputs, ...state, 'git config'])
+    expect(scoped).toEqual(['git rev-parse', 'git rev-parse', 'realpath', 'realpath', ...inputs, ...state, 'git config', 'realpath', 'git rev-parse --verify', 'git rev-parse --verify', 'git ls-tree'])
     // a command refused for its shape, or for a path outside the scope, runs no revision proof at all
     expect(await cost(narrow, 'git log --full-diff -- hooks/swarm.ts')).toEqual([])
     expect((await cost(narrow, 'git diff main...HEAD -- README.md')).filter(run => run.includes('--verify'))).toEqual([])
@@ -140,7 +146,7 @@ describe('a read-only Git command does not widen a scope', () => {
     expect(out.deny).toContain('…/private/key.txt')
     // as a path after `--` it is the resolved path that Git is given, so that is what must be owned, and is
     expect((await git($, a, 'git log --oneline -3 -- private/key.txt')).deny).toBeUndefined()
-    expect(sentOf(w)).toEqual([[...HEAD, 'log', '--no-ext-diff', '--no-textconv', '--oneline', '-3', '--', `${ROOT}/tests/key.txt`]])
+    expect(sentOf(w)).toEqual([[...HEAD, 'log', '--no-ext-diff', '--no-textconv', NO_SUB, '--oneline', '-3', '--', `${ROOT}/tests/key.txt`]])
     // and a link that leads out of the scope is refused both ways
     w.links[`${ROOT}/tests/out`] = `${ROOT}/secret`
     expect((await git($, a, 'git show HEAD:tests/out/key.txt')).deny).toContain('read outside owned resources')
@@ -233,15 +239,15 @@ describe('a read-only Git command does not widen a scope', () => {
 })
 
 describe('a wildcard reader keeps the v0.6.0 rule, with the path separator', () => {
-  test('`--` and its paths are accepted, and the command is not pinned or narrowed', options, async ($, on) => {
+  test('`--` and its paths are accepted, and the command is not narrowed; v0.6.6: it runs in the verified directory', options, async ($, on) => {
     const w = world(on); const a = await reviewer($, ['*'])
     expect((await git($, a, 'git diff main...HEAD -- hooks/swarm.ts')).deny).toBeUndefined()
     expect((await git($, a, "git grep -n '\\$\\.process' -- hooks")).deny).toBeUndefined()
     expect((await git($, a, 'git log --oneline -5')).deny).toBeUndefined()
     expect(sentOf(w)).toEqual([
-      ['git', '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, 'diff', '--no-ext-diff', '--no-textconv', 'main...HEAD', '--', 'hooks/swarm.ts'],
-      ['git', '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, 'grep', '-n', '\\$\\.process', '--', 'hooks'],
-      ['git', '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, 'log', '--no-ext-diff', '--no-textconv', '--oneline', '-5'],
+      [...HEAD, 'diff', '--no-ext-diff', '--no-textconv', NO_SUB, 'main...HEAD', '--', 'hooks/swarm.ts'],
+      [...HEAD, 'grep', '-n', '\\$\\.process', '--', 'hooks'],
+      [...HEAD, 'log', '--no-ext-diff', '--no-textconv', NO_SUB, '--oneline', '-5'],
     ])
   })
   test('what it refused before it refuses still, and the pager and output options in every form Git reads', options, async ($, on) => {

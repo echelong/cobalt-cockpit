@@ -147,10 +147,22 @@ export type World = {
   statCalls: number
   /** v0.6.4: calls to stat that inspect a path's kind before it is read, for cost. */
   inspectCalls: number
-  /** A git subcommand that times out (throws), by name. */
+  /** A git subcommand that times out (throws), by name; `<subcommand> <option>` hangs only when the option is given. */
   gitHangs: string | null
   /** v0.6.4: a git subcommand whose output the host cuts short (isStdoutTruncated), by name. */
   gitTruncates: string | null
+  /** v0.6.6: promisor pack markers in the object store's pack directory (names ending .promisor), as `find` lists them. */
+  promisorPacks: string[]
+  /** v0.6.6: the pack directory cannot be listed (`find` fails). */
+  packListFails: boolean
+  /** v0.6.6: paths staged as gitlinks (mode 160000) in the index only, as `ls-files -z --stage` lists them. */
+  indexGitlinks: string[]
+  /** v0.6.6: what `git --version` prints. */
+  gitVersion: string
+  /** v0.6.6: `git config --null --list` exits 1 with nothing printed (as a signal can read where GNU timeout is absent). */
+  configListFails: boolean
+  /** v0.6.6: revision names that peel to another commit (GITLINK_COMMIT), whose tree records a gitlink at vendor/lib; HEAD and the index do not. */
+  gitlinkRevisions: string[]
   /** The content of .git/info/exclude. */
   excludes: string
   /** The working tree as git sees it against HEAD: path to content. Changing it is a change the fingerprint must notice. */
@@ -235,6 +247,8 @@ export type World = {
 
 const MODEL_ALIAS: Record<string, string> = { sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5', haiku: 'claude-haiku-5-5' }
 
+/** v0.6.6: the commit a gitlink revision peels to (see `gitlinkRevisions`); no other test uses it as HEAD. */
+export const GITLINK_COMMIT = '5ee1ed0c0ffee'.padEnd(40, '5')
 export const CLEAN_REPO = '# branch.oid 1111111aaaaaaa\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n'
 
 const ran = (exitCode: number, stdout = '') => ({
@@ -307,6 +321,12 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
     inspectCalls: 0,
     gitHangs: null,
     gitTruncates: null,
+    promisorPacks: [],
+    packListFails: false,
+    indexGitlinks: [],
+    gitVersion: 'git version 2.47.3',
+    configListFails: false,
+    gitlinkRevisions: [],
     excludes: '',
     tree: {},
     head: 'a'.repeat(40),
@@ -577,6 +597,13 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
 
       return ran(0, argv.includes('-z') ? `${text}\0` : `${text}\n`)
     }
+    // v0.6.6: the preflight's listing of promisor pack markers in the pack directory
+    if (program === 'find' && argv.includes('-name') && argv[argv.indexOf('-name') + 1] === '*.promisor') {
+      const asked = String(argv[2])
+      if (w.packListFails) return { value: { exitCode: 1, stdout: '', stderr: `find: '${asked}': Permission denied\n`, isStdoutTruncated: false, isStderrTruncated: false } }
+
+      return ran(0, w.promisorPacks.map(name => `${asked}/${name}\0`).join(''))
+    }
     if (program === 'find') {
       const asked = String(argv[2])
       if (w.watchedUnreadable.includes(asked)) return ran(1, `${(w.watchedDirs[asked] ?? []).slice(0, 1).map(n => `${n}\0`).join('')}`)
@@ -611,13 +638,21 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
         else break
       }
       const git = argv.slice(at)
-      if (w.gitHangs !== null && git[0] === w.gitHangs) throw new Error('git was still running at the timeout')
+      // a subcommand, or a subcommand with one of its options (`ls-files -o`: only the listings that read .gitignore)
+      const [hangs, hangsWith] = (w.gitHangs ?? '').split(' ')
+      if (w.gitHangs !== null && git[0] === hangs && (hangsWith === undefined || git.includes(hangsWith))) throw new Error('git was still running at the timeout')
       if (w.gitTruncates !== null && git[0] === w.gitTruncates) return { value: { exitCode: 0, stdout: 'cut', stderr: '', isStdoutTruncated: true, isStderrTruncated: false } }
       if (git[0] === 'rev-parse' && git.includes('--git-path')) return ran(0, git.flatMap((a, i) => (a === '--git-path' ? [`${w.gitPathBase}${git[i + 1]}\n`] : [])).join(''))
+      // v0.6.6: every configuration entry, as `config --null --list` prints them (key, newline, value, NUL)
+      if (git[0] === 'config' && git.includes('--list') && w.configListFails) return ran(1)
+      if (git[0] === 'config' && git.includes('--list')) return ran(0, Object.entries(w.gitConfig).map(([key, value]) => `${key}\n${value}\0`).join('') + w.gitFilterConfig)
+      if (git[0] === '--version') return ran(0, `${w.gitVersion}\n`)
       if (git[0] === 'config') return git.includes('--get-regexp') && w.gitFilterConfig !== '' ? ran(0, w.gitFilterConfig) : w.gitConfig[git.at(-1)!] !== undefined ? ran(0, w.gitConfig[git.at(-1)!] + '\n') : ran(1)
       if (git[0] === 'check-attr') return ran(0, w.gitFilterAttributes)
       if (git[0] === 'rev-parse' && git.includes('--show-prefix')) return ran(0, w.gitPrefix + '\n')
       if (git[0] === 'rev-parse' && git.includes('--verify') && w.nonCommits.some(name => git.at(-1) === `${name}^{commit}`)) return ran(1)
+      if (git[0] === 'rev-parse' && git.includes('--verify') && w.gitlinkRevisions.some(name => git.at(-1) === `${name}^{commit}`)) return ran(0, `${GITLINK_COMMIT}\n`)
+      if (git[0] === 'ls-tree' && git.at(-1) === GITLINK_COMMIT) return ran(0, `160000 commit ${'c'.repeat(40)}\tvendor/lib\0`)
       if (git[0] === 'rev-parse') return ran(0, git.includes('--verify') ? `${w.head}\n` : `${w.top}\n`)
       if (git[0] === 'diff') {
         // like git, `diff` does not see a path the index is told to ignore (assume-unchanged: lowercase tag; skip-worktree: S)
@@ -633,6 +668,13 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
         answer.value.stderr = w.statusWarning
         answer.value.isStderrTruncated = w.statusStderrTruncated
         return answer
+      }
+      // v0.6.6: the index's stage entries: the committed paths with their modes, and any gitlink staged in the index only
+      if (git[0] === 'ls-files' && git.includes('--stage')) {
+        const oidOf = (value: string | undefined) => (value !== undefined && /^[0-9a-f]{40}$/.test(value) ? value : 'e'.repeat(40))
+        const committed = Object.keys(w.headBlobs).map(path => `${w.headModes[path] ?? '100644'} ${oidOf(w.headBlobs[path])} 0\t${path}\0`)
+
+        return ran(0, [...committed, ...w.indexGitlinks.map(path => `160000 ${'c'.repeat(40)} 0\t${path}\0`)].join(''))
       }
       if (git[0] === 'ls-files' && git.includes('-o') && w.lsFilesWarning !== null) {
         const out = git.includes('-i') ? w.ignoredEntries : w.untracked

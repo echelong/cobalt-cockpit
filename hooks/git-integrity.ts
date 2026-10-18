@@ -1,6 +1,8 @@
 // Authoritative tracked-content evidence comes from the commit tree and the disk, never the index's stat cache.
 
-export const GIT_SAFE = ['--no-optional-locks', '--no-replace-objects', '--literal-pathspecs', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'diff.ignoreSubmodules=none', '-c', 'status.submoduleSummary=false', '-c', 'core.checkStat=default', '-c', 'core.trustctime=true', '-c', 'log.showSignature=false', '-c', 'format.pretty=medium']
+// v0.6.6: submodules are never examined (a submodule's own configuration can run a program during a superproject's status or
+// diff), and no command recurses into one; a repository that records a gitlink is refused before any such command (repoState).
+export const GIT_SAFE = ['--no-optional-locks', '--no-replace-objects', '--literal-pathspecs', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'diff.ignoreSubmodules=all', '-c', 'submodule.recurse=false', '-c', 'status.submoduleSummary=false', '-c', 'core.checkStat=default', '-c', 'core.trustctime=true', '-c', 'log.showSignature=false', '-c', 'format.pretty=medium']
 export const TRACKED_LIMIT = 100_000
 export type CommitEntry = { path: string; oid: string; mode: '100644' | '100755' | '120000' | '160000' }
 export type DiskEntry = CommitEntry & { raw: string; isSameType: boolean; diskMode?: string }
@@ -73,6 +75,13 @@ export const GIT_OVERRIDES = ['-c', 'core.hooksPath=/dev/null', '-c', 'diff.orde
 export const GIT_BOUNDED = [...GIT_OVERRIDES, '-c', 'core.packedGitWindowSize=32m', '-c', 'core.packedGitLimit=256m', '-c', 'core.deltaBaseCacheLimit=64m', '-c', 'core.bigFileThreshold=16m', '-c', 'core.preloadIndex=false', '-c', 'index.threads=1']
 /** glibc reserves address space per malloc arena; two keep a bounded Git well inside its cap. */
 export const BOUND_ENV = { MALLOC_ARENA_MAX: '2' }
+/**
+ * v0.6.6: laid over every measurement process's environment last, so no caller can take them back. A missing object is never
+ * fetched: Git's own switch (documented from 2.45.0, ignored where Git does not know it) and a protocol allow-list no transport
+ * matches, which overrides all protocol configuration (measured: it stopped a repository's `ext::` transport program on 2.43.0
+ * and 2.47.3). No measurement fetches anything, so neither changes what a legitimate measurement reads.
+ */
+export const BOUND_PINS: Readonly<Record<string, string>> = { GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: 'cockpit-none' }
 
 /** One working-tree file the fingerprint reads, and all of them together, at most; beyond either, the tree is UNKNOWN. */
 export const FINGERPRINT_FILE_BYTES = 1024 ** 3
@@ -114,4 +123,170 @@ export const inspectedOf = (record: string, gnu: boolean): Inspected | null => {
   const size = Number(m[2])
   if (kind === null || !Number.isSafeInteger(size)) return null
   return { kind, mode, size, identity: `${m[1]} ${m[2]} ${m[3]} ${m[4]} ${m[5]}`, ...(gnu ? { name: m[6]! } : {}) }
+}
+
+// --- Repository state and the measurement runner's admission (v0.6.6) ---
+// Some repository states make an ordinary-looking Git read run a program the repository chose: a submodule's own
+// configuration during a superproject's status or diff, and a lazy fetch of a missing object in a partial clone. Such states are
+// refused before any Git command that could enter or fetch (repoState in register.tsx). The runner admits a Git command that
+// reads the index, the work tree or objects only with the authorisation that refusal check hands out; what it may run without
+// one is the closed discovery list below.
+
+/** The only programs a measurement process may be; anything else is refused before it starts. */
+export const BOUND_PROGRAMS: readonly string[] = ['git', 'stat', 'find', 'readlink', 'realpath']
+/** A commit a preflight listing may name: HEAD or a full object id. */
+const COMMIT_NAME = /^(?:HEAD|[0-9a-f]{40}|[0-9a-f]{64})$/
+/** One `-c` setting as Cockpit writes them: a plain dotted key, then its value. */
+const SETTING = /^[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)+=/
+/** A Git command as the runner sees it: the subcommand, its arguments, and the directory given with `-C`. */
+export type GitCall = { sub: string; args: readonly string[]; dir: string | null }
+/**
+ * Reads the words before the subcommand. Only Cockpit's own forms are accepted: the three safe flags, `-c <key=value>` and at
+ * most one `-C <dir>`. Any other word there (another global option, a second `-C`, a setting that is not `key=value`) is no Git
+ * call the runner knows, and is refused.
+ */
+export const gitCallOf = (argv: readonly string[]): GitCall | null => {
+  if (argv[0] !== 'git') return null
+  let at = 1
+  let dir: string | null = null
+  for (;;) {
+    const word = argv[at]
+    if (word === undefined) return null
+    if (word === '-c') {
+      const setting = argv[at + 1]
+      if (setting === undefined || !SETTING.test(setting)) return null
+      at += 2
+    } else if (word === '-C') {
+      const named = argv[at + 1]
+      if (named === undefined || named === '' || dir !== null) return null
+      dir = named
+      at += 2
+    } else if (word === '--no-optional-locks' || word === '--no-replace-objects' || word === '--literal-pathspecs') {
+      at += 1
+    } else {
+      // any other option here is a global option Cockpit does not write (`--git-dir`, `--exec-path`, `--no-pager`, …)
+      return word.startsWith('-') && word !== '--version' ? null : { sub: word, args: argv.slice(at + 1), dir }
+    }
+  }
+}
+/**
+ * What a Git command reads, for admission. `discovery`: where the repository and its files are, and configuration (read without
+ * running any program, fetching or entering a submodule). `listing`: the two listings the refusal check itself makes, the index's
+ * stage entries and one commit's tree. `state`: everything else, which reads the index, the work tree or objects and needs the
+ * check's authorisation. `rev-parse --verify HEAD` resolves a reference and reads no object; a peel (`<name>^{commit}`) is state.
+ */
+export type GitAccess = 'discovery' | 'listing' | 'state'
+export const gitAccessOf = (call: GitCall): GitAccess => {
+  const { sub, args } = call
+  if (sub === '--version') return args.length === 0 ? 'discovery' : 'state'
+  if (sub === 'rev-parse') {
+    if (args.length === 2 && args[0] === '--verify' && args[1] === 'HEAD') return 'discovery'
+    let i = 0
+    while (i < args.length) {
+      const word = args[i] as string
+      const next = args[i + 1]
+      if (word === '--show-toplevel' || word === '--show-prefix') i += 1
+      else if (word === '--git-path' && next !== undefined && next !== '' && !next.startsWith('-')) i += 2
+      else return 'state'
+    }
+    return args.length > 0 ? 'discovery' : 'state'
+  }
+  if (sub === 'config') {
+    let form: string | null = null
+    let i = 0
+    while (i < args.length) {
+      const word = args[i] as string
+      const next = args[i + 1]
+      if (word === '--null' || word === '--type=path' || word === '--bool') i += 1
+      else if (form === null && (word === '--get' || word === '--get-regexp') && next !== undefined && next !== '' && !next.startsWith('-') && i + 2 === args.length) { form = word; i += 2 }
+      else if (form === null && word === '--list' && i + 1 === args.length) { form = word; i += 1 }
+      else return 'state'
+    }
+    return form === null ? 'state' : 'discovery'
+  }
+  if (sub === 'ls-files' && args.length === 2 && args[0] === '-z' && args[1] === '--stage') return 'listing'
+  if (sub === 'ls-tree' && args.length === 4 && args[0] === '-r' && args[1] === '-z' && args[2] === '--full-tree' && COMMIT_NAME.test(args[3] as string)) return 'listing'
+
+  return 'state'
+}
+
+/** The values Git reads as false for a boolean; anything else, a key with no value included, is read as true here. */
+const FALSE_WORDS: ReadonlySet<string> = new Set(['false', 'no', 'off', '0'])
+/**
+ * Whether `git config --null --list` (every scope Git reads, includes and the environment's) shows a partial clone: an
+ * `extensions.partialClone` key, any `remote.<name>.partialCloneFilter`, or a `remote.<name>.promisor` that is not plainly false.
+ * Doubt counts as partial: an empty value, a number or a value-less key. Null for output that does not parse.
+ */
+export const partialCloneOf = (text: string): boolean | null => {
+  if (text !== '' && !text.endsWith('\0')) return null
+  for (const record of text === '' ? [] : text.slice(0, -1).split('\0')) {
+    const split = record.indexOf('\n')
+    const key = (split < 0 ? record : record.slice(0, split)).toLowerCase()
+    if (!/^[a-z0-9-]+(?:\..+)?\.[a-z0-9-]+$/.test(key)) return null
+    const value = split < 0 ? null : record.slice(split + 1)
+    if (key === 'extensions.partialclone') return true
+    if (/^remote\..+\.partialclonefilter$/.test(key)) return true
+    if (/^remote\..+\.promisor$/.test(key) && (value === null || !FALSE_WORDS.has(value.toLowerCase()))) return true
+  }
+
+  return false
+}
+/** How many gitlinks (mode 160000) `git ls-files -z --stage` lists; null for output that does not parse or is past the tracked-file limit. */
+export const stageGitlinks = (text: string): number | null => {
+  if (text !== '' && !text.endsWith('\0')) return null
+  const records = text === '' ? [] : text.slice(0, -1).split('\0')
+  if (records.length > TRACKED_LIMIT) return null
+  let gitlinks = 0
+  for (const record of records) {
+    const match = /^([0-7]{6}) (?:[0-9a-f]{40}|[0-9a-f]{64}) [0-3]\t[\s\S]+$/.exec(record)
+    if (match === null) return null
+    if (match[1] === '160000') gitlinks += 1
+  }
+
+  return gitlinks
+}
+/** How many promisor pack markers a `find … -name '*.promisor' -print0` listed; null for output that does not parse. */
+export const promisorPacksOf = (text: string): number | null => {
+  if (text !== '' && !text.endsWith('\0')) return null
+  const names = text === '' ? [] : text.slice(0, -1).split('\0')
+
+  return names.every(name => name.endsWith('.promisor')) ? names.length : null
+}
+
+/** Why a repository is not measured (v0.6.6). */
+export type RepoRefusal = 'submodule' | 'partial-clone' | 'unreadable' | 'moved'
+/** The reason in words, wherever an UNKNOWN reason is shown; the first two say what a person can do about it. */
+export const REPO_REFUSAL_WORDS: Readonly<Record<RepoRefusal, string>> = {
+  submodule: 'a submodule (gitlink) is recorded in the index, HEAD or the commit compared against; Cockpit does not measure submodules and does not let Git enter them, so goal checks and Stop checks cannot be verified in this repository (a checkout without submodules can be measured)',
+  'partial-clone': 'the repository is a partial clone (a promisor remote, extensions.partialClone or promisor packs) and Git could fetch a missing object by running the remote\'s transport, so it is not measured; goal checks and Stop checks cannot be verified here (a full clone, made without --filter, can be measured)',
+  unreadable: 'the repository\'s submodule and partial-clone state could not be read (Git failed, timed out, reached a limit or its output was cut short)',
+  moved: 'the repository\'s submodule or partial-clone state changed while the working tree was being measured',
+}
+/** The same, in the few words the HUD has room for. */
+export const REPO_REFUSAL_SHORT: Readonly<Record<RepoRefusal, string>> = { submodule: 'submodule', 'partial-clone': 'partial clone', unreadable: 'state unreadable', moved: 'state changed' }
+
+/**
+ * Settings a helper's rebuilt Git inspection also carries (v0.6.6), as defence in depth behind the refusal of submodule and
+ * partial-clone repositories: no submodule diff, and no transport for any protocol. A helper cannot pass `-c` itself.
+ */
+export const HELPER_PINS: readonly string[] = ['-c', 'diff.submodule=short', '-c', 'protocol.allow=never', ...['ext', 'file', 'ssh', 'git', 'http', 'https'].flatMap(p => ['-c', `protocol.${p}.allow=never`])]
+/**
+ * Variables that move where Git looks, what configuration it reads, what it runs or where it writes. A helper's inspection runs
+ * in the host's Bash tool with the host's environment; where Cockpit's own environment sets any of these, it is refused rather
+ * than trusted (register.tsx reads each by its literal name, and only whether it is set).
+ */
+export const GIT_ENV_REFUSED: readonly string[] = [
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE',
+  'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
+  'GIT_EXEC_PATH', 'GIT_EXTERNAL_DIFF', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'GIT_PROXY_COMMAND', 'GIT_ALLOW_PROTOCOL',
+  'GIT_ATTR_SOURCE', 'GIT_REPLACE_REF_BASE', 'GIT_SHALLOW_FILE', 'GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF',
+]
+
+/** `git --version` read strictly; `lazyFetchSwitch` where Git documents its own switch for lazy fetching (2.45.0 and later). */
+export const gitVersionOf = (text: string): { version: string; lazyFetchSwitch: boolean } | null => {
+  const match = /^git version (\d{1,3})\.(\d{1,3})(?:\.(\d{1,3}))?[^\n]{0,80}\n?$/.exec(text)
+  if (match === null) return null
+  const major = Number(match[1]), minor = Number(match[2])
+
+  return { version: `${major}.${minor}${match[3] === undefined ? '' : `.${Number(match[3])}`}`, lazyFetchSwitch: major > 2 || (major === 2 && minor >= 45) }
 }

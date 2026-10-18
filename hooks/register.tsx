@@ -49,9 +49,9 @@ import type { TransportTest } from './transport'
 import type { Player } from './audio'
 import { EMPTY_LOG, EVENT_TTL_MS, callOf, closeOf, liveOf, push } from './activity'
 import { activityOf, readBash } from './classify'
-import { parseStatus, projectOf, filterCommands, activeFilter } from './git'
-import { GIT_SAFE, commitEntries, BOUND_AS_KIB, BOUND_CPU_S, BOUND_ENV, BOUND_PROBE_CAPPED, BOUND_PROBE_CONTROL, BOUND_PROBE_GROUP, BOUND_PROBE_SET, BOUND_SLOTS, BOUND_TAG, FINGERPRINT_FILE_BYTES, FINGERPRINT_TOTAL_BYTES, GIT_BOUNDED, INSPECT_BSD, INSPECT_GNU, SOURCE_BYTES, boundScript, inspectedOf } from './git-integrity'
-import type { CommitEntry, DiskEntry, Inspected, Kind, Measurement } from './git-integrity'
+import { parseStatus, projectOf, filterCommands, activeFilter, refusedReason } from './git'
+import { GIT_SAFE, commitEntries, BOUND_AS_KIB, BOUND_CPU_S, BOUND_ENV, BOUND_PINS, BOUND_PROBE_CAPPED, BOUND_PROBE_CONTROL, BOUND_PROBE_GROUP, BOUND_PROBE_SET, BOUND_PROGRAMS, BOUND_SLOTS, BOUND_TAG, FINGERPRINT_FILE_BYTES, FINGERPRINT_TOTAL_BYTES, GIT_BOUNDED, GIT_ENV_REFUSED, INSPECT_BSD, INSPECT_GNU, REPO_REFUSAL_SHORT, REPO_REFUSAL_WORDS, SOURCE_BYTES, boundScript, gitAccessOf, gitCallOf, gitVersionOf, inspectedOf, partialCloneOf, promisorPacksOf, stageGitlinks } from './git-integrity'
+import type { CommitEntry, DiskEntry, Inspected, Kind, Measurement, RepoRefusal } from './git-integrity'
 import { assessCommand } from './guard'
 import { failClosed, guardFailure, isInsideFolder } from './guard-rules'
 import {
@@ -292,7 +292,32 @@ const boundSlot = async (): Promise<() => void> => {
 
   return release
 }
-type RunInit = { cwd?: string; timeoutMs?: number; env?: Record<string, string>; stdin?: string }
+type RunInit = { cwd?: string; timeoutMs?: number; env?: Record<string, string>; stdin?: string; auth?: RepoPass | PreflightListing }
+// --- Admission (v0.6.6; the reason and the closed lists: git-integrity.ts) ---
+// A Git command that reads a repository's index, work tree or objects starts only for a repository `repoState` has checked: no
+// gitlink, no partial clone. The check hands out a pass, an object it creates and keeps in `repoPasses`; holding an equal object
+// proves nothing, and nothing a repository or a model writes can become one. A pass is for one root, given with `-C`.
+/** A repository that passed `repoState`, by its verified root. */
+type RepoPass = { readonly root: string }
+const repoPasses = new WeakSet<RepoPass>()
+/** What `repoState` holds while it makes its own two listings, before a pass exists. It never leaves this file. */
+type PreflightListing = { readonly listing: true }
+const PREFLIGHT_LISTING: PreflightListing = Object.freeze({ listing: true as const })
+/** A pass `repoState` handed out: membership, not shape, decides. */
+const isRepoPass = (auth: RepoPass | PreflightListing | undefined): auth is RepoPass => auth !== undefined && auth !== PREFLIGHT_LISTING && repoPasses.has(auth as RepoPass)
+/** Why `bounded` will not start a command, or null: a program that is not a measurement program, a Git command of a form Cockpit does not write, or a Git read of repository state without the pass for its root. */
+const admissionRefusal = (argv: readonly string[], auth: RepoPass | PreflightListing | undefined): string | null => {
+  if (!BOUND_PROGRAMS.includes(argv[0] ?? '')) return 'a program that is not one of the measurement programs'
+  if (argv[0] !== 'git') return null
+  const call = gitCallOf(argv)
+  if (call === null) return 'a Git command in a form the measurement runner does not accept'
+  const access = gitAccessOf(call)
+  if (access === 'discovery') return null
+  if (access === 'listing' && auth === PREFLIGHT_LISTING) return null
+  if (isRepoPass(auth) && call.dir === auth.root) return null
+
+  return 'a Git read of repository state without the repository-state check for that repository'
+}
 let boundMode: Promise<Bound> | null = null
 /** Until when an unanswered probe's result stands before the next probe (no shell at all would otherwise cost two failed starts a call). */
 let boundRetryAt = 0
@@ -323,11 +348,16 @@ const boundOf = async ($: EngineInterface): Promise<Bound> => {
   return found
 }
 const bounded = async ($: EngineInterface, argv: string[], init: RunInit = {}) => {
+  const { auth, ...host } = init
+  // v0.6.6: refused before anything is probed or started; every caller reads BoundRefused as UNKNOWN or a refusal
+  const refusal = admissionRefusal(argv, auth)
+  if (refusal !== null) throw new BoundRefused(`Cockpit did not start ${refusal}, so nothing was measured`)
   const { script, group } = await boundOf($)
   // no limit can be applied: nothing is started, rather than something unbounded (v0.6.4)
   if (script === null) throw new BoundRefused('resource limits could not be applied here (no POSIX shell answered), so nothing was measured')
   const inner = argv[0] === 'git' ? ['git', ...GIT_BOUNDED, ...argv.slice(1)] : argv
-  const run = { ...init, env: { ...BOUND_ENV, ...(init.env ?? {}) } }
+  // the pins go last: no caller's environment can take them back (v0.6.6)
+  const run = { ...host, env: { ...BOUND_ENV, ...(host.env ?? {}), ...BOUND_PINS } }
   // the group timeout ends a second before the host's, so the whole group is gone before the host gives up on it
   const seconds = String(Math.max(1, Math.floor(((init.timeoutMs ?? 30_000) - 1000) / 1000)))
   const release = await boundSlot()
@@ -445,8 +475,9 @@ const gitInputs = async ($: EngineInterface, top: string): Promise<GitInput[] | 
 
 /**
  * The commit a release review is for: the full id of HEAD, and only when the working tree is clean (every
- * untracked file and submodule counted, whatever the user's git configuration says), because a review of a
- * commit says nothing of changes that are not in it. `dirty` is a real difference; `unknown` is git failing.
+ * untracked file counted, whatever the user's git configuration says), because a review of a commit says nothing
+ * of changes that are not in it. `dirty` is a real difference; `unknown` is git failing, or a repository that is
+ * not measured (v0.6.6: a gitlink or a partial clone).
  */
 type Candidate = { sha: string } | { sha: null; why: 'dirty' | 'unknown' }
 /** Match Git's root + relative prefix to the actual session directory. A linked worktree or a session
@@ -471,26 +502,82 @@ const verifiedGitRoot = async ($: EngineInterface): Promise<string | null> => {
 
   return place === null ? null : place.root
 }
+/**
+ * v0.6.6: whether this repository may be measured at all, decided before any Git command reads its index, work tree or objects
+ * (`bounded` admits such a command only with the pass this returns). Refused: a partial clone (its configuration in any scope,
+ * or promisor packs), where a missing object would be fetched by running the remote's transport; and a gitlink in the index or
+ * in `commits`, where Git would enter the submodule and could run what its own configuration names. Commits that the caller's
+ * own measurement reads with `measureCommit` before it compares anything are refused there (a gitlink in that tree), so only
+ * the others are named here. Every answer must be complete: a failure, a cut, stderr or a non-zero exit is `unreadable`, never
+ * "absent" (a signal can read as exit 1). `packDir` repeats a check without asking Git again where the packs are.
+ */
+type RepoState = { pass: RepoPass; packDir: string } | { refused: Exclude<RepoRefusal, 'moved'> }
+const repoState = async ($: EngineInterface, top: string, commits: readonly string[] = [], knownPackDir?: string): Promise<RepoState> => {
+  try {
+    const git = (args: string[], auth?: PreflightListing) => bounded($, ['git', ...GIT_SAFE, '-C', top, ...args], { timeoutMs: GIT_TIMEOUT_MS, ...(auth === undefined ? {} : { auth }) })
+    // 1. configuration only: nothing runs and nothing is fetched to read it
+    const config = await git(['config', '--null', '--list'])
+    const partial = gitAnswered(config) ? partialCloneOf(config.stdout) : null
+    if (partial === null) return { refused: 'unreadable' }
+    if (partial) return { refused: 'partial-clone' }
+    // 2. promisor packs, which a partial clone keeps whatever its configuration says now
+    let packDir = knownPackDir
+    if (packDir === undefined) {
+      const where = await git(['rev-parse', '--git-path', 'objects/pack'])
+      packDir = gitAnswered(where) && where.stdout.endsWith('\n') && where.stdout.indexOf('\n') === where.stdout.length - 1 ? where.stdout.slice(0, -1) : ''
+      if (packDir === '') return { refused: 'unreadable' }
+    }
+    const listed = await bounded($, ['find', '-H', packDir.startsWith('/') ? packDir : `./${packDir}`, '-maxdepth', '1', '-name', '*.promisor', '-print0'], { cwd: top, timeoutMs: GIT_TIMEOUT_MS })
+    const packs = gitAnswered(listed) ? promisorPacksOf(listed.stdout) : null
+    if (packs === null) return { refused: 'unreadable' }
+    if (packs > 0) return { refused: 'partial-clone' }
+    // 3. gitlinks in the index, from a listing that does not enter a submodule (measured)
+    const stage = await git(['ls-files', '-z', '--stage'], PREFLIGHT_LISTING)
+    const staged = gitAnswered(stage) ? stageGitlinks(stage.stdout) : null
+    if (staged === null) return { refused: 'unreadable' }
+    if (staged > 0) return { refused: 'submodule' }
+    // 4. gitlinks in the other commits compared; a partial clone was ruled out above, so reading a tree fetches nothing
+    for (const commit of new Set(commits)) {
+      const tree = await git(['ls-tree', '-r', '-z', '--full-tree', commit], PREFLIGHT_LISTING)
+      const entries = gitAnswered(tree) ? commitEntries(tree.stdout) : null
+      if (entries === null) return { refused: 'unreadable' }
+      if (entries.some(e => e.mode === '160000')) return { refused: 'submodule' }
+    }
+    const pass: RepoPass = Object.freeze({ root: top })
+    repoPasses.add(pass)
+
+    return { pass, packDir }
+  } catch {
+    return { refused: 'unreadable' }
+  }
+}
+/** v0.6.6: the same check once more, after a measurement: a state that appeared meanwhile never yields an answer. Null: unchanged. */
+const repoMoved = async ($: EngineInterface, top: string, packDir: string): Promise<RepoRefusal | null> => {
+  const again = await repoState($, top, [], packDir)
+  if ('pass' in again) return null
+
+  return again.refused === 'unreadable' ? 'unreadable' : 'moved'
+}
 /** Check attributes before status/diff can run a repository-controlled clean/process command. The effective
  * command value wins; dormant filters (for example globally installed LFS) do not make ordinary trees unknown. */
-const gitFiltersReliable = async ($: EngineInterface, top: string, committed: string[] = []): Promise<boolean> => {
+const gitFiltersReliable = async ($: EngineInterface, top: string, pass: RepoPass, committed: string[] = []): Promise<boolean> => {
   const cfg = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'config', '--null', '--get-regexp', '^filter\\..*\\.(clean|process)$'], { timeoutMs: GIT_TIMEOUT_MS })
   if (cfg.isStdoutTruncated || cfg.isStderrTruncated || cfg.stderr.trim() !== '' || (cfg.exitCode !== 0 && cfg.exitCode !== 1)) return false
   if (cfg.exitCode === 1) return cfg.stdout === ''
   const drivers = filterCommands(cfg.stdout)
   if (drivers === null) return false
   if (drivers.size === 0) return true
-  const tree = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'ls-tree', '-r', '-z', '--full-tree', 'HEAD'], { timeoutMs: GIT_TIMEOUT_MS })
+  const tree = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'ls-tree', '-r', '-z', '--full-tree', 'HEAD'], { timeoutMs: GIT_TIMEOUT_MS, auth: pass })
   const base = gitAnswered(tree) ? commitEntries(tree.stdout) : null
   if (base === null) return false
-  const paths = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'ls-files', '-z'], { timeoutMs: GIT_TIMEOUT_MS })
+  const paths = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'ls-files', '-z'], { timeoutMs: GIT_TIMEOUT_MS, auth: pass })
   if (paths.exitCode !== 0 || paths.isStdoutTruncated || paths.isStderrTruncated || paths.stderr.trim() !== '') return false
   if (paths.stdout !== '' && !paths.stdout.endsWith('\0')) return false
   const all = [...new Set([...paths.stdout.split('\0').filter(Boolean), ...base.map(e => e.path), ...committed])]
   if (all.length > 100_000) return false
   for (let i = 0; i < all.length; i += HASH_CHUNK) {
     const names = all.slice(i, i + HASH_CHUNK).join('\0') + '\0'
-    const attrs = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'check-attr', '-z', '--stdin', 'filter'], { stdin: names, timeoutMs: GIT_TIMEOUT_MS })
+    const attrs = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'check-attr', '-z', '--stdin', 'filter'], { stdin: names, timeoutMs: GIT_TIMEOUT_MS, auth: pass })
     if (attrs.exitCode !== 0 || attrs.isStdoutTruncated || attrs.isStderrTruncated || attrs.stderr.trim() !== '' || activeFilter(attrs.stdout, drivers, names) !== false) return false
   }
   return true
@@ -519,15 +606,16 @@ const KIND_WORDS: Record<Kind, string> = { file: 'file', link: 'symbolic link', 
 type ReadBudget = { bytes: number }
 const GIB = 1024 ** 3
 /** Read every intended tracked file even if status, diff, and the index's dirty listing all say clean. */
-const measureCommit = async ($: EngineInterface, root: string, sha: string, budget: ReadBudget = { bytes: 0 }): Promise<Measurement> => {
+const measureCommit = async ($: EngineInterface, root: string, sha: string, pass: RepoPass, budget: ReadBudget = { bytes: 0 }): Promise<Measurement> => {
   try {
     const began = await $.clock.now()
     const late = async () => await $.clock.now() - began > FINGERPRINT_BUDGET_MS
-    const git = (args: string[], stdin?: string) => bounded($, ['git', ...GIT_SAFE, '-C', root, ...args], { timeoutMs: GIT_TIMEOUT_MS, ...(stdin === undefined ? {} : { stdin }) })
+    const git = (args: string[], stdin?: string) => bounded($, ['git', ...GIT_SAFE, '-C', root, ...args], { timeoutMs: GIT_TIMEOUT_MS, auth: pass, ...(stdin === undefined ? {} : { stdin }) })
     const tree = await git(['ls-tree', '-r', '-z', '--full-tree', sha])
     const entries = gitAnswered(tree) ? commitEntries(tree.stdout) : null
     if (entries === null) return { why: 'the intended commit tree is unreadable, malformed or exceeds the tracked-file limit' }
-    if (entries.some(e => e.mode === '160000')) return { why: 'a submodule needs independent nested-tree verification; its index/status alone is insufficient' }
+    // the commit a measurement compares against is checked here, before anything is compared (repoState names only the others)
+    if (entries.some(e => e.mode === '160000')) return { why: REPO_REFUSAL_WORDS.submodule }
     const out: DiskEntry[] = []
     let regularLinks: boolean | undefined
     for (let i = 0; i < entries.length; i += HASH_CHUNK) {
@@ -589,7 +677,7 @@ const measureCommit = async ($: EngineInterface, root: string, sha: string, budg
 
 /** Called only after effective external clean/process filters have been ruled out for all commit paths.
  * Native Git EOL/encoding normalization remains supported without trusting cached index content. */
-const matchesCommit = async ($: EngineInterface, root: string, entries: DiskEntry[]): Promise<boolean | null> => {
+const matchesCommit = async ($: EngineInterface, root: string, entries: DiskEntry[], pass: RepoPass): Promise<boolean | null> => {
   const began = await $.clock.now()
   if (entries.some(e => !e.isSameType)) return false
   if (entries.some(e => e.mode !== '120000' && e.diskMode !== undefined && e.diskMode !== e.mode)) {
@@ -606,7 +694,7 @@ const matchesCommit = async ($: EngineInterface, root: string, entries: DiskEntr
     // Each is read again, so each is inspected again: only an ordinary file within the size bound, unchanged by the read.
     const seen = await inspectPaths($, root, chunk.map(e => `./${e.path}`))
     if (seen === null || seen.some(s => s.kind !== 'file' || s.size > FINGERPRINT_FILE_BYTES)) return null
-    const r = await bounded($, ['git', ...GIT_SAFE, '-C', root, 'hash-object', '--', ...chunk.map(e => `./${e.path}`)], { timeoutMs: GIT_TIMEOUT_MS }).catch(() => null)
+    const r = await bounded($, ['git', ...GIT_SAFE, '-C', root, 'hash-object', '--', ...chunk.map(e => `./${e.path}`)], { timeoutMs: GIT_TIMEOUT_MS, auth: pass }).catch(() => null)
     const hashes = r !== null && gitAnswered(r) ? hashesOf(r.stdout, chunk.length) : null
     if (hashes === null) return null
     const again = await inspectPaths($, root, chunk.map(e => `./${e.path}`))
@@ -619,18 +707,24 @@ const matchesCommit = async ($: EngineInterface, root: string, entries: DiskEntr
 const candidateOf = async ($: EngineInterface): Promise<Candidate> => {
   try {
     const top = await verifiedGitRoot($)
-    if (top === null || 'why' in await gitInputs($, top) || !(await gitFiltersReliable($, top))) return { sha: null, why: 'unknown' }
-    const run = (argv: string[]) => bounded($, ['git', ...GIT_SAFE, '-C', top, ...argv], { timeoutMs: GIT_TIMEOUT_MS })
+    if (top === null || 'why' in await gitInputs($, top)) return { sha: null, why: 'unknown' }
+    // v0.6.6: nothing reads this repository's state before it is known to hold no gitlink and to be no partial clone
+    const state = await repoState($, top)
+    if (!('pass' in state)) return { sha: null, why: 'unknown' }
+    const { pass } = state
+    if (!(await gitFiltersReliable($, top, pass))) return { sha: null, why: 'unknown' }
+    const run = (argv: string[]) => bounded($, ['git', ...GIT_SAFE, '-C', top, ...argv], { timeoutMs: GIT_TIMEOUT_MS, auth: pass })
     const head = await run(['rev-parse', '--verify', 'HEAD'])
     if (head.exitCode !== 0 || head.isStdoutTruncated || head.isStderrTruncated || head.stderr.trim() !== '') return { sha: null, why: 'unknown' }
     const sha = head.stdout.trim()
     if (!isCandidate(sha)) return { sha: null, why: 'unknown' }
-    const measured = await measureCommit($, top, sha)
-    if ('why' in measured || !(await gitFiltersReliable($, top, measured.entries.map(e => e.path)))) return { sha: null, why: 'unknown' }
-    const matches = await matchesCommit($, top, measured.entries)
+    const measured = await measureCommit($, top, sha, pass)
+    if ('why' in measured || !(await gitFiltersReliable($, top, pass, measured.entries.map(e => e.path)))) return { sha: null, why: 'unknown' }
+    const matches = await matchesCommit($, top, measured.entries, pass)
     if (matches === null) return { sha: null, why: 'unknown' }
     if (!matches) return { sha: null, why: 'dirty' }
-    const status = await run(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'])
+    // every submodule was refused above, so none is examined (a submodule's own configuration could run a program here)
+    const status = await run(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=all'])
     if (status.exitCode !== 0 || status.isStdoutTruncated || status.isStderrTruncated || status.stderr.trim() !== '') return { sha: null, why: 'unknown' }
     if (status.stdout.trim() !== '') return { sha: null, why: 'dirty' }
     // `status` does not see a path the index is told to ignore: assume-unchanged (a lowercase tag) or skip-worktree (S or s). A flagged
@@ -640,6 +734,7 @@ const candidateOf = async ($: EngineInterface): Promise<Candidate> => {
     if (flags.stdout.split('\0').some(entry => /^[a-zSs] /.test(entry))) return { sha: null, why: 'unknown' }
     const finalHead = await run(['rev-parse', '--verify', 'HEAD'])
     if (finalHead.exitCode !== 0 || finalHead.isStdoutTruncated || finalHead.isStderrTruncated || finalHead.stderr.trim() !== '' || finalHead.stdout.trim() !== sha) return { sha: null, why: 'unknown' }
+    if ((await repoMoved($, top, state.packDir)) !== null) return { sha: null, why: 'unknown' }
     return { sha }
   } catch {
     return { sha: null, why: 'unknown' }
@@ -889,19 +984,57 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
 // verified repository, canonical paths checked against the task's ownership, and proof that each revision is a commit.
 const GIT_IDENTITY_DENY = 'SWARM / read-only Git inspection cannot establish safe repository identity and filter configuration; use the host Read/Grep tools instead'
 const SEARCH_HINT = ' To search or list inside your scope: git grep -n <pattern> -- <path>, git ls-files -- <path>; to read a file: the Read tool.'
-type GitPlan = { pin?: ScopedPin; root?: string }
+/** Where an accepted helper inspection runs (v0.6.6): the verified session directory, its repository and that repository's pass. */
+type HelperPlace = { root: string; dir: string; pass: RepoPass }
+type GitPlan = { pin?: ScopedPin; place?: HelperPlace }
+/**
+ * Whether Cockpit's own environment sets a variable that moves where Git looks, what configuration it reads, what it runs or
+ * where it writes (GIT_ENV_REFUSED, in the same order). A helper's command runs in the host's Bash tool, which Cockpit does not
+ * start; its environment is taken to be the host's, which is also Cockpit's. Each name is read only to see whether it is set.
+ */
+const gitEnvironmentSet = async ($: EngineInterface): Promise<string | null> => {
+  const values = await Promise.all([
+    $.env.get('GIT_DIR'), $.env.get('GIT_WORK_TREE'), $.env.get('GIT_INDEX_FILE'), $.env.get('GIT_OBJECT_DIRECTORY'), $.env.get('GIT_ALTERNATE_OBJECT_DIRECTORIES'), $.env.get('GIT_COMMON_DIR'), $.env.get('GIT_NAMESPACE'),
+    $.env.get('GIT_CONFIG'), $.env.get('GIT_CONFIG_PARAMETERS'), $.env.get('GIT_CONFIG_COUNT'), $.env.get('GIT_CONFIG_GLOBAL'), $.env.get('GIT_CONFIG_SYSTEM'),
+    $.env.get('GIT_EXEC_PATH'), $.env.get('GIT_EXTERNAL_DIFF'), $.env.get('GIT_SSH'), $.env.get('GIT_SSH_COMMAND'), $.env.get('GIT_ASKPASS'), $.env.get('GIT_PROXY_COMMAND'), $.env.get('GIT_ALLOW_PROTOCOL'),
+    $.env.get('GIT_ATTR_SOURCE'), $.env.get('GIT_REPLACE_REF_BASE'), $.env.get('GIT_SHALLOW_FILE'), $.env.get('GIT_TRACE'), $.env.get('GIT_TRACE2'), $.env.get('GIT_TRACE2_EVENT'), $.env.get('GIT_TRACE2_PERF'),
+  ].map(value => value.then(v => v, () => 'unreadable')))
+  const at = values.findIndex(v => v !== undefined)
+
+  return at < 0 ? null : (GIT_ENV_REFUSED[at] ?? 'a Git variable')
+}
+/**
+ * v0.6.6: where a helper's Git inspection may run. The environment must not redirect Git; the session directory must be in a
+ * verified repository whose inputs are safe, which holds no gitlink (index or HEAD), is no partial clone and has no active
+ * filter. The rebuilt command is pinned to that directory, so the directory the helper's own shell is in does not matter.
+ * Every failure is a refusal that names the reason; nothing runs in its place.
+ */
+const helperGitPlace = async ($: EngineInterface): Promise<HelperPlace | { deny: string }> => {
+  try {
+    const variable = await gitEnvironmentSet($)
+    if (variable !== null) return { deny: `SWARM / read-only Git inspection is refused here: the environment sets ${variable}, which changes where Git looks, what it reads or what it runs, and a helper's command would inherit it. Use the host Read/Grep tools instead` }
+    const place = await verifiedGitPlace($)
+    if (place === null || 'why' in await gitInputs($, place.root)) return { deny: GIT_IDENTITY_DENY }
+    const state = await repoState($, place.root, ['HEAD'])
+    if (!('pass' in state)) return { deny: `SWARM / read-only Git inspection is refused in this repository (${REPO_REFUSAL_SHORT[state.refused]}): Git could enter a submodule or fetch a missing object and run what the repository names. Use the host Read/Grep tools instead` }
+    if (!(await gitFiltersReliable($, place.root, state.pass))) return { deny: GIT_IDENTITY_DENY }
+
+    return { root: place.root, dir: place.dir, pass: state.pass }
+  } catch { return { deny: GIT_IDENTITY_DENY } }
+}
 const ownedText = (task: SwarmTask): string => `${task.owned.slice(0, 4).map(shortResource).join(', ')}${task.owned.length > 4 ? ` +${task.owned.length - 4}` : ''}`
 /**
  * A narrowly scoped task's Git inspection: accepted only when the command has the allowed shape, every path it names is
  * inside the task's owned resources, and every revision is a commit (so none addresses a tree or a file). Nothing is
  * widened: a path outside the scope is refused with the scope named, and the commander is the one who can change it.
  */
-const scopedGitPlan = async ($: EngineInterface, s: Swarm, task: SwarmTask, command: string): Promise<{ pin: ScopedPin; root: string } | { deny: string; isGit: boolean }> => {
+const scopedGitPlan = async ($: EngineInterface, s: Swarm, task: SwarmTask, command: string): Promise<{ pin: ScopedPin; place: HelperPlace } | { deny: string; isGit: boolean }> => {
   const vetted = scopedGit(command)
   if (!vetted.ok) return { deny: `SWARM / ${vetted.reason}. Owned: ${ownedText(task)}.`, isGit: vetted.isGit }
   try {
-    const place = await verifiedGitPlace($)
-    if (place === null) return { deny: GIT_IDENTITY_DENY, isGit: true }
+    // v0.6.6: the repository is checked before any revision is read; a pass is what the revision proof below needs
+    const place = await helperGitPlace($)
+    if ('deny' in place) return { deny: place.deny, isGit: true }
     const outside = (shown: string): { deny: string; isGit: boolean } => ({ deny: `SWARM / read outside owned resources: ${shown} is not inside this task's scope (owned: ${ownedText(task)}). A read-only Git command does not widen a scope; ask the commander to assign the path.`, isGit: true })
     const paths: string[] = []
     for (const path of vetted.git.paths) {
@@ -919,12 +1052,21 @@ const scopedGitPlan = async ($: EngineInterface, s: Swarm, task: SwarmTask, comm
       if (!ownershipAllows(s, task.id, written, 'read')) return outside(shortResource(written))
       if (!ownershipAllows(s, task.id, canonical, 'read')) return outside(shortResource(canonical))
     }
+    const peeledCommits: string[] = []
     for (const name of vetted.git.commits) {
-      const peeled = await bounded($, ['git', ...GIT_SAFE, '-C', place.dir, 'rev-parse', '--verify', '--quiet', `${name}^{commit}`], { timeoutMs: GIT_TIMEOUT_MS })
-      if (!gitAnswered(peeled) || hashesOf(peeled.stdout, 1) === null) return { deny: `SWARM / "${name.slice(0, 60)}" does not name a commit here. Under a narrow scope a revision must be a branch, tag or commit id that resolves to a commit; a tree, a file or an unknown name is refused.`, isGit: true }
+      const peeled = await bounded($, ['git', ...GIT_SAFE, '-C', place.root, 'rev-parse', '--verify', '--quiet', `${name}^{commit}`], { timeoutMs: GIT_TIMEOUT_MS, auth: place.pass })
+      const sha = gitAnswered(peeled) ? hashesOf(peeled.stdout, 1) : null
+      if (sha === null) return { deny: `SWARM / "${name.slice(0, 60)}" does not name a commit here. Under a narrow scope a revision must be a branch, tag or commit id that resolves to a commit; a tree, a file or an unknown name is refused.`, isGit: true }
+      peeledCommits.push(sha[0]!)
+    }
+    // v0.6.6: a named commit that records a gitlink is refused like the repository would be (the check covered HEAD and the index)
+    for (const sha of new Set(peeledCommits)) {
+      const tree = await bounded($, ['git', ...GIT_SAFE, '-C', place.root, 'ls-tree', '-r', '-z', '--full-tree', sha], { timeoutMs: GIT_TIMEOUT_MS, auth: place.pass })
+      const entries = gitAnswered(tree) ? commitEntries(tree.stdout) : null
+      if (entries === null || entries.some(e => e.mode === '160000')) return { deny: `SWARM / read-only Git inspection is refused: a revision it names ${entries === null ? 'could not be read' : 'records a submodule'}, and Git could enter it. Use the host Read/Grep tools instead`, isGit: true }
     }
 
-    return { pin: { git: vetted.git, dir: place.dir, paths }, root: place.root }
+    return { pin: { git: vetted.git, dir: place.dir, paths }, place }
   } catch { return { deny: GIT_IDENTITY_DENY, isGit: true } }
 }
 /**
@@ -1015,7 +1157,7 @@ const guardSwarm = async ($: EngineInterface, e: Record<string, unknown>, plan: 
   const isScopedShell = task !== undefined && tool === 'Bash' && !task.owned.includes('*')
   if (task !== undefined && isScopedShell) {
     const scoped = await scopedGitPlan($, s, task, command)
-    if ('pin' in scoped) { plan.pin = scoped.pin; plan.root = scoped.root }
+    if ('pin' in scoped) { plan.pin = scoped.pin; plan.place = scoped.place }
     // a Git inspection this scope cannot run is told exactly why; any other command meets the rules below
     else if (scoped.isGit) return scoped.deny
   }
@@ -1179,7 +1321,8 @@ const isSameGit = (a: GitState | null, b: GitState): boolean =>
   a.startSha === b.startSha &&
   a.dirty === b.dirty &&
   a.ahead === b.ahead &&
-  a.behind === b.behind
+  a.behind === b.behind &&
+  a.refused === b.refused
 
 const styleOf = (segment: Segment) => ({
   ...(segment.color !== undefined ? { color: segment.color } : {}),
@@ -1513,7 +1656,14 @@ const doctorFacts = async ($: EngineInterface): Promise<DoctorFacts> => {
     stop: await stopFacts($),
     guard: await guardFacts($),
     measurement: await boundWords($).catch(() => undefined),
+    gitVersion: await gitVersionFact($),
   }
+}
+/** For /cockpit doctor (v0.6.6): the Git measurement runs, and whether that Git documents its own switch for lazy fetching. Null: not readable. */
+const gitVersionFact = async ($: EngineInterface): Promise<{ version: string; lazyFetchSwitch: boolean } | null> => {
+  const r = await bounded($, ['git', '--version'], { timeoutMs: GIT_TIMEOUT_MS }).catch(() => null)
+
+  return r !== null && gitAnswered(r) ? gitVersionOf(r.stdout) : null
 }
 
 // --- Local telemetry (what is kept and how: telemetry.ts). The host follows `$` only into functions declared in this file. ---
@@ -1979,17 +2129,51 @@ const change = async ($: EngineInterface, apply: (task: Task, now: number) => Ta
   return task
 }
 
+/** Why the HUD did not read a verified repository (v0.6.6). */
+type GitRefusal = NonNullable<GitState['refused']>
+/** The HUD's state for a verified repository it did not read: a repository, with nothing known about its changes. */
+const refusedGit = (old: GitState | null, project: string, refused: GitRefusal, now: number): GitState => ({
+  isRepo: true,
+  project,
+  branch: null,
+  isDetached: false,
+  sha: null,
+  startSha: old !== null && old.isRepo && old.project === project ? old.startSha : null,
+  dirty: 0,
+  ahead: null,
+  behind: null,
+  refused,
+  at: now,
+})
 const refreshGit = async ($: EngineInterface): Promise<void> => {
+  let verified: string | null = null
   try {
     const now = await $.clock.now()
     cwd = await $.session.cwd()
     const root = await verifiedGitRoot($)
-    // HUD reads must not run repository-controlled clean/process filters either.
-    const reliable = root !== null && !('why' in await gitInputs($, root)) && await gitFiltersReliable($, root)
-    const status = reliable ? await bounded($, ['git', ...GIT_SAFE, '-C', root!, 'status', '--porcelain=v2', '--branch'], {
-      timeoutMs: GIT_TIMEOUT_MS,
-    }) : { exitCode: 128, stdout: '' }
+    verified = root
     const old = await read($, gitAtom)
+    // v0.6.6: a verified repository Cockpit will not read (unsafe inputs, a gitlink, a partial clone, an active filter, or a
+    // state that cannot be read) is shown as refused, never as clean: whatever changed in it cannot be seen, and the Stop
+    // guard reads that as a possible change. HUD reads must not run repository-controlled clean/process filters either.
+    const refuse = async (refused: GitRefusal): Promise<void> => {
+      const state = refusedGit(old, projectOf(root ?? cwd), refused, now)
+      if (!isSameGit(old, state)) await update($, gitAtom, () => state)
+    }
+    let pass: RepoPass | null = null
+    if (root !== null) {
+      if ('why' in await gitInputs($, root)) return await refuse('inputs')
+      const checked = await repoState($, root)
+      if (!('pass' in checked)) return await refuse(checked.refused)
+      if (!(await gitFiltersReliable($, root, checked.pass))) return await refuse('filter')
+      pass = checked.pass
+    }
+    // every submodule was refused above, so none is examined
+    const status = root !== null && pass !== null ? await bounded($, ['git', ...GIT_SAFE, '-C', root, 'status', '--porcelain=v2', '--branch', '--ignore-submodules=all'], {
+      timeoutMs: GIT_TIMEOUT_MS,
+      auth: pass,
+    }) : { exitCode: 128, stdout: '' }
+    if (root !== null && status.exitCode !== 0) return await refuse('unreadable')
     let state: GitState
     if (status.exitCode !== 0) {
       state = {
@@ -2019,7 +2203,11 @@ const refreshGit = async ($: EngineInterface): Promise<void> => {
     }
     if (!isSameGit(old, state)) await update($, gitAtom, () => state)
   } catch {
-    // git missing or slow: the HUD keeps what it had
+    // git missing or slow: the HUD keeps what it had. v0.6.6: once the repository was verified, a failure is a refusal.
+    if (verified !== null) {
+      const project = projectOf(verified)
+      await quiet(async () => { const now = await $.clock.now(); await update($, gitAtom, old => refusedGit(old, project, 'unreadable', now)) })
+    }
   }
 }
 
@@ -2397,8 +2585,10 @@ const measureTree = async ($: EngineInterface, base?: string): Promise<TreeReadi
     const began = await $.clock.now()
     const overdue = async () => (await $.clock.now()) - began > FINGERPRINT_DEADLINE_MS
     const late = `measuring the working tree took longer than ${FINGERPRINT_DEADLINE_MS / 1000}s`
+    // v0.6.6: the repository-state check's pass, once it is given; until then only discovery commands run
+    let pass: RepoPass | undefined
     const sh = async (argv: string[]): Promise<string | null> => {
-      const r = await bounded($, ['git', ...GIT_SAFE, ...argv], { timeoutMs: GIT_TIMEOUT_MS })
+      const r = await bounded($, ['git', ...GIT_SAFE, ...argv], { timeoutMs: GIT_TIMEOUT_MS, ...(pass === undefined ? {} : { auth: pass }) })
 
       return r.exitCode === 0 && !r.isStdoutTruncated ? r.stdout : null
     }
@@ -2406,7 +2596,7 @@ const measureTree = async ($: EngineInterface, base?: string): Promise<TreeReadi
     // files in it out of the listing (reproduced with real git). Any stderr from a listing means it was not complete: UNKNOWN.
     let incomplete = ''
     const listing = async (argv: string[]): Promise<string | null> => {
-      const r = await bounded($, ['git', ...GIT_SAFE, ...argv], { timeoutMs: GIT_TIMEOUT_MS })
+      const r = await bounded($, ['git', ...GIT_SAFE, ...argv], { timeoutMs: GIT_TIMEOUT_MS, ...(pass === undefined ? {} : { auth: pass }) })
       if (r.exitCode === 0 && r.stderr.trim() !== '') incomplete = oneLine(r.stderr, 160)
 
       return r.exitCode === 0 && !r.isStdoutTruncated && r.stderr.trim() === '' ? r.stdout : null
@@ -2425,7 +2615,15 @@ const measureTree = async ($: EngineInterface, base?: string): Promise<TreeReadi
     // Git's excludes, attributes and alternates files are checked before any Git command below reads them (gitInputs).
     const inputs = await gitInputs($, top)
     if ('why' in inputs) return unknown(inputs.why)
-    if (!(await gitFiltersReliable($, top))) return unknown('an active clean/process filter or unreadable filter configuration makes the working tree unreliable')
+    // Which commit is measured against, before anything of the repository's state is read (`rev-parse --verify HEAD` reads no object).
+    const head = base ?? (await at('rev-parse', '--verify', 'HEAD'))?.trim()
+    if (!head) return unknown('no commit to measure against')
+    // v0.6.6: no gitlink, no partial clone, or nothing more is read. measureCommit checks the commit compared against; HEAD is
+    // named here when it is another commit.
+    const checked = await repoState($, top, base === undefined ? [] : ['HEAD'])
+    if (!('pass' in checked)) return unknown(REPO_REFUSAL_WORDS[checked.refused])
+    pass = checked.pass
+    if (!(await gitFiltersReliable($, top, checked.pass))) return unknown('an active clean/process filter or unreadable filter configuration makes the working tree unreliable')
     // Bytes read by the whole fingerprint, against FINGERPRINT_TOTAL_BYTES.
     const budget: ReadBudget = { bytes: 0 }
     // Reads regular files already inspected, then inspects them again: a file replaced (by a link to a device, say) or rewritten in
@@ -2437,7 +2635,7 @@ const measureTree = async ($: EngineInterface, base?: string): Promise<TreeReadi
         budget.bytes += s.size
       }
       if (budget.bytes > FINGERPRINT_TOTAL_BYTES) return { why: `the working tree holds more than ${FINGERPRINT_TOTAL_BYTES / GIB} GiB to read, more than the fingerprint reads` }
-      const r = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'hash-object', '--no-filters', '--', ...names], { timeoutMs: GIT_TIMEOUT_MS })
+      const r = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'hash-object', '--no-filters', '--', ...names], { timeoutMs: GIT_TIMEOUT_MS, auth: checked.pass })
       const hashes = gitAnswered(r) ? hashesOf(r.stdout, names.length) : null
       if (hashes === null) return { why: 'a file could not be hashed (deleted meanwhile, unreadable, not present in a sparse checkout, or its process reached a time or memory limit)' }
       const again = await inspectPaths($, top, names, follow)
@@ -2457,15 +2655,14 @@ const measureTree = async ($: EngineInterface, base?: string): Promise<TreeReadi
 
       return { why: `${dir} exists but could not be listed in full (unreadable, too large or timed out)` }
     }
-    const head = base ?? (await at('rev-parse', '--verify', 'HEAD'))?.trim()
-    if (!head) return unknown('no commit to measure against')
-    const tracked = await measureCommit($, top, head, budget)
+    const tracked = await measureCommit($, top, head, checked.pass, budget)
     if ('why' in tracked) return unknown(tracked.why, tracked.why === TRACKED_RACE)
-    if (!(await gitFiltersReliable($, top, tracked.entries.map(e => e.path)))) return unknown('active commit-path filters make the working tree unreliable')
+    if (!(await gitFiltersReliable($, top, checked.pass, tracked.entries.map(e => e.path)))) return unknown('active commit-path filters make the working tree unreliable')
     if (await overdue()) return unknown(late)
     // -O/dev/null: a configured diff.orderFile is read whole (measured: one pointed at a device exhausted memory); no order is needed here.
-    const changed = await at('diff', head, '-O/dev/null', '--no-renames', '--ignore-submodules=none', '--name-only', '-z', '--diff-filter=d')
-    const deleted = await at('diff', head, '-O/dev/null', '--no-renames', '--ignore-submodules=none', '--name-only', '-z', '--diff-filter=D')
+    // every submodule was refused above, so none is examined (a submodule's own configuration could run a program here)
+    const changed = await at('diff', head, '-O/dev/null', '--no-renames', '--ignore-submodules=all', '--name-only', '-z', '--diff-filter=d')
+    const deleted = await at('diff', head, '-O/dev/null', '--no-renames', '--ignore-submodules=all', '--name-only', '-z', '--diff-filter=D')
     const untracked = await listing(['-C', top, 'ls-files', '-o', '--exclude-standard', '-z'])
     // What git ignores is not hashed, but its NAMES are part of the state: a nested .gitignore of `*`, a line in .git/info/exclude or in
     // any global ignore file moves a new file out of the untracked list and into this one, which is a change in itself (reproduced).
@@ -2605,6 +2802,9 @@ const measureTree = async ($: EngineInterface, base?: string): Promise<TreeReadi
     // and compares UNKNOWN (see compareTree), never as an unchanged tree. A SHA-256 of the work tree path, cut to 128 bits: the path
     // itself is never stored.
     const id = (await sha256Text(`cobalt-cockpit/project/v1\0${top}`)).slice(0, 32)
+    // v0.6.6: a gitlink or a partial clone that appeared while the tree was measured: no stamp
+    const moved = await repoMoved($, top, checked.packDir)
+    if (moved !== null) return unknown(REPO_REFUSAL_WORDS[moved])
 
     return `${head}:${lines.length}.${digest}@${id}`
   } catch (error) {
@@ -4109,14 +4309,19 @@ const stopGuard = async ($: EngineInterface, e: { stop_hook_active?: boolean; la
     // A clean `git status` is not evidence that nothing happened: a tool that can write ran with no task (or an unverified task was
     // reset), and that obligation stands until a check completes. With no such evidence and no visible change there is nothing to ask:
     // a conversation that touched nothing is not made to verify, even where git cannot be read (the host gives no more to go on).
+    // v0.6.6: a repository Cockpit did not read (a gitlink, a partial clone, unsafe inputs, an active filter, an unreadable state)
+    // is not a clean one: its changes cannot be ruled out, so it asks for the check as a changed one does.
     const owed = await read($, owedAtom)
+    let unread: GitState['refused']
     if (owed === null) {
       await quiet(() => refreshGit($))
-      if (((await read($, gitAtom))?.dirty ?? 0) === 0) return null
+      const git = await read($, gitAtom)
+      unread = git?.isRepo === true ? git.refused : undefined
+      if (unread === undefined && (git?.dirty ?? 0) === 0) return null
     }
     const now = await $.clock.now()
     const sha = (await read($, gitAtom))?.sha ?? null
-    const why = owed === null ? 'changes were found with no task in progress' : owed.why
+    const why = owed !== null ? owed.why : unread !== undefined ? `the working tree could not be measured (${refusedReason(await read($, gitAtom))}), so changes cannot be ruled out with no task in progress` : 'changes were found with no task in progress'
     task = await update($, taskAtom, old => old ?? markEdited({ ...newTask(1, '', now, sha), startTree: null }, why))
     if (task === null) return null
   }
@@ -4568,15 +4773,15 @@ export const register: Register = (on, options) => {
     if (refusal !== null) { await ledgerToolEnd($, call, refusal); return refusal }
 
     if (config.hasOrchestration && e.agentId && e.tool === 'Bash' && (gitPlan.pin !== undefined || agentInspection(String(call['command'] ?? '')))) {
-      // a scoped command's repository was verified when its paths were checked; a wildcard one's is verified here
-      const root = gitPlan.root ?? await verifiedGitRoot($)
-      if (root === null || 'why' in await gitInputs($, root) || !(await gitFiltersReliable($, root))) {
-        const deny = GIT_IDENTITY_DENY
+      // a scoped command's place was checked with its paths; a wildcard one's is checked here (v0.6.6: the same check)
+      const place = gitPlan.place ?? await helperGitPlace($)
+      if ('deny' in place) {
+        const deny = place.deny
         await ledgerToolEnd($, call, { deny })
         return { deny }
       }
-      // what runs is never the text the agent typed: every word is quoted again behind the safe flags
-      (call as Record<string, unknown>)['command'] = rebuildGit(String(call['command']), gitPlan.pin)
+      // what runs is never the text the agent typed: every word is quoted again behind the safe flags, in the checked directory
+      (call as Record<string, unknown>)['command'] = rebuildGit(String(call['command']), place.dir, gitPlan.pin)
     }
     // A subagent's reasoning level goes on its own Agent call: the engine's
     // native, per-invocation setting, so nothing global moves under a sibling.
@@ -5828,7 +6033,7 @@ export const register: Register = (on, options) => {
       const stake =
         git !== null && git.isRepo
           ? `${git.project} · ${git.isDetached ? 'detached HEAD' : (git.branch ?? 'no branch')} · ${
-              git.dirty === 0 ? 'working tree clean' : `${git.dirty} uncommitted change${git.dirty === 1 ? '' : 's'} at stake`
+              git.refused !== undefined ? `working tree not measured (${refusedReason(git)}); changes cannot be ruled out` : git.dirty === 0 ? 'working tree clean' : `${git.dirty} uncommitted change${git.dirty === 1 ? '' : 's'} at stake`
             }`
           : ''
 

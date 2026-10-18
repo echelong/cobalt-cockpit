@@ -2,6 +2,7 @@
 // ahead/behind, read from `git status --porcelain=v2 --branch`.
 
 import type { GitState } from '../types'
+import { REPO_REFUSAL_SHORT } from './git-integrity'
 
 export type GitRead = Omit<GitState, 'startSha' | 'at' | 'project' | 'isRepo'>
 
@@ -38,10 +39,17 @@ export const projectOf = (path: string): string => {
   return trimmed.slice(trimmed.lastIndexOf('/') + 1) || '/'
 }
 
-/** `3 changed`, `clean`, `no repo`: the working tree in a word or two. */
+/** v0.6.6: why a repository was not read, in a word or two. */
+const REFUSED_LABEL: Readonly<Record<NonNullable<GitState['refused']>, string>> = { inputs: 'unsafe Git inputs', submodule: REPO_REFUSAL_SHORT.submodule, 'partial-clone': REPO_REFUSAL_SHORT['partial-clone'], unreadable: REPO_REFUSAL_SHORT.unreadable, filter: 'active filter' }
+/** Why a repository was not read, in a word or two; null when it was read (or is no repository). */
+export const refusedReason = (git: GitState | null): string | null => (git === null || !git.isRepo || git.refused === undefined ? null : REFUSED_LABEL[git.refused])
+/** Whether the HUD has something to warn about in the working tree: changes, or a repository it did not read (v0.6.6). */
+export const treeNeedsAttention = (git: GitState | null): boolean => git !== null && git.isRepo && (git.refused !== undefined || git.dirty > 0)
+/** `3 changed`, `clean`, `no repo`, or `not measured (submodule)`: the working tree in a word or two. A repository Cockpit did not read is never `clean`. */
 export const dirtyLabel = (git: GitState | null): string => {
   if (git === null) return ''
   if (!git.isRepo) return 'no repo'
+  if (git.refused !== undefined) return `not measured (${refusedReason(git)})`
 
   return git.dirty === 0 ? 'clean' : `${git.dirty} changed`
 }
