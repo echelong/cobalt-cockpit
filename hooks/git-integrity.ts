@@ -176,11 +176,10 @@ export const ownersOf = (text: string, gnu: boolean, names: readonly string[]): 
  * user and not writable by others (a sticky one included). A directory its group may write to is accepted: on macOS /usr/local
  * often is (admin), and that group already administers the machine.
  */
-export const programTrusted = (file: Owner, dirs: readonly Owner[], uid: number | null): boolean => {
-  const owned = (o: Owner) => o.uid === 0 || (uid !== null && o.uid === uid)
-
-  return kindOfMode(file.mode) === 'file' && owned(file) && (file.mode & 0o022) === 0 && dirs.length > 0 && dirs.every(dir => kindOfMode(dir.mode) === 'dir' && owned(dir) && (dir.mode & 0o002) === 0)
-}
+export const programTrusted = (file: Owner, dirs: readonly Owner[], uid: number | null): boolean =>
+  kindOfMode(file.mode) === 'file' && (file.uid === 0 || (uid !== null && file.uid === uid)) && (file.mode & 0o022) === 0 && dirs.length > 0 && dirs.every(dir => dirTrusted(dir, uid))
+/** A directory a program may be found or kept in: owned by root or the session's user, not writable by others. */
+export const dirTrusted = (dir: Owner, uid: number | null): boolean => kindOfMode(dir.mode) === 'dir' && (dir.uid === 0 || (uid !== null && dir.uid === uid)) && (dir.mode & 0o002) === 0
 /**
  * Variables that make the person's own Git use another repository, index, object store, configuration or attributes than it
  * would find from the session directory. The clean environment does not pass them, so where one is set Cockpit's Git would

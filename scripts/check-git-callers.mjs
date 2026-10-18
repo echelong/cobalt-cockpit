@@ -34,6 +34,34 @@ const owners = lines => {
 }
 const firstLiteral = text => { const m = /^\s*(?:[^'`[]*\?\s*)?\[\s*'([^']+)'/.exec(text); return m ? m[1] : null }
 
+/**
+ * Other routes to a process or to code, on one line: none is used, and none may be. Stage B: the process capability reached through
+ * another name, a bracket (`$['process']`, `` $[`process`] ``) or destructuring (`const { process } = $`). Patterns about code are
+ * tested with strings blanked (a string may mention them); the bracket and destructuring ones with comments removed only, since
+ * the name is itself a string there.
+ */
+const otherRoutes = line => {
+  const code = line.replace(/\/\/.*$/, '')
+  const blanked = code.replace(/'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, "''")
+  const found = []
+  if (/(?<![\w$])(?!\$)[A-Za-z_]\w*\s*\.\s*process\s*\.\s*(?:run|spawn)\b/.test(blanked)) found.push('the process capability through another binding')
+  if (/\[\s*(['"`])process\1\s*\]/.test(code)) found.push('the process capability through a bracket')
+  if (/\{[^}]*\bprocess\b[^}]*\}\s*=\s*\$(?![\w$])/.test(blanked)) found.push('the process capability through destructuring')
+  // a module name is a string: tested with comments removed only
+  if (/\bchild_process\b|\bBun\.spawn|\bDeno\.(?:run|Command)\b/.test(code)) found.push('a process API other than $.process')
+  if (/\beval\s*\(|\bnew\s+Function\s*\(/.test(blanked)) found.push('eval or new Function')
+  if (/\bimport\s*\(/.test(blanked)) found.push('a dynamic import()')
+  return found
+}
+// the patterns are live: each of these lines must be flagged, and the ordinary call and mentions in text must not (exit 2 otherwise)
+const SELF_TEST = [
+  ["const r = await $['process'].run(['x'])", true], ['const r = await $[`process`].run(["x"])', true], ['const r = await $["process"].run(["x"])', true],
+  ['const { process } = $', true], ['const { clock, process: p } = $', true], ['const host = $; await host.process.run(["x"])', true],
+  ["import('./x')", true], ["eval('1')", true], ["require('child_process')", true],
+  ["const r = await $.process.run(['realpath', '-m', '--', path])", false], ["// $['process'] in a comment", false], ["const text = 'host.process.run is refused'", false],
+]
+for (const [sample, flagged] of SELF_TEST) if ((otherRoutes(sample).length > 0) !== flagged) { console.error(`check-git-callers: self-test failed on: ${sample}`); process.exit(2) }
+
 const hooks = readdirSync(resolve(root, 'hooks'), { recursive: true }).map(String).filter(f => /\.(?:tsx?|mjs|cjs|js)$/.test(f)).map(f => `hooks/${f}`)
 const processSites = []
 for (const file of hooks) {
@@ -46,10 +74,7 @@ for (const file of hooks) {
       const after = line.slice(m.index + m[0].length)
       processSites.push({ file, function: who[i], program: firstLiteral(after) ?? after.slice(0, after.search(/[(,\]]/)).replace(/^\[/, '').trim() })
     }
-    // other routes to a process or to code: none is used, and none may be (Stage B: `process` reached through another name or a bracket)
-    for (const [pattern, what] of [[/(?<![\w$])(?!\$)[A-Za-z_]\w*\s*\.\s*process\s*\.\s*(?:run|spawn)\b/, 'the process capability through another binding'], [/\[\s*['"`]process['"`]\s*\]/, 'the process capability through a bracket'], [/\bchild_process\b|\bBun\.spawn|\bDeno\.(?:run|Command)\b/, 'a process API other than $.process'], [/\beval\s*\(|\bnew\s+Function\s*\(/, 'eval or new Function'], [/\bimport\s*\(/, 'a dynamic import()']]) {
-      if (pattern.test(line.replace(/\/\/.*$/, '').replace(/'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, "''"))) problems.push(`${file}:${i + 1}: ${what}`)
-    }
+    for (const what of otherRoutes(line)) problems.push(`${file}:${i + 1}: ${what}`)
   })
 }
 for (const site of processSites) if (site.file !== 'hooks/register.tsx') problems.push(`${site.file}: starts a process; only hooks/register.tsx may`)

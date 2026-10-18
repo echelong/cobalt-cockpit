@@ -50,7 +50,7 @@ import type { Player } from './audio'
 import { EMPTY_LOG, EVENT_TTL_MS, callOf, closeOf, liveOf, push } from './activity'
 import { activityOf, readBash } from './classify'
 import { parseStatus, projectOf, filterCommands, activeFilter, refusedReason } from './git'
-import { GIT_SAFE, commitEntries, BOUND_AS_KIB, BOUND_CPU_S, BOUND_PROBE_CAPPED, BOUND_PROBE_CONTROL, BOUND_PROBE_GROUP, BOUND_PROBE_SET, BOUND_PROGRAMS, BOUND_SLOTS, BOUND_TAG, CLEAN_ENV, CLEAN_SHELL, FINGERPRINT_FILE_BYTES, FINGERPRINT_TOTAL_BYTES, GIT_BOUNDED, GIT_ENV_MEASURED, GIT_ENV_REFUSED, IGNORED_BSD, IGNORED_GNU, INSPECT_BSD, INSPECT_GNU, LOADER_BLANK, MEASURE_PROGRAMS, OWNER_BSD, OWNER_GNU, REPO_REFUSAL_SHORT, REPO_REFUSAL_WORDS, OWNER_STAT_AT, REQUIRED_PROGRAMS, RESOLVE_SCRIPT, SOURCE_BYTES, USER_ID_AT, ancestorsOf, boundScript, callerEnvAdmitted, cleanAssignments, filterRecordsOf, gitAccessOf, gitCallOf, gitVersionOf, helperAssignments, runsFilters, inspectedOf, nonGitAdmitted, ownersOf, partialCloneOf, programTrusted, promisorPacksOf, resolvedOf, stageGitlinks, trustedPathOf } from './git-integrity'
+import { GIT_SAFE, commitEntries, BOUND_AS_KIB, BOUND_CPU_S, BOUND_PROBE_CAPPED, BOUND_PROBE_CONTROL, BOUND_PROBE_GROUP, BOUND_PROBE_SET, BOUND_PROGRAMS, BOUND_SLOTS, BOUND_TAG, CLEAN_ENV, CLEAN_SHELL, FINGERPRINT_FILE_BYTES, FINGERPRINT_TOTAL_BYTES, GIT_BOUNDED, GIT_ENV_MEASURED, GIT_ENV_REFUSED, IGNORED_BSD, IGNORED_GNU, INSPECT_BSD, INSPECT_GNU, LOADER_BLANK, MEASURE_PROGRAMS, OWNER_BSD, OWNER_GNU, REPO_REFUSAL_SHORT, REPO_REFUSAL_WORDS, OWNER_STAT_AT, REQUIRED_PROGRAMS, RESOLVE_SCRIPT, SOURCE_BYTES, USER_ID_AT, ancestorsOf, dirTrusted, boundScript, callerEnvAdmitted, cleanAssignments, filterRecordsOf, gitAccessOf, gitCallOf, gitVersionOf, helperAssignments, runsFilters, inspectedOf, nonGitAdmitted, ownersOf, partialCloneOf, programTrusted, promisorPacksOf, resolvedOf, stageGitlinks, trustedPathOf } from './git-integrity'
 import type { CleanBase, CommitEntry, DiskEntry, HelperLaunch, Inspected, Kind, MeasureProgram, Measurement, Owner, RepoRefusal } from './git-integrity'
 import { assessCommand } from './guard'
 import { failClosed, guardFailure, isInsideFolder } from './guard-rules'
@@ -445,7 +445,9 @@ const probeBound = async ($: EngineInterface): Promise<Bound> => {
   const idAt = await anchor(USER_ID_AT, programs.id)
   if (statAt === undefined || insideAny(roots, statAt.at) || (idAt !== undefined && insideAny(roots, idAt.at))) return refuse('the owner of the measurement programs could not be checked from outside the repository', true)
   const files = [...new Set([...canonical, statAt.at, ...(idAt === undefined ? [] : [idAt.at])])]
-  const names = [...files, ...new Set(files.flatMap(ancestorsOf))]
+  // the directories above each file, and above each path as it was found (a link in a directory others can write to could be
+  // pointed elsewhere later, and it is the found path that is started)
+  const names = [...files, ...new Set([...files.flatMap(ancestorsOf), ...started.flatMap(ancestorsOf)])]
   const gnu = await run([statAt.path, '-L', '--printf', OWNER_GNU, '--', ...names])
   const owners = gnu !== null && gnu.exitCode === 0 && !gnu.isStdoutTruncated && gnu.stderr === '' ? ownersOf(gnu.stdout, true, names) : null
   const bsd = owners !== null ? null : await run([statAt.path, '-L', '-f', OWNER_BSD, '--', ...names])
@@ -456,12 +458,18 @@ const probeBound = async ($: EngineInterface): Promise<Bound> => {
   // `id` runs only once it is known to be root's and closed to others; without it, only root's programs are trusted
   const id = idAt !== undefined && trusted(idAt.at, null) ? await run([idAt.path, '-u']) : null
   const uid = id !== null && id.exitCode === 0 && /^\d+\n$/.test(id.stdout) ? Number(id.stdout.trim()) : null
-  const unsafe = files.find(path => !trusted(path, uid))
+  // an `id` that was not run is not trusted for anything, so its own owner does not refuse the rest
+  const idFiles = new Set([...(idAt === undefined ? [] : [idAt.at]), ...(programs.id === undefined ? [] : [canonical[started.indexOf(programs.id)]!])])
+  const unused = (path: string) => id === null && idFiles.has(path)
+  const unsafe = files.find(path => !unused(path) && !trusted(path, uid))
   if (unsafe !== undefined) return refuse(`${unsafe} is not a regular file owned by root${uid === null ? '' : ' or this user'} and closed to writes by others (or a directory above it is not)`, true)
+  const exposed = started.find(path => !(id === null && path === programs.id) && !ancestorsOf(path).every(dir => dirTrusted(ownerOf.get(dir)!, uid)))
+  if (exposed !== undefined) return refuse(`${exposed} is found in a directory owned by another user or open to writes by others`, true)
   // only now the probes that start a program found: GNU timeout's version, and dd under and without the 32 MiB cap
   const timeout = programs.timeout === undefined ? null : await sh(BOUND_PROBE_GROUP, programs.timeout)
   const group = timeout !== null && /\(GNU coreutils\)/.test(timeout.stdout.split('\n')[0] ?? '')
-  let enforced: boolean | null = script === 'memory' ? null : false
+  // without dd, the memory limit cannot be shown to be enforced: not enforced, as a probe that could not run read before
+  let enforced: boolean | null = script === 'memory' && programs.dd !== undefined ? null : false
   let enforcementAnswered = true
   if (script === 'memory' && set !== null && set.exitCode === 0 && programs.dd !== undefined) {
     // accepted is not enforced: a 64 MiB allocation must succeed without the cap and fail under a 32 MiB one

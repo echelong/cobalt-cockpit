@@ -97,7 +97,7 @@ describe('the clean launch, piece by piece', () => {
   })
   test('the loader\'s variables are blanked for /usr/bin/env itself; every measured name is also refused for helpers', () => {
     expect(Object.values(LOADER_BLANK).every(v => v === '')).toBe(true)
-    expect(Object.keys(LOADER_BLANK)).toEqual(expect.arrayContaining(['LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'LD_DEBUG', 'LD_PROFILE', 'GLIBC_TUNABLES', 'GCONV_PATH', 'DYLD_INSERT_LIBRARIES']))
+    expect(Object.keys(LOADER_BLANK).sort()).toEqual(['DYLD_FALLBACK_LIBRARY_PATH', 'DYLD_FRAMEWORK_PATH', 'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH', 'GCONV_PATH', 'GLIBC_TUNABLES', 'LD_AUDIT', 'LD_BIND_NOT', 'LD_BIND_NOW', 'LD_DEBUG', 'LD_DEBUG_OUTPUT', 'LD_LIBRARY_PATH', 'LD_ORIGIN_PATH', 'LD_PRELOAD', 'LD_PROFILE', 'LD_PROFILE_OUTPUT', 'LD_VERBOSE', 'LD_WARN', 'LOCPATH', 'NLSPATH'])
     // those that act when merely present are never set: an empty value would turn them on
     for (const name of ['LD_TRACE_LOADED_OBJECTS', 'LD_SHOW_AUXV', 'LD_DYNAMIC_WEAK']) expect([name, name in LOADER_BLANK]).toEqual([name, false])
     expect(GIT_ENV_MEASURED).toHaveLength(20)
@@ -238,7 +238,12 @@ describe('every measurement process starts clean', () => {
     const { w } = fixture(on, { owners: { '/usr/bin/id': { uid: 1001, mode: 0x81ed } } })
     await start($)
     expect(w.launchProbes).toEqual([['resolve', '/usr/bin:/bin'], ['owners', 'gnu', '/usr/bin/stat']])
-    expect(String((await command($, 'doctor')).text)).toContain('/usr/bin/id is not a regular file owned by root and closed to writes by others')
+    expect(String((await command($, 'doctor')).text)).toContain('OK   measurement processes start with a clean environment')    // root's programs: measured
+  })
+  test('with the user unknown, a program of the user\'s is refused', guard(), async ($, on) => {
+    world(on, { owners: { '/usr/bin/id': { uid: 1001, mode: 0x81ed }, '/usr/bin/git': { uid: 1000, mode: 0x81ed } } })
+    await start($)
+    expect(String((await command($, 'doctor')).text)).toContain('/usr/bin/git is not a regular file owned by root and closed to writes by others')
   })
   test('the owner check reads owners with the system\'s own stat, never one it has yet to check', guard(), async ($, on) => {
     const { w } = fixture(on, { programs: { stat: '/opt/x/bin/stat' }, owners: { '/opt/x': { uid: 1001, mode: 0x41ed } } })
@@ -263,6 +268,25 @@ describe('every measurement process starts clean', () => {
       expect([script, launches.length]).toEqual([script, 1])
       expect(launches[0]!.at(-1)).toBe(script === BOUND_PROBE_GROUP ? '/usr/bin/timeout' : '/usr/bin/dd')
     }
+  })
+  test('a program found as a link in a directory anyone can write to is refused, though the file it leads to is root\'s', guard(), async ($, on) => {
+    const { w } = fixture(on, { programs: { git: '/tmp/bin/git' }, realPaths: { '/tmp/bin/git': '/usr/bin/git' }, owners: { '/tmp': { uid: 0, mode: 0x43ff } } })
+    await start($)
+    expect(String((await command($, 'doctor')).text)).toContain('/tmp/bin/git is found in a directory owned by another user or open to writes by others')
+    expect(w.runs.filter((_, i) => w.programPaths[i] === '/tmp/bin/git')).toEqual([])
+  })
+  test('without dd the memory limit is reported as not enforced, never as a probe that will run again', guard(), async ($, on) => {
+    world(on, { programs: { dd: null } })
+    await start($)
+    const out = String((await command($, 'doctor')).text)
+    expect(out).toContain('this platform does NOT enforce the memory limit it accepts')
+    expect(out).not.toContain('runs again at the next measurement')
+  })
+  test('an id that is not root\'s is not run, and does not refuse the rest: root\'s programs still measure', guard(), async ($, on) => {
+    const { w, h } = fixture(on, { programs: { id: '/opt/x/bin/id' }, systemTools: false, owners: { '/opt/x/bin/id': { uid: 1000, mode: 0x81ed } } })
+    await start($); await enroll($); await prompt($, 'tidy it')
+    expect(w.launchProbes.filter(p => p[0] === 'id')).toEqual([])
+    expect(taskOf(h)?.startTree).toEqual(expect.any(String))
   })
   test('a program in a directory owned by another user is refused, as one below a directory anyone can write to', guard(), async ($, on) => {
     world(on, { programs: { git: '/opt/tools/bin/git' }, owners: { '/opt/tools': { uid: 1001, mode: 0x41ed } } })
