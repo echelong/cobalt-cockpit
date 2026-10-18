@@ -5,11 +5,11 @@
 // rather than measured. A helper's rebuilt inspection starts the same way. Everything a refusal touches is UNKNOWN, never clean.
 // Through the fake host only: what the real host and real Git do with these argv is for the approved real-Git acceptance.
 import { describe, expect, test } from 'claude-code/testing'
-import { BOUND_ENV, BOUND_PINS, CALLER_ENV, CLEAN_ENV, CLEAN_SHELL, GIT_ENV_MEASURED, GIT_ENV_REFUSED, LOADER_BLANK, MEASURE_PROGRAMS, OWNER_BSD, OWNER_GNU, RESOLVE_SCRIPT, boundScript, callerEnvAdmitted, cleanAssignments, helperAssignments, ownersOf, programTrusted, resolvedOf, trustedPathOf } from '../hooks/git-integrity'
+import { BOUND_ENV, BOUND_PINS, BOUND_PROBE_CAPPED, BOUND_PROBE_CONTROL, BOUND_PROBE_GROUP, BOUND_PROBE_SET, CALLER_ENV, CLEAN_ENV, CLEAN_SHELL, GIT_ENV_MEASURED, GIT_ENV_REFUSED, LOADER_BLANK, MEASURE_PROGRAMS, OWNER_BSD, OWNER_GNU, RESOLVE_SCRIPT, ancestorsOf, boundScript, callerEnvAdmitted, cleanAssignments, helperAssignments, ownersOf, programTrusted, resolvedOf, runsFilters, trustedPathOf } from '../hooks/git-integrity'
 import { checkpointOf, emptyLedger, UNKNOWN } from '../hooks/ledger'
 import { dirtyLabel } from '../hooks/git'
 import type { GitState, Task } from '../types'
-import { blobOf, command, FIVE, GATE_NAMES, hostState, passAllGates, planAndComplete, progress, prompt, start, world } from './world'
+import { blobOf, CLEAN_REPO, command, FIVE, GATE_NAMES, hostState, passAllGates, planAndComplete, progress, prompt, start, world } from './world'
 import type { World } from './world'
 
 type Engine = Parameters<typeof start>[0]
@@ -46,10 +46,10 @@ describe('the clean launch, piece by piece', () => {
   test('the clean shell\'s `command -v` answer, line by line: a path, or not found', () => {
     const lines = (...paths: string[]) => paths.map(p => `${p}\n`).join('')
     expect(RESOLVE_SCRIPT).toBe(`for p in ${MEASURE_PROGRAMS.join(' ')}; do command -v "$p" || echo; done`)
-    expect(resolvedOf(lines('/usr/bin/git', '/usr/bin/stat', '/usr/bin/find', '/usr/bin/readlink', '/usr/bin/realpath', '/usr/bin/timeout', '/usr/bin/id'))).toEqual({ git: '/usr/bin/git', stat: '/usr/bin/stat', find: '/usr/bin/find', readlink: '/usr/bin/readlink', realpath: '/usr/bin/realpath', timeout: '/usr/bin/timeout', id: '/usr/bin/id' })
+    expect(resolvedOf(lines('/usr/bin/git', '/usr/bin/stat', '/usr/bin/find', '/usr/bin/readlink', '/usr/bin/realpath', '/usr/bin/timeout', '/usr/bin/id', '/bin/dd'))).toEqual({ git: '/usr/bin/git', stat: '/usr/bin/stat', find: '/usr/bin/find', readlink: '/usr/bin/readlink', realpath: '/usr/bin/realpath', timeout: '/usr/bin/timeout', id: '/usr/bin/id', dd: '/bin/dd' })
     // a builtin, alias or function answers with a word: not found, never run
-    expect(resolvedOf(lines('/usr/bin/git', 'stat', '', '/usr/bin/readlink', '/usr/bin/realpath', '', '/usr/bin/id'))).toEqual({ git: '/usr/bin/git', readlink: '/usr/bin/readlink', realpath: '/usr/bin/realpath', id: '/usr/bin/id' })
-    for (const bad of ['', '/usr/bin/git', lines('/usr/bin/git'), lines('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h')]) expect([bad, resolvedOf(bad)]).toEqual([bad, null])
+    expect(resolvedOf(lines('/usr/bin/git', 'stat', '', '/usr/bin/readlink', '/usr/bin/realpath', '', '/usr/bin/id', 'dd'))).toEqual({ git: '/usr/bin/git', readlink: '/usr/bin/readlink', realpath: '/usr/bin/realpath', id: '/usr/bin/id' })
+    for (const bad of ['', '/usr/bin/git', lines('/usr/bin/git'), lines('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i')]) expect([bad, resolvedOf(bad)]).toEqual([bad, null])
   })
   test('owners and modes read strictly, GNU (named) or BSD', () => {
     expect(ownersOf(`0 81ed /usr/bin/git\0${''}1000 41ed /usr/bin\0`, true, ['/usr/bin/git', '/usr/bin'])).toEqual([{ uid: 0, mode: 0x81ed }, { uid: 1000, mode: 0x41ed }])
@@ -57,18 +57,31 @@ describe('the clean launch, piece by piece', () => {
     for (const [text, gnu] of [['0 81ed /usr/bin/other\0', true], ['0 81ed /usr/bin/git', true], ['x 81ed /usr/bin/git\0', true], ['0 100755', false], ['0 100755\n0 40755\n', false]] as const) expect([text, ownersOf(text, gnu, ['/usr/bin/git'])]).toEqual([text, null])
     expect([OWNER_GNU, OWNER_BSD]).toEqual(['%u %f %n\\0', '%u %p'])
   })
-  test('a program may start: a regular file of root or this user, closed to writes by others, in a directory others cannot write to', () => {
+  test('a program may start: a regular file of root or this user, closed to writes by others, every directory above it too', () => {
     const file = (uid: number, mode: number) => ({ uid, mode: 0o100000 | mode }), dir = (uid: number, mode: number) => ({ uid, mode: 0o40000 | mode })
-    expect(programTrusted(file(0, 0o755), dir(0, 0o755), 1000)).toBe(true)
-    expect(programTrusted(file(1000, 0o755), dir(1000, 0o755), 1000)).toBe(true)                       // Homebrew, a ~/.local/bin
-    expect(programTrusted(file(0, 0o555), dir(0, 0o775), 1000)).toBe(true)                            // a group-writable directory, as /usr/local/bin can be
-    expect(programTrusted(file(1001, 0o755), dir(0, 0o755), 1000)).toBe(false)                        // another user's
-    expect(programTrusted(file(1000, 0o755), dir(0, 0o755), null)).toBe(false)                        // the user unknown: root's only
-    expect(programTrusted(file(0, 0o775), dir(0, 0o755), 1000)).toBe(false)                           // writable by its group
-    expect(programTrusted(file(0, 0o757), dir(0, 0o755), 1000)).toBe(false)                           // writable by anyone
-    expect(programTrusted(file(0, 0o755), dir(0, 0o1777), 1000)).toBe(false)                          // in /tmp
-    expect(programTrusted({ uid: 0, mode: 0o40755 }, dir(0, 0o755), 1000)).toBe(false)                // not a file
-    expect(programTrusted(file(0, 0o755), file(0, 0o755), 1000)).toBe(false)                          // its "directory" is not one
+    const root = dir(0, 0o755)
+    expect(programTrusted(file(0, 0o755), [dir(0, 0o755), root], 1000)).toBe(true)
+    expect(programTrusted(file(1000, 0o755), [dir(1000, 0o755), dir(1000, 0o755), root], 1000)).toBe(true)   // Homebrew, a ~/.local/bin
+    expect(programTrusted(file(0, 0o555), [dir(1000, 0o775), dir(0, 0o755), root], 1000)).toBe(true)        // a group-writable directory, as /usr/local/bin can be
+    expect(programTrusted(file(0, 0o555), [dir(0, 0o1775), root], 1000)).toBe(true)                          // the Nix store: sticky, group-writable
+    expect(programTrusted(file(1001, 0o755), [root], 1000)).toBe(false)                                       // another user's
+    expect(programTrusted(file(1000, 0o755), [root], null)).toBe(false)                                       // the user unknown: root's only
+    expect(programTrusted(file(0, 0o775), [root], 1000)).toBe(false)                                          // writable by its group
+    expect(programTrusted(file(0, 0o757), [root], 1000)).toBe(false)                                          // writable by anyone
+    expect(programTrusted(file(0, 0o755), [dir(0, 0o1777), root], 1000)).toBe(false)                         // in /tmp
+    expect(programTrusted(file(0, 0o755), [dir(1001, 0o755), root], 1000)).toBe(false)                       // in another user's directory
+    expect(programTrusted(file(0, 0o755), [dir(0, 0o755), dir(1001, 0o755), root], 1000)).toBe(false)        // below another user's directory
+    expect(programTrusted(file(0, 0o755), [dir(0, 0o755), dir(0, 0o777), root], 1000)).toBe(false)           // below one anyone can write to
+    expect(programTrusted({ uid: 0, mode: 0o40755 }, [root], 1000)).toBe(false)                               // not a file
+    expect(programTrusted(file(0, 0o755), [file(0, 0o755)], 1000)).toBe(false)                                // its "directory" is not one
+    expect(programTrusted(file(0, 0o755), [], 1000)).toBe(false)                                              // no directory known
+    expect(ancestorsOf('/usr/local/bin/git')).toEqual(['/usr/local/bin', '/usr/local', '/usr', '/'])
+    expect(ancestorsOf('/git')).toEqual(['/'])
+  })
+  test('a filtering command is told apart from a raw one, for the filter check\'s mark', () => {
+    const call = (sub: string, ...args: string[]) => ({ sub, args, dir: '/r' })
+    expect([runsFilters(call('status', '--porcelain')), runsFilters(call('diff', 'HEAD')), runsFilters(call('hash-object', '--', 'a'))]).toEqual([true, true, true])
+    expect([runsFilters(call('hash-object', '--no-filters', '--', 'a')), runsFilters(call('hash-object', '--no-filters', '--stdin')), runsFilters(call('ls-files', '-z')), runsFilters(call('check-attr', '-z', '--stdin', 'filter'))]).toEqual([false, false, false, false])
   })
   test('the variables, in order, the pins last; a caller may add LC_ALL=C and nothing else', () => {
     const base = { path: ['/opt/git/bin', '/usr/bin'], home: '/home/p', xdgConfigHome: '/home/p/.config' }
@@ -84,7 +97,9 @@ describe('the clean launch, piece by piece', () => {
   })
   test('the loader\'s variables are blanked for /usr/bin/env itself; every measured name is also refused for helpers', () => {
     expect(Object.values(LOADER_BLANK).every(v => v === '')).toBe(true)
-    expect(Object.keys(LOADER_BLANK)).toEqual(expect.arrayContaining(['LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'DYLD_INSERT_LIBRARIES']))
+    expect(Object.keys(LOADER_BLANK)).toEqual(expect.arrayContaining(['LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'LD_DEBUG', 'LD_PROFILE', 'GLIBC_TUNABLES', 'GCONV_PATH', 'DYLD_INSERT_LIBRARIES']))
+    // those that act when merely present are never set: an empty value would turn them on
+    for (const name of ['LD_TRACE_LOADED_OBJECTS', 'LD_SHOW_AUXV', 'LD_DYNAMIC_WEAK']) expect([name, name in LOADER_BLANK]).toEqual([name, false])
     expect(GIT_ENV_MEASURED).toHaveLength(20)
     for (const name of GIT_ENV_MEASURED) expect([name, GIT_ENV_REFUSED.includes(name)]).toEqual([name, true])
   })
@@ -153,6 +168,23 @@ describe('every measurement process starts clean', () => {
     expect(paths.length).toBeGreaterThan(0)
     expect(new Set(paths)).toEqual(new Set(['/usr/bin:/bin']))
   })
+  test('a PATH entry that is a link into the repository is not passed on either', guard(), async ($, on) => {
+    const { w, h } = fixture(on, { env: { PATH: '/opt/tools:/usr/bin:/bin' }, realPaths: { '/opt/tools': `${ROOT}/bin` }, files: { [`${ROOT}/.git`]: '' } })
+    await start($); await enroll($); await prompt($, 'tidy it')
+    expect(taskOf(h)?.startTree).toEqual(expect.any(String))
+    expect(new Set(w.runEnvs.filter((_, i) => w.programPaths[i] !== null).map(env => env?.['PATH']))).toEqual(new Set(['/usr/bin:/bin']))
+  })
+  test('a file check that fails after the probe refuses there too: the repository check is made for each process outside a repository', guard(), async ($, on) => {
+    const { w, h } = fixture(on)
+    await start($); await enroll($); await prompt($, 'tidy it')
+    expect(taskOf(h)?.startTree).toEqual(expect.any(String))                        // the probe and the first checks answered
+    w.failExists = true
+    w.tree['src/a.ts'] = 'b'
+    const from = w.runs.length
+    await stop($)
+    expect(kept(h).at(-1)?.summary).toContain('whether a measurement program lies inside the repository could not be checked')
+    expect(measured(w, from)).toEqual([])
+  })
   test('a session directory too deep to walk to the root refuses: the check never answers about part of the path', guard(), async ($, on) => {
     world(on, { cwd: `/${'d/'.repeat(300)}w` })
     await start($)
@@ -181,7 +213,61 @@ describe('every measurement process starts clean', () => {
     await start($); await enroll($); await prompt($, 'tidy it')
     w.tree['src/a.ts'] = 'b'
     await stop($); await stop($)
-    expect(w.launchProbes).toEqual([['resolve', '/usr/bin:/bin'], ['id'], ['owners', 'gnu']])
+    // the owners first, then `id`, once it is known to be root's (v0.6.6 Stage B, after review)
+    expect(w.launchProbes).toEqual([['resolve', '/usr/bin:/bin'], ['owners', 'gnu', '/usr/bin/stat'], ['id', '/usr/bin/id']])
+  })
+  test('nothing the clean shell found runs before it is resolved, kept out of the repository and checked: a timeout inside the repository never starts', guard(), async ($, on) => {
+    const { w, h } = fixture(on, { programs: { timeout: `${ROOT}/bin/timeout`, dd: `${ROOT}/bin/dd` }, files: { [`${ROOT}/.git`]: '' } })
+    await start($); await enroll($); await prompt($, 'tidy it')
+    w.tree['src/a.ts'] = 'b'
+    await stop($)
+    expect(kept(h).at(-1)?.summary).toContain(`${ROOT}/bin/timeout lies inside the repository`)
+    // no probe started it, nor dd, nor the owner check, nor id
+    expect(w.launched.filter(argv => argv.some(word => word.startsWith(`${ROOT}/`)))).toEqual([])
+    expect(w.launchProbes).toEqual([['resolve', '/usr/bin:/bin']])
+    expect(w.boundProbes.filter(script => script !== BOUND_PROBE_SET(true) && script !== BOUND_PROBE_SET(false))).toEqual([])
+  })
+  test('nothing found runs before its owner is checked: a timeout and dd of another user\'s never start', guard(), async ($, on) => {
+    const { w } = fixture(on, { owners: { '/usr/bin/timeout': { uid: 1001, mode: 0x81ed }, '/usr/bin/dd': { uid: 1001, mode: 0x81ed } } })
+    await start($)
+    expect(String((await command($, 'doctor')).text)).toContain('/usr/bin/timeout is not a regular file owned by root or this user')
+    // started, not inspected: the owner check names them as files to stat
+    expect(w.launched.filter(argv => !argv.includes(OWNER_GNU) && !argv.includes(OWNER_BSD) && (argv.includes('/usr/bin/timeout') || argv.includes('/usr/bin/dd')))).toEqual([])
+  })
+  test('id runs only once it is root\'s; one of another user\'s is never started, and only root\'s programs are trusted then', guard(), async ($, on) => {
+    const { w } = fixture(on, { owners: { '/usr/bin/id': { uid: 1001, mode: 0x81ed } } })
+    await start($)
+    expect(w.launchProbes).toEqual([['resolve', '/usr/bin:/bin'], ['owners', 'gnu', '/usr/bin/stat']])
+    expect(String((await command($, 'doctor')).text)).toContain('/usr/bin/id is not a regular file owned by root and closed to writes by others')
+  })
+  test('the owner check reads owners with the system\'s own stat, never one it has yet to check', guard(), async ($, on) => {
+    const { w } = fixture(on, { programs: { stat: '/opt/x/bin/stat' }, owners: { '/opt/x': { uid: 1001, mode: 0x41ed } } })
+    await start($)
+    expect(String((await command($, 'doctor')).text)).toContain('/opt/x/bin/stat is not a regular file owned by root or this user')
+    expect(w.launchProbes.filter(p => p[0] === 'owners').map(p => p[2])).toEqual(['/usr/bin/stat'])
+    // the stat found was inspected, never started
+    expect(w.launched.filter(argv => argv[argv.findIndex(word => !/^[A-Z_]+=/.test(word) && word !== CLEAN_ENV && word !== '-i')] === '/opt/x/bin/stat')).toEqual([])
+  })
+  test('without the system\'s stat and id, the ones found are used, after the repository check', guard(), async ($, on) => {
+    const { w, h } = fixture(on, { programs: { stat: '/opt/x/bin/stat', id: '/opt/x/bin/id' }, systemTools: false })
+    await start($); await enroll($); await prompt($, 'tidy it')
+    expect(w.launchProbes.filter(p => p[0] !== 'resolve')).toEqual([['owners', 'gnu', '/opt/x/bin/stat'], ['id', '/opt/x/bin/id']])
+    expect(taskOf(h)?.startTree).toEqual(expect.any(String))
+  })
+  test('the probes that start a program found give it by absolute path, once checked: GNU timeout and dd', guard(), async ($, on) => {
+    const { w } = fixture(on)
+    await start($)
+    for (const script of [BOUND_PROBE_GROUP, BOUND_PROBE_CONTROL, BOUND_PROBE_CAPPED]) {
+      expect(script).toContain('"$1"')
+      const launches = w.launched.filter(argv => argv.includes(script))
+      expect([script, launches.length]).toEqual([script, 1])
+      expect(launches[0]!.at(-1)).toBe(script === BOUND_PROBE_GROUP ? '/usr/bin/timeout' : '/usr/bin/dd')
+    }
+  })
+  test('a program in a directory owned by another user is refused, as one below a directory anyone can write to', guard(), async ($, on) => {
+    world(on, { programs: { git: '/opt/tools/bin/git' }, owners: { '/opt/tools': { uid: 1001, mode: 0x41ed } } })
+    await start($)
+    expect(String((await command($, 'doctor')).text)).toContain('/opt/tools/bin/git is not a regular file owned by root or this user and closed to writes by others (or a directory above it is not)')
   })
   test('XDG_CONFIG_HOME, where set, reaches Git with HOME, so it reads the global configuration the person\'s Git reads', guard(), async ($, on) => {
     const { w } = fixture(on, { env: { XDG_CONFIG_HOME: '/home/tester/.cfg' } })
@@ -195,7 +281,7 @@ describe('every measurement process starts clean', () => {
     await start($); await enroll($); await prompt($, 'tidy it')
     w.tree['src/a.ts'] = 'b'
     await stop($)
-    expect(w.launchProbes).toEqual([['resolve', '/usr/bin:/bin'], ['id'], ['owners', 'gnu'], ['owners', 'bsd']])
+    expect(w.launchProbes).toEqual([['resolve', '/usr/bin:/bin'], ['owners', 'gnu', '/usr/bin/stat'], ['owners', 'bsd', '/usr/bin/stat'], ['id', '/usr/bin/id']])
     expect(new Set(w.wrappers.filter((_, i) => w.programPaths[i] !== null))).toEqual(new Set([boundScript(true, false)]))
     expect(taskOf(h)?.startTree).toEqual(expect.any(String))
     expect(kept(h).filter(check => !check.complete)).toEqual([])
@@ -215,7 +301,7 @@ const LAUNCH_REFUSED: Refusing[] = [
   { name: 'a git writable by its group', set: { owners: { '/usr/bin/git': { uid: 0, mode: 0x81fd } } }, words: '/usr/bin/git is not a regular file' },
   { name: 'a git in a directory anyone can write to', set: { programs: { git: '/tmp/git' }, owners: { '/tmp': { uid: 0, mode: 0x43ff } } }, words: '/tmp/git is not a regular file' },
   { name: 'a /bin/sh writable by anyone', set: { realPaths: { '/bin/sh': '/usr/bin/dash' }, owners: { '/usr/bin/dash': { uid: 0, mode: 0x81ff } } }, words: '/usr/bin/dash is not a regular file' },
-  { name: 'a user-owned git when the user cannot be told', set: { uid: null, owners: { '/usr/bin/git': { uid: 1000, mode: 0x81ed } } }, words: '/usr/bin/git is not a regular file owned by root and' },
+  { name: 'a user-owned git when the user cannot be told', set: { uid: null, owners: { '/usr/bin/git': { uid: 1000, mode: 0x81ed } } }, words: '/usr/bin/git is not a regular file owned by root and closed' },
   { name: 'a git that cannot be resolved to the file it is', set: { realPaths: { '/usr/bin/git': 'somewhere' } }, words: '/usr/bin/git could not be resolved' },
   { name: 'a git inside the repository', set: { programs: { git: `${ROOT}/bin/git` }, files: { [`${ROOT}/.git`]: '' } }, words: `${ROOT}/bin/git lies inside the repository` },
   { name: 'a git that is a link into the repository', set: { programs: { git: '/usr/local/bin/git' }, realPaths: { '/usr/local/bin/git': `${ROOT}/tools/git` }, files: { [`${ROOT}/.git`]: '' } }, words: `${ROOT}/tools/git lies inside the repository` },
@@ -370,6 +456,23 @@ describe('the HUD never keeps a stale line after Git fails before the repository
     await stop($)
     expect(gitOf(h) ?? null).toBeNull()
     expect(scriptRuns(w)).toBeGreaterThan(0)
+  })
+  test('a repository that cannot be verified is not called no repo: no Git with a .git here is not measured', guard(), async ($, on) => {
+    const { h } = fixture(on, { programs: { git: null } })
+    await start($); await enroll($)
+    await stop($)
+    expect(dirtyLabel(gitOf(h) ?? null)).toBe('not measured (state unreadable)')
+  })
+  test('a no repo line becomes not measured when Git later fails before the repository is found', guard(), async ($, on) => {
+    const { w, h } = fixture(on, { gitStatus: null })
+    await start($); await enroll($)
+    await stop($)
+    expect(dirtyLabel(gitOf(h) ?? null)).toBe('no repo')
+    // a repository here now (made, or the session moved), and a Git that does not answer
+    w.gitStatus = CLEAN_REPO
+    w.gitHangs = 'rev-parse --show-toplevel'
+    await stop($)
+    expect(dirtyLabel(gitOf(h) ?? null)).toBe('not measured (state unreadable)')
   })
   test('control: outside every repository the line says no repo', guard(), async ($, on) => {
     const { h } = fixture(on, { gitStatus: null })

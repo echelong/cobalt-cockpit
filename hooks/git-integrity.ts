@@ -64,8 +64,9 @@ export const BOUND_PROBE_GROUP = 'exec "$1" --version'
 export const BOUND_SLOTS = 2
 /** Probes, once a session: are the limits accepted, and is the memory cap actually enforced (a 64 MiB allocation under 32 MiB must fail, and succeed without it)? */
 export const BOUND_PROBE_SET = (memory: boolean): string => `${LIMITS(memory)} && echo set`
-export const BOUND_PROBE_CONTROL = 'exec dd if=/dev/zero of=/dev/null bs=67108864 count=1'
-export const BOUND_PROBE_CAPPED = `${LOWER} && lower -v 32768 && exec dd if=/dev/zero of=/dev/null bs=67108864 count=1`
+/** Both take `dd`'s absolute path as their first argument (v0.6.6 Stage B), once it has been checked like every other program. */
+export const BOUND_PROBE_CONTROL = 'exec "$1" if=/dev/zero of=/dev/null bs=67108864 count=1'
+export const BOUND_PROBE_CAPPED = `${LOWER} && lower -v 32768 && exec "$1" if=/dev/zero of=/dev/null bs=67108864 count=1`
 /** No repository hooks, and no diff order file (read whole by status, diff and log; one pointed at a device exhausted memory). Also on a helper's rebuilt Git inspection. */
 export const GIT_OVERRIDES = ['-c', 'core.hooksPath=/dev/null', '-c', 'diff.orderFile=/dev/null']
 /**
@@ -95,12 +96,23 @@ export const BOUND_PINS: Readonly<Record<string, string>> = { GIT_NO_LAZY_FETCH:
 export const CLEAN_ENV = '/usr/bin/env'
 export const CLEAN_SHELL = '/bin/sh'
 /**
- * Laid over the host's environment for `/usr/bin/env` itself, the one program that starts with it: the dynamic loader ignores
- * an empty value. Everything after `env -i` starts with none of them.
+ * Laid over the host's environment for `/usr/bin/env` itself, the one program that starts with it: the dynamic loader's and
+ * glibc's variables whose empty value is documented to do nothing (ld.so(8): ignored, or "if set to a nonempty string"). Those
+ * that act when merely present (`LD_TRACE_LOADED_OBJECTS`, `LD_SHOW_AUXV`, `LD_DYNAMIC_WEAK`) cannot be blanked this way, since
+ * the host can only add a variable; one of those set in the host's environment changes what `env` does, not what runs after it
+ * (`env -i`), and a measurement that does not answer as expected is UNKNOWN. Everything after `env -i` starts with none of them.
  */
-export const LOADER_BLANK: Readonly<Record<string, string>> = { LD_PRELOAD: '', LD_LIBRARY_PATH: '', LD_AUDIT: '', DYLD_INSERT_LIBRARIES: '', DYLD_LIBRARY_PATH: '', DYLD_FRAMEWORK_PATH: '', DYLD_FALLBACK_LIBRARY_PATH: '' }
-/** The programs measurement finds once a load: the five it runs, GNU `timeout` for the group kill, and `id` for the owner check. */
-export const MEASURE_PROGRAMS = ['git', 'stat', 'find', 'readlink', 'realpath', 'timeout', 'id'] as const
+export const LOADER_BLANK: Readonly<Record<string, string>> = {
+  LD_PRELOAD: '', LD_LIBRARY_PATH: '', LD_AUDIT: '', LD_BIND_NOW: '', LD_BIND_NOT: '', LD_DEBUG: '', LD_DEBUG_OUTPUT: '', LD_ORIGIN_PATH: '', LD_PROFILE: '', LD_PROFILE_OUTPUT: '', LD_VERBOSE: '', LD_WARN: '',
+  GLIBC_TUNABLES: '', GCONV_PATH: '', LOCPATH: '', NLSPATH: '',
+  DYLD_INSERT_LIBRARIES: '', DYLD_LIBRARY_PATH: '', DYLD_FRAMEWORK_PATH: '', DYLD_FALLBACK_LIBRARY_PATH: '',
+}
+/**
+ * The programs measurement finds once a load: the five it runs, GNU `timeout` for the group kill, `id` for the owner check, and
+ * `dd` for the probe of whether the memory limit is enforced. None of them runs before it was found, resolved, kept out of the
+ * repository and checked for owner and mode (probeBound).
+ */
+export const MEASURE_PROGRAMS = ['git', 'stat', 'find', 'readlink', 'realpath', 'timeout', 'id', 'dd'] as const
 export type MeasureProgram = (typeof MEASURE_PROGRAMS)[number]
 /**
  * Programs measurement cannot run without. `timeout` and `id` only weaken what is killed or trusted when absent; without Git no Git
@@ -127,6 +139,21 @@ export const resolvedOf = (text: string): Partial<Record<MeasureProgram, string>
  * directory, which may be the repository, so it is never searched. An unset PATH is the shell's usual default.
  */
 export const trustedPathOf = (path: string | undefined): string[] => [...new Set((path ?? '/usr/bin:/bin').split(':').filter(entry => entry.startsWith('/') && !entry.includes('\n')))]
+/**
+ * Where the owner check's own `stat` and the user's `id` are looked for first: the system's, owned by root on the platforms
+ * Cockpit runs on, so the check does not depend on a program it has yet to check. Where neither is there (NixOS, say), the ones
+ * the clean shell found are used, after the repository check; a `stat` there is the one program run before its owner is known.
+ */
+export const OWNER_STAT_AT: readonly string[] = ['/usr/bin/stat', '/bin/stat']
+export const USER_ID_AT: readonly string[] = ['/usr/bin/id', '/bin/id']
+/** Every directory above a path, the root included, nearest first. */
+export const ancestorsOf = (path: string): string[] => {
+  const out: string[] = []
+  for (let dir = path.slice(0, path.lastIndexOf('/')) || '/'; ; dir = dir.slice(0, dir.lastIndexOf('/')) || '/') {
+    out.push(dir)
+    if (dir === '/') return out
+  }
+}
 /** `stat -L` forms for a program's owner and mode, GNU and BSD; the GNU one carries the name asked for. */
 export const OWNER_GNU = '%u %f %n\\0'
 export const OWNER_BSD = '%u %p'
@@ -145,10 +172,15 @@ export const ownersOf = (text: string, gnu: boolean, names: readonly string[]): 
 }
 /**
  * Whether a program may be started for measurement: a regular file owned by root or by the session's user (`uid`; root only
- * when it is not known), not writable by its group or others, in a directory others cannot write to.
+ * when it is not known), not writable by its group or others; and every directory above it, to the root, owned by root or that
+ * user and not writable by others (a sticky one included). A directory its group may write to is accepted: on macOS /usr/local
+ * often is (admin), and that group already administers the machine.
  */
-export const programTrusted = (file: Owner, dir: Owner, uid: number | null): boolean =>
-  kindOfMode(file.mode) === 'file' && (file.uid === 0 || (uid !== null && file.uid === uid)) && (file.mode & 0o022) === 0 && kindOfMode(dir.mode) === 'dir' && (dir.mode & 0o002) === 0
+export const programTrusted = (file: Owner, dirs: readonly Owner[], uid: number | null): boolean => {
+  const owned = (o: Owner) => o.uid === 0 || (uid !== null && o.uid === uid)
+
+  return kindOfMode(file.mode) === 'file' && owned(file) && (file.mode & 0o022) === 0 && dirs.length > 0 && dirs.every(dir => kindOfMode(dir.mode) === 'dir' && owned(dir) && (dir.mode & 0o002) === 0)
+}
 /**
  * Variables that make the person's own Git use another repository, index, object store, configuration or attributes than it
  * would find from the session directory. The clean environment does not pass them, so where one is set Cockpit's Git would
@@ -261,7 +293,8 @@ export const nonGitAdmitted = (argv: readonly string[]): boolean => {
     if (rest[2] === '--' && ((rest[0] === '--printf' && rest[1] === IGNORED_GNU) || (rest[0] === '-f' && rest[1] === IGNORED_BSD))) return allPaths(rest.slice(3))
     return rest.length === 2 && rest[0] === '--' && isPathWord(rest[1])
   }
-  if (argv[0] === 'realpath') return args.length === 3 && args[0] === '-e' && args[1] === '--' && isPathWord(args[2])
+  // `-e` for an identity (it must exist); `-m` for a path an orchestration task claims or names (it need not exist yet)
+  if (argv[0] === 'realpath') return args.length === 3 && (args[0] === '-e' || args[0] === '-m') && args[1] === '--' && isPathWord(args[2]) && args[2].startsWith('/')
   if (argv[0] === 'readlink') return (args.length === 3 && args[0] === '-z' && args[1] === '--' && isPathWord(args[2])) || (args.length === 1 && isPathWord(args[0]) && (args[0].startsWith('./') || args[0].startsWith('/')))
   if (argv[0] !== 'find' || argv[1] !== '-H' || argv[2] === undefined || argv[2] === '' || argv[2].startsWith('-')) return false
   const rest = argv.slice(3)
@@ -271,7 +304,7 @@ export const nonGitAdmitted = (argv: readonly string[]): boolean => {
 /** A commit a measurement names to Git: HEAD or a full object id, never an option or a revision expression. */
 const COMMIT_NAME = /^(?:HEAD|[0-9a-f]{40}|[0-9a-f]{64})$/
 /** A helper's revision, peeled to a commit: the scoped rule's plain name (git-inspect.ts REV_NAME), then `^{commit}`. */
-const PEEL_NAME = /^[A-Za-z0-9@][A-Za-z0-9_.\/~^@-]{0,199}\^\{commit\}$/
+const PEEL_NAME = /^(?!.*\.\.)[A-Za-z0-9@][A-Za-z0-9_.\/~^@-]{0,199}\^\{commit\}$/
 /** A Git command as the runner sees it: the subcommand, its arguments, and the directory given with `-C`. */
 export type GitCall = { sub: string; args: readonly string[]; dir: string | null }
 /**
@@ -342,6 +375,11 @@ export const gitAccessOf = (call: GitCall): GitAccess => {
       return 'refused'
   }
 }
+/**
+ * Whether an admitted command applies the repository's clean/process filters to the work tree (v0.6.6 Stage B): `status`, `diff`,
+ * and `hash-object` without `--no-filters`. The runner starts one only for a pass the filter check has accepted.
+ */
+export const runsFilters = (call: GitCall): boolean => call.sub === 'status' || call.sub === 'diff' || (call.sub === 'hash-object' && call.args[0] !== '--no-filters')
 /**
  * The filter-driver entries of a `config --null --list` answer, in the form `config --null --get-regexp` gives them, for
  * `filterCommands`: the check's one complete read of the configuration also decides the filter check, so no second read can

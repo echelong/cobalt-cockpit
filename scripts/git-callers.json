@@ -20,12 +20,6 @@
     },
     {
       "file": "hooks/register.tsx",
-      "function": "canonicalIn",
-      "program": "realpath",
-      "count": 1
-    },
-    {
-      "file": "hooks/register.tsx",
       "function": "modeIs",
       "program": "stat",
       "count": 1
@@ -72,6 +66,12 @@
       "function": "candidateOf",
       "program": "git",
       "sub": "-C",
+      "count": 1
+    },
+    {
+      "function": "canonicalIn",
+      "program": "realpath",
+      "sub": "-",
       "count": 1
     },
     {

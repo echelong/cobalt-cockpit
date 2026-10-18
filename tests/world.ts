@@ -35,6 +35,8 @@ export type World = {
   owners: Record<string, { uid: number; mode: number }>
   /** v0.6.6 Stage B: what `id -u` prints for the session's user (null: `id` fails). */
   uid: number | null
+  /** v0.6.6 Stage B: whether the system's own `/usr/bin/stat` and `/usr/bin/id` are there, whatever the clean shell finds first on PATH (default: yes). */
+  systemTools: boolean
   /** v0.6.6 Stage B: the clean launch's own probes (finding the programs, the user, their owners), apart from `boundProbes`. */
   launchProbes: string[][]
   /** v0.6.6 Stage B: every clean launch as the host received it, word for word. */
@@ -298,6 +300,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
     realPaths: {},
     owners: {},
     uid: 1000,
+    systemTools: true,
     launchProbes: [],
     launched: [],
     resolveOutput: null,
@@ -522,8 +525,10 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
   // ledger in `files` gets a size that matches what `read` will hand back.
   on('fs.stat', ($, e) => {
     // v0.6.6 Stage B: the programs measurement starts, and the session directory, where they really are
-    const started = [...MEASURE_PROGRAMS.map(name => programPath(name)), CLEAN_ENV, CLEAN_SHELL]
+    const started = [...MEASURE_PROGRAMS.map(name => programPath(name)), CLEAN_ENV, CLEAN_SHELL, ...(w.systemTools ? ['/usr/bin/stat', '/usr/bin/id'] : [])]
     if (started.includes(e.path) || e.path === w.cwd) return { value: { kind: e.path === w.cwd ? 'dir' as const : 'file' as const, size: 1, mtimeMs: 0, isLink: w.realPaths[e.path] !== undefined, ...(e.resolve ? { realPath: w.realPaths[e.path] ?? e.path } : {}) } }
+    // any other path a test says leads elsewhere (a PATH directory that is a link, say)
+    if (w.realPaths[e.path] !== undefined) return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: true, ...(e.resolve ? { realPath: w.realPaths[e.path] } : {}) } }
     const text = w.files[e.path]
     if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
 
@@ -607,13 +612,14 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
         return ran(0, w.resolveOutput ?? MEASURE_PROGRAMS.map(name => `${programPath(name) ?? ''}\n`).join(''))
       }
       // the session's user, and each program's owner and mode (a name another one lies inside is a directory)
-      if (launched[0] === programPath('id') && launched[1] === '-u') { w.launchProbes.push(['id']); return w.uid === null ? ran(1) : ran(0, `${w.uid}\n`) }
-      if (launched[0] === programPath('stat') && launched[1] === '-L' && (launched[3] === OWNER_GNU || launched[3] === OWNER_BSD)) {
+      const system = (path: string | undefined, name: MeasureProgram) => path === programPath(name) || (w.systemTools && path === `/usr/bin/${name}`)
+      if (system(launched[0], 'id') && launched[1] === '-u') { w.launchProbes.push(['id', launched[0]!]); return w.uid === null ? ran(1) : ran(0, `${w.uid}\n`) }
+      if (system(launched[0], 'stat') && launched[1] === '-L' && (launched[3] === OWNER_GNU || launched[3] === OWNER_BSD)) {
         const gnu = launched[2] === '--printf'
-        w.launchProbes.push(['owners', gnu ? 'gnu' : 'bsd'])
+        w.launchProbes.push(['owners', gnu ? 'gnu' : 'bsd', launched[0]!])
         if ((w.statFlavor === 'gnu') !== gnu) return { value: { exitCode: 1, stdout: '', stderr: gnu ? 'stat: illegal option -- -\n' : 'stat: cannot read file system information\n', isStdoutTruncated: false, isStderrTruncated: false } }
         const names = launched.slice(5)
-        const owner = (name: string) => w.owners[name] ?? { uid: 0, mode: names.some(other => other.startsWith(`${name}/`)) ? 0x41ed : 0x81ed }
+        const owner = (name: string) => w.owners[name] ?? { uid: 0, mode: name === '/' || names.some(other => other.startsWith(`${name}/`)) ? 0x41ed : 0x81ed }
         return ran(0, names.map(name => (gnu ? `${owner(name).uid} ${owner(name).mode.toString(16)} ${name}\0` : `${owner(name).uid} ${owner(name).mode.toString(8)}\n`)).join(''))
       }
     }

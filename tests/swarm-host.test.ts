@@ -275,7 +275,8 @@ describe('commander effect admission fences', () => {
     const gate = new Promise<void>(resolve => { release = resolve })
     const registering = ((event: string, handler: (...args: any[]) => any) => {
       if (event === 'process.run') return on('process.run', async (host, call) => {
-        if (armed && call.argv[0] === 'realpath') { entered(); await gate }
+        // v0.6.6 Stage B: the path lookup starts clean through the measurement runner (`/usr/bin/env -i … realpath -m -- <path>`)
+        if (armed && call.argv.includes('-m') && call.argv.some(word => word === 'realpath' || word.endsWith('/realpath'))) { entered(); await gate }
         return handler(host, call)
       })
       return (on as any)(event, handler)

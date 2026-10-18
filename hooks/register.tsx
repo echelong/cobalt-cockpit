@@ -50,7 +50,7 @@ import type { Player } from './audio'
 import { EMPTY_LOG, EVENT_TTL_MS, callOf, closeOf, liveOf, push } from './activity'
 import { activityOf, readBash } from './classify'
 import { parseStatus, projectOf, filterCommands, activeFilter, refusedReason } from './git'
-import { GIT_SAFE, commitEntries, BOUND_AS_KIB, BOUND_CPU_S, BOUND_PROBE_CAPPED, BOUND_PROBE_CONTROL, BOUND_PROBE_GROUP, BOUND_PROBE_SET, BOUND_PROGRAMS, BOUND_SLOTS, BOUND_TAG, CLEAN_ENV, CLEAN_SHELL, FINGERPRINT_FILE_BYTES, FINGERPRINT_TOTAL_BYTES, GIT_BOUNDED, GIT_ENV_MEASURED, GIT_ENV_REFUSED, IGNORED_BSD, IGNORED_GNU, INSPECT_BSD, INSPECT_GNU, LOADER_BLANK, MEASURE_PROGRAMS, OWNER_BSD, OWNER_GNU, REPO_REFUSAL_SHORT, REPO_REFUSAL_WORDS, REQUIRED_PROGRAMS, RESOLVE_SCRIPT, SOURCE_BYTES, boundScript, callerEnvAdmitted, cleanAssignments, filterRecordsOf, gitAccessOf, gitCallOf, gitVersionOf, helperAssignments, inspectedOf, nonGitAdmitted, ownersOf, partialCloneOf, programTrusted, promisorPacksOf, resolvedOf, stageGitlinks, trustedPathOf } from './git-integrity'
+import { GIT_SAFE, commitEntries, BOUND_AS_KIB, BOUND_CPU_S, BOUND_PROBE_CAPPED, BOUND_PROBE_CONTROL, BOUND_PROBE_GROUP, BOUND_PROBE_SET, BOUND_PROGRAMS, BOUND_SLOTS, BOUND_TAG, CLEAN_ENV, CLEAN_SHELL, FINGERPRINT_FILE_BYTES, FINGERPRINT_TOTAL_BYTES, GIT_BOUNDED, GIT_ENV_MEASURED, GIT_ENV_REFUSED, IGNORED_BSD, IGNORED_GNU, INSPECT_BSD, INSPECT_GNU, LOADER_BLANK, MEASURE_PROGRAMS, OWNER_BSD, OWNER_GNU, REPO_REFUSAL_SHORT, REPO_REFUSAL_WORDS, OWNER_STAT_AT, REQUIRED_PROGRAMS, RESOLVE_SCRIPT, SOURCE_BYTES, USER_ID_AT, ancestorsOf, boundScript, callerEnvAdmitted, cleanAssignments, filterRecordsOf, gitAccessOf, gitCallOf, gitVersionOf, helperAssignments, runsFilters, inspectedOf, nonGitAdmitted, ownersOf, partialCloneOf, programTrusted, promisorPacksOf, resolvedOf, stageGitlinks, trustedPathOf } from './git-integrity'
 import type { CleanBase, CommitEntry, DiskEntry, HelperLaunch, Inspected, Kind, MeasureProgram, Measurement, Owner, RepoRefusal } from './git-integrity'
 import { assessCommand } from './guard'
 import { failClosed, guardFailure, isInsideFolder } from './guard-rules'
@@ -243,7 +243,8 @@ const canonicalIn = async ($: EngineInterface, base: string, path: string): Prom
   // `~` is the engine's to expand, not a directory under cwd: it is unknown, so everything.
   if (!path || /[*?\[\]{}]/.test(path) || path.startsWith('~')) return '*'
   try {
-    const r = await $.process.run(['realpath','-m','--', path.startsWith('/') ? path : `${base}/${path}`], { timeoutMs: 2000 })
+    // v0.6.6 Stage B: through the measurement runner, so it starts clean, by absolute path, and only in this form; one that cannot start is '*'
+    const r = await bounded($, ['realpath', '-m', '--', path.startsWith('/') ? path : `${base}/${path}`], { timeoutMs: 2000 })
     return r.exitCode === 0 && !r.isStdoutTruncated ? normalizeOwned(r.stdout.trim()) : '*'
   } catch { return '*' }
 }
@@ -313,6 +314,8 @@ type RunInit = { cwd?: string; timeoutMs?: number; env?: Record<string, string>;
  */
 type RepoPass = { readonly root: string; readonly filters: ReadonlySet<string> | null }
 const repoPasses = new WeakSet<RepoPass>()
+/** v0.6.6 Stage B: the passes the clean/process filter check accepted; only these admit a command that applies filters. */
+const filterChecked = new WeakSet<RepoPass>()
 /** What `repoState` holds while it makes its own two listings, before a pass exists. It never leaves this file. */
 type PreflightListing = { readonly listing: true }
 const PREFLIGHT_LISTING: PreflightListing = Object.freeze({ listing: true as const })
@@ -328,7 +331,7 @@ const admissionRefusal = (argv: readonly string[], auth: RepoPass | PreflightLis
   if (access === 'refused') return 'a Git command the measurement runner never starts'
   if (access === 'discovery') return null
   if (access === 'listing' && auth === PREFLIGHT_LISTING) return null
-  if (isRepoPass(auth) && call.dir === auth.root) return null
+  if (isRepoPass(auth) && call.dir === auth.root) return !runsFilters(call) || filterChecked.has(auth) ? null : 'a Git command that applies the repository\'s filters before the filter check accepted them'
 
   return 'a Git read of repository state without the repository-state check for that repository'
 }
@@ -371,6 +374,32 @@ const cleanBaseOf = async ($: EngineInterface): Promise<{ base: CleanBase; refus
   return { base, refused: null }
 }
 const parentOf = (path: string): string => path.slice(0, path.lastIndexOf('/')) || '/'
+/**
+ * v0.6.6 Stage B: every directory from the session directory up that holds a `.git` entry, along the path the session names and
+ * along its physical one, found with the host's own file calls (no process). Throws where it cannot answer for the whole path (a
+ * failing call, a relative directory, one too deep to walk to the root): the caller refuses.
+ */
+const repositoriesAbove = async ($: EngineInterface, cwd: string): Promise<string[]> => {
+  if (!cwd.startsWith('/')) throw new Error('the session directory is not an absolute path')
+  const real = await $.fs.stat(cwd, { resolve: true }).then(s => s.realPath, () => undefined)
+  const roots: string[] = []
+  for (const start of new Set([cwd, real].filter((p): p is string => typeof p === 'string' && p.startsWith('/')))) {
+    let dir = start.replace(/\/+$/, '') || '/'
+    for (let depth = 0; ; dir = parentOf(dir), depth++) {
+      if (depth >= 256) throw new Error('too deep')
+      if (await $.fs.exists(`${dir === '/' ? '' : dir}/.git`)) roots.push(dir)
+      if (dir === '/') break
+    }
+  }
+  return roots
+}
+const insideAny = (roots: readonly string[], path: string): boolean => roots.some(root => root === '/' || path === root || path.startsWith(`${root}/`))
+const INSIDE = (path: string) => `${path} lies inside the repository (a PATH entry names a directory there), and a program the repository holds is never started`
+/**
+ * The probe, once a load (again after BOUND_RETRY_MS while it is not settled). Order matters (v0.6.6 Stage B): only
+ * `/usr/bin/env` and `/bin/sh`, by absolute path, run before every other program they find has been resolved to the file it is,
+ * kept out of the repository and checked for owner and mode; the limit probes that run before that are the shell's own builtins.
+ */
 const probeBound = async ($: EngineInterface): Promise<Bound> => {
   const clean = await cleanBaseOf($)
   // Every probe starts as a measurement process does: /usr/bin/env -i, the trusted PATH, then the program by absolute path
@@ -380,51 +409,70 @@ const probeBound = async ($: EngineInterface): Promise<Bound> => {
   // which programs measurement runs: found by the clean shell's own `command -v`, so nothing on PATH runs to answer
   const found = await sh(RESOLVE_SCRIPT)
   const programs = found !== null && found.exitCode === 0 && !found.isStdoutTruncated ? resolvedOf(found.stdout) : null
+  // the limits themselves: `ulimit` is the shell's builtin
   const set = await sh(BOUND_PROBE_SET(true))
-  const timeout = programs?.timeout === undefined ? null : await sh(BOUND_PROBE_GROUP, programs.timeout)
-  const group = timeout !== null && /\(GNU coreutils\)/.test(timeout.stdout.split('\n')[0] ?? '')
-  const answered = found !== null && (programs?.timeout === undefined || timeout !== null)
-  const limits = async (): Promise<Omit<Bound, 'launch'>> => {
-    if (set !== null && set.exitCode === 0 && set.stdout.trim() === 'set') {
-      // accepted is not enforced: a 64 MiB allocation must succeed without the cap and fail under a 32 MiB one
-      const control = await sh(BOUND_PROBE_CONTROL)
-      const capped = await sh(BOUND_PROBE_CAPPED)
-      const enforced = control === null || capped === null ? null : control.exitCode === 0 && capped.exitCode !== 0
-      return { script: 'memory', enforced, group, settled: enforced !== null && answered }
-    }
-    const basic = await sh(BOUND_PROBE_SET(false))
-    const settled = set !== null && basic !== null && answered
-    // a shell that answers one probe but not the other is a slow one, not one without `ulimit -v`: keep the stronger script
-    if (basic !== null && basic.exitCode === 0 && basic.stdout.trim() === 'set') return { script: set === null ? 'memory' : 'basic', enforced: set === null ? null : false, group, settled }
-    return { script: null, enforced: false, group: false, settled }
-  }
-  const bound = await limits()
-  const refuse = (refused: string, settled = bound.settled): Bound => ({ ...bound, settled, launch: { refused } })
-  if (clean.refused !== null) return refuse(clean.refused)
+  const basic = set !== null && set.exitCode === 0 && set.stdout.trim() === 'set' ? null : await sh(BOUND_PROBE_SET(false))
+  const script: Bound['script'] = set !== null && set.exitCode === 0 && set.stdout.trim() === 'set' ? 'memory' : basic !== null && basic.exitCode === 0 && basic.stdout.trim() === 'set' ? (set === null ? 'memory' : 'basic') : null
+  const limitsAnswered = set !== null && (basic !== null || script === 'memory')
+  const refuse = (refused: string, settled: boolean): Bound => ({ script, enforced: script === null ? false : null, group: false, settled: settled && limitsAnswered, launch: { refused } })
+  if (clean.refused !== null) return refuse(clean.refused, true)
   if (programs === null) return refuse('the clean shell could not say where Git and the measurement programs are', false)
   const missing = REQUIRED_PROGRAMS.find(name => programs[name] === undefined)
-  if (missing !== undefined) return refuse(`${missing} was not found on an absolute PATH entry`)
+  if (missing !== undefined) return refuse(`${missing} was not found on an absolute PATH entry`, true)
   // where each program really is, every link followed, by the host's own file system call (no program runs for it)
+  const real = async (path: string) => $.fs.stat(path, { resolve: true }).then(s => (s.kind === 'file' && s.realPath?.startsWith('/') === true ? s.realPath : undefined), () => undefined)
   const started = [...MEASURE_PROGRAMS.flatMap(name => (programs[name] === undefined ? [] : [programs[name]!])), CLEAN_ENV, CLEAN_SHELL]
   const canonical: string[] = []
   for (const path of started) {
-    const real = await $.fs.stat(path, { resolve: true }).then(s => (s.kind === 'file' ? s.realPath : undefined), () => undefined)
-    if (real === undefined || !real.startsWith('/')) return refuse(`${path} could not be resolved to the file it is`, false)
-    canonical.push(real)
+    const at = await real(path)
+    if (at === undefined) return refuse(`${path} could not be resolved to the file it is`, false)
+    canonical.push(at)
   }
-  // owned by root or by this user, writable by neither its group nor others, in a directory others cannot write to
-  const id = programs.id === undefined ? null : await run([programs.id, '-u'])
-  const uid = id !== null && id.exitCode === 0 && /^\d+\n$/.test(id.stdout) ? Number(id.stdout.trim()) : null
-  const names = [...canonical, ...canonical.map(parentOf)]
-  const gnu = await run([programs.stat!, '-L', '--printf', OWNER_GNU, '--', ...names])
+  // none of them inside the repository the session is in (launchFor checks again wherever the session directory moves)
+  let roots: string[]
+  try { roots = await repositoriesAbove($, await $.session.cwd()) } catch { return refuse('whether a measurement program lies inside the repository could not be checked', false) }
+  const inside = canonical.find(path => insideAny(roots, path))
+  if (inside !== undefined) return refuse(INSIDE(inside), true)
+  // owner and mode, read by the system's own `stat` where there is one, of every program, the owner check's own `stat` and `id`,
+  // and every directory above each of them
+  const anchor = async (paths: readonly string[], fallback: string | undefined) => {
+    for (const path of paths) { const at = await real(path); if (at !== undefined) return { path, at } }
+    if (fallback === undefined) return undefined
+    const at = await real(fallback)
+    return at === undefined ? undefined : { path: fallback, at }
+  }
+  const statAt = await anchor(OWNER_STAT_AT, programs.stat)
+  const idAt = await anchor(USER_ID_AT, programs.id)
+  if (statAt === undefined || insideAny(roots, statAt.at) || (idAt !== undefined && insideAny(roots, idAt.at))) return refuse('the owner of the measurement programs could not be checked from outside the repository', true)
+  const files = [...new Set([...canonical, statAt.at, ...(idAt === undefined ? [] : [idAt.at])])]
+  const names = [...files, ...new Set(files.flatMap(ancestorsOf))]
+  const gnu = await run([statAt.path, '-L', '--printf', OWNER_GNU, '--', ...names])
   const owners = gnu !== null && gnu.exitCode === 0 && !gnu.isStdoutTruncated && gnu.stderr === '' ? ownersOf(gnu.stdout, true, names) : null
-  const bsd = owners !== null ? null : await run([programs.stat!, '-L', '-f', OWNER_BSD, '--', ...names])
+  const bsd = owners !== null ? null : await run([statAt.path, '-L', '-f', OWNER_BSD, '--', ...names])
   const seen = owners ?? (bsd !== null && bsd.exitCode === 0 && !bsd.isStdoutTruncated && bsd.stderr === '' ? ownersOf(bsd.stdout, false, names) : null)
   if (seen === null) return refuse('the owner and mode of the measurement programs could not be read', gnu !== null && (owners !== null || bsd !== null))
-  const unsafe = canonical.findIndex((_, k) => !programTrusted(seen[k]!, seen[canonical.length + k]!, uid))
-  if (unsafe >= 0) return refuse(`${canonical[unsafe]} is not a regular file owned by root${uid === null ? '' : ' or this user'} and closed to writes by others (or its directory is open to them)`)
+  const ownerOf = new Map(names.map((name, k) => [name, seen[k]!]))
+  const trusted = (path: string, uid: number | null) => programTrusted(ownerOf.get(path)!, ancestorsOf(path).map(dir => ownerOf.get(dir)!), uid)
+  // `id` runs only once it is known to be root's and closed to others; without it, only root's programs are trusted
+  const id = idAt !== undefined && trusted(idAt.at, null) ? await run([idAt.path, '-u']) : null
+  const uid = id !== null && id.exitCode === 0 && /^\d+\n$/.test(id.stdout) ? Number(id.stdout.trim()) : null
+  const unsafe = files.find(path => !trusted(path, uid))
+  if (unsafe !== undefined) return refuse(`${unsafe} is not a regular file owned by root${uid === null ? '' : ' or this user'} and closed to writes by others (or a directory above it is not)`, true)
+  // only now the probes that start a program found: GNU timeout's version, and dd under and without the 32 MiB cap
+  const timeout = programs.timeout === undefined ? null : await sh(BOUND_PROBE_GROUP, programs.timeout)
+  const group = timeout !== null && /\(GNU coreutils\)/.test(timeout.stdout.split('\n')[0] ?? '')
+  let enforced: boolean | null = script === 'memory' ? null : false
+  let enforcementAnswered = true
+  if (script === 'memory' && set !== null && set.exitCode === 0 && programs.dd !== undefined) {
+    // accepted is not enforced: a 64 MiB allocation must succeed without the cap and fail under a 32 MiB one
+    const control = await sh(BOUND_PROBE_CONTROL, programs.dd)
+    const capped = await sh(BOUND_PROBE_CAPPED, programs.dd)
+    enforced = control === null || capped === null ? null : control.exitCode === 0 && capped.exitCode !== 0
+    enforcementAnswered = enforced !== null
+  }
+  const settled = limitsAnswered && enforcementAnswered && (programs.timeout === undefined || timeout !== null) && (idAt === undefined || id !== null || !trusted(idAt.at, null))
 
-  return { ...bound, settled: bound.settled && (programs.id === undefined || id !== null), launch: { base: clean.base, programs, canonical, uid } }
+  return { script, enforced, group: script !== null && group, settled, launch: { base: clean.base, programs, canonical, uid } }
 }
 const boundOf = async ($: EngineInterface): Promise<Bound> => {
   if (boundMode !== null && boundRetryAt !== 0 && (await $.clock.now()) >= boundRetryAt) { boundMode = null; boundRetryAt = 0 }
@@ -451,24 +499,19 @@ const launchFor = async ($: EngineInterface, found: Bound): Promise<CleanLaunch 
   const launch = found.launch
   const cwd = await $.session.cwd()
   if (containment !== null && containment.cwd === cwd && containment.found === launch) return containment.answer
-  const roots: string[] = []
+  let roots: string[] = []
   let answer: CleanLaunch | { refused: string }
   try {
-    if (!cwd.startsWith('/')) throw new Error('relative')
-    const real = await $.fs.stat(cwd, { resolve: true }).then(s => s.realPath, () => undefined)
-    for (const start of new Set([cwd, real].filter((p): p is string => typeof p === 'string' && p.startsWith('/')))) {
-      let dir = start.replace(/\/+$/, '') || '/'
-      for (let depth = 0; ; dir = parentOf(dir), depth++) {
-        if (depth >= 256) throw new Error('too deep')
-        if (await $.fs.exists(`${dir === '/' ? '' : dir}/.git`)) roots.push(dir)
-        if (dir === '/') break
-      }
+    roots = await repositoriesAbove($, cwd)
+    const inside = launch.canonical.find(path => insideAny(roots, path))
+    // a PATH entry inside the repository, by its name or where it really leads, is not passed on
+    const path: string[] = []
+    for (const entry of launch.base.path) {
+      if (insideAny(roots, entry)) continue
+      const real = roots.length === 0 ? undefined : await $.fs.stat(entry, { resolve: true }).then(s => s.realPath, () => undefined)
+      if (real === undefined || !insideAny(roots, real)) path.push(entry)
     }
-    const within = (path: string) => roots.some(root => root === '/' || path === root || path.startsWith(`${root}/`))
-    const inside = launch.canonical.find(within)
-    answer = inside !== undefined
-      ? { refused: `${inside} lies inside the repository (a PATH entry names a directory there), and a program the repository holds is never started` }
-      : { ...launch, base: { ...launch.base, path: launch.base.path.filter(entry => !within(entry)) } }
+    answer = inside !== undefined ? { refused: INSIDE(inside) } : { ...launch, base: { ...launch.base, path } }
   } catch { answer = { refused: cwd.startsWith('/') ? 'whether a measurement program lies inside the repository could not be checked' : 'the session directory is not an absolute path' } }
   containment = roots.length > 0 ? { cwd, found: launch, answer } : null
 
@@ -721,7 +764,8 @@ const gitFiltersReliable = async ($: EngineInterface, top: string, pass: RepoPas
     drivers = gitAnswered(config) && partialCloneOf(config.stdout) === false ? filterCommands(filterRecordsOf(config.stdout)) : null
   }
   if (drivers === null) return false
-  if (drivers.size === 0) return true
+  // v0.6.6 Stage B: what admits `status`, `diff` and a filtering `hash-object` for this pass
+  if (drivers.size === 0) { filterChecked.add(pass); return true }
   const tree = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'ls-tree', '-r', '-z', '--full-tree', 'HEAD'], { timeoutMs: GIT_TIMEOUT_MS, auth: pass })
   const base = gitAnswered(tree) ? commitEntries(tree.stdout) : null
   if (base === null) return false
@@ -735,6 +779,7 @@ const gitFiltersReliable = async ($: EngineInterface, top: string, pass: RepoPas
     const attrs = await bounded($, ['git', ...GIT_SAFE, '-C', top, 'check-attr', '-z', '--stdin', 'filter'], { stdin: names, timeoutMs: GIT_TIMEOUT_MS, auth: pass })
     if (attrs.exitCode !== 0 || attrs.isStdoutTruncated || attrs.isStderrTruncated || attrs.stderr.trim() !== '' || activeFilter(attrs.stdout, drivers, names) !== false) return false
   }
+  filterChecked.add(pass)
   return true
 }
 const gitAnswered = (r: { exitCode: number | null; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean }) =>
@@ -2350,6 +2395,9 @@ const refreshGit = async ($: EngineInterface): Promise<GitReading> => {
       return { outcome: 'refused', state }
     }
     if (root === null) {
+      // v0.6.6 Stage B: "no repo" only where the session is outside every repository; a repository that could not be verified (or
+      // no Git with a .git here) is one Cockpit did not read, and the Stop guard reads it as possibly changed
+      if ((await outsideGit($)) !== 'outside') return await refuse('unreadable')
       const state: GitState = { isRepo: false, project: projectOf(cwd), branch: null, isDetached: false, sha: null, startSha: null, dirty: 0, ahead: null, behind: null, at: now }
       await write(state)
 
@@ -2371,21 +2419,21 @@ const refreshGit = async ($: EngineInterface): Promise<GitReading> => {
 
     return { outcome: 'read', state }
   } catch (error) {
-    // Once the repository was verified, a failure is a refusal (v0.6.6). Stage B: before that (Git failed or timed out before it
-    // said where the repository is, or no measurement starts in this environment), a line that showed a repository is replaced by
-    // a refused one, never kept as a count that may be stale; a line with no repository is kept, as nothing here says there is
-    // one, except where the environment itself refuses. The reading says it failed either way: the Stop guard decides from it.
+    // Once the repository was verified, a failure is a refusal (v0.6.6). Stage B: before that too (Git failed or timed out before
+    // it said where the repository is, or no measurement starts in this environment), any line shown is replaced by a refused one,
+    // never kept as a count or a "no repo" that may be stale; with no line yet, only an environment refusal is shown (nothing then
+    // says there is a repository). The reading says it failed either way: the Stop guard decides from it.
     if (verified === null) {
       const environment = error instanceof EnvironmentRefused
       const old = await read($, gitAtom).catch(() => null)
-      if (environment || (old !== null && old.isRepo)) {
+      if (environment || old !== null) {
         const now = await $.clock.now().catch(() => 0)
         await quiet(() => write(refusedGit(old, old !== null && old.isRepo ? old.project : projectOf(cwd), environment ? 'environment' : 'unreadable', now)))
       }
       return { outcome: 'failed', state: null }
     }
     const now = await $.clock.now().catch(() => 0)
-    const state = refusedGit(await read($, gitAtom).catch(() => null), projectOf(verified), 'unreadable', now)
+    const state = refusedGit(await read($, gitAtom).catch(() => null), projectOf(verified), error instanceof EnvironmentRefused ? 'environment' : 'unreadable', now)
     await quiet(() => write(state))
 
     return { outcome: 'refused', state }

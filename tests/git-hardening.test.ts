@@ -89,7 +89,7 @@ describe('the runner admits Git commands by form', () => {
       // finding the repository runs in the session directory; everything else names the repository with -C
       ['-C', R, 'rev-parse', '--show-toplevel'], ['rev-parse', '--verify', 'HEAD'], ['config', '--null', '--list'], ['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=all'], ['-C', R, '--version'],
       ['-C', R, 'rev-parse', '--verify', 'HEAD^{commit}'], ['-C', R, 'rev-parse', '--verify', 'main'], ['-C', R, 'rev-parse'], ['-C', R, 'rev-parse', '--git-path', 'x'], ['-C', R, 'rev-parse', '--show-toplevel', '--show-prefix'],
-      ['-C', R, 'rev-parse', '--verify', '--quiet', '-x^{commit}'], ['-C', R, 'rev-parse', '--verify', '--quiet', 'a:b^{commit}'], ['-C', R, 'rev-parse', '--verify', '--quiet', 'a b^{commit}'],
+      ['-C', R, 'rev-parse', '--verify', '--quiet', '-x^{commit}'], ['-C', R, 'rev-parse', '--verify', '--quiet', 'a:b^{commit}'], ['-C', R, 'rev-parse', '--verify', '--quiet', 'a b^{commit}'], ['-C', R, 'rev-parse', '--verify', '--quiet', 'a..b^{commit}'],
       ['-C', R, 'config', '--null', '--get-regexp', '^filter\\..*\\.(clean|process)$'], ['-C', R, 'config', '--type=path', '--get', 'core.hooksPath'], ['-C', R, 'config', '--bool', '--get', 'core.bare'], ['-C', R, 'config', '--get', 'core.excludesFile'],
       ['-C', R, 'config', '--add', 'a', 'b'], ['-C', R, 'config', '--file', '/x', '--get', 'a'], ['-C', R, 'config', '--null', '--list', '--show-origin'], ['-C', R, 'config', '--unset', 'a'],
       ['-C', R, 'ls-files', '-z', '--stage', '--', 'x'], ['-C', R, 'ls-files'], ['-C', R, 'ls-files', '-z', '-v'], ['-C', R, 'ls-files', '-o', '-z'], ['-C', R, 'ls-files', '--recurse-submodules', '-z'],
@@ -110,12 +110,12 @@ describe('the runner admits Git commands by form', () => {
     for (const argv of [
       ['stat', '--printf', INSPECT_GNU, '--', './a', '/w/b'], ['stat', '-L', '--printf', INSPECT_GNU, '--', 'a'], ['stat', '-f', INSPECT_BSD, '--', 'a'], ['stat', '-L', '-f', INSPECT_BSD, '--', 'a'],
       ['stat', '--printf', IGNORED_GNU, '--', 'a', 'b'], ['stat', '-f', IGNORED_BSD, '--', 'a'], ['stat', '--', '/w/dir'],
-      ['readlink', '-z', '--', './a'], ['readlink', './a'], ['readlink', '/w/a'], ['realpath', '-e', '--', '/a'],
+      ['readlink', '-z', '--', './a'], ['readlink', './a'], ['readlink', '/w/a'], ['realpath', '-e', '--', '/a'], ['realpath', '-m', '--', '/a/not/yet'],
       ['find', '-H', '/w/dir', '(', '-type', 'f', '-o', '-type', 'l', ')', '-print0'], ['find', '-H', './.git/objects/pack', '-maxdepth', '1', '-name', '*.promisor', '-print0'],
     ]) expect([argv, nonGitAdmitted(argv)]).toEqual([argv, true])
     for (const argv of [
       ['stat', '--printf', '%s', '--', 'a'], ['stat', '-L', '--printf', IGNORED_GNU, '--', 'a'], ['stat', '-L', '--', 'a'], ['stat', '--printf', INSPECT_GNU, '--'], ['stat', '--printf', INSPECT_GNU, 'a'], ['stat', '--', 'a', 'b'], ['stat', '-c', '%a', 'a'], ['stat', '--', ''],
-      ['readlink', 'a'], ['readlink', '-f', 'a'], ['readlink', '-z', 'a'], ['readlink', '-z', '--', 'a', 'b'], ['realpath', '-m', '--', '/a'], ['realpath', '-e', '/a'], ['realpath', '-e', '--', '/a', '/b'],
+      ['readlink', 'a'], ['readlink', '-f', 'a'], ['readlink', '-z', 'a'], ['readlink', '-z', '--', 'a', 'b'], ['realpath', '-m', '--', 'relative'], ['realpath', '-e', '--', 'relative'], ['realpath', '-s', '--', '/a'], ['realpath', '-e', '/a'], ['realpath', '-e', '--', '/a', '/b'],
       ['find', '-H', '/w', '-exec', 'sh', '{}', ';'], ['find', '/w', '-print0'], ['find', '-H', '-delete'], ['find', '-H', '/w', '-maxdepth', '1', '-name', '*.promisor', '-fprint', '/tmp/x'],
       ['find', '-H', '/w', '(', '-type', 'f', '-o', '-type', 'l', ')', '-print0', '-delete'], ['sh', '-c', 'x'], ['tail', '-c', '1', 'a'], ['git', 'status'],
     ]) expect([argv, nonGitAdmitted(argv)]).toEqual([argv, false])

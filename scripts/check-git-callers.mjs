@@ -2,7 +2,8 @@
 // checked-in record scripts/git-callers.json. A new process site, a new `bounded` call, or a new call of a closure that runs
 // Git changes the census and fails this check until the record is regenerated (--write) and the difference reviewed. It also
 // holds the invariants the runtime admission rests on:
-//   - only register.tsx starts processes, at exactly the recorded sites; there is no $.process.spawn;
+//   - only register.tsx starts processes, at exactly the recorded sites (10 since Stage B moved `realpath -m` into the runner); there is
+//     no $.process.spawn, and the process capability is reached through no other name, member or bracket;
 //   - every `bounded` call starts one of the measurement programs (BOUND_PROGRAMS in hooks/git-integrity.ts);
 //   - a repository-state pass is created in one place only (repoState), and `auth` is only ever a pass or the preflight's own
 //     listing capability, never a value built from a string;
@@ -45,8 +46,8 @@ for (const file of hooks) {
       const after = line.slice(m.index + m[0].length)
       processSites.push({ file, function: who[i], program: firstLiteral(after) ?? after.slice(0, after.search(/[(,\]]/)).replace(/^\[/, '').trim() })
     }
-    // other routes to a process or to code: none is used, and none may be
-    for (const [pattern, what] of [[/\bchild_process\b|\bBun\.spawn|\bDeno\.(?:run|Command)\b/, 'a process API other than $.process'], [/\beval\s*\(|\bnew\s+Function\s*\(/, 'eval or new Function'], [/\bimport\s*\(/, 'a dynamic import()']]) {
+    // other routes to a process or to code: none is used, and none may be (Stage B: `process` reached through another name or a bracket)
+    for (const [pattern, what] of [[/(?<![\w$])(?!\$)[A-Za-z_]\w*\s*\.\s*process\s*\.\s*(?:run|spawn)\b/, 'the process capability through another binding'], [/\[\s*['"`]process['"`]\s*\]/, 'the process capability through a bracket'], [/\bchild_process\b|\bBun\.spawn|\bDeno\.(?:run|Command)\b/, 'a process API other than $.process'], [/\beval\s*\(|\bnew\s+Function\s*\(/, 'eval or new Function'], [/\bimport\s*\(/, 'a dynamic import()']]) {
       if (pattern.test(line.replace(/\/\/.*$/, '').replace(/'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, "''"))) problems.push(`${file}:${i + 1}: ${what}`)
     }
   })
@@ -122,6 +123,14 @@ if (JSON.stringify(envNames) !== JSON.stringify(ENV_REFUSED)) problems.push(`git
 const body = name => { const at = lines.findIndex(l => l.startsWith(`const ${name} = `)); if (at < 0) return ''; const end = lines.findIndex((l, k) => k > at && /^(?:const|let|type|function|class) /.test(l)); return lines.slice(at, end < 0 ? undefined : end).join('\n') }
 const runner = body('bounded'), probe = body('probeBound')
 if (!/admissionRefusal\(argv, auth\) \?\? \(callerEnvAdmitted\(env\) \?/.test(runner)) problems.push('bounded does not refuse a caller\'s variables other than LC_ALL=C before anything starts')
+// the filter check's mark: given only by gitFiltersReliable, and required by the admission for a command that applies filters
+const marks = lines.flatMap((l, i) => (l.includes('filterChecked.add(') ? [who[i]] : []))
+if (marks.length === 0 || marks.some(f => f !== 'gitFiltersReliable')) problems.push(`filterChecked.add must occur only in gitFiltersReliable; found in: ${marks.join(', ') || 'nowhere'}`)
+if (!/!runsFilters\(call\) \|\| filterChecked\.has\(auth\)/.test(body('admissionRefusal'))) problems.push('admissionRefusal does not require the filter check\'s mark for a command that applies filters')
+// the probe runs no program it found before the repository and owner checks: its first process after the lookup is the owner check
+const probeText = body('probeBound')
+const order = ['sh(RESOLVE_SCRIPT)', 'repositoriesAbove(', "run([statAt.path, '-L'", "run([idAt.path, '-u'])", 'sh(BOUND_PROBE_GROUP', 'sh(BOUND_PROBE_CONTROL'].map(w => probeText.indexOf(w))
+if (order.some(at => at < 0) || order.some((at, k) => k > 0 && at < order[k - 1])) problems.push('probeBound does not look up, check the repository, check owners, run id, then the probes that start a found program, in that order')
 if (!/const words = \[CLEAN_ENV, '-i', \.\.\.cleanAssignments\(launch\.base, env\), CLEAN_SHELL, '-c', boundScript\(/.test(runner) || !/\$\.process\.run\(words, \{ \.\.\.host, env: LOADER_BLANK \}\)/.test(runner)) problems.push('bounded does not start its process as /usr/bin/env -i <clean variables> /bin/sh with the loader blanked')
 if (!/\$\.process\.run\(\[CLEAN_ENV, '-i', `PATH=\$\{clean\.base\.path\.join\(':'\)\}`, 'LC_ALL=C', \.\.\.words\], \{ timeoutMs: 5000, env: LOADER_BLANK \}\)/.test(probe)) problems.push('probeBound does not start its probes as /usr/bin/env -i PATH=<trusted> with the loader blanked')
 const measuredStart = lines.findIndex(l => l.startsWith('const measuredEnvironmentSet'))
@@ -134,7 +143,7 @@ if (JSON.stringify(baseNames) !== JSON.stringify(['PATH', 'HOME', 'XDG_CONFIG_HO
 
 const count = rows => Object.entries(rows.reduce((m, r) => { const k = JSON.stringify(r); m[k] = (m[k] ?? 0) + 1; return m }, {})).map(([k, n]) => ({ ...JSON.parse(k), count: n })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
 const census = { processSites: count(processSites), bounded: count(bounded), closureCalls: count(closureCalls) }
-if (processSites.length !== 11) problems.push(`expected 11 process sites, found ${processSites.length}`)
+if (processSites.length !== 10) problems.push(`expected 10 process sites, found ${processSites.length}`)
 
 if (write) { writeFileSync(record, JSON.stringify(census, null, 2) + '\n'); console.log(`check-git-callers: wrote ${record}`) }
 else {
