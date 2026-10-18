@@ -331,6 +331,9 @@ for (const origin of [{ kind: 'composer' }, { kind: 'sdk' }]) {
       const w = world(on, {}, store)
       const held = hostState(on, {})
       await start($)
+      // the HUD's first Git refresh, which a session start does not wait for, lands before the snapshot rather than inside the
+      // command (v0.6.6 Stage B: the clean launch's probe moved when it lands); one turn of the event loop is enough
+      await new Promise<void>(resolve => { (globalThis as unknown as { setTimeout: (f: () => void, ms: number) => unknown }).setTimeout(resolve, 0) })
       const writes = w.storeWrites.length
       const snap = snapshot(w)
       const vers = versions(held as never)

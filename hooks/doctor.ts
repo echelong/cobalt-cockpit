@@ -34,6 +34,8 @@ export type DoctorFacts = {
   measurement?: { enforced: boolean; text: string }
   /** v0.6.6: the Git measurement runs, and whether it documents its own switch for lazy fetching (2.45.0 and later); null when it could not be read. */
   gitVersion?: { version: string; lazyFetchSwitch: boolean } | null
+  /** v0.6.6 Stage B: how measurement processes start: Git by absolute path and the PATH entries searched, or why none starts. */
+  cleanLaunch?: { git: string; entries: number; home: boolean; xdg: boolean } | { refused: string }
   guard: { enabled: boolean; /** v0.5.9: incidents are recorded without being notified. */ recordOnly?: boolean; label: string; used: number; max: number; cooldownSec: number; repeat: boolean; sound: boolean; /** The transport diagnostics, already worded. */ transport: string[]; /** Priorities, notified kinds, quiet hours and active conditions, already worded. */ policy?: string[] }
 }
 
@@ -59,6 +61,14 @@ export const gitVersionText = (git: { version: string; lazyFetchSwitch: boolean 
   if (git.lazyFetchSwitch) return `Git ${git.version}: measurement never fetches (Git's own switch and a protocol allow-list no transport matches), and ${common}`
 
   return `Git ${git.version} is older than 2.45, whose own switch against lazy fetching it may lack; measurement never fetches (a protocol allow-list no transport matches), and ${common}`
+}
+
+/** v0.6.6 Stage B: how measurement processes start, in words. */
+export const cleanLaunchText = (launch: NonNullable<DoctorFacts['cleanLaunch']>, home: string | null): string => {
+  if ('refused' in launch) return `measurement processes start only with a clean environment, and none starts here: ${launch.refused}; the working tree is UNKNOWN`
+  const kept = ['PATH', ...(launch.home ? ['HOME'] : []), ...(launch.xdg ? ['XDG_CONFIG_HOME'] : [])].join(', ')
+
+  return `measurement processes start with a clean environment (/usr/bin/env -i; ${kept} and Cockpit's own settings, nothing else inherited), every program by absolute path; Git ${shown(launch.git, home)}, found on ${launch.entries} absolute PATH entr${launch.entries === 1 ? 'y' : 'ies'} (empty or relative ones are never searched)`
 }
 
 /** A path for a diagnostic: relative to the session's own home where it is inside it, and otherwise whole but for a personal directory's name. */
@@ -98,6 +108,7 @@ export const doctorText = (f: DoctorFacts): string => {
   if (f.measurement !== undefined) out.push(line(f.measurement.enforced ? 'OK' : 'WARN', f.measurement.text))
   // older or unknown Git: the partial-clone refusal and the protocol allow-list stand without Git's own lazy-fetch switch
   if (f.gitVersion !== undefined) out.push(line(f.gitVersion?.lazyFetchSwitch === true ? 'INFO' : 'WARN', gitVersionText(f.gitVersion)))
+  if (f.cleanLaunch !== undefined) out.push(line('refused' in f.cleanLaunch ? 'WARN' : 'OK', cleanLaunchText(f.cleanLaunch, f.home)))
   out.push(line('INFO', 'Auto mode: the host classifier decides tool permissions. Cockpit adds no bypass; its own file and process calls are the plugin API\'s, and a refusal is recorded as unverified and not retried another way.'))
   out.push('', 'TELEMETRY')
   const t = f.telemetry

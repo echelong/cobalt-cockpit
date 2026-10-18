@@ -49,7 +49,8 @@ const unidentified = (h: ReturnType<typeof hostState>, why: string) => {
 describe('the limit script', () => {
   test('is one constant: memory, CPU, file size and no core, each only ever lowered, then exec of the words it is given', () => {
     const lower = 'lower() { c=$(ulimit "$1") || return 1; if [ "$c" = unlimited ] || [ "$c" -gt "$2" ]; then ulimit "$1" "$2"; fi; }'
-    expect(boundScript(true, true)).toBe(`${lower} && lower -v 1048576 && lower -t 20 && lower -f 131072 && lower -c 0 && t=$1 && shift && exec timeout -s KILL "$t" "$@"`)
+    // v0.6.6 Stage B: GNU timeout by the absolute path it is given after the seconds, never looked up on PATH
+    expect(boundScript(true, true)).toBe(`${lower} && lower -v 1048576 && lower -t 20 && lower -f 131072 && lower -c 0 && t=$1 && shift && k=$1 && shift && exec "$k" -s KILL "$t" "$@"`)
     expect(boundScript(false, false)).toBe(`${lower} && lower -t 20 && lower -f 131072 && lower -c 0 && t=$1 && shift && exec "$@"`)
     // no command word is ever interpolated: the probes and the script are fixed strings
     for (const s of [boundScript(true, true), boundScript(false, false), BOUND_PROBE_SET(true), BOUND_PROBE_CONTROL, BOUND_PROBE_CAPPED, BOUND_PROBE_GROUP]) expect(s).not.toMatch(/\$\{|`/)
@@ -118,10 +119,12 @@ describe('every measurement process is bounded', () => {
     await begun($); await stop($)
     expect(w.runs.filter(r => MEASURING.includes(r[0]!))).toEqual([])            // refused before launch, never run unbounded
     unidentified(h, 'resource limits could not be applied here')
-    expect(w.boundProbes).toHaveLength(3)                                           // not once per process: one unanswered probe stands a while
+    // not once per process: one unanswered probe stands a while. v0.6.6 Stage B: two, not three: GNU timeout's probe needs the
+    // path the clean shell finds it at, and a shell that does not answer finds none
+    expect(w.boundProbes).toHaveLength(2)
     await w.clock.advance(31_000)
     expect(String((await command($, 'doctor')).text)).toContain('WARN working-tree measurement is OFF: no shell here could set kernel limits')
-    expect(w.boundProbes).toHaveLength(6)                                           // and is then tried again
+    expect(w.boundProbes).toHaveLength(4)                                           // and is then tried again
   })
   test('without GNU timeout the limits still apply, without the group kill, and doctor says a child may outlive a measurement', guard(), async ($, on) => {
     const { w } = fixture(on); busyTree(w); w.groupTimeout = false
@@ -703,7 +706,9 @@ describe('a Git repository that cannot be measured is never accepted as protecte
   test('a session directory deeper than the walk is not called outside Git', async ($, on) => {
     const w = world(on); const h = hostState(on, {}); w.gitStatus = null; w.cwd = `/${Array.from({ length: 300 }, (_, i) => `d${i}`).join('/')}`
     await ready($)
-    await recordedUnknown($, 'Git could not say whether this is a Git repository', h)
+    // v0.6.6 Stage B: the clean start's own walk for a repository holding a measurement program has the same bound, and refuses
+    // first, before any Git runs: UNKNOWN still, with that reason
+    await recordedUnknown($, 'whether a measurement program lies inside the repository could not be checked', h)
   })
   for (const [what, set, why] of [
     ['a .git in a parent directory', (w: World) => { w.kinds['/work/.git'] = 'dir' }, 'a Git repository is here'],

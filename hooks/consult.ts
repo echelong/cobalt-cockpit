@@ -260,7 +260,7 @@ export const consultVerdict = (r: ConsultRequest): { ok: true; key: string; isMa
  * another, and a commit that returned is not reviewed again.
  */
 const releaseVerdict = (r: ConsultRequest, isMandatory: boolean): { ok: true; key: string; isMandatory: boolean } | { ok: false; reason: string } => {
-  if (!isCandidate(r.candidate)) return { ok: false, reason: 'OPUS / CANDIDATE UNKNOWN. A release review is tied to one full commit id of a clean working tree, and none could be established (no repository, no commit, uncommitted changes, a repository Cockpit does not measure: one with a submodule or a partial clone, or git did not answer). Commit the candidate, then ask again. Nothing was started.' }
+  if (!isCandidate(r.candidate)) return { ok: false, reason: 'OPUS / CANDIDATE UNKNOWN. A release review is tied to one full commit id of a clean working tree, and none could be established (no repository, no commit, uncommitted changes, a repository Cockpit does not measure: one with a submodule or a partial clone, an environment in which Cockpit starts no measurement process, or git did not answer). Commit the candidate, then ask again. Nothing was started.' }
   const sha = r.candidate
   const mine = r.consults.filter(c => c.ground === 'release' && c.candidate === sha)
   const kept = (r.history ?? []).filter(h => h.candidate === sha)

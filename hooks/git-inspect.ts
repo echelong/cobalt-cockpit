@@ -20,7 +20,8 @@
 // and carries settings that keep any transport from running), and every rebuilt command, wildcard ones too, runs in the
 // directory the caller verified, whatever directory the helper's own shell is in.
 
-import { GIT_OVERRIDES, GIT_SAFE, HELPER_PINS } from './git-integrity'
+import { CLEAN_ENV, GIT_OVERRIDES, GIT_SAFE, HELPER_PINS } from './git-integrity'
+import type { HelperLaunch } from './git-integrity'
 import { parseShell, unwrap } from './shell'
 import type { Simple } from './shell'
 
@@ -306,8 +307,12 @@ const quote = (word: string): string => `'${word.replace(/'/g, "'\\''")}'`
 const NO_DRIVERS: readonly string[] = ['diff', 'show', 'log']
 /** v0.6.6: subcommands that would otherwise compare a submodule. No helper word can ask for one (REFUSED_LONG), so this one stands. */
 const NO_SUBMODULES: readonly string[] = ['diff', 'show', 'log', 'status']
-const hardened = (sub: string, before: readonly string[], rest: readonly string[]): string =>
-  ['git', '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...HELPER_PINS, ...before, sub, ...(NO_DRIVERS.includes(sub) ? ['--no-ext-diff', '--no-textconv'] : []), ...(NO_SUBMODULES.includes(sub) ? ['--ignore-submodules=all'] : []), ...rest].map(quote).join(' ')
+// v0.6.6 Stage B: the command starts as `/usr/bin/env -i <variables> <git by absolute path>`. Names with a slash are never looked
+// up, so no alias, shell function or PATH entry of the Bash tool's shell decides what runs (that shell loads the person's
+// aliases and functions, as Claude Code documents; one was seen defining a `find` function), and Git sees only the variables
+// listed, the lazy-fetch pins with them, never the shell's own environment.
+const hardened = (launch: HelperLaunch, sub: string, before: readonly string[], rest: readonly string[]): string =>
+  [CLEAN_ENV, '-i', ...launch.env, launch.git, '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...HELPER_PINS, ...before, sub, ...(NO_DRIVERS.includes(sub) ? ['--no-ext-diff', '--no-textconv'] : []), ...(NO_SUBMODULES.includes(sub) ? ['--ignore-submodules=all'] : []), ...rest].map(quote).join(' ')
 
 /** Where a scoped command runs and what it may read: the verified session directory and the canonical, owned paths. */
 export type ScopedPin = { git: ScopedGit; dir: string; paths: readonly string[] }
@@ -317,13 +322,14 @@ export type ScopedPin = { git: ScopedGit; dir: string; paths: readonly string[] 
  * flags, external diff and textconv switched off, repository hooks and a configured diff order file overridden (v0.6.4),
  * submodules ignored and no transport allowed (v0.6.6). Every command is pinned with `-C` to `dir`, the directory the caller
  * verified (v0.6.6; before, only a scoped one was): a passing check of one directory says nothing about another. A scoped
- * command is given its paths as the canonical absolute ones that were checked, after an explicit `--`.
+ * command is given its paths as the canonical absolute ones that were checked, after an explicit `--`. Each starts with the clean
+ * launch the caller found (`launch`, Stage B): `env -i`, the listed variables, and Git by absolute path.
  */
-export const rebuildGit = (command: string, dir: string, pin?: ScopedPin): string => {
-  if (pin !== undefined) return hardened(pin.git.sub, ['-C', pin.dir], [...pin.git.words, '--', ...pin.paths])
+export const rebuildGit = (command: string, dir: string, launch: HelperLaunch, pin?: ScopedPin): string => {
+  if (pin !== undefined) return hardened(launch, pin.git.sub, ['-C', pin.dir], [...pin.git.words, '--', ...pin.paths])
 
   return parseShell(command).pipelines.map(p => {
-    const pipeline = p.commands.map(c => hardened(c.argv[1] as string, ['-C', dir], c.argv.slice(2))).join(' | ')
+    const pipeline = p.commands.map(c => hardened(launch, c.argv[1] as string, ['-C', dir], c.argv.slice(2))).join(' | ')
 
     return pipeline + (p.next === null ? '' : ` ${p.next} `)
   }).join('')

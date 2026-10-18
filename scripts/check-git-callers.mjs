@@ -6,7 +6,10 @@
 //   - every `bounded` call starts one of the measurement programs (BOUND_PROGRAMS in hooks/git-integrity.ts);
 //   - a repository-state pass is created in one place only (repoState), and `auth` is only ever a pass or the preflight's own
 //     listing capability, never a value built from a string;
-//   - the helper's environment check reads exactly GIT_ENV_REFUSED, by literal name, in order.
+//   - the helper's environment check reads exactly GIT_ENV_REFUSED, by literal name, in order;
+//   - (Stage B) the two sites that start measurement processes and their probes start `/usr/bin/env -i` with the loader's
+//     variables blanked, the measurement environment check reads exactly GIT_ENV_MEASURED in order, every one of those names is
+//     also refused for helpers, and the clean base reads PATH, HOME and XDG_CONFIG_HOME and no other variable.
 // Plugin tests cannot read source files (the test runtime imports only the plugin's own modules), so this is a script, run by CI.
 // It reads text, not a syntax tree: it is a tripwire for review, and the runtime admission in `bounded` is the guard.
 // Usage: node scripts/check-git-callers.mjs [--write]. Exit 0: matches. Exit 1: differences or a broken invariant. Exit 2: could not run.
@@ -53,6 +56,7 @@ for (const site of processSites) if (site.file !== 'hooks/register.tsx') problem
 const integrity = read('hooks/git-integrity.ts')
 const PROGRAMS = JSON.parse(/BOUND_PROGRAMS: readonly string\[\] = (\[[^\]]*\])/.exec(integrity)[1].replace(/'/g, '"'))
 const ENV_REFUSED = [...(/GIT_ENV_REFUSED: readonly string\[\] = \[([\s\S]*?)\]/.exec(integrity)[1].matchAll(/'([A-Z0-9_]+)'/g))].map(m => m[1])
+const ENV_MEASURED = [...(/GIT_ENV_MEASURED: readonly string\[\] = \[([\s\S]*?)\]/.exec(integrity)[1].matchAll(/'([A-Z0-9_]+)'/g))].map(m => m[1])
 
 const text = read('hooks/register.tsx'), lines = text.split('\n'), who = owners(lines)
 // `bounded` calls, and the closures over `bounded` each function defines (a `const` whose line, or the next two, call it)
@@ -114,6 +118,19 @@ const envStart = lines.findIndex(l => l.startsWith('const gitEnvironmentSet'))
 const envEnd = envStart < 0 ? -1 : lines.findIndex((l, k) => k > envStart && /^\s*\]\.map\(/.test(l))
 const envNames = envStart < 0 || envEnd < 0 ? [] : [...lines.slice(envStart, envEnd + 1).join('\n').matchAll(/\$\.env\.get\('([A-Z0-9_]+)'\)/g)].map(m => m[1])
 if (JSON.stringify(envNames) !== JSON.stringify(ENV_REFUSED)) problems.push(`gitEnvironmentSet reads ${envNames.join(',')}; GIT_ENV_REFUSED is ${ENV_REFUSED.join(',')}`)
+// Stage B: the clean launch, read from the text of the two functions that start measurement processes and their probes
+const body = name => { const at = lines.findIndex(l => l.startsWith(`const ${name} = `)); if (at < 0) return ''; const end = lines.findIndex((l, k) => k > at && /^(?:const|let|type|function|class) /.test(l)); return lines.slice(at, end < 0 ? undefined : end).join('\n') }
+const runner = body('bounded'), probe = body('probeBound')
+if (!/admissionRefusal\(argv, auth\) \?\? \(callerEnvAdmitted\(env\) \?/.test(runner)) problems.push('bounded does not refuse a caller\'s variables other than LC_ALL=C before anything starts')
+if (!/const words = \[CLEAN_ENV, '-i', \.\.\.cleanAssignments\(launch\.base, env\), CLEAN_SHELL, '-c', boundScript\(/.test(runner) || !/\$\.process\.run\(words, \{ \.\.\.host, env: LOADER_BLANK \}\)/.test(runner)) problems.push('bounded does not start its process as /usr/bin/env -i <clean variables> /bin/sh with the loader blanked')
+if (!/\$\.process\.run\(\[CLEAN_ENV, '-i', `PATH=\$\{clean\.base\.path\.join\(':'\)\}`, 'LC_ALL=C', \.\.\.words\], \{ timeoutMs: 5000, env: LOADER_BLANK \}\)/.test(probe)) problems.push('probeBound does not start its probes as /usr/bin/env -i PATH=<trusted> with the loader blanked')
+const measuredStart = lines.findIndex(l => l.startsWith('const measuredEnvironmentSet'))
+const measuredEnd = measuredStart < 0 ? -1 : lines.findIndex((l, k) => k > measuredStart && /^\s*\]\.map\(/.test(l))
+const measuredNames = measuredStart < 0 || measuredEnd < 0 ? [] : [...lines.slice(measuredStart, measuredEnd + 1).join('\n').matchAll(/\$\.env\.get\('([A-Z0-9_]+)'\)/g)].map(m => m[1])
+if (JSON.stringify(measuredNames) !== JSON.stringify(ENV_MEASURED)) problems.push(`measuredEnvironmentSet reads ${measuredNames.join(',')}; GIT_ENV_MEASURED is ${ENV_MEASURED.join(',')}`)
+for (const name of ENV_MEASURED) if (!ENV_REFUSED.includes(name)) problems.push(`${name} refuses measurement but not helper inspection`)
+const baseNames = [...body('cleanBaseOf').matchAll(/\$\.env\.get\('([A-Z0-9_]+)'\)/g)].map(m => m[1])
+if (JSON.stringify(baseNames) !== JSON.stringify(['PATH', 'HOME', 'XDG_CONFIG_HOME'])) problems.push(`cleanBaseOf reads ${baseNames.join(',')}, not exactly PATH, HOME and XDG_CONFIG_HOME`)
 
 const count = rows => Object.entries(rows.reduce((m, r) => { const k = JSON.stringify(r); m[k] = (m[k] ?? 0) + 1; return m }, {})).map(([k, n]) => ({ ...JSON.parse(k), count: n })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
 const census = { processSites: count(processSites), bounded: count(bounded), closureCalls: count(closureCalls) }

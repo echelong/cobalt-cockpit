@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { GIT_OVERRIDES, GIT_SAFE, HELPER_PINS } from '../hooks/git-integrity'
+import { CLEAN_ENV, GIT_OVERRIDES, GIT_SAFE, HELPER_PINS } from '../hooks/git-integrity'
+import type { HelperLaunch } from '../hooks/git-integrity'
 import { agentInspection, readOnlyShell, rebuildGit, scopedGit, SCOPED_MAX_COMMITS, SCOPED_MAX_PATHS } from '../hooks/git-inspect'
 import type { ScopedGit } from '../hooks/git-inspect'
 import { parseShell } from '../hooks/shell'
@@ -7,6 +8,9 @@ import { parseShell } from '../hooks/shell'
 const argvOf = (command: string): string[] => parseShell(command).pipelines[0]!.commands[0]!.argv
 /** v0.6.6: the directory the caller verified; every rebuilt command is pinned to it. */
 const DIR = '/work/example'
+/** v0.6.6 Stage B: how a rebuilt inspection starts Git: env -i, the clean variables, Git by absolute path. */
+const LAUNCH: HelperLaunch = { env: ['PATH=/usr/bin:/bin', 'HOME=/home/tester', 'GIT_NO_LAZY_FETCH=1', 'GIT_ALLOW_PROTOCOL=cockpit-none'], git: '/usr/bin/git' }
+const PREFIX = [CLEAN_ENV, '-i', ...LAUNCH.env, LAUNCH.git]
 const accepted = (command: string): ScopedGit => {
   const verdict = scopedGit(command)
   if (!verdict.ok) throw new Error(`refused: ${command} (${verdict.reason})`)
@@ -198,14 +202,14 @@ describe('a wildcard subagent\'s rule: the same, with single-quoted text as data
     // the escaped and quoted forms as well: each is one literal word to Git, which knows no such option
     for (const [typed, word] of [['git log --{output=/tmp/canary\\},}', '--{output=/tmp/canary},}'], ['git log --{output=/tmp/canary,\\{}', '--{output=/tmp/canary,{}'], ["git log --{output=/tmp/canary,'{'}", '--{output=/tmp/canary,{}']] as const) {
       expect([typed, agentInspection(typed)]).toEqual([typed, true])
-      expect(argvOf(rebuildGit(typed, DIR)).at(-1)).toBe(word)
-      expect(parseShell(rebuildGit(typed, DIR)).pipelines).toHaveLength(1)
+      expect(argvOf(rebuildGit(typed, DIR, LAUNCH)).at(-1)).toBe(word)
+      expect(parseShell(rebuildGit(typed, DIR, LAUNCH)).pipelines).toHaveLength(1)
     }
     const command = 'git log --{output=/tmp/canary,}'
     expect(agentInspection(command)).toBe(true)
     // Git is handed the braces themselves, as one word, and refuses the option it does not know
-    expect(argvOf(rebuildGit(command, DIR)).at(-1)).toBe('--{output=/tmp/canary,}')
-    expect(rebuildGit(command, DIR).endsWith("'--{output=/tmp/canary,}'")).toBe(true)
+    expect(argvOf(rebuildGit(command, DIR, LAUNCH)).at(-1)).toBe('--{output=/tmp/canary,}')
+    expect(rebuildGit(command, DIR, LAUNCH).endsWith("'--{output=/tmp/canary,}'")).toBe(true)
   })
   test('the same characters outside single quotes are still refused', () => {
     for (const command of [
@@ -225,13 +229,13 @@ describe('a wildcard subagent\'s rule: the same, with single-quoted text as data
 describe('what runs is rebuilt, never the typed text', () => {
   test('every word is single-quoted behind --no-pager and the safe flags; diff, show and log lose their drivers', () => {
     // v0.6.6: the helper pins, the verified directory (wildcard commands too) and no submodule comparison
-    const argv = argvOf(rebuildGit('git diff main...HEAD -- hooks/swarm.ts', DIR))
-    expect(argv).toEqual(['git', '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...HELPER_PINS, '-C', DIR, 'diff', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', 'main...HEAD', '--', 'hooks/swarm.ts'])
-    expect(argvOf(rebuildGit('git grep -n x', DIR))).toEqual(['git', '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...HELPER_PINS, '-C', DIR, 'grep', '-n', 'x'])
-    expect(rebuildGit('git status', DIR)).toMatch(/^'git' '--no-pager' /)
+    const argv = argvOf(rebuildGit('git diff main...HEAD -- hooks/swarm.ts', DIR, LAUNCH))
+    expect(argv).toEqual([...PREFIX, '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...HELPER_PINS, '-C', DIR, 'diff', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', 'main...HEAD', '--', 'hooks/swarm.ts'])
+    expect(argvOf(rebuildGit('git grep -n x', DIR, LAUNCH))).toEqual([...PREFIX, '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...HELPER_PINS, '-C', DIR, 'grep', '-n', 'x'])
+    expect(rebuildGit('git status', DIR, LAUNCH)).toMatch(/^'\/usr\/bin\/env' '-i' 'PATH=\/usr\/bin:\/bin' /)            // v0.6.6 Stage B: the clean launch, Git by absolute path
   })
   test('a substitution inside single quotes stays text after the rebuild', () => {
-    const rebuilt = rebuildGit("git grep '$(touch /tmp/pwned)' -- hooks", DIR)
+    const rebuilt = rebuildGit("git grep '$(touch /tmp/pwned)' -- hooks", DIR, LAUNCH)
     const parsed = parseShell(rebuilt)
     expect(parsed.substitutions).toEqual([])
     expect(parsed.pipelines).toHaveLength(1)
@@ -239,24 +243,24 @@ describe('what runs is rebuilt, never the typed text', () => {
     expect(parsed.pipelines[0]!.commands[0]!.writes).toEqual([])
   })
   test('a quote inside a word cannot close the quoting', () => {
-    const rebuilt = rebuildGit('git grep "it\'s; rm -rf x" -- docs', DIR)
+    const rebuilt = rebuildGit('git grep "it\'s; rm -rf x" -- docs', DIR, LAUNCH)
     const parsed = parseShell(rebuilt)
     expect(parsed.pipelines).toHaveLength(1)
     expect(parsed.pipelines[0]!.commands).toHaveLength(1)
     expect(parsed.pipelines[0]!.commands[0]!.argv.slice(-3)).toEqual(["it's; rm -rf x", '--', 'docs'])
   })
   test('a pipeline of inspections is rebuilt command by command', () => {
-    const parsed = parseShell(rebuildGit('git diff --stat | git log --oneline', DIR))
+    const parsed = parseShell(rebuildGit('git diff --stat | git log --oneline', DIR, LAUNCH))
     expect(parsed.pipelines[0]!.commands.map(c => c.argv.includes('--no-pager'))).toEqual([true, true])
   })
   test('a scoped command is pinned to the verified directory and reads only the canonical paths it was checked for', () => {
     const git = accepted('git diff --stat main...HEAD -- hooks/swarm.ts ./tests')
-    const argv = argvOf(rebuildGit('ignored: the pin is what runs', DIR, { git, dir: '/work/example', paths: ['/work/example/hooks/swarm.ts', '/work/example/tests'] }))
-    expect(argv).toEqual(['git', '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...HELPER_PINS, '-C', '/work/example', 'diff', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', '--stat', 'main...HEAD', '--', '/work/example/hooks/swarm.ts', '/work/example/tests'])
+    const argv = argvOf(rebuildGit('ignored: the pin is what runs', DIR, LAUNCH, { git, dir: '/work/example', paths: ['/work/example/hooks/swarm.ts', '/work/example/tests'] }))
+    expect(argv).toEqual([...PREFIX, '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...HELPER_PINS, '-C', '/work/example', 'diff', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', '--stat', 'main...HEAD', '--', '/work/example/hooks/swarm.ts', '/work/example/tests'])
   })
   test('a file at a revision keeps its object name and still ends the options', () => {
     const git = accepted('git show HEAD~2:hooks/swarm.ts')
-    expect(argvOf(rebuildGit('', DIR, { git, dir: '/work/example', paths: [] })).slice(-6)).toEqual(['show', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', 'HEAD~2:hooks/swarm.ts', '--'])
+    expect(argvOf(rebuildGit('', DIR, LAUNCH, { git, dir: '/work/example', paths: [] })).slice(-6)).toEqual(['show', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', 'HEAD~2:hooks/swarm.ts', '--'])
   })
 })
 

@@ -6,8 +6,8 @@
 import type { On } from 'claude-code'
 import { mock } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
-import { BOUND_PROBE_CAPPED, BOUND_PROBE_CONTROL, BOUND_PROBE_GROUP, BOUND_PROBE_SET, BOUND_TAG, INSPECT_BSD, INSPECT_GNU } from '../hooks/git-integrity'
-import type { Kind } from '../hooks/git-integrity'
+import { BOUND_PROBE_CAPPED, BOUND_PROBE_CONTROL, BOUND_PROBE_GROUP, BOUND_PROBE_SET, BOUND_TAG, CLEAN_ENV, CLEAN_SHELL, IGNORED_BSD, INSPECT_BSD, INSPECT_GNU, MEASURE_PROGRAMS, OWNER_BSD, OWNER_GNU, RESOLVE_SCRIPT } from '../hooks/git-integrity'
+import type { Kind, MeasureProgram } from '../hooks/git-integrity'
 
 export const PLUGIN = 'cobalt-cockpit'
 export const TOOL = 'mcp__cobalt-cockpit__progress'
@@ -16,8 +16,31 @@ export type PlayerBehavior = 'ok' | 'fails' | 'missing' | 'hangs'
 
 export type World = {
   clock: MockClock
-  /** Every `$.process.run`, as its argv; a command started through the limit script is recorded as itself (see `wrappers`). */
+  /**
+   * Every `$.process.run`, as its argv; a command started through the limit script is recorded as itself (see `wrappers`), and
+   * (v0.6.6 Stage B) one started through the clean launch by the program's name, its absolute path in `programPaths`.
+   */
   runs: string[][]
+  /** v0.6.6 Stage B, in the order of `runs`: the absolute path a measurement process was started by, or null for a direct start. */
+  programPaths: (string | null)[]
+  /** v0.6.6 Stage B, in the order of `runs`: the variables laid over the host's environment for the process the host started (`/usr/bin/env` for a clean one). */
+  hostEnvs: (Readonly<Record<string, string>> | undefined)[]
+  /**
+   * v0.6.6 Stage B: where the clean shell finds each measurement program on PATH (`command -v`); null: not found. Unset: under
+   * /usr/bin. `realPaths` is where a path really is (every link followed), as `$.fs.stat` resolves it (unset: itself).
+   */
+  programs: Partial<Record<MeasureProgram, string | null>>
+  realPaths: Record<string, string>
+  /** v0.6.6 Stage B: the owner and raw mode `stat -L` reports for a program or its directory (unset: root, 0755). */
+  owners: Record<string, { uid: number; mode: number }>
+  /** v0.6.6 Stage B: what `id -u` prints for the session's user (null: `id` fails). */
+  uid: number | null
+  /** v0.6.6 Stage B: the clean launch's own probes (finding the programs, the user, their owners), apart from `boundProbes`. */
+  launchProbes: string[][]
+  /** v0.6.6 Stage B: every clean launch as the host received it, word for word. */
+  launched: string[][]
+  /** v0.6.6 Stage B: what the clean shell's lookup prints instead of the programs' paths (null: their paths). */
+  resolveOutput: string | null
   /** v0.6.4, in the order of `runs`: the limit script a command was started through, or null when it was started directly. */
   wrappers: (string | null)[]
   /** The limit probes the plugin ran, as their scripts; they are not in `runs`. */
@@ -251,6 +274,11 @@ export type World = {
 
 const MODEL_ALIAS: Record<string, string> = { sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5', haiku: 'claude-haiku-5-5' }
 
+/**
+ * v0.6.6 Stage B: how a helper's rebuilt Git inspection starts in the default world: `env -i`, the trusted PATH (the shell's
+ * default, PATH being unset here), HOME, the lazy-fetch pins, and Git by the absolute path the clean shell found.
+ */
+export const HELPER_START: readonly string[] = [CLEAN_ENV, '-i', 'PATH=/usr/bin:/bin', 'HOME=/home/tester', 'GIT_NO_LAZY_FETCH=1', 'GIT_ALLOW_PROTOCOL=cockpit-none', '/usr/bin/git']
 /** v0.6.6: the commit a gitlink revision peels to (see `gitlinkRevisions`); no other test uses it as HEAD. */
 export const GITLINK_COMMIT = '5ee1ed0c0ffee'.padEnd(40, '5')
 export const CLEAN_REPO = '# branch.oid 1111111aaaaaaa\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n'
@@ -264,6 +292,15 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
   const w: World = {
     clock: mock.clock(on, { now: 1_000_000 }),
     runs: [],
+    programPaths: [],
+    hostEnvs: [],
+    programs: {},
+    realPaths: {},
+    owners: {},
+    uid: 1000,
+    launchProbes: [],
+    launched: [],
+    resolveOutput: null,
     wrappers: [],
     wrapperSeconds: [],
     groupTimeout: true,
@@ -484,6 +521,9 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
   // `stat` answers from the same map the reads come from, so a test that puts a
   // ledger in `files` gets a size that matches what `read` will hand back.
   on('fs.stat', ($, e) => {
+    // v0.6.6 Stage B: the programs measurement starts, and the session directory, where they really are
+    const started = [...MEASURE_PROGRAMS.map(name => programPath(name)), CLEAN_ENV, CLEAN_SHELL]
+    if (started.includes(e.path) || e.path === w.cwd) return { value: { kind: e.path === w.cwd ? 'dir' as const : 'file' as const, size: 1, mtimeMs: 0, isLink: w.realPaths[e.path] !== undefined, ...(e.resolve ? { realPath: w.realPaths[e.path] ?? e.path } : {}) } }
     const text = w.files[e.path]
     if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
 
@@ -539,6 +579,9 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
   const PROBES = new Set([BOUND_PROBE_SET(true), BOUND_PROBE_SET(false), BOUND_PROBE_CONTROL, BOUND_PROBE_CAPPED, BOUND_PROBE_GROUP])
 
   let running = 0
+  /** v0.6.6 Stage B: where the clean shell finds a measurement program (null: nowhere), and the name a path is the program of. */
+  const programPath = (name: MeasureProgram): string | null => (w.programs[name] === undefined ? `/usr/bin/${name}` : w.programs[name]!)
+  const nameOf = (path: string): string => MEASURE_PROGRAMS.find(name => programPath(name) === path) ?? path.slice(path.lastIndexOf('/') + 1)
   on('process.run', async ($, e) => {
     if (['mkdir', 'chmod', 'rm', 'stat'].includes(e.argv[0] ?? '') && e.argv.some(a => a.includes('/cobalt-cockpit/telemetry') || a.endsWith('/.local/state/cobalt-cockpit'))) {
       w.telemetryRuns.push([...e.argv])
@@ -547,10 +590,38 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
 
       return ran(0)
     }
+    // v0.6.6 Stage B: a process started through the clean launch, `/usr/bin/env -i NAME=value… <program>`: answered as the program
+    // it starts, with those variables as its whole environment (as `env -i` gives it).
+    let launched: readonly string[] = e.argv
+    let clean: Record<string, string> | undefined
+    if (e.argv[0] === CLEAN_ENV && e.argv[1] === '-i') {
+      w.launched.push([...e.argv])
+      clean = {}
+      let k = 2
+      for (; k < e.argv.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(e.argv[k]!); k++) { const word = e.argv[k]!; clean[word.slice(0, word.indexOf('='))] = word.slice(word.indexOf('=') + 1) }
+      launched = e.argv.slice(k)
+      // the clean shell finding the programs on PATH, one line each (none: there is no shell)
+      if (launched[0] === CLEAN_SHELL && launched[1] === '-c' && launched[2] === RESOLVE_SCRIPT) {
+        w.launchProbes.push(['resolve', clean['PATH'] ?? ''])
+        if (w.boundMode === 'none') throw new Error(`spawn ${CLEAN_SHELL} ENOENT`)
+        return ran(0, w.resolveOutput ?? MEASURE_PROGRAMS.map(name => `${programPath(name) ?? ''}\n`).join(''))
+      }
+      // the session's user, and each program's owner and mode (a name another one lies inside is a directory)
+      if (launched[0] === programPath('id') && launched[1] === '-u') { w.launchProbes.push(['id']); return w.uid === null ? ran(1) : ran(0, `${w.uid}\n`) }
+      if (launched[0] === programPath('stat') && launched[1] === '-L' && (launched[3] === OWNER_GNU || launched[3] === OWNER_BSD)) {
+        const gnu = launched[2] === '--printf'
+        w.launchProbes.push(['owners', gnu ? 'gnu' : 'bsd'])
+        if ((w.statFlavor === 'gnu') !== gnu) return { value: { exitCode: 1, stdout: '', stderr: gnu ? 'stat: illegal option -- -\n' : 'stat: cannot read file system information\n', isStdoutTruncated: false, isStderrTruncated: false } }
+        const names = launched.slice(5)
+        const owner = (name: string) => w.owners[name] ?? { uid: 0, mode: names.some(other => other.startsWith(`${name}/`)) ? 0x41ed : 0x81ed }
+        return ran(0, names.map(name => (gnu ? `${owner(name).uid} ${owner(name).mode.toString(16)} ${name}\0` : `${owner(name).uid} ${owner(name).mode.toString(8)}\n`)).join(''))
+      }
+    }
+    const shell = clean === undefined ? 'sh' : CLEAN_SHELL
     // The limit probes: `full` accepts and enforces every limit, `partial` accepts them but a 64 MiB allocation still succeeds
     // under the 32 MiB cap, `none` has no `sh`.
-    if (e.argv[0] === 'sh' && e.argv[1] === '-c' && PROBES.has(String(e.argv[2]))) {
-      const script = String(e.argv[2])
+    if (launched[0] === shell && launched[1] === '-c' && PROBES.has(String(launched[2]))) {
+      const script = String(launched[2])
       w.boundProbes.push(script)
       if (w.boundMode === 'none') throw new Error('spawn sh ENOENT')
       if (w.boundMode === 'basic' && script === BOUND_PROBE_SET(true)) return ran(2)
@@ -559,16 +630,21 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
 
       return script === BOUND_PROBE_CAPPED ? ran(w.boundMode === 'partial' ? 0 : 1) : script === BOUND_PROBE_CONTROL ? ran(0) : ran(0, 'set\n')
     }
-    // A command started through the limit script is answered as itself; the script is recorded beside it.
-    const isWrapped = e.argv[0] === 'sh' && e.argv[1] === '-c' && e.argv[3] === BOUND_TAG
-    const argv: readonly string[] = isWrapped ? e.argv.slice(5) : e.argv
+    // A command started through the limit script is answered as itself; the script is recorded beside it. With the group kill the
+    // script's arguments are the seconds and then timeout's path (Stage B), before the command.
+    const isWrapped = launched[0] === shell && launched[1] === '-c' && launched[3] === BOUND_TAG
+    const grouped = isWrapped && String(launched[2]).includes('k=$1')
+    const inner: readonly string[] = isWrapped ? launched.slice(grouped ? 6 : 5) : launched
+    const argv: readonly string[] = clean !== undefined && inner[0]?.startsWith('/') === true ? [nameOf(inner[0]), ...inner.slice(1)] : inner
     w.runs.push([...argv])
-    w.wrappers.push(isWrapped ? String(e.argv[2]) : null)
-    w.wrapperSeconds.push(isWrapped ? String(e.argv[4]) : null)
+    w.programPaths.push(clean !== undefined ? inner[0] ?? null : null)
+    w.hostEnvs.push(e.init?.env)
+    w.wrappers.push(isWrapped ? String(launched[2]) : null)
+    w.wrapperSeconds.push(isWrapped ? String(launched[4]) : null)
     if (isWrapped) { running++; w.peakRunning = Math.max(w.peakRunning, running) }
     try {
     if (isWrapped) for (let tick = 0; tick < w.runDelayTicks; tick++) await Promise.resolve()
-    w.runEnvs.push(e.init?.env)
+    w.runEnvs.push(clean ?? e.init?.env)
     if (w.duringRun !== null) await w.duringRun(argv)
     const program = argv[0] ?? ''
     const inspecting = program === 'stat' && ((argv.includes('--printf') && argv[argv.indexOf('--printf') + 1] === INSPECT_GNU) || (argv.includes('-f') && argv[argv.indexOf('-f') + 1] === INSPECT_BSD))
@@ -584,7 +660,7 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
 
       return { value: { exitCode: errors.length > 0 ? 1 : 0, stdout, stderr: errors.join(''), isStdoutTruncated: false, isStderrTruncated: false } }
     }
-    if (program === 'stat' && w.statFileSystem && (argv.includes('--printf') || (argv.includes('-f') && argv[argv.indexOf('-f') + 1] === '%i %z %m %c %N'))) {
+    if (program === 'stat' && w.statFileSystem && (argv.includes('--printf') || (argv.includes('-f') && argv[argv.indexOf('-f') + 1] === IGNORED_BSD))) {
       const names = argv.slice(argv.indexOf('--') + 1)
       if (argv.includes('--printf')) return { value: { exitCode: 1, stdout: '', stderr: `stat: cannot statx '${names[0]}': No such file or directory\n`, isStdoutTruncated: false, isStderrTruncated: false } }
 

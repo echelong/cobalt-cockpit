@@ -15,7 +15,7 @@
     {
       "file": "hooks/register.tsx",
       "function": "bounded",
-      "program": "sh",
+      "program": "words",
       "count": 1
     },
     {
@@ -39,7 +39,7 @@
     {
       "file": "hooks/register.tsx",
       "function": "probeBound",
-      "program": "sh",
+      "program": "CLEAN_ENV",
       "count": 1
     },
     {

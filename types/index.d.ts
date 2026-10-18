@@ -368,10 +368,10 @@ export type GitState = {
   behind: number | null
   /**
    * v0.6.6: set when this is a repository Cockpit did not read (unsafe inputs, a gitlink, a partial clone, an active filter,
-   * or a state it could not read). Nothing is known about its changes: `dirty` is not a count then, and the Stop guard reads
-   * the repository as possibly changed.
+   * or a state it could not read; Stage B: an environment in which no measurement process starts). Nothing is known about its
+   * changes: `dirty` is not a count then, and the Stop guard reads the repository as possibly changed.
    */
-  refused?: 'inputs' | 'submodule' | 'partial-clone' | 'unreadable' | 'filter'
+  refused?: 'inputs' | 'submodule' | 'partial-clone' | 'unreadable' | 'filter' | 'environment'
   at: number
 }
 

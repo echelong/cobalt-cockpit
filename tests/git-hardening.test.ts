@@ -5,14 +5,14 @@
 // of repository state only with the check's pass, every Git process carries the lazy-fetch and protocol pins, and fingerprints of
 // ordinary repositories are the ones v0.6.5 took. What real Git does with these argv is for the approved real-Git acceptance.
 import { describe, expect, test } from 'claude-code/testing'
-import { BOUND_PINS, BOUND_PROGRAMS, GIT_ENV_REFUSED, GIT_SAFE, HELPER_PINS, REPO_REFUSAL_SHORT, REPO_REFUSAL_WORDS, TRACKED_LIMIT, filterRecordsOf, gitAccessOf, gitCallOf, gitVersionOf, nonGitAdmitted, partialCloneOf, promisorPacksOf, stageGitlinks } from '../hooks/git-integrity'
+import { BOUND_PINS, BOUND_PROGRAMS, GIT_ENV_REFUSED, GIT_SAFE, HELPER_PINS, IGNORED_BSD, IGNORED_GNU, INSPECT_BSD, INSPECT_GNU, REPO_REFUSAL_SHORT, REPO_REFUSAL_WORDS, TRACKED_LIMIT, filterRecordsOf, gitAccessOf, gitCallOf, gitVersionOf, nonGitAdmitted, partialCloneOf, promisorPacksOf, stageGitlinks } from '../hooks/git-integrity'
 import { checkpointOf, emptyLedger, UNKNOWN } from '../hooks/ledger'
 import { filterCommands } from '../hooks/git'
 import type { RepoRefusal } from '../hooks/git-integrity'
 import { dirtyLabel, refusedReason, treeNeedsAttention } from '../hooks/git'
 import { gitVersionText } from '../hooks/doctor'
 import type { GitState, Task } from '../types'
-import { blobOf, command, FIVE, GATE_NAMES, hostState, mountHud, passAllGates, planAndComplete, progress, prompt, rowsOf, start, world } from './world'
+import { blobOf, command, FIVE, GATE_NAMES, HELPER_START, hostState, mountHud, passAllGates, planAndComplete, progress, prompt, rowsOf, start, world } from './world'
 import type { World } from './world'
 
 type Engine = Parameters<typeof start>[0]
@@ -36,50 +36,89 @@ const subcommands = (w: World, from = 0): string[] => w.runs.slice(from).filter(
   while (r[at] === '-c' || r[at] === '-C' || r[at] === '--no-optional-locks' || r[at] === '--no-replace-objects' || r[at] === '--literal-pathspecs') at += r[at] === '-c' || r[at] === '-C' ? 2 : 1
   return r[at]!
 })
+/** One turn of the event loop: the HUD refresh a session start does not wait for has landed by then (v0.6.6 Stage B). */
+const settled = () => new Promise<void>(resolve => { (globalThis as unknown as { setTimeout: (f: () => void, ms: number) => unknown }).setTimeout(resolve, 0) })
 /** What reads a repository's work tree, index or objects beyond the refusal check's own listings. */
 const READS_STATE = ['status', 'diff', 'hash-object', 'check-attr', 'ls-tree']
 
 // --- the runner's admission and the refusal check's parsers (pure) ---
 
 describe('the runner admits Git commands by form', () => {
-  test('only Cockpit\'s own pre-subcommand words are accepted', () => {
-    expect(gitCallOf(['git', ...GIT_SAFE, '-C', '/r', 'status'])).toEqual({ sub: 'status', args: [], dir: '/r' })
+  // v0.6.6 Stage B: by exact form (before: any GIT_SAFE setting in any order, and any arguments for an admitted subcommand)
+  const R = '/r'
+  const git = (...words: string[]) => ['git', ...GIT_SAFE, ...words]
+  test('the words before the subcommand are GIT_SAFE, word for word, then at most one absolute -C', () => {
+    expect(gitCallOf(git('-C', R, 'status'))).toEqual({ sub: 'status', args: [], dir: R })
+    expect(gitCallOf(git('rev-parse', '--show-toplevel'))).toEqual({ sub: 'rev-parse', args: ['--show-toplevel'], dir: null })
     expect(gitCallOf(['git', '--version'])).toEqual({ sub: '--version', args: [], dir: null })
+    const [first, ...rest] = GIT_SAFE
     for (const argv of [
-      ['git'], ['env', 'git', 'status'], ['/usr/bin/git', 'status'],
-      ['git', '--git-dir=/x', 'status'], ['git', '--exec-path=/x', 'status'], ['git', '-C', '/a', '-C', '/b', 'status'], ['git', '-C', '', 'status'],
-      ['git', '-c', 'nokey', 'status'], ['git', '-c', 'core.fsmonitor', 'status'], ['git', '-c'], ['git', '--no-pager', 'status'],
-      // only GIT_SAFE's own settings: no other value, and no setting that names a program
-      ['git', '-c', 'core.fsmonitor=true', 'status'], ['git', '-c', 'alias.x=!sh', 'x'], ['git', '-c', 'diff.ignoreSubmodules=none', 'diff'], ['git', '-c', 'core.sshCommand=sh', 'status'],
+      ['git'], ['env', 'git', 'status'], ['/usr/bin/git', 'status'], ['git', '-C', R, 'status'], ['git', 'status'],
+      // GIT_SAFE incomplete, reordered, with one setting changed or one more added
+      ['git', ...rest, '-C', R, 'status'], ['git', ...rest, first!, '-C', R, 'status'], git('-c', 'core.fsmonitor=false', '-C', R, 'status'),
+      ['git', ...GIT_SAFE.map(word => (word === 'diff.ignoreSubmodules=all' ? 'diff.ignoreSubmodules=none' : word)), '-C', R, 'diff'],
+      git('-c', 'alias.x=!sh', 'x'), git('--git-dir=/x', 'status'), git('--exec-path=/x', 'status'), git('--no-pager', 'status'),
+      git('-C', R, '-C', '/b', 'status'), git('-C', '', 'status'), git('-C', 'relative', 'status'), git('-C', './r', 'status'), git('-C'), git(), ['git', '--version', 'x'],
     ]) expect([argv, gitCallOf(argv)]).toEqual([argv, null])
-    expect(gitCallOf(['git', '-c', 'diff.ignoreSubmodules=all', '-C', '/r', 'diff'])).toEqual({ sub: 'diff', args: [], dir: '/r' })
   })
-  test('the discovery list is closed: where things are, configuration, and HEAD without a peel', () => {
-    const access = (...args: string[]) => gitAccessOf(gitCallOf(['git', '-C', '/r', ...args])!)
-    for (const args of [
-      ['rev-parse', '--show-toplevel'], ['rev-parse', '--show-prefix'], ['rev-parse', '--git-path', 'info/exclude', '--git-path', 'objects/pack'], ['rev-parse', '--verify', 'HEAD'],
-      ['config', '--type=path', '--get', 'core.excludesFile'], ['config', '--bool', '--get', 'core.filemode'], ['config', '--null', '--get-regexp', '^filter\\..*\\.(clean|process)$'], ['config', '--null', '--list'],
-    ]) expect([args, access(...args)]).toEqual([args, 'discovery'])
+  test('every form Cockpit writes is admitted, with what it reads', () => {
+    const access = (...words: string[]) => { const call = gitCallOf(git(...words)); return call === null ? 'not a call' : gitAccessOf(call) }
+    const discovery = [
+      ['rev-parse', '--show-toplevel'], ['rev-parse', '--show-prefix'],
+      ['-C', R, 'rev-parse', '--git-path', 'info/exclude', '--git-path', 'info/attributes', '--git-path', 'objects/info/alternates'], ['-C', R, 'rev-parse', '--git-path', 'objects/pack'], ['-C', R, 'rev-parse', '--verify', 'HEAD'],
+      ['-C', R, 'config', '--null', '--list'], ['-C', R, 'config', '--type=path', '--get', 'core.excludesFile'], ['-C', R, 'config', '--type=path', '--get', 'core.attributesFile'],
+      ['-C', R, 'config', '--bool', '--get', 'core.symlinks'], ['-C', R, 'config', '--bool', '--get', 'core.filemode'],
+    ]
+    for (const words of discovery) expect([words, access(...words)]).toEqual([words, 'discovery'])
     expect(gitAccessOf(gitCallOf(['git', '--version'])!)).toBe('discovery')
-    for (const args of [['ls-files', '-z', '--stage'], ['ls-tree', '-r', '-z', '--full-tree', 'HEAD'], ['ls-tree', '-r', '-z', '--full-tree', 'a'.repeat(40)]]) expect([args, access(...args)]).toEqual([args, 'listing'])
-    // what reads repository state: admitted only with the check's pass for that root
-    for (const args of [
-      ['rev-parse', '--verify', '--quiet', 'main^{commit}'],
-      ['ls-files', '-z'], ['ls-files', '-z', '--stage', '--', 'x'], ['ls-files', '-v', '-z'], ['ls-tree', '-r', '-z', '--full-tree', 'main'], ['ls-tree', '-r', '-z', '--full-tree', 'HEAD~1'],
-      ['status', '--porcelain'], ['diff', 'HEAD'], ['hash-object', '--', 'a'], ['check-attr', '-z', '--stdin', 'filter'],
-    ]) expect([args, access(...args)]).toEqual([args, 'state'])
-    // everything else: no pass admits it
-    for (const args of [
-      ['rev-parse', '--verify', 'HEAD^{commit}'], ['rev-parse', '--verify', 'main'], ['rev-parse'], ['rev-parse', '--git-path'], ['rev-parse', '--git-path', '--x'], ['rev-parse', '--verify', '--quiet', '-x^{commit}'],
-      ['config', '--get'], ['config', '--get', 'a', 'b'], ['config', '--add', 'a', 'b'], ['config', '--file', '/x', '--get', 'a'], ['config', '--list', '--get', 'a'], ['config', '--unset', 'a'], ['config', '--get', '-a'],
-      ['cat-file', '--batch-check'], ['fetch'], ['submodule', 'update'], ['gc'], ['log', '-p'], ['show', 'HEAD'], ['grep', 'x'], ['--version', 'x'],
-    ]) expect([args, access(...args)]).toEqual([args, 'refused'])
+    for (const words of [['-C', R, 'ls-files', '-z', '--stage'], ['-C', R, 'ls-tree', '-r', '-z', '--full-tree', 'HEAD'], ['-C', R, 'ls-tree', '-r', '-z', '--full-tree', 'a'.repeat(40)], ['-C', R, 'ls-tree', '-r', '-z', '--full-tree', 'b'.repeat(64)]]) expect([words, access(...words)]).toEqual([words, 'listing'])
+    const state = [
+      ['rev-parse', '--verify', '--quiet', 'main^{commit}'], ['rev-parse', '--verify', '--quiet', 'origin/release-1.2~3^{commit}'],
+      ['ls-files', '-z'], ['ls-files', '-v', '-z'], ['ls-files', '-o', '--exclude-standard', '-z'], ['ls-files', '-o', '-i', '--exclude-standard', '-z', '--', '.'], ['ls-files', '-o', '-i', '--exclude-standard', '-z', '--', '.', ':(exclude)dist/', ':(exclude).cache/'],
+      ['check-attr', '-z', '--stdin', 'filter'],
+      ['hash-object', '--no-filters', '--stdin'], ['hash-object', '--no-filters', '--', './a', '/w/b', '.git/info/exclude'], ['hash-object', '--', './a'],
+      ['diff', 'HEAD', '-O/dev/null', '--no-renames', '--ignore-submodules=all', '--name-only', '-z', '--diff-filter=d'], ['diff', 'a'.repeat(40), '-O/dev/null', '--no-renames', '--ignore-submodules=all', '--name-only', '-z', '--diff-filter=D'],
+      ['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=all'], ['status', '--porcelain=v2', '--branch', '--ignore-submodules=all'],
+    ]
+    for (const words of state) expect([words, access('-C', R, ...words)]).toEqual([words, 'state'])
+  })
+  test('anything else is refused, the forms next to Cockpit\'s own included', () => {
+    // a command that is no Git call the runner knows (gitCallOf null) is refused as well
+    const access = (...words: string[]) => { const call = gitCallOf(git(...words)); return call === null ? 'refused' : gitAccessOf(call) }
+    for (const words of [
+      // finding the repository runs in the session directory; everything else names the repository with -C
+      ['-C', R, 'rev-parse', '--show-toplevel'], ['rev-parse', '--verify', 'HEAD'], ['config', '--null', '--list'], ['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=all'], ['-C', R, '--version'],
+      ['-C', R, 'rev-parse', '--verify', 'HEAD^{commit}'], ['-C', R, 'rev-parse', '--verify', 'main'], ['-C', R, 'rev-parse'], ['-C', R, 'rev-parse', '--git-path', 'x'], ['-C', R, 'rev-parse', '--show-toplevel', '--show-prefix'],
+      ['-C', R, 'rev-parse', '--verify', '--quiet', '-x^{commit}'], ['-C', R, 'rev-parse', '--verify', '--quiet', 'a:b^{commit}'], ['-C', R, 'rev-parse', '--verify', '--quiet', 'a b^{commit}'],
+      ['-C', R, 'config', '--null', '--get-regexp', '^filter\\..*\\.(clean|process)$'], ['-C', R, 'config', '--type=path', '--get', 'core.hooksPath'], ['-C', R, 'config', '--bool', '--get', 'core.bare'], ['-C', R, 'config', '--get', 'core.excludesFile'],
+      ['-C', R, 'config', '--add', 'a', 'b'], ['-C', R, 'config', '--file', '/x', '--get', 'a'], ['-C', R, 'config', '--null', '--list', '--show-origin'], ['-C', R, 'config', '--unset', 'a'],
+      ['-C', R, 'ls-files', '-z', '--stage', '--', 'x'], ['-C', R, 'ls-files'], ['-C', R, 'ls-files', '-z', '-v'], ['-C', R, 'ls-files', '-o', '-z'], ['-C', R, 'ls-files', '--recurse-submodules', '-z'],
+      ['-C', R, 'ls-files', '-o', '-i', '--exclude-standard', '-z', '--', '.', 'x'], ['-C', R, 'ls-files', '-o', '-i', '--exclude-standard', '-z', '--', '.', ':(exclude)'],
+      ['-C', R, 'ls-tree', '-r', '-z', '--full-tree', 'main'], ['-C', R, 'ls-tree', '-r', '-z', '--full-tree', 'HEAD~1'], ['-C', R, 'ls-tree', '-r', '-z', 'HEAD'], ['-C', R, 'ls-tree', '-r', '-z', '--full-tree', 'HEAD', '--', 'a'],
+      ['-C', R, 'check-attr', '-z', '--stdin', 'diff'], ['-C', R, 'check-attr', '-a', '--stdin'], ['-C', R, 'check-attr', '-z', '--stdin', 'filter', 'x'],
+      ['-C', R, 'hash-object', '-w', '--', 'a'], ['-C', R, 'hash-object', '--no-filters', '-w', '--', 'a'], ['-C', R, 'hash-object', '--no-filters', '--'], ['-C', R, 'hash-object', '--'], ['-C', R, 'hash-object', 'a'],
+      ['-C', R, 'hash-object', '-t', 'commit', '--', 'a'], ['-C', R, 'hash-object', '--stdin'], ['-C', R, 'hash-object', '--no-filters', '--stdin', '-w'], ['-C', R, 'hash-object', '--', ''],
+      ['-C', R, 'diff', 'HEAD'], ['-C', R, 'diff', 'main', '-O/dev/null', '--no-renames', '--ignore-submodules=all', '--name-only', '-z', '--diff-filter=d'],
+      ['-C', R, 'diff', 'HEAD', '-O/dev/null', '--no-renames', '--ignore-submodules=all', '--name-only', '-z', '--diff-filter=d', '--output=/tmp/x'],
+      ['-C', R, 'diff', 'HEAD', '-O/dev/null', '--no-renames', '--ignore-submodules=none', '--name-only', '-z', '--diff-filter=d'], ['-C', R, 'diff', 'HEAD', '-O/dev/null', '--no-renames', '--ignore-submodules=all', '--ext-diff', '-z', '--diff-filter=d'],
+      ['-C', R, 'diff', '--output=/tmp/x', '-O/dev/null', '--no-renames', '--ignore-submodules=all', '--name-only', '-z', '--diff-filter=d'],
+      ['-C', R, 'status', '--porcelain'], ['-C', R, 'status', '--porcelain', '--untracked-files=all'], ['-C', R, 'status', '--porcelain=v2', '--branch'], ['-C', R, 'status', '--porcelain=v2', '--branch', '--ignore-submodules=all', '--', 'x'],
+      ['-C', R, 'cat-file', '--batch-check'], ['-C', R, 'fetch'], ['-C', R, 'submodule', 'update'], ['-C', R, 'gc'], ['-C', R, 'log', '-p'], ['-C', R, 'show', 'HEAD'], ['-C', R, 'grep', 'x'],
+    ]) expect([words, access(...words)]).toEqual([words, 'refused'])
   })
   test('the other measurement programs: only the forms Cockpit writes', () => {
-    for (const argv of [['stat', '--printf', '%s', '--', 'a'], ['readlink', '-z', '--', 'a'], ['realpath', '-e', '--', '/a'],
-      ['find', '-H', '/w/dir', '(', '-type', 'f', '-o', '-type', 'l', ')', '-print0'], ['find', '-H', './.git/objects/pack', '-maxdepth', '1', '-name', '*.promisor', '-print0']]) expect([argv, nonGitAdmitted(argv)]).toEqual([argv, true])
-    for (const argv of [['find', '-H', '/w', '-exec', 'sh', '{}', ';'], ['find', '/w', '-print0'], ['find', '-H', '-delete'], ['find', '-H', '/w', '-maxdepth', '1', '-name', '*.promisor', '-fprint', '/tmp/x'],
-      ['find', '-H', '/w', '(', '-type', 'f', '-o', '-type', 'l', ')', '-print0', '-delete'], ['sh', '-c', 'x'], ['tail', '-c', '1', 'a'], ['git', 'status']]) expect([argv, nonGitAdmitted(argv)]).toEqual([argv, false])
+    for (const argv of [
+      ['stat', '--printf', INSPECT_GNU, '--', './a', '/w/b'], ['stat', '-L', '--printf', INSPECT_GNU, '--', 'a'], ['stat', '-f', INSPECT_BSD, '--', 'a'], ['stat', '-L', '-f', INSPECT_BSD, '--', 'a'],
+      ['stat', '--printf', IGNORED_GNU, '--', 'a', 'b'], ['stat', '-f', IGNORED_BSD, '--', 'a'], ['stat', '--', '/w/dir'],
+      ['readlink', '-z', '--', './a'], ['readlink', './a'], ['readlink', '/w/a'], ['realpath', '-e', '--', '/a'],
+      ['find', '-H', '/w/dir', '(', '-type', 'f', '-o', '-type', 'l', ')', '-print0'], ['find', '-H', './.git/objects/pack', '-maxdepth', '1', '-name', '*.promisor', '-print0'],
+    ]) expect([argv, nonGitAdmitted(argv)]).toEqual([argv, true])
+    for (const argv of [
+      ['stat', '--printf', '%s', '--', 'a'], ['stat', '-L', '--printf', IGNORED_GNU, '--', 'a'], ['stat', '-L', '--', 'a'], ['stat', '--printf', INSPECT_GNU, '--'], ['stat', '--printf', INSPECT_GNU, 'a'], ['stat', '--', 'a', 'b'], ['stat', '-c', '%a', 'a'], ['stat', '--', ''],
+      ['readlink', 'a'], ['readlink', '-f', 'a'], ['readlink', '-z', 'a'], ['readlink', '-z', '--', 'a', 'b'], ['realpath', '-m', '--', '/a'], ['realpath', '-e', '/a'], ['realpath', '-e', '--', '/a', '/b'],
+      ['find', '-H', '/w', '-exec', 'sh', '{}', ';'], ['find', '/w', '-print0'], ['find', '-H', '-delete'], ['find', '-H', '/w', '-maxdepth', '1', '-name', '*.promisor', '-fprint', '/tmp/x'],
+      ['find', '-H', '/w', '(', '-type', 'f', '-o', '-type', 'l', ')', '-print0', '-delete'], ['sh', '-c', 'x'], ['tail', '-c', '1', 'a'], ['git', 'status'],
+    ]) expect([argv, nonGitAdmitted(argv)]).toEqual([argv, false])
   })
   test('the measurement programs are exactly the five that measure', () => {
     expect([...BOUND_PROGRAMS].sort()).toEqual(['find', 'git', 'readlink', 'realpath', 'stat'])
@@ -401,6 +440,7 @@ describe('a refused repository: a helper\'s Git inspection is refused, and nothi
   ] as const) {
     test(`a HEAD that is not Git's own answer for a repository with no commit (${name}): refused, and nothing is sent`, options, async ($, on) => {
       const w = world(on, { headUnreadable: head }); const a = await reviewer($, ['*'])
+      await settled()                                                              // the session start's HUD refresh lands before `from`
       const from = w.runs.length
       expect((await git($, a, 'git status')).deny).toContain('cannot establish safe repository identity')
       expect(sent(w)).toEqual([])
@@ -416,7 +456,7 @@ describe('a refused repository: a helper\'s Git inspection is refused, and nothi
     const w = world(on); const a = await reviewer($, ['*'])
     expect((await git($, a, 'git log --oneline -3')).deny).toBeUndefined()
     const command = String(sent(w)[0]!['command'])
-    expect(command.startsWith(`'git' '--no-pager'`)).toBe(true)
+    expect(command.startsWith(`${HELPER_START.map(word => `'${word}'`).join(' ')} '--no-pager'`)).toBe(true)        // Stage B: the clean launch
     expect(command).toContain(`'-C' '${ROOT}' 'log' '--no-ext-diff' '--no-textconv' '--ignore-submodules=all' '--oneline' '-3'`)
     for (const pin of HELPER_PINS.filter(p => p !== '-c')) expect(command).toContain(`'${pin}'`)
   })

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { GIT_OVERRIDES, GIT_SAFE, HELPER_PINS } from '../hooks/git-integrity'
 import { parseShell } from '../hooks/shell'
-import { start, world } from './world'
+import { HELPER_START, start, world } from './world'
 
 // A narrowly scoped helper's Git inspection, through the real tool hook: what reaches the host, and what never does.
 
@@ -22,8 +22,9 @@ const reviewer = async ($: Engine, owned: string[] = SCOPE, mode: 'read' | 'writ
   return (await spawn($, 'rev', mode === 'write' ? 'cobalt-cockpit:worker' : 'cobalt-cockpit:reviewer')).agentId!
 }
 const sentOf = (w: ReturnType<typeof world>): string[][] => w.ran.filter(call => call['tool'] === 'Bash').map(call => parseShell(String(call['command'])).pipelines[0]!.commands[0]!.argv)
-// v0.6.6: the helper pins come before the directory; diff, log, show and status also ignore submodules
-const HEAD = ['git', '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...HELPER_PINS, '-C', ROOT]
+// v0.6.6: the helper pins come before the directory; diff, log, show and status also ignore submodules. Stage B: the command
+// starts with the clean launch, Git by absolute path
+const HEAD = [...HELPER_START, '--no-pager', ...GIT_SAFE, ...GIT_OVERRIDES, ...HELPER_PINS, '-C', ROOT]
 const NO_SUB = '--ignore-submodules=all'
 
 describe('a scoped reviewer inspects Git inside its scope', () => {
@@ -46,7 +47,8 @@ describe('a scoped reviewer inspects Git inside its scope', () => {
       [...HEAD, 'ls-files', '--', `${ROOT}/tests`],
     ])
     // nothing but the rebuilt command was sent: no word of it is outside single quotes
-    for (const call of w.ran.filter(c => c['tool'] === 'Bash')) expect(String(call['command'])).toMatch(/^'git'(?: '(?:[^']|'\\'')*')+$/)
+    // every word single-quoted, the first the clean launch's (Stage B: /usr/bin/env, then Git by absolute path)
+    for (const call of w.ran.filter(c => c['tool'] === 'Bash')) expect(String(call['command'])).toMatch(/^'\/usr\/bin\/env'(?: '(?:[^']|'\\'')*')+$/)
   })
   test('every revision is proved to be a commit before the command runs', options, async ($, on) => {
     const w = world(on); const a = await reviewer($)

@@ -50,8 +50,8 @@ import type { Player } from './audio'
 import { EMPTY_LOG, EVENT_TTL_MS, callOf, closeOf, liveOf, push } from './activity'
 import { activityOf, readBash } from './classify'
 import { parseStatus, projectOf, filterCommands, activeFilter, refusedReason } from './git'
-import { GIT_SAFE, commitEntries, BOUND_AS_KIB, BOUND_CPU_S, BOUND_ENV, BOUND_PINS, BOUND_PROBE_CAPPED, BOUND_PROBE_CONTROL, BOUND_PROBE_GROUP, BOUND_PROBE_SET, BOUND_PROGRAMS, BOUND_SLOTS, BOUND_TAG, FINGERPRINT_FILE_BYTES, FINGERPRINT_TOTAL_BYTES, GIT_BOUNDED, GIT_ENV_REFUSED, INSPECT_BSD, INSPECT_GNU, REPO_REFUSAL_SHORT, REPO_REFUSAL_WORDS, SOURCE_BYTES, boundScript, filterRecordsOf, gitAccessOf, gitCallOf, gitVersionOf, inspectedOf, nonGitAdmitted, partialCloneOf, promisorPacksOf, stageGitlinks } from './git-integrity'
-import type { CommitEntry, DiskEntry, Inspected, Kind, Measurement, RepoRefusal } from './git-integrity'
+import { GIT_SAFE, commitEntries, BOUND_AS_KIB, BOUND_CPU_S, BOUND_PROBE_CAPPED, BOUND_PROBE_CONTROL, BOUND_PROBE_GROUP, BOUND_PROBE_SET, BOUND_PROGRAMS, BOUND_SLOTS, BOUND_TAG, CLEAN_ENV, CLEAN_SHELL, FINGERPRINT_FILE_BYTES, FINGERPRINT_TOTAL_BYTES, GIT_BOUNDED, GIT_ENV_MEASURED, GIT_ENV_REFUSED, IGNORED_BSD, IGNORED_GNU, INSPECT_BSD, INSPECT_GNU, LOADER_BLANK, MEASURE_PROGRAMS, OWNER_BSD, OWNER_GNU, REPO_REFUSAL_SHORT, REPO_REFUSAL_WORDS, REQUIRED_PROGRAMS, RESOLVE_SCRIPT, SOURCE_BYTES, boundScript, callerEnvAdmitted, cleanAssignments, filterRecordsOf, gitAccessOf, gitCallOf, gitVersionOf, helperAssignments, inspectedOf, nonGitAdmitted, ownersOf, partialCloneOf, programTrusted, promisorPacksOf, resolvedOf, stageGitlinks, trustedPathOf } from './git-integrity'
+import type { CleanBase, CommitEntry, DiskEntry, HelperLaunch, Inspected, Kind, MeasureProgram, Measurement, Owner, RepoRefusal } from './git-integrity'
 import { assessCommand } from './guard'
 import { failClosed, guardFailure, isInsideFolder } from './guard-rules'
 import {
@@ -275,9 +275,19 @@ const finishObserved = (s: Swarm, id: string, reason: string, conclusion: string
  * failed under a 32 MiB limit; null when a probe did not answer. A result in which a probe did not answer (a timeout under load,
  * say) stands for BOUND_RETRY_MS and is then probed again, so one slow moment cannot lower the rest of the session.
  */
-type Bound = { script: 'memory' | 'basic' | null; enforced: boolean | null; group: boolean; settled: boolean }
+type Bound = { script: 'memory' | 'basic' | null; enforced: boolean | null; group: boolean; settled: boolean; launch: CleanLaunch | { refused: string } }
+/**
+ * How measurement processes start (v0.6.6 Stage B): the variables of the clean environment, each program by the absolute path
+ * the clean shell found it at, and where each really is (`canonical`, every link followed) for the check that none lies inside
+ * the repository. `uid` is the session's user, null where `id` did not answer (then only root's programs are trusted).
+ */
+type CleanLaunch = { base: CleanBase; programs: Partial<Record<MeasureProgram, string>>; canonical: readonly string[]; uid: number | null }
 /** A measurement that was not started because its limits could not be applied (v0.6.4): the caller's answer is UNKNOWN. */
 class BoundRefused extends Error {}
+/** v0.6.6 Stage B: one not started because no clean start is possible in this environment (its reason says why). */
+class EnvironmentRefused extends BoundRefused {}
+/** v0.6.6 Stage B: a Git call not started because the clean shell found no Git; outside a repository that is "no Git at all". */
+class GitMissing extends BoundRefused {}
 /**
  * Measurement processes running now, and those waiting for one of BOUND_SLOTS; a slot is handed straight to the next in line.
  * One pool for the whole process, never reset: every slot is given back in a `finally` when its run ends, and the host's
@@ -326,23 +336,95 @@ let boundMode: Promise<Bound> | null = null
 /** Until when an unanswered probe's result stands before the next probe (no shell at all would otherwise cost two failed starts a call). */
 let boundRetryAt = 0
 const BOUND_RETRY_MS = 30_000
+/**
+ * v0.6.6 Stage B: whether Cockpit's own environment sets a Git variable that makes the person's Git use another repository,
+ * configuration or attributes (GIT_ENV_MEASURED, in the same order). Each name is read only to see whether it is set.
+ */
+const measuredEnvironmentSet = async ($: EngineInterface): Promise<string | null> => {
+  const values = await Promise.all([
+    $.env.get('GIT_DIR'), $.env.get('GIT_WORK_TREE'), $.env.get('GIT_INDEX_FILE'), $.env.get('GIT_OBJECT_DIRECTORY'), $.env.get('GIT_ALTERNATE_OBJECT_DIRECTORIES'), $.env.get('GIT_COMMON_DIR'), $.env.get('GIT_NAMESPACE'),
+    $.env.get('GIT_CEILING_DIRECTORIES'), $.env.get('GIT_DISCOVERY_ACROSS_FILESYSTEM'), $.env.get('GIT_SHALLOW_FILE'), $.env.get('GIT_GRAFT_FILE'), $.env.get('GIT_REPLACE_REF_BASE'),
+    $.env.get('GIT_CONFIG'), $.env.get('GIT_CONFIG_PARAMETERS'), $.env.get('GIT_CONFIG_COUNT'), $.env.get('GIT_CONFIG_GLOBAL'), $.env.get('GIT_CONFIG_SYSTEM'), $.env.get('GIT_CONFIG_NOSYSTEM'), $.env.get('GIT_ATTR_SOURCE'), $.env.get('GIT_ATTR_NOSYSTEM'),
+  ].map(value => value.then(v => v, () => 'unreadable')))
+  const at = values.findIndex(v => v !== undefined)
+
+  return at < 0 ? null : (GIT_ENV_MEASURED[at] ?? 'a Git variable')
+}
+/**
+ * v0.6.6 Stage B: what a clean measurement process may see of Cockpit's environment, or why measurement is refused. PATH keeps
+ * only its absolute entries (an empty or relative one names the current directory); HOME and XDG_CONFIG_HOME are passed as they
+ * are, so Git reads the person's global configuration and ignore file as the person's Git does, and refuse when set but not
+ * absolute (Git would then look for its global configuration relative to the directory it runs in). `base` is given either way:
+ * the limit probes need a PATH.
+ */
+const cleanBaseOf = async ($: EngineInterface): Promise<{ base: CleanBase; refused: string | null }> => {
+  // each by its literal name (the host reads no other kind), null where it could not be read
+  const [path, home, xdg] = await Promise.all([$.env.get('PATH'), $.env.get('HOME'), $.env.get('XDG_CONFIG_HOME')].map(value => value.then(v => v, () => null)))
+  const base: CleanBase = { path: trustedPathOf(path ?? undefined), ...(typeof home === 'string' && home !== '' ? { home } : {}), ...(typeof xdg === 'string' && xdg !== '' ? { xdgConfigHome: xdg } : {}) }
+  if (path === null || home === null || xdg === null) return { base, refused: 'Cockpit\'s environment could not be read' }
+  const moving = await measuredEnvironmentSet($)
+  if (moving !== null) return { base, refused: `the environment sets ${moving}, which makes the person's Git use another repository, configuration or attributes than Cockpit's clean measurement would see` }
+  if (base.home !== undefined && !base.home.startsWith('/')) return { base, refused: 'HOME is not an absolute path, so Git would look for its global configuration relative to the directory it runs in' }
+  if (base.xdgConfigHome !== undefined && !base.xdgConfigHome.startsWith('/')) return { base, refused: 'XDG_CONFIG_HOME is not an absolute path, so Git would look for its configuration relative to the directory it runs in' }
+  if (base.path.length === 0) return { base, refused: 'PATH has no absolute entry to find Git in' }
+
+  return { base, refused: null }
+}
+const parentOf = (path: string): string => path.slice(0, path.lastIndexOf('/')) || '/'
 const probeBound = async ($: EngineInterface): Promise<Bound> => {
-  const sh = (script: string) => $.process.run(['sh', '-c', script], { timeoutMs: 5000, env: { LC_ALL: 'C' } }).then(r => r, () => null)
+  const clean = await cleanBaseOf($)
+  // Every probe starts as a measurement process does: /usr/bin/env -i, the trusted PATH, then the program by absolute path
+  const run = (words: string[]) => $.process.run([CLEAN_ENV, '-i', `PATH=${clean.base.path.join(':')}`, 'LC_ALL=C', ...words], { timeoutMs: 5000, env: LOADER_BLANK }).then(r => r, () => null)
+  // a probe's $0 is its own: only a measurement process is ever `cockpit-bounded`
+  const sh = (script: string, ...args: string[]) => run([CLEAN_SHELL, '-c', script, ...(args.length > 0 ? ['cockpit-probe', ...args] : [])])
+  // which programs measurement runs: found by the clean shell's own `command -v`, so nothing on PATH runs to answer
+  const found = await sh(RESOLVE_SCRIPT)
+  const programs = found !== null && found.exitCode === 0 && !found.isStdoutTruncated ? resolvedOf(found.stdout) : null
   const set = await sh(BOUND_PROBE_SET(true))
-  const timeout = await sh(BOUND_PROBE_GROUP)
-  const group = timeout !== null && /\(GNU coreutils\)/.test(timeout.stdout)
-  if (set !== null && set.exitCode === 0 && set.stdout.trim() === 'set') {
-    // accepted is not enforced: a 64 MiB allocation must succeed without the cap and fail under a 32 MiB one
-    const control = await sh(BOUND_PROBE_CONTROL)
-    const capped = await sh(BOUND_PROBE_CAPPED)
-    const enforced = control === null || capped === null ? null : control.exitCode === 0 && capped.exitCode !== 0
-    return { script: 'memory', enforced, group, settled: enforced !== null && timeout !== null }
+  const timeout = programs?.timeout === undefined ? null : await sh(BOUND_PROBE_GROUP, programs.timeout)
+  const group = timeout !== null && /\(GNU coreutils\)/.test(timeout.stdout.split('\n')[0] ?? '')
+  const answered = found !== null && (programs?.timeout === undefined || timeout !== null)
+  const limits = async (): Promise<Omit<Bound, 'launch'>> => {
+    if (set !== null && set.exitCode === 0 && set.stdout.trim() === 'set') {
+      // accepted is not enforced: a 64 MiB allocation must succeed without the cap and fail under a 32 MiB one
+      const control = await sh(BOUND_PROBE_CONTROL)
+      const capped = await sh(BOUND_PROBE_CAPPED)
+      const enforced = control === null || capped === null ? null : control.exitCode === 0 && capped.exitCode !== 0
+      return { script: 'memory', enforced, group, settled: enforced !== null && answered }
+    }
+    const basic = await sh(BOUND_PROBE_SET(false))
+    const settled = set !== null && basic !== null && answered
+    // a shell that answers one probe but not the other is a slow one, not one without `ulimit -v`: keep the stronger script
+    if (basic !== null && basic.exitCode === 0 && basic.stdout.trim() === 'set') return { script: set === null ? 'memory' : 'basic', enforced: set === null ? null : false, group, settled }
+    return { script: null, enforced: false, group: false, settled }
   }
-  const basic = await sh(BOUND_PROBE_SET(false))
-  const settled = set !== null && basic !== null && timeout !== null
-  // a shell that answers one probe but not the other is a slow one, not one without `ulimit -v`: keep the stronger script
-  if (basic !== null && basic.exitCode === 0 && basic.stdout.trim() === 'set') return { script: set === null ? 'memory' : 'basic', enforced: set === null ? null : false, group, settled }
-  return { script: null, enforced: false, group: false, settled }
+  const bound = await limits()
+  const refuse = (refused: string, settled = bound.settled): Bound => ({ ...bound, settled, launch: { refused } })
+  if (clean.refused !== null) return refuse(clean.refused)
+  if (programs === null) return refuse('the clean shell could not say where Git and the measurement programs are', false)
+  const missing = REQUIRED_PROGRAMS.find(name => programs[name] === undefined)
+  if (missing !== undefined) return refuse(`${missing} was not found on an absolute PATH entry`)
+  // where each program really is, every link followed, by the host's own file system call (no program runs for it)
+  const started = [...MEASURE_PROGRAMS.flatMap(name => (programs[name] === undefined ? [] : [programs[name]!])), CLEAN_ENV, CLEAN_SHELL]
+  const canonical: string[] = []
+  for (const path of started) {
+    const real = await $.fs.stat(path, { resolve: true }).then(s => (s.kind === 'file' ? s.realPath : undefined), () => undefined)
+    if (real === undefined || !real.startsWith('/')) return refuse(`${path} could not be resolved to the file it is`, false)
+    canonical.push(real)
+  }
+  // owned by root or by this user, writable by neither its group nor others, in a directory others cannot write to
+  const id = programs.id === undefined ? null : await run([programs.id, '-u'])
+  const uid = id !== null && id.exitCode === 0 && /^\d+\n$/.test(id.stdout) ? Number(id.stdout.trim()) : null
+  const names = [...canonical, ...canonical.map(parentOf)]
+  const gnu = await run([programs.stat!, '-L', '--printf', OWNER_GNU, '--', ...names])
+  const owners = gnu !== null && gnu.exitCode === 0 && !gnu.isStdoutTruncated && gnu.stderr === '' ? ownersOf(gnu.stdout, true, names) : null
+  const bsd = owners !== null ? null : await run([programs.stat!, '-L', '-f', OWNER_BSD, '--', ...names])
+  const seen = owners ?? (bsd !== null && bsd.exitCode === 0 && !bsd.isStdoutTruncated && bsd.stderr === '' ? ownersOf(bsd.stdout, false, names) : null)
+  if (seen === null) return refuse('the owner and mode of the measurement programs could not be read', gnu !== null && (owners !== null || bsd !== null))
+  const unsafe = canonical.findIndex((_, k) => !programTrusted(seen[k]!, seen[canonical.length + k]!, uid))
+  if (unsafe >= 0) return refuse(`${canonical[unsafe]} is not a regular file owned by root${uid === null ? '' : ' or this user'} and closed to writes by others (or its directory is open to them)`)
+
+  return { ...bound, settled: bound.settled && (programs.id === undefined || id !== null), launch: { base: clean.base, programs, canonical, uid } }
 }
 const boundOf = async ($: EngineInterface): Promise<Bound> => {
   if (boundMode !== null && boundRetryAt !== 0 && (await $.clock.now()) >= boundRetryAt) { boundMode = null; boundRetryAt = 0 }
@@ -351,22 +433,77 @@ const boundOf = async ($: EngineInterface): Promise<Bound> => {
   if (!found.settled && boundMode === probing && boundRetryAt === 0) boundRetryAt = (await $.clock.now()) + BOUND_RETRY_MS
   return found
 }
+/**
+ * The last session directory checked for programs inside its repository, and the answer: the launch to use there (its PATH without
+ * the entries inside the repository) or the refusal. Kept only where a repository was found (the session directory rarely moves);
+ * where none was, the next process checks again, so a `.git` made meanwhile is seen.
+ */
+let containment: { cwd: string; found: CleanLaunch; answer: CleanLaunch | { refused: string } } | null = null
+/**
+ * v0.6.6 Stage B: the launch, unless a measurement program lies at or below a directory of the session's that holds a `.git`
+ * entry: the session directory or any parent, along the path the session names and along its physical one. Such a program
+ * would be the repository's own (a PATH entry inside it), so nothing is started; and no PATH entry inside the repository is passed
+ * on, so nothing Git looks up by name comes from there either. Decided with the host's file system calls, before any program
+ * runs there; a check that cannot answer, or a directory too deep to walk to the root, refuses.
+ */
+const launchFor = async ($: EngineInterface, found: Bound): Promise<CleanLaunch | { refused: string }> => {
+  if ('refused' in found.launch) return found.launch
+  const launch = found.launch
+  const cwd = await $.session.cwd()
+  if (containment !== null && containment.cwd === cwd && containment.found === launch) return containment.answer
+  const roots: string[] = []
+  let answer: CleanLaunch | { refused: string }
+  try {
+    if (!cwd.startsWith('/')) throw new Error('relative')
+    const real = await $.fs.stat(cwd, { resolve: true }).then(s => s.realPath, () => undefined)
+    for (const start of new Set([cwd, real].filter((p): p is string => typeof p === 'string' && p.startsWith('/')))) {
+      let dir = start.replace(/\/+$/, '') || '/'
+      for (let depth = 0; ; dir = parentOf(dir), depth++) {
+        if (depth >= 256) throw new Error('too deep')
+        if (await $.fs.exists(`${dir === '/' ? '' : dir}/.git`)) roots.push(dir)
+        if (dir === '/') break
+      }
+    }
+    const within = (path: string) => roots.some(root => root === '/' || path === root || path.startsWith(`${root}/`))
+    const inside = launch.canonical.find(within)
+    answer = inside !== undefined
+      ? { refused: `${inside} lies inside the repository (a PATH entry names a directory there), and a program the repository holds is never started` }
+      : { ...launch, base: { ...launch.base, path: launch.base.path.filter(entry => !within(entry)) } }
+  } catch { answer = { refused: cwd.startsWith('/') ? 'whether a measurement program lies inside the repository could not be checked' : 'the session directory is not an absolute path' } }
+  containment = roots.length > 0 ? { cwd, found: launch, answer } : null
+
+  return answer
+}
+/** v0.6.6 Stage B: how a helper's Git inspection starts, or why it may not: the measurement launch's variables and Git. */
+const helperLaunchOf = async ($: EngineInterface): Promise<HelperLaunch | { refused: string }> => {
+  const launch = await launchFor($, await boundOf($))
+  if ('refused' in launch) return launch
+  if (launch.programs.git === undefined) return { refused: 'git was not found on an absolute PATH entry' }
+
+  return { env: helperAssignments(launch.base), git: launch.programs.git }
+}
 const bounded = async ($: EngineInterface, argv: string[], init: RunInit = {}) => {
-  const { auth, ...host } = init
+  const { auth, env, ...host } = init
   // v0.6.6: refused before anything is probed or started; every caller reads BoundRefused as UNKNOWN or a refusal
-  const refusal = admissionRefusal(argv, auth)
+  const refusal = admissionRefusal(argv, auth) ?? (callerEnvAdmitted(env) ? null : 'a measurement process with variables of its caller\'s other than LC_ALL=C')
   if (refusal !== null) throw new BoundRefused(`Cockpit did not start ${refusal}, so nothing was measured`)
-  const { script, group } = await boundOf($)
+  const found = await boundOf($)
   // no limit can be applied: nothing is started, rather than something unbounded (v0.6.4)
-  if (script === null) throw new BoundRefused('resource limits could not be applied here (no POSIX shell answered), so nothing was measured')
-  const inner = argv[0] === 'git' ? ['git', ...GIT_BOUNDED, ...argv.slice(1)] : argv
-  // the pins go last: no caller's environment can take them back (v0.6.6)
-  const run = { ...host, env: { ...BOUND_ENV, ...(host.env ?? {}), ...BOUND_PINS } }
+  if (found.script === null) throw new BoundRefused('resource limits could not be applied here (no POSIX shell answered), so nothing was measured')
+  // v0.6.6 Stage B: no clean start, no start
+  const launch = await launchFor($, found)
+  if ('refused' in launch) throw new EnvironmentRefused(`measurement is not started in this environment: ${launch.refused}`)
+  const program = launch.programs[argv[0] as MeasureProgram]
+  if (program === undefined) throw new GitMissing('Git was not found on an absolute PATH entry, so nothing was measured')
+  const inner = argv[0] === 'git' ? [program, ...GIT_BOUNDED, ...argv.slice(1)] : [program, ...argv.slice(1)]
   // the group timeout ends a second before the host's, so the whole group is gone before the host gives up on it
   const seconds = String(Math.max(1, Math.floor(((init.timeoutMs ?? 30_000) - 1000) / 1000)))
+  const group = found.group && launch.programs.timeout !== undefined
+  // /usr/bin/env -i: the shell and the program see only these variables, the pins last (v0.6.6); the loader's are blanked for env itself
+  const words = [CLEAN_ENV, '-i', ...cleanAssignments(launch.base, env), CLEAN_SHELL, '-c', boundScript(found.script === 'memory', group), BOUND_TAG, seconds, ...(group ? [launch.programs.timeout!] : []), ...inner]
   const release = await boundSlot()
   try {
-    return await $.process.run(['sh', '-c', boundScript(script === 'memory', group), BOUND_TAG, seconds, ...inner], run)
+    return await $.process.run(words, { ...host, env: LOADER_BLANK })
   } finally {
     release()
   }
@@ -489,7 +626,9 @@ type Candidate = { sha: string } | { sha: null; why: 'dirty' | 'unknown' }
 const verifiedGitPlace = async ($: EngineInterface): Promise<{ root: string; dir: string } | null> => {
   const intended = await $.session.cwd()
   if (!intended) return null
-  const top = await bounded($, ['git', ...GIT_SAFE, 'rev-parse', '--show-toplevel'], { cwd: intended, timeoutMs: GIT_TIMEOUT_MS })
+  // v0.6.6 Stage B: no Git found is no verified repository, as when Git could not be started before; outsideGit tells the rest
+  const top = await bounded($, ['git', ...GIT_SAFE, 'rev-parse', '--show-toplevel'], { cwd: intended, timeoutMs: GIT_TIMEOUT_MS }).catch((error: unknown) => { if (error instanceof GitMissing) return null; throw error })
+  if (top === null) return null
   const prefix = await bounded($, ['git', ...GIT_SAFE, 'rev-parse', '--show-prefix'], { cwd: intended, timeoutMs: GIT_TIMEOUT_MS })
   if (top.exitCode !== 0 || prefix.exitCode !== 0 || top.isStdoutTruncated || prefix.isStdoutTruncated || top.isStderrTruncated || prefix.isStderrTruncated || top.stderr.trim() !== '' || prefix.stderr.trim() !== '') return null
   const root = top.stdout.replace(/\n$/, '')
@@ -1000,8 +1139,8 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
 // verified repository, canonical paths checked against the task's ownership, and proof that each revision is a commit.
 const GIT_IDENTITY_DENY = 'SWARM / read-only Git inspection cannot establish safe repository identity and filter configuration; use the host Read/Grep tools instead'
 const SEARCH_HINT = ' To search or list inside your scope: git grep -n <pattern> -- <path>, git ls-files -- <path>; to read a file: the Read tool.'
-/** Where an accepted helper inspection runs (v0.6.6): the verified session directory, its repository and that repository's pass. */
-type HelperPlace = { root: string; dir: string; pass: RepoPass }
+/** Where an accepted helper inspection runs (v0.6.6): the verified session directory, its repository, that repository's pass, and (Stage B) how the rebuilt command starts Git. */
+type HelperPlace = { root: string; dir: string; pass: RepoPass; launch: HelperLaunch }
 type GitPlan = { pin?: ScopedPin; place?: HelperPlace }
 /**
  * Whether Cockpit's own environment sets a variable that moves where Git looks, what configuration it reads, what it runs or
@@ -1015,6 +1154,7 @@ const gitEnvironmentSet = async ($: EngineInterface): Promise<string | null> => 
     $.env.get('GIT_EXEC_PATH'), $.env.get('GIT_EXTERNAL_DIFF'), $.env.get('GIT_SSH'), $.env.get('GIT_SSH_COMMAND'), $.env.get('GIT_ASKPASS'), $.env.get('GIT_PROXY_COMMAND'), $.env.get('GIT_ALLOW_PROTOCOL'),
     $.env.get('GIT_ATTR_SOURCE'), $.env.get('GIT_REPLACE_REF_BASE'), $.env.get('GIT_SHALLOW_FILE'), $.env.get('GIT_TRACE'), $.env.get('GIT_TRACE2'), $.env.get('GIT_TRACE2_EVENT'), $.env.get('GIT_TRACE2_PERF'),
     $.env.get('GIT_TRACE_PACKET'), $.env.get('GIT_TRACE_PACKFILE'), $.env.get('GIT_TRACE_PERFORMANCE'), $.env.get('GIT_TRACE_SETUP'), $.env.get('GIT_TRACE_SHALLOW'), $.env.get('GIT_TRACE_CURL'), $.env.get('GIT_TRACE_REFS'), $.env.get('GIT_TRACE_FSMONITOR'),
+    $.env.get('GIT_CEILING_DIRECTORIES'), $.env.get('GIT_DISCOVERY_ACROSS_FILESYSTEM'), $.env.get('GIT_GRAFT_FILE'), $.env.get('GIT_CONFIG_NOSYSTEM'), $.env.get('GIT_ATTR_NOSYSTEM'),
   ].map(value => value.then(v => v, () => 'unreadable')))
   const at = values.findIndex(v => v !== undefined)
 
@@ -1030,6 +1170,9 @@ const helperGitPlace = async ($: EngineInterface): Promise<HelperPlace | { deny:
   try {
     const variable = await gitEnvironmentSet($)
     if (variable !== null) return { deny: `SWARM / read-only Git inspection is refused here: the environment sets ${variable}, which changes where Git looks, what it reads or what it runs, and a helper's command would inherit it. Use the host Read/Grep tools instead` }
+    // v0.6.6 Stage B: the rebuilt command starts Git as measurement does, clean and by absolute path, or not at all
+    const launch = await helperLaunchOf($)
+    if ('refused' in launch) return { deny: `SWARM / read-only Git inspection is refused here: ${launch.refused}. Use the host Read/Grep tools instead` }
     const place = await verifiedGitPlace($)
     if (place === null || 'why' in await gitInputs($, place.root)) return { deny: GIT_IDENTITY_DENY }
     // HEAD's tree is checked when HEAD is a commit. Before the first commit there is no tree to hold a gitlink (the index still is
@@ -1042,7 +1185,7 @@ const helperGitPlace = async ($: EngineInterface): Promise<HelperPlace | { deny:
     if (!('pass' in state)) return { deny: `SWARM / read-only Git inspection is refused in this repository (${REPO_REFUSAL_SHORT[state.refused]}): Git could enter a submodule or fetch a missing object and run what the repository names. Use the host Read/Grep tools instead` }
     if (!(await gitFiltersReliable($, place.root, state.pass))) return { deny: GIT_IDENTITY_DENY }
 
-    return { root: place.root, dir: place.dir, pass: state.pass }
+    return { root: place.root, dir: place.dir, pass: state.pass, launch }
   } catch { return { deny: GIT_IDENTITY_DENY } }
 }
 const ownedText = (task: SwarmTask): string => `${task.owned.slice(0, 4).map(shortResource).join(', ')}${task.owned.length > 4 ? ` +${task.owned.length - 4}` : ''}`
@@ -1680,7 +1823,15 @@ const doctorFacts = async ($: EngineInterface): Promise<DoctorFacts> => {
     guard: await guardFacts($),
     measurement: await boundWords($).catch(() => undefined),
     gitVersion: await gitVersionFact($),
+    cleanLaunch: await cleanLaunchFact($).catch(() => undefined),
   }
+}
+/** For /cockpit doctor (v0.6.6 Stage B): how measurement processes start here, or why none does. */
+const cleanLaunchFact = async ($: EngineInterface): Promise<NonNullable<DoctorFacts['cleanLaunch']>> => {
+  const launch = await launchFor($, await boundOf($))
+  if ('refused' in launch) return launch
+
+  return { git: launch.programs.git!, entries: launch.base.path.length, home: launch.base.home !== undefined, xdg: launch.base.xdgConfigHome !== undefined }
 }
 /** For /cockpit doctor (v0.6.6): the Git measurement runs, and whether that Git documents its own switch for lazy fetching. Null: not readable. */
 const gitVersionFact = async ($: EngineInterface): Promise<{ version: string; lazyFetchSwitch: boolean } | null> => {
@@ -2219,10 +2370,20 @@ const refreshGit = async ($: EngineInterface): Promise<GitReading> => {
     await write(state)
 
     return { outcome: 'read', state }
-  } catch {
-    // git missing or slow: the HUD keeps what it had, and the reading says it failed. Once the repository was verified, a
-    // failure is a refusal (v0.6.6).
-    if (verified === null) return { outcome: 'failed', state: null }
+  } catch (error) {
+    // Once the repository was verified, a failure is a refusal (v0.6.6). Stage B: before that (Git failed or timed out before it
+    // said where the repository is, or no measurement starts in this environment), a line that showed a repository is replaced by
+    // a refused one, never kept as a count that may be stale; a line with no repository is kept, as nothing here says there is
+    // one, except where the environment itself refuses. The reading says it failed either way: the Stop guard decides from it.
+    if (verified === null) {
+      const environment = error instanceof EnvironmentRefused
+      const old = await read($, gitAtom).catch(() => null)
+      if (environment || (old !== null && old.isRepo)) {
+        const now = await $.clock.now().catch(() => 0)
+        await quiet(() => write(refusedGit(old, old !== null && old.isRepo ? old.project : projectOf(cwd), environment ? 'environment' : 'unreadable', now)))
+      }
+      return { outcome: 'failed', state: null }
+    }
     const now = await $.clock.now().catch(() => 0)
     const state = refusedGit(await read($, gitAtom).catch(() => null), projectOf(verified), 'unreadable', now)
     await quiet(() => write(state))
@@ -2759,11 +2920,11 @@ const measureTree = async ($: EngineInterface, base?: string): Promise<TreeReadi
       if ((await $.clock.now()) - ignoredBegan > FINGERPRINT_BUDGET_MS) return unknown(`measuring the ignored files took longer than ${FINGERPRINT_BUDGET_MS / 1000}s`)
       if (await overdue()) return unknown(late)
       const chunk = toMeasure.slice(i, i + HASH_CHUNK)
-      const first = await bounded($, ['stat', '--printf', '%i %s %.9Y %.9Z %n\\0', '--', ...chunk], { cwd: top, timeoutMs: GIT_TIMEOUT_MS })
+      const first = await bounded($, ['stat', '--printf', IGNORED_GNU, '--', ...chunk], { cwd: top, timeoutMs: GIT_TIMEOUT_MS })
       let r = first
       let lines: string[] = r.exitCode === 0 ? r.stdout.split('\0').filter(Boolean) : []
       if (r.exitCode !== 0) {
-        r = await bounded($, ['stat', '-f', '%i %z %m %c %N', '--', ...chunk], { cwd: top, timeoutMs: GIT_TIMEOUT_MS })
+        r = await bounded($, ['stat', '-f', IGNORED_BSD, '--', ...chunk], { cwd: top, timeoutMs: GIT_TIMEOUT_MS })
         lines = r.exitCode === 0 ? r.stdout.split('\n').filter(Boolean) : []
       }
       // each record must be the form asked for: GNU `stat -f` is another command (file system status), not BSD's format
@@ -2844,13 +3005,14 @@ const measureTree = async ($: EngineInterface, base?: string): Promise<TreeReadi
 const outsideGit = async ($: EngineInterface): Promise<'outside' | 'repository' | 'unknown'> => {
   const cwd = await $.session.cwd()
   if (!cwd || !cwd.startsWith('/')) return 'unknown'
-  const r = await bounded($, ['git', ...GIT_SAFE, 'rev-parse', '--show-toplevel'], { cwd, timeoutMs: GIT_TIMEOUT_MS, env: { LC_ALL: 'C' } }).catch(() => null)
-  if (r === null || r.isStdoutTruncated || r.isStderrTruncated) return 'unknown'
+  // v0.6.6 Stage B: no Git on the trusted PATH is "no Git at all", as a shell's "not found" was; any other refusal is no answer
+  const r = await bounded($, ['git', ...GIT_SAFE, 'rev-parse', '--show-toplevel'], { cwd, timeoutMs: GIT_TIMEOUT_MS, env: { LC_ALL: 'C' } }).catch((error: unknown) => (error instanceof GitMissing ? 'no git' as const : null))
+  if (r === null || (r !== 'no git' && (r.isStdoutTruncated || r.isStderrTruncated))) return 'unknown'
   // Evidence of a repository is Git finding one, or a `.git` entry being there (the walk below). Anything else Git says, or a
   // timeout, a signal or a limit, is no evidence either way. Outside Git needs Git's own "not a git repository", or no Git at all.
-  if (r.exitCode === 0) return 'repository'
-  const notRepository = r.exitCode === 128 && NOT_A_REPOSITORY.test(r.stderr)
-  const noGit = r.exitCode === 127 && /\bgit\b[^\n]*(?:not found|No such file or directory)/.test(r.stderr)
+  if (r !== 'no git' && r.exitCode === 0) return 'repository'
+  const notRepository = r !== 'no git' && r.exitCode === 128 && NOT_A_REPOSITORY.test(r.stderr)
+  const noGit = r === 'no git' || (r.exitCode === 127 && /\bgit\b[^\n]*(?:not found|No such file or directory)/.test(r.stderr))
   // Git searches up the physical path; the session may name it through a link. Both chains of parents are checked.
   const real = await bounded($, ['realpath', '-e', '--', cwd], { timeoutMs: GIT_TIMEOUT_MS }).catch(() => null)
   if (real === null || !gitAnswered(real) || !real.stdout.startsWith('/')) return 'unknown'
@@ -4811,7 +4973,7 @@ export const register: Register = (on, options) => {
         return { deny }
       }
       // what runs is never the text the agent typed: every word is quoted again behind the safe flags, in the checked directory
-      (call as Record<string, unknown>)['command'] = rebuildGit(String(call['command']), place.dir, gitPlan.pin)
+      (call as Record<string, unknown>)['command'] = rebuildGit(String(call['command']), place.dir, place.launch, gitPlan.pin)
     }
     // A subagent's reasoning level goes on its own Agent call: the engine's
     // native, per-invocation setting, so nothing global moves under a sibling.
