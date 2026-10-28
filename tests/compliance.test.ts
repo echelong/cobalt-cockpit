@@ -264,6 +264,13 @@ describe('a pass-through hands the engine its own event unless it changed it', (
 // pass-through itself. Cockpit's hook there was a watcher that read the verdict
 // to light a HUD state, which is not a reason to stand in the permission check.
 // So it stands nowhere in it: no hook on the check, and no query of its own.
+//
+// The engine runs its own check on every call that gets past the `tool.call`
+// hooks, the AskUserQuestion behind `$.ui.ask` included. The 2.1.296 test host
+// skipped that step and 2.1.312's runs it, so an empty list of checks no longer
+// tells the two apart. A query of Cockpit's own would carry no call id (a
+// `$.tool.check`) or name a call the engine never made; the engine's carry the
+// id of the one call they decide, once.
 describe('the permission check belongs to the engine and the person', () => {
   /** Answers every permission check that reaches the engine, and keeps each one. */
   const checking = (on: Parameters<typeof world>[0], decide: () => string = () => 'allow') => {
@@ -275,6 +282,20 @@ describe('the permission check belongs to the engine and the person', () => {
     })
 
     return checks
+  }
+
+  /** The checks that are not the engine's own check of one of `calls`: no id, a call it did not make, or a second ask. */
+  const notTheEngines = (checks: readonly Record<string, unknown>[], calls: readonly Record<string, unknown>[]): Record<string, unknown>[] => {
+    const made = new Set(calls.map(call => `${String(call['tool'])}:${String(call['tool_use_id'])}`))
+    const seen = new Set<string>()
+
+    return checks.filter(check => {
+      const id = `${String(check['tool'])}:${String(check['tool_use_id'])}`
+      const isOwn = typeof check['tool_use_id'] === 'string' && made.has(id) && !seen.has(id)
+      seen.add(id)
+
+      return !isOwn
+    })
   }
 
   test('no hook is registered on the permission check, under any policy', () => {
@@ -289,7 +310,7 @@ describe('the permission check belongs to the engine and the person', () => {
     }
   })
 
-  test('ordinary allowed tool calls ask no permission query', async ($, on) => {
+  test('ordinary allowed tool calls ask no permission query of Cockpit\'s own', async ($, on) => {
     const checks = checking(on); const w = world(on); hostState(on, {}); await start($)
     await bash($, 'ls -la')
     await $.tool.call({ tool: 'Read', file_path: '/work/example/a.ts', tool_use_id: 'tu-read' } as never)
@@ -297,17 +318,32 @@ describe('the permission check belongs to the engine and the person', () => {
     await w.clock.advance(2_000)
 
     expect(w.ran.map(call => call['tool'])).toEqual(['Bash', 'Read', 'Write'])
-    expect(checks).toEqual([])
+    expect(notTheEngines(checks, w.ran)).toEqual([])
   })
 
-  test('with orchestration on, a subagent\'s and the commander\'s calls ask none either', { options: { orchestration: true } }, async ($, on) => {
+  test('with orchestration on, a subagent\'s and the commander\'s calls ask none of Cockpit\'s own either', { options: { orchestration: true } }, async ($, on) => {
     const checks = checking(on); const w = world(on, { version: '2.1.294' }); hostState(on, {}); await start($)
     await bash($, 'git status')
     await $.tool.call({ tool: 'Read', file_path: '/work/example/a.ts', tool_use_id: 'tu-main-read' } as never)
     await w.clock.advance(2_000)
 
     expect(w.ran.some(call => call['tool'] === 'Read')).toBe(true)
-    expect(checks).toEqual([])
+    expect(notTheEngines(checks, w.ran)).toEqual([])
+  })
+
+  test('a call the engine\'s check refuses stays refused, and Cockpit answers neither the check nor the call', async ($, on) => {
+    const checks = checking(on, () => 'deny'); const w = world(on); hostState(on, {}); await start($)
+    const answer = await $.tool.call({ tool: 'Read', file_path: '/work/example/a.ts', tool_use_id: 'tu-refused' } as never)
+    const checked = checks.filter(check => check['tool_use_id'] === 'tu-refused').length
+    const ran = w.ran.some(call => call['tool_use_id'] === 'tu-refused')
+
+    expect(notTheEngines(checks, [{ tool: 'Read', tool_use_id: 'tu-refused' }])).toEqual([])
+    // The call reaches the engine on every host. One that runs its check
+    // (2.1.312) refuses it there, once, and the tool never runs; one that skips
+    // the check (2.1.296) runs the tool, so no refusal can be shown on it.
+    // A Cockpit that answered the call itself would leave neither outcome.
+    expect({ checked, ran }).toEqual(checked === 0 ? { checked: 0, ran: true } : { checked: 1, ran: false })
+    if (checked === 1) expect(textOf(answer)).toBe('the engine decided')
   })
 
   test('the engine\'s own check reaches it once and comes back as it decided', async ($, on) => {
@@ -324,14 +360,17 @@ describe('the permission check belongs to the engine and the person', () => {
     expect(checks.map(one => one['tool_use_id'])).toEqual(['tu-allow', 'tu-ask', 'tu-deny'])
   })
 
-  test('a destructive command the person cancels stays refused, and asks no permission query', async ($, on) => {
+  test('a destructive command the person cancels stays refused, and asks no permission query of Cockpit\'s own', async ($, on) => {
     const checks = checking(on); const w = world(on, { answer: 'Cancel' }); hostState(on, {}); await start($)
     const answer = await bash($, 'git reset --hard origin/main')
 
     expect(w.asked.length).toBe(1)
     expect(denyOf(answer)).toContain('did not approve')
     expect(w.ran.some(call => call['command'] === 'git reset --hard origin/main')).toBe(false)
-    expect(checks).toEqual([])
+    // The person is asked in the engine's own dialog, which the engine checks as
+    // it checks any call; the command itself never reaches the check.
+    expect(notTheEngines(checks, w.ran)).toEqual([])
+    expect(checks.some(check => check['tool'] === 'Bash')).toBe(false)
   })
 
   test('a Fable route stays refused, and asks no permission query', { options: { blockFable: true } }, async ($, on) => {
