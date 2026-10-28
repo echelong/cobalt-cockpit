@@ -70,7 +70,7 @@ import { LABEL_MEANING, LABEL_USAGE, calibrationOf, calibrationText, labelKeyOf,
 import type { Reviewed } from './calibration'
 import { isQuiet } from './quiet'
 import { uidOf, attemptsOf, spentOf, boundedChecks, retainChecks, validChecks, configOf as stopConfigOf, hasChangeSummary, hasChanges, outputTail, migrateStopHold, verdictOf, compareTree, type CheckRecord, type StopConfig, type TreeVerdict } from './stopguard'
-import { applyAction, clearHold, reclassifyChanged, markEdited, setGuardRequired, isGuardOwned, withdrawDone, holdTask, isGuardHeld, releaseHold, newTask, noteFailure, oneLine, progressNudge, checkedAt, reopenVerification, setGate, settle, stampGates, summaryOf, touchFile, treeMoved, treeUnmeasured, unmeasuredWhy } from './model'
+import { applyAction, clearHold, reclassifyChanged, markEdited, setGuardRequired, isGuardOwned, withdrawDone, holdTask, isGuardHeld, releaseHold, newTask, noteFailure, oneLine, progressNudge, checkedAt, reopenVerification, setGate, settle, stampGates, summaryOf, touchFile, treeMoved, treeUnmeasured, unmeasuredWhy, unqualifiedEvidence, hasUnboundPass, reportedGates } from './model'
 import type { Cue, ProgressInput } from './model'
 import { basename } from './shell'
 import { agentInspection, readOnlyShell, rebuildGit, scopedGit, SCOPED_FORM } from './git-inspect'
@@ -2780,6 +2780,12 @@ const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: 
 
       return reopenVerification(old, unmeasuredWhy(stampWhy))
     }
+    // a pass that was never observed on a measured tree cannot be taken to describe this one, however it is measured now (v0.6.6)
+    if (e.action === 'align' && goalChecked && old !== null && stamp !== null && hasUnboundPass(old)) {
+      reply = 'error: ALIGNED refused: a passed check was not observed on a measured working tree, so it cannot be shown to describe this one. Run the checks again, record the gates, then align. Nothing was recorded'
+
+      return reopenVerification(old, 'a passed check was not observed on a measured working tree')
+    }
     const outcome = applyAction(old === null ? { ...newTask(1, '', now, sha), startTree: null } : checkedAt(old, gateStamp, gateWhy), input, now, sha)
     if (outcome.error !== undefined) {
       reply = `error: ${outcome.error}`
@@ -2789,7 +2795,8 @@ const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: 
     // The person's pin and the evidence of the plan are applied before the task is settled, so the goal check counts toward DONE.
     // A task stored by v0.5.0 (milestones, no discovery) keeps the rules it began under, unless this call starts a new one.
     const isLegacy = old !== null && old.milestones.length > 0 && old.discovery === undefined && e.action !== 'plan'
-    const gated = e.action === 'gate' || (e.action as string) === 'gates' ? stampGates(outcome.task, gateStamp) : outcome.task
+    // only the gates this call reported are bound to the tree measured for it; an older unbound pass is not (v0.6.6)
+    const gated = e.action === 'gate' || (e.action as string) === 'gates' ? stampGates(outcome.task, gateStamp, reportedGates(input)) : outcome.task
     let stamped = stamp !== null && gated.alignment?.state === 'ALIGNED' ? { ...gated, alignment: { ...gated.alignment, tree: stamp } } : gated
     let notAccepted = ''
     if (goalChecked && e.action === 'align' && stamp === null && gated.alignment?.state === 'ALIGNED') {
@@ -2925,15 +2932,26 @@ const noteEnd = async (
   const observedReading = measuring ? await settledReading($, baseOf((await read($, taskAtom))?.gateTree)) : null
   const observed = observedReading?.stamp ?? null
   const observedWhy = observedReading !== null && observedReading.stamp === null ? observedReading.why : undefined
+  // a repository is (or may be) here and its tree could not be measured: outside every repository there is no tree to identify
+  const unidentified = observedReading !== null && observedReading.stamp === null && observedReading.noRepo !== true
   if (edits.length > 0 || readings.length > 0) {
     await change($, (task, now) => {
       let chain = task
       for (const edit of edits) chain = touchFile(chain, edit.path, edit.added, edit.removed)
       if (measuring) chain = checkedAt(chain, observed, observedWhy)
       if (edits.length > 0 && isSonnetLed()) chain = requireReview(chain, mandatoryGrounds(factsOf({ ...chain, files: chain.files.map(f => ({ ...f, path: relative(f.path) })) }, 0, chain.promptGrounds ?? [])))
-      // a test command's result cannot lift or replace what the Stop guard holds the task for
-      for (const reading of readings) if (!(reading.gate === 'TEST' && isGuardHeld(chain))) chain = setGate(chain, reading.gate, reading.state, reading.evidence, 'auto', now)
-      if (observed !== null) chain = stampGates(chain, observed)
+      // A goal-checked task's pass needs the tree it was observed on: where that cannot be identified, the exit is kept as an
+      // observation (pending, with its evidence), never as a qualified pass a later measurement could adopt (v0.6.6).
+      const mustIdentify = unidentified && needsAlignment(chain)
+      const recorded: (typeof readings)[number]['gate'][] = []
+      for (const reading of readings) {
+        // a test command's result cannot lift or replace what the Stop guard holds the task for
+        if (reading.gate === 'TEST' && isGuardHeld(chain)) continue
+        const isUnqualified = mustIdentify && reading.state === 'pass'
+        chain = setGate(chain, reading.gate, isUnqualified ? 'pending' : reading.state, isUnqualified ? unqualifiedEvidence(reading.evidence, observedWhy ?? '') : reading.evidence, 'auto', now)
+        recorded.push(reading.gate)
+      }
+      if (observed !== null) chain = stampGates(chain, observed, recorded)
 
       return chain
     })
@@ -4188,8 +4206,11 @@ const stopGuard = async ($: EngineInterface, e: { stop_hook_active?: boolean; la
     if (uidOf(t) !== uid) return t // a result for a replaced task cannot hold or complete its successor
     let chain = t
     if (run.outcome === 'pass' && run.tree !== null) chain = checkedAt(chain, run.tree)
-    if (run.outcome === 'pass' || run.outcome === 'fail' || run.outcome === 'timeout') chain = setGate(chain, 'TEST', run.outcome === 'pass' ? 'pass' : 'fail', `stop check ${run.name} ${detail}${unidentified ? ' (tree identity unknown)' : ''}`, 'auto', now)
-    if (run.outcome === 'pass' && run.tree !== null) chain = stampGates(chain, run.tree)
+    // Exit 0 on a tree the guard cannot identify is an observation, kept in the Ledger record above and in the gate's evidence,
+    // not a qualified TEST pass; and checks observed on a measured tree cannot be shown to describe this one (v0.6.6).
+    if (unidentified) chain = setGate(checkedAt(chain, null, whyNow), 'TEST', 'pending', unqualifiedEvidence(`stop check ${run.name} ${detail}`, whyNow), 'auto', now)
+    else if (run.outcome === 'pass' || run.outcome === 'fail' || run.outcome === 'timeout') chain = setGate(chain, 'TEST', run.outcome === 'pass' ? 'pass' : 'fail', `stop check ${run.name} ${detail}`, 'auto', now)
+    if (run.outcome === 'pass' && run.tree !== null) chain = stampGates(chain, run.tree, ['TEST'])
     // Every check that did not complete the task holds it, not only once the budget is spent: the refusal count bounds the loop,
     // the hold keeps the task from reading DONE in between (and across a prompt, a restart or a release).
     if (!isComplete) {

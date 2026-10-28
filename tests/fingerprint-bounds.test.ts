@@ -588,11 +588,15 @@ describe('a Git repository that cannot be measured is never accepted as protecte
     expect(done).toStartWith('DONE 100%')
     expect(done).toContain('alignment ALIGNED (UNPROTECTED: not a Git repository, no working-tree fingerprint)')
   })
-  test('a repository that becomes measurable again is accepted as protected, and a later change withdraws it', async ($, on) => {
+  test('a repository that becomes measurable again: checks from before do not count; observed again, it is accepted as protected, and a later change withdraws it', async ($, on) => {
     const w = world(on); const h = hostState(on, {}); w.gitConfig['core.excludesFile'] = '/dev/zero'; w.kinds['/dev/zero'] = 'char'
     await ready($)
     expect(await progress($, aligned)).toContain('recorded as UNKNOWN')
     delete w.gitConfig['core.excludesFile']
+    // the checks were observed while the tree could not be measured: the measurable tree now does not qualify them (v0.6.6)
+    expect(await progress($, aligned)).toStartWith('error: ALIGNED refused: a passed check was not observed on a measured working tree')
+    expect(taskOf(h)?.gates.TEST.state).toBe('pending')
+    await passAllGates($, { align: false })
     const reply = await progress($, aligned)
     expect(reply).toContain('alignment ALIGNED')
     expect(reply).not.toContain('UNPROTECTED')

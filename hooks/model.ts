@@ -604,9 +604,39 @@ export const checkedAt = (task: Task, tree: string | null, unmeasured?: string):
     ? task
     : reopenVerification(task, tree === null ? unmeasuredWhy(unmeasured ?? '') : 'the working tree changed since the checks were observed')
 
-/** After a check is recorded: the passed checks are about this tree. */
-export const stampGates = (task: Task, tree: string | null): Task =>
-  tree !== null && needsAlignment(task) && Object.values(task.gates).some(g => g.state === 'pass') ? { ...task, gateTree: tree } : task
+/**
+ * After a check is recorded: the passed checks are about this tree. `fresh` names the gates observed in this very step. On the
+ * first binding, a pass observed earlier was never shown to be about any measured tree, so it is pending again rather than taken
+ * to describe this one: a later measurement does not qualify an older result (v0.6.6).
+ */
+export const stampGates = (task: Task, tree: string | null, fresh: readonly GateName[] = GATES): Task => {
+  if (tree === null || !needsAlignment(task) || !Object.values(task.gates).some(g => g.state === 'pass')) return task
+  if (task.gateTree !== undefined) return { ...task, gateTree: tree }
+  const older = GATES.filter(name => task.gates[name].isRequired && task.gates[name].state === 'pass' && !fresh.includes(name))
+  if (older.length === 0) return { ...task, gateTree: tree }
+  const gates = { ...task.gates }
+  for (const name of older) gates[name] = { ...gates[name], state: 'pending', evidence: oneLine(`stale: not on a measured tree (${gates[name].evidence ?? 'pass'})`, 120) }
+  const bound: Task = { ...task, gates, ...(Object.values(gates).some(g => g.state === 'pass') ? { gateTree: tree } : {}) }
+
+  return invalidateAlignment(bound, 'a pass was not observed on a measured working tree')
+}
+
+/**
+ * What a check that exited 0 is recorded as where the working tree had to be identified and could not be: the observation is
+ * kept, as evidence, but it is not a qualified pass and cannot later become one (v0.6.6).
+ */
+export const unqualifiedEvidence = (evidence: string | null, why: string): string =>
+  oneLine(`unqualified: ${evidence ?? 'pass'}; the working tree could not be identified (${why || 'its fingerprint is UNKNOWN'})`, 120)
+
+/** The gates one `gate` call of the progress tool names, as `applyAction` reads them. */
+export const reportedGates = (input: ProgressInput): GateName[] =>
+  Array.isArray(input.gates) && input.gates.length > 0
+    ? input.gates.slice(0, GATES.length).map(one => (one !== null && typeof one === 'object' ? (one as ProgressInput).gate : undefined)).filter(isGateName)
+    : isGateName(input.gate) ? [input.gate] : []
+
+/** Whether a required gate passes with no fingerprint of the tree it was observed on, where the goal check needs one. */
+export const hasUnboundPass = (task: Task): boolean =>
+  needsAlignment(task) && task.gateTree === undefined && GATES.some(name => task.gates[name].isRequired && task.gates[name].state === 'pass')
 
 /** Where the working tree no longer matches the one ALIGNED was accepted for, that acceptance is stale. */
 export const treeMoved = (task: Task, tree: string | null): Task => {
