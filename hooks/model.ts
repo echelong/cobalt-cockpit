@@ -162,6 +162,20 @@ export const withdrawDone = (task: Task): Task => {
   return rest
 }
 
+/**
+ * Completion that rested on a trust no longer in force (withdrawn, enrolled again, a changed script or pin): the guard's record
+ * goes, a TEST pass the guard's own check wrote is stale, and the goal check starts over. The Run Ledger keeps what ran; only its
+ * standing as current evidence is withdrawn (v0.6.6).
+ */
+export const revokeTrustedCompletion = (task: Task, why: string): Task => {
+  const { guardDone: _revoked, ...rest } = task
+  const test = rest.gates.TEST
+  const isGuardPass = test.state === 'pass' && test.source === 'auto' && (test.evidence ?? '').startsWith('stop check ')
+  const gates = isGuardPass ? { ...rest.gates, TEST: { ...test, state: 'pending' as const, evidence: oneLine(`stale: ${why} (${test.evidence})`, 120) } } : rest.gates
+
+  return invalidateAlignment({ ...rest, gates }, why)
+}
+
 export const newTask = (id: number, goal: string, now: number, startSha: string | null): Task => ({
   id,
   lifecycle: 1,

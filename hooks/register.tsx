@@ -70,7 +70,7 @@ import { LABEL_MEANING, LABEL_USAGE, calibrationOf, calibrationText, labelKeyOf,
 import type { Reviewed } from './calibration'
 import { isQuiet } from './quiet'
 import { uidOf, attemptsOf, spentOf, boundedChecks, retainChecks, validChecks, configOf as stopConfigOf, hasChangeSummary, hasChanges, outputTail, migrateStopHold, verdictOf, compareTree, type CheckRecord, type StopConfig, type TreeVerdict } from './stopguard'
-import { applyAction, clearHold, reclassifyChanged, markEdited, setGuardRequired, isGuardOwned, withdrawDone, holdTask, isGuardHeld, releaseHold, newTask, noteFailure, oneLine, progressNudge, checkedAt, reopenVerification, setGate, settle, stampGates, summaryOf, touchFile, treeMoved, treeUnmeasured, unmeasuredWhy, unqualifiedEvidence, hasUnboundPass, reportedGates } from './model'
+import { applyAction, clearHold, reclassifyChanged, markEdited, setGuardRequired, isGuardOwned, withdrawDone, holdTask, isGuardHeld, releaseHold, newTask, noteFailure, oneLine, progressNudge, checkedAt, reopenVerification, setGate, settle, stampGates, summaryOf, touchFile, treeMoved, treeUnmeasured, unmeasuredWhy, unqualifiedEvidence, hasUnboundPass, reportedGates, revokeTrustedCompletion } from './model'
 import type { Cue, ProgressInput } from './model'
 import { basename } from './shell'
 import { agentInspection, readOnlyShell, rebuildGit, scopedGit, SCOPED_FORM } from './git-inspect'
@@ -4081,10 +4081,49 @@ const recordUnchanged = async ($: EngineInterface, task: Task, tree: string | nu
 }
 
 /**
+ * Why a verified completion no longer rests on the trust in force, or null when it does. Its check, as the Run Ledger keeps it,
+ * must have run for this script and project (verifier), on these bytes, after the current enrolment, with the script enrolled
+ * and matching its pin now. A withdrawn, re-enrolled or changed trust, or a check that cannot be found, is not in force. A
+ * record that the tree was unchanged ran no script and rests on no trust (v0.6.6).
+ */
+const completionDistrust = async ($: EngineInterface, task: Task): Promise<string | null> => {
+  const done = task.guardDone
+  if (done === undefined || done.outcome !== 'verified') return null
+  if (stopCfg.script === null) return 'no verification script is configured now'
+  const trust = await trustState($, stopCfg)
+  if (trust.state !== 'enrolled') return `the verification script ${trust.state === 'pin-mismatch' ? '' : 'is '}${TRUST_WORDS[trust.state]}`
+  const run = (await checksOf($)).find(c => c.uid === done.uid && c.complete && c.outcome === 'pass' && `${c.name}@${c.at}` === done.check)
+  if (run === undefined) return 'the check it rests on is no longer in the Run Ledger'
+  if (run.verifier !== trust.verifier || run.sha === null || !(trust.sha ?? '').startsWith(run.sha)) return 'it was checked under another trust'
+  const enrolled = (await trustMap($))[(await trustScope($, stopCfg.script)).key]
+  if (enrolled === undefined || enrolled.at > run.at) return 'the trust it was checked under was withdrawn or enrolled again since'
+
+  return null
+}
+
+const REVOKED_NOTE = ' The completion this task was verified with under the earlier trust no longer counts; the check runs again at the next Stop.'
+
+/**
+ * A typed untrust or enrolment replaces the trust for one script and project. A completion the current task's check verified
+ * under it is revoked at once. A completion whose check record shows another verifier is left (the completion check still
+ * weighs it against the trust in force). One whose check record cannot be found cannot be shown to be unrelated, so it is
+ * revoked too (v0.6.6).
+ */
+const revokeScoped = async ($: EngineInterface, verifier: string, why: string): Promise<boolean> => {
+  const done = (await read($, taskAtom))?.guardDone
+  if (done === undefined || done.outcome !== 'verified') return false
+  const run = (await checksOf($)).find(r => r.uid === done.uid && `${r.name}@${r.at}` === done.check)
+  if (run !== undefined && run.verifier !== verifier) return false
+  await change($, t => (t.guardDone?.check === done.check ? revokeTrustedCompletion(t, why) : t))
+
+  return true
+}
+
+/**
  * Before another task can start or a session can go on: a task that claims to be finished is checked against the guard's own
- * record. No record for this task, a record for another tree, or a tree that cannot be identified: the task is held, so what
- * was done without a completed check is neither DONE nor the next task's baseline. A read-only task whose tree still equals its
- * own start needs no check and is recorded here.
+ * record. No record for this task, a record for another tree, a tree that cannot be identified, or a record whose trust is no
+ * longer in force: the task is held, so what was done without a completed check is neither DONE nor the next task's baseline.
+ * A read-only task whose tree still equals its own start needs no check and is recorded here.
  */
 const reconcileCompletion = async ($: EngineInterface): Promise<void> => {
   await loadStopCfg($)
@@ -4093,10 +4132,15 @@ const reconcileCompletion = async ($: EngineInterface): Promise<void> => {
   const task = await read($, taskAtom)
   if (task === null || isGuardHeld(task) || task.milestones.length === 0 || !task.milestones.every(m => m.state === 'done')) return
   let why: string | null = null
+  let distrust: string | null = null
   if (task.guardDone !== undefined && isGuardOwned(task)) {
     const now = await treeStamp($, baseOf(task.guardDone.tree))
-    if (now !== null && now === task.guardDone.tree) return
-    why = now === null ? `the tree cannot be identified (${treeWhy}), so the guard's record for it cannot be matched` : 'the tree changed after the guard completed this task'
+    const whyTree = treeWhy
+    distrust = await completionDistrust($, task)
+    if (now !== null && now === task.guardDone.tree && distrust === null) return
+    why = distrust !== null
+      ? `the trust this completion was checked under is no longer in force (${distrust})`
+      : now === null ? `the tree cannot be identified (${whyTree}), so the guard's record for it cannot be matched` : 'the tree changed after the guard completed this task'
   } else if (task.kind === 'readonly' && typeof task.startTree === 'string') {
     const now = await treeStamp($)
     if (now !== null && now === task.startTree) return recordUnchanged($, task, now)
@@ -4105,7 +4149,8 @@ const reconcileCompletion = async ($: EngineInterface): Promise<void> => {
     why = 'the task finished without a completed Stop check for this task and tree'
   }
   const reason = why
-  await change($, (t, now) => (uidOf(t) === uidOf(task) && !isGuardHeld(t) ? holdTask(withdrawDone(t), reason, 0, now) : t))
+  const revoked = distrust
+  await change($, (t, now) => (uidOf(t) === uidOf(task) && !isGuardHeld(t) ? holdTask(revoked !== null ? revokeTrustedCompletion(t, revoked) : withdrawDone(t), reason, 0, now) : t))
 }
 
 const stopGuard = async ($: EngineInterface, e: { stop_hook_active?: boolean; last_assistant_message?: string }): Promise<string | null> => {
@@ -4138,11 +4183,12 @@ const stopGuard = async ($: EngineInterface, e: { stop_hook_active?: boolean; la
     task = await update($, taskAtom, old => old ?? markEdited({ ...newTask(1, '', now, sha), startTree: null }, why))
     if (task === null) return null
   }
-  // a record that still matches this task and this tree: there is nothing to ask again
+  // a record that still matches this task and this tree, under the trust in force now: there is nothing to ask again
   if (!isGuardHeld(task) && isGuardOwned(task) && task.guardDone !== undefined) {
     const now = await treeStamp($, baseOf(task.guardDone.tree))
-    if (now !== null && now === task.guardDone.tree) return null
-    await change($, t => withdrawDone(t))
+    const distrust = await completionDistrust($, task)
+    if (now !== null && now === task.guardDone.tree && distrust === null) return null
+    await change($, t => (distrust !== null ? revokeTrustedCompletion(t, distrust) : withdrawDone(t)))
   }
   const seen = isGuardHeld(task) ? { state: 'CHANGED' as TreeVerdict, why: 'the task is held', tree: null } : await changeState($, task)
   if (seen.state === 'UNCHANGED') {
@@ -5206,8 +5252,10 @@ export const register: Register = (on, options) => {
             const map = await trustMap($)
             delete map[scope.key]
             await $.store.set(TRUST_KEY, map)
+            const name = c.script.slice(c.script.lastIndexOf('/') + 1)
+            const isRevoked = await revokeScoped($, scope.verifier, `the trust for ${name} was withdrawn`)
 
-            return { text: `Cockpit: the trust for ${c.script.slice(c.script.lastIndexOf('/') + 1)} in this project was removed.` }
+            return { text: `Cockpit: the trust for ${name} in this project was removed.${isRevoked ? REVOKED_NOTE : ''}` }
           }
           const sha = await rawSha($, c.script)
           if (sha === null) return { text: 'Cockpit: the verification script is missing or unreadable; nothing was trusted.' }
@@ -5219,8 +5267,10 @@ export const register: Register = (on, options) => {
           const map = await trustMap($)
           map[scope.key] = { sha, at: await $.clock.now() }
           await $.store.set(TRUST_KEY, Object.fromEntries(Object.entries(map).slice(-32)))
+          // enrolling again replaces the trust: a completion verified under the earlier one is not current evidence any more
+          const isRevoked = await revokeScoped($, scope.verifier, `the trust for ${c.script.slice(c.script.lastIndexOf('/') + 1)} was enrolled again`)
 
-          return { text: `Cockpit: trusted ${c.script.slice(c.script.lastIndexOf('/') + 1)} (${sha.slice(0, 12)}) for this project. A change to its bytes ends the trust. If this task is already held, /cockpit guard release lets it be checked again.` }
+          return { text: `Cockpit: trusted ${c.script.slice(c.script.lastIndexOf('/') + 1)} (${sha.slice(0, 12)}) for this project. A change to its bytes ends the trust. If this task is already held, /cockpit guard release lets it be checked again.${isRevoked ? REVOKED_NOTE : ''}`}
         }
         if (arg === 'release') {
           // lifting a hold is the person's alone, and it passes nothing: TEST goes back to pending and the budget starts over
