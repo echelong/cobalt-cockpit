@@ -5,10 +5,11 @@
 
 import type { Activity, Gate, GateName, GitState, Meter, Task } from '../types'
 import { aheadBehindLabel, branchLabel, dirtyLabel, shaLabel } from './git'
-import { GATES, settle } from './model'
+import { GATES, isGuardRequired, settle } from './model'
 import { GATE_GLYPH, GATE_TONE, MILESTONE_GLYPH, PALETTE, STAGE_LABEL, STAGE_SHORT, STATE_COLOR, STATE_LABEL, label as segLabel } from './theme'
 import type { VisualState } from './theme'
 import { MICRO, OPERATOR } from './mascot'
+import { completionEvidenceOf, gateClaimText } from './verification'
 
 /**
  * The colours a `Text` may be given. A state resolves to a host colour where
@@ -189,8 +190,10 @@ export const statusWord = (input: HudInput): string => {
   const { task, activity, isWorking } = input
   const agents = activity.agents.length
   const withAgents = (text: string) => (agents > 0 ? `${text} +${agents} agent${agents === 1 ? '' : 's'}` : text)
+  // P3: a DONE word carries the evidence it rests on; it never stands alone as a
+  // verification claim, and SECURITY_ATTESTED is never produced.
   const verdict =
-    task?.status === 'unverified' ? 'UNVERIFIED' : task?.status === 'blocked' ? 'BLOCKED' : task?.status === 'done' ? 'DONE' : ''
+    task?.status === 'unverified' ? 'UNVERIFIED' : task?.status === 'blocked' ? 'BLOCKED' : task?.status === 'done' ? `DONE · ${completionEvidenceOf(task, isGuardRequired()).state}` : ''
   if (isWorking) {
     const doing = activity.kind === 'IDLE' ? 'THINK' : activity.kind
     const now = activity.detail !== '' ? `${doing} ${activity.detail}` : doing
@@ -443,7 +446,7 @@ export const paneRows = (input: HudInput, columns: number, now: number, withBann
       { text: cells.empty, isDim: true },
       { text: `  ${percentText(task)}`, isBold: true },
     ]),
-    field('Milestones', [{ text: `${done}/${task.milestones.length}`, color: done === task.milestones.length ? COLORS.ok : undefined }, { text: `  ${task.status.toUpperCase()}`, color }]),
+    field('Milestones', [{ text: `${done}/${task.milestones.length}`, color: done === task.milestones.length ? COLORS.ok : undefined }, { text: `  ${task.status === 'done' ? `DONE · ${completionEvidenceOf(task, isGuardRequired()).state}` : task.status.toUpperCase()}`, color }]),
   )
   if (task.stopHold !== undefined) push(field('Held', [{ text: `STOP GUARD: ${task.stopHold.reason}`, color: COLORS.warn }]))
   if (task.blocker !== null) push(field('Blocker', [{ text: task.blocker, color: COLORS.warn }]))
@@ -470,7 +473,9 @@ export const paneRows = (input: HudInput, columns: number, now: number, withBann
       { text: `  ${GATE_GLYPH[gate.state]} `, ...gateColor(gate) },
       { text: `${name.padEnd(10)}`, ...(gate.state === 'unset' ? { isDim: true } : {}) },
       { text: `${(gate.state === 'na' ? 'n/a' : gate.state).padEnd(9)}`, ...gateColor(gate) },
-      { text: gate.evidence ?? (gate.isRequired ? 'required, not yet verified' : ''), isDim: true },
+      ...(gate.state === 'pass'
+        ? [{ text: `${gateClaimText(name, gate)} · ${typeof gate.evidence === 'string' && gate.evidence.trim().length > 0 ? gate.evidence : 'no evidence line'}`, isDim: true }]
+        : [{ text: gate.evidence ?? (gate.isRequired ? 'required, not yet verified' : ''), isDim: true }]),
     ])
   }
 

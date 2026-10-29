@@ -17,6 +17,7 @@ import type {
   WorkPhase,
 } from '../types'
 import { align, alignmentNote, criteriaMissing, decide, discover, discoverySummary, foldAliases, invalidateAlignment, isAlignmentSatisfied, needsAlignment, resetCriteria, withDiscovery } from './discovery'
+import { completionEvidenceOf, verificationLine } from './verification'
 
 export const GATES: readonly GateName[] = ['CODE', 'TEST', 'TYPE', 'BUILD', 'SECURITY', 'GIT']
 export const WORK_PHASES: readonly WorkPhase[] = [
@@ -719,8 +720,10 @@ export const summaryOf = (task: Task | null): string => {
             : 'All required gates satisfied.'
 
   const review = task.review === undefined ? '' : ` Review: ${reviewNote(task)}.`
+  // P3: a DONE line says what the claim rests on and never implies security attestation.
+  const evidence = task.status === 'done' ? ` Verification: ${verificationLine(completionEvidenceOf(task, guardRequired))}.` : ''
 
-  return `${task.phase} ${task.percent}% (${done}/${task.milestones.length} milestones). ${verdict} Milestones: ${list}. Gates: ${gates}.${review}${discoverySummary(task)}`
+  return `${task.phase} ${task.percent}% (${done}/${task.milestones.length} milestones). ${verdict} Milestones: ${list}. Gates: ${gates}.${review}${discoverySummary(task)}${evidence}`
 }
 
 /** The progress tool's input, as the model sends it. */

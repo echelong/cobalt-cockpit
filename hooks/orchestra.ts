@@ -330,12 +330,12 @@ export const orchestraRows = (view: OrchestraView, columns: number, colors: { ac
     if (s.effortEscalations.length) rows.push(pair('EFFORT STEPS', s.effortEscalations.slice(-3).map(e => `${e.task} ${e.from.toUpperCase()} → ${e.to.toUpperCase()}`).join(' · '), colors.bad))
     rows.push(pair('CONFLICTS', String(s.conflicts), s.conflicts ? colors.bad : colors.steel))
     const tasks = view.swarm.tasks
-    rows.push(pair('VERIFICATION', `${tasks.filter(t => t.verification === 'pass').length} pass · ${tasks.filter(t => t.verification === 'fail').length} fail · ${tasks.filter(t => t.verification === 'pending').length} pending · ${tasks.filter(t => t.verification === 'unknown').length} unknown`, colors.steel))
+    rows.push(pair('COMMANDER REPORTS', `${tasks.filter(t => t.verification === 'pass').length} pass · SELF_REPORTED_UNCHECKED · ${tasks.filter(t => t.verification === 'fail').length} fail · ${tasks.filter(t => t.verification === 'pending').length} pending · ${tasks.filter(t => t.verification === 'unknown').length} unknown`, colors.steel))
     if (led && view.consults && view.consults.length > 0) {
       const swarm = view.swarm
       const states = view.consults.map(c => consultStatus(swarm.tasks.find(t => t.id === c.id)))
-      const verified = view.consults.filter(c => ['pass', 'fail'].includes(swarm.tasks.find(t => t.id === c.id)?.verification ?? '')).length
-      rows.push(pair('OPUS CONSULTS', `${states.filter(x => x === 'admitted' || x === 'running').length} open · ${states.filter(x => x === 'returned').length} returned · ${verified} verified`, colors.accent))
+      const reported = view.consults.filter(c => ['pass', 'fail'].includes(swarm.tasks.find(t => t.id === c.id)?.verification ?? '')).length
+      rows.push(pair('OPUS CONSULTS', `${states.filter(x => x === 'admitted' || x === 'running').length} open · ${states.filter(x => x === 'returned').length} returned · ${reported} commander-reported (SELF_REPORTED_UNCHECKED)`, colors.accent))
       for (const c of view.consults.slice(-3)) rows.push([{ text: ` ${fitText(consultLine(c, swarm), Math.max(20, columns - 2))}` }])
     }
   }

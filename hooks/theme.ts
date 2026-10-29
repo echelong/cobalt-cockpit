@@ -5,7 +5,8 @@
 // The language: near-black surfaces, a lifted charcoal panel, vivid red as the
 // single loud accent, silver as the quiet one, and cyan held back for glitch
 // and scan states only. Amber is a question, red is a failure, green is a
-// verified result; no state is allowed to be louder than another.
+// completed result; no state is allowed to be louder than another, and no state
+// claims security attestation.
 
 import type { GateState, MilestoneState } from '../types'
 
@@ -82,7 +83,7 @@ export const STATE_LABEL: Record<VisualState, string> = {
   running: 'ACTIVE',
   needs_input: 'QUERY',
   error: 'FAULT',
-  done: 'VERIFIED',
+  done: 'DONE',
 }
 
 /** The stage the pill shows for a work phase. */

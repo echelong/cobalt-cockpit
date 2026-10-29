@@ -8,6 +8,7 @@
 
 import { GATES, isGuardHeld, isGuardOwned, isGuardRequired, isReviewSatisfied } from './model'
 import { alignmentNote, isAlignmentSatisfied, needsAlignment } from './discovery'
+import { completionEvidenceOf, gateClaimText, verificationLine } from './verification'
 import type { Swarm, Task } from '../types'
 
 const clip = (text: string, n: number): string => (text.length <= n ? text : `${text.slice(0, Math.max(0, n - 1))}…`)
@@ -27,9 +28,8 @@ export type Readiness = {
 const gateLine = (task: Task, name: (typeof GATES)[number]): { text: string; ok: boolean } => {
   const g = task.gates[name]
   const stale = typeof g.evidence === 'string' && g.evidence.startsWith('stale:')
-  const how = g.source === 'auto' ? 'read from a command' : g.source === 'model' ? 'reported by Claude, not read from a command' : 'no source recorded'
   if (!g.isRequired) return { text: `${name} not required (${g.state})`, ok: true }
-  if (g.state === 'pass') return { text: `${name} pass · ${how}${g.evidence === null ? ' · no evidence line' : ''}`, ok: true }
+  if (g.state === 'pass') return { text: `${name} pass · ${gateClaimText(name, g)}${g.evidence === null && g.source !== 'auto' ? ' · no evidence line' : ''}`, ok: true }
   if (g.state === 'na') return { text: `${name} n/a · ${g.evidence === null ? 'no reason recorded' : clip(one(g.evidence), 60)}`, ok: true }
   if (g.state === 'fail') return { text: `${name} FAILED · ${g.evidence === null ? 'no evidence line' : clip(one(g.evidence), 70)}`, ok: false }
   return { text: `${name} ${stale ? 'STALE (it passed on something that has since changed)' : g.state === 'pending' ? 'pending (not run, or not recorded)' : g.state === 'unset' ? 'not reported yet' : g.state}${stale && g.evidence !== null ? ` · ${clip(one(g.evidence), 70)}` : ''}`, ok: false }
@@ -57,8 +57,10 @@ export const readinessOf = (task: Task | null, swarm: Swarm | null): Readiness =
   // the Stop guard: a hold is its own, and only its own check or a person's release lifts it
   if (isGuardHeld(task)) open.push(`STOP GUARD HOLD: ${clip(one(task.stopHold?.reason ?? ''), 90)} · only the guard's own check or your /cockpit guard release lifts it`)
   else if (isGuardRequired()) {
-    if (isGuardOwned(task)) satisfied.push('the Stop guard completed its check for this task and tree')
-    else open.push('the Stop guard has not yet completed its check for this task and tree')
+    if (isGuardOwned(task)) {
+      if (task.guardDone?.outcome === 'unchanged') satisfied.push('the Stop guard observed this task\'s working tree unchanged; no check was run')
+      else satisfied.push('the Stop guard ran its check for this task and tree and recorded a pass · the stored record is historical; this view does not revalidate current script trust or tree identity')
+    } else open.push('the Stop guard has not yet completed its check for this task and tree')
   }
 
   // the gates
@@ -85,7 +87,9 @@ export const readinessOf = (task: Task | null, swarm: Swarm | null): Readiness =
     const pending = swarm.tasks.filter(t => t.state === 'escalated' || (t.escalation !== null && t.state !== 'completed' && t.state !== 'failed' && t.state !== 'cancelled'))
     if (pending.length > 0) notes.push(`${pending.length} agent escalation${pending.length === 1 ? '' : 's'} pending the commander: ${pending.slice(0, 4).map(t => t.id).join(', ')}`)
     const unverified = swarm.tasks.filter(t => t.state === 'completed' && t.verification !== 'pass')
-    if (unverified.length > 0) notes.push(`${unverified.length} agent result${unverified.length === 1 ? '' : 's'} reported, not verified: ${unverified.slice(0, 4).map(t => `${t.id} (${t.verification})`).join(', ')}`)
+    // A fail is a recorded commander judgment, not a missing one: the note groups by what is absent (an approved PASS)
+    // and keeps each recorded state beside its task.
+    if (unverified.length > 0) notes.push(`${unverified.length} completed agent result${unverified.length === 1 ? '' : 's'} without a commander-approved PASS: ${unverified.slice(0, 4).map(t => `${t.id} (${t.verification})`).join(', ')}`)
     const waiting = swarm.tasks.filter(t => t.state === 'queued' || t.state === 'blocked' || t.state === 'stalled')
     if (waiting.length > 0) notes.push(`${waiting.length} agent task${waiting.length === 1 ? '' : 's'} waiting or stalled: ${waiting.slice(0, 4).map(t => `${t.id} ${t.state}`).join(', ')} · /cockpit agents explains why`)
     const running = swarm.tasks.filter(t => t.state === 'running' || t.state === 'reserved')
@@ -105,6 +109,8 @@ export const readyText = (task: Task | null, swarm: Swarm | null, columns: numbe
   const r = readinessOf(task, swarm)
   if (r.standing === 'NO TASK') return 'READY · no task is recorded in this session, so there is nothing to explain. Plan one with the progress tool.'
   const lines = [clip(`READY · ${r.standing} · ${task!.percent}% · status ${task!.status.toUpperCase()}`, columns)]
+  // P3: the completion claim carries what it rests on, on its own line, before the conditions.
+  lines.push(clip(`COMPLETION · ${verificationLine(completionEvidenceOf(task, isGuardRequired()))}`, Math.max(columns, 20)))
   if (r.open.length > 0) {
     lines.push('STANDING IN THE WAY')
     for (const l of r.open) lines.push(clip(`  ✗ ${l}`, Math.max(columns, 20)))

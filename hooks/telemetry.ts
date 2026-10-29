@@ -326,7 +326,7 @@ export const statsText = (s: Stats): string => {
   out.push('', `OPUS CONSULTATIONS / attempts ${c.attempts} · admitted ${c.admitted} (${pct(c.admitted, c.attempts)} of attempts) · returned ${pct(c.returned, c.admitted)} of admitted`)
   const grounds = Object.entries(c.byGround)
   if (grounds.length === 0) out.push('  none observed')
-  for (const [name, x] of grounds) out.push(`  ${name.padEnd(16)} refused ${x.refused} · admitted ${x.admitted} · returned ${x.returned} · verified pass ${x.passed} · fail ${x.failed} · ${lat(x.latency)}`)
+  for (const [name, x] of grounds) out.push(`  ${name.padEnd(16)} refused ${x.refused} · admitted ${x.admitted} · returned ${x.returned} · commander report pass ${x.passed} · fail ${x.failed} · ${lat(x.latency)}`)
   if (c.release.go + c.release.noGo > 0) out.push(`  release recommendations: GO ${c.release.go} · NO-GO ${c.release.noGo}`)
   const t = s.tasks
   out.push('', `TASKS COMPLETED / ${t.completed}`)

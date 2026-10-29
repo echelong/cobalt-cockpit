@@ -1130,7 +1130,7 @@ const HELP =
   '/cockpit stats     observed model use, routing and consultations: 7d | 30d | all, with --json or --csv\n' +
   '/cockpit agents    the agent inspector: tasks, agents, waves, ownership, requested versus applied effort, and why a task is waiting (read-only); agents <task> explains one\n' +
   '/cockpit ready     which recorded conditions stand between the task and DONE: gates, review, goal check, guard, escalations (read-only; approves nothing)\n' +
-  '/cockpit flow      the Neural Flow in words: which of input, discovery, routing, workers, verify and done are verified\n' +
+  '/cockpit flow      the Neural Flow in words: which of input, discovery, routing, workers, verify and done are complete\n' +
   '/cockpit guard     Cobalt Guard owner alerts: status, priorities, quiet hours and active conditions; ack, silence or unsilence; test and seen check that a notification reaches you (none changes a verdict)\n' +
   '/cockpit alerts   the alert inbox: recorded alerts with their notification outcome, acknowledgment and whether the condition is still open; alerts digest summarises the unacknowledged and what is new since your last look; alerts ack <id> acknowledges one (changes no verdict); alerts review lists incidents to label, alerts label <id> notify|record|noise|clear records whether you would have wanted a notification, and alerts calibration reports how the alert policy would have done against your labels (simulated: nothing is sent and no setting changes)\n' +
   '/cockpit doctor    read-only checks: installs, profile, telemetry storage, host and prompt-cache policy\n' +

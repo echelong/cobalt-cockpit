@@ -922,7 +922,7 @@ describe('Mission Control', () => {
       expect(text).toContain('Latest       1m 05s ago  TEST npm test')
       expect(text).toContain(' ✓ m1  Inspect  INSPECT')
       expect(text).toContain(' ▶ m3  Test  TEST')
-      expect(text).toContain(' ✓ TEST      pass     npm test (exit 0)')
+      expect(text).toContain(' ✓ TEST      pass     PROVISIONAL_CHECKED · read from a command')
       expect(text).toContain(' · SECURITY  unset    required, not yet verified')
       expect(text).toContain('Branch       main  example')
       expect(text).toContain('HEAD         1111111')

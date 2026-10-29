@@ -121,7 +121,8 @@ const modelText = (t: SwarmTask, a: LedgerAgent | undefined): string => {
 const outcomeText = (t: SwarmTask): string => {
   if (t.result === null) return t.state === 'completed' ? 'completed without a report' : 'none yet'
   const delivery = t.resultDelivery === 'host_accepted' ? 'report accepted by the host' : t.resultDelivery === 'answer_observed' ? 'answer observed' : t.resultDelivery === 'unavailable' ? 'report unavailable' : 'reported by the agent'
-  const verified = t.verification === 'pass' ? 'VERIFIED by the commander' : t.verification === 'fail' ? 'verification FAILED' : t.verification === 'unknown' ? 'verification UNKNOWN' : 'NOT verified (pending)'
+  // The commander's judgment is a report: it ran no check here and attests no security state.
+  const verified = t.verification === 'pass' ? 'commander report PASS · SELF_REPORTED_UNCHECKED' : t.verification === 'fail' ? 'commander report FAILED · SELF_REPORTED_UNCHECKED' : t.verification === 'unknown' ? 'commander report UNKNOWN · SELF_REPORTED_UNCHECKED' : 'NOT verified (pending)'
 
   return `${delivery}; ${verified}`
 }

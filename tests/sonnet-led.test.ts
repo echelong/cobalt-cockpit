@@ -201,7 +201,7 @@ describe('presentation and accounting', () => {
     const c = { ...consult('opus-1-abc', packet(), 'release'), isMandatory: true }
     const l: Ledger = { ...emptyLedger('s'), swarm, consults: [c] }
     const lines = ledgerLines(l, 3, 'SUBSCRIPTION', 'unavailable').join('\n')
-    for (const s of ['11 OPUS CONSULTATIONS', 'opus-1-abc release (mandatory) · status returned', 'decision Use SQLite with WAL', 'verified by main pass', 'host cost unavailable']) expect(lines).toContain(s)
+    for (const s of ['11 OPUS CONSULTATIONS', 'opus-1-abc release (mandatory) · status returned', 'decision Use SQLite with WAL', 'commander report pass · SELF_REPORTED_UNCHECKED · not a security attestation', 'host cost unavailable']) expect(lines).toContain(s)
     expect(ledgerLines(emptyLedger('s'), 3).join('\n')).not.toContain('OPUS CONSULTATIONS')
     const big: Ledger = { ...l, receipts: [], consults: Array.from({ length: 32 }, (_, i) => ({ ...c, id: `c${i}`, packet: packet({ architecture: 'z'.repeat(1200), objective: 'o'.repeat(1200), files: Array.from({ length: 12 }, () => 'f'.repeat(300)) }) })), replay: [], tools: [], requests: [] }
     const stored = storageLedger({ ...big, warnings: Array.from({ length: 32 }, () => 'w'.repeat(10_000)) })

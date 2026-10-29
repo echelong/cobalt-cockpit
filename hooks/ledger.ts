@@ -5,6 +5,7 @@ import { appendReplay, safeFile, safeText, secretText } from './replay'
 import type { ReplayStep } from './replay'
 import { emptySwarm } from './swarm'
 import { statusOf as consultStatus } from './consult'
+import { HISTORICAL_PROVENANCE_UNKNOWN, NOT_SECURITY_ATTESTED } from './verification'
 import { decisionLine } from './router'
 import { roleOf } from './orchestra'
 import { activityOf } from './classify'
@@ -124,7 +125,7 @@ const consultLines = (l: Ledger): string[] => {
   const rows = ['11 OPUS CONSULTATIONS']
   for (const c of l.consults) {
     const t = l.swarm?.tasks.find(x => x.id === c.id)
-    rows.push(`${c.id} ${c.ground}${c.isMandatory ? ' (mandatory)' : ''} · status ${consultStatus(t)} · admitted: ground holds · agent ${t?.agentId ?? UNKNOWN}`, `asked ${c.packet.decision}`, `decision ${t?.result?.conclusion || 'not returned'}`, `verified by main ${t?.verification ?? UNKNOWN}`)
+    rows.push(`${c.id} ${c.ground}${c.isMandatory ? ' (mandatory)' : ''} · status ${consultStatus(t)} · admitted: ground holds · agent ${t?.agentId ?? UNKNOWN}`, `asked ${c.packet.decision}`, `decision ${t?.result?.conclusion || 'not returned'}`, `commander report ${t?.verification ?? UNKNOWN} · SELF_REPORTED_UNCHECKED · ${NOT_SECURITY_ATTESTED}`)
   }
   return rows
 }
@@ -142,7 +143,7 @@ export const ledgerLines = (l: Ledger, now: number, auth: string = UNKNOWN, cost
   for (const t of l.tools.filter(t => t.file !== UNKNOWN).slice(-32)) rows.push(`${t.tool} ${t.file} · ${t.status}`)
   rows.push('07 FAILURES / RETRIES', `tools ${run?.counts.tools ?? 0} · failures ${run?.counts.failures ?? 0} · retries unknown`)
   for (const t of l.tools.filter(t => t.status === 'failure').slice(-12)) rows.push(`${t.id} · ${t.tool} · failure`)
-  rows.push('08 VERIFICATION', ...Object.entries(l.checkpoint?.gates ?? {}).map(([k, v]) => `${k} ${v}`), `git ${l.checkpoint?.branch ?? UNKNOWN} · ${l.checkpoint?.currentSha ?? UNKNOWN} · dirty ${l.checkpoint?.dirty ?? UNKNOWN}`, ...discoveryRows(l), '09 REPLAY / HISTORY', `${l.replay.length} snapshots · /replay · ${l.runs.length} runs`, 'Bounded observed history; unknown means unexposed or unobserved. No cost estimates.')
+  rows.push('08 VERIFICATION', ...Object.entries(l.checkpoint?.gates ?? {}).map(([k, v]) => `${k} ${v}${v === 'pass' ? ` · ${HISTORICAL_PROVENANCE_UNKNOWN}` : ''}`), `git ${l.checkpoint?.branch ?? UNKNOWN} · ${l.checkpoint?.currentSha ?? UNKNOWN} · dirty ${l.checkpoint?.dirty ?? UNKNOWN}`, `checkpoint gates are historical state; ${NOT_SECURITY_ATTESTED}`, ...discoveryRows(l), '09 REPLAY / HISTORY', `${l.replay.length} snapshots · /replay · ${l.runs.length} runs`, 'Bounded observed history; unknown means unexposed or unobserved. No cost estimates.')
   if (l.swarm?.tasks.length) {
     rows.push('10 ELASTIC SWARM', `wave ${l.swarm.wave} · requested ${l.swarm.requested} · actual ${l.swarm.actual} · high-water ${l.swarm.highWater} · conflicts ${l.swarm.conflicts}`)
     for (const t of l.swarm.tasks) rows.push(`${t.id} ${t.tier} ${t.role} · ${t.state} · effort ${t.requestedEffort}${t.appliedEffort ? ` → ${t.appliedEffort}` : ''} · agent ${t.agentId ?? UNKNOWN} · parent ${t.parentTask ?? UNKNOWN}/${t.parentAgent ?? UNKNOWN}`, `why ${t.spawnReason} · objective ${t.objective}`, `ownership ${t.mode} ${t.owned.join(', ')} · dependencies ${t.dependencies.join(', ') || 'none'} · wave ${t.wave}`, `result ${t.result?.conclusion ?? UNKNOWN} · report ${t.resultDelivery ?? 'unavailable'} · verification ${t.verification}${t.escalation ? ` · escalation ${t.tier} → ${t.escalation.to}: ${t.escalation.question}` : ''}${t.effortEscalation ? ` · effort escalation ${t.effortEscalation.from} → ${t.effortEscalation.to}: ${t.effortEscalation.reason}` : ''}`)

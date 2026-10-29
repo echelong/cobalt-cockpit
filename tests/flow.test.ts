@@ -163,7 +163,7 @@ describe('layout', () => {
   test('the plain command text spells every state in words, with no colour', () => {
     const out = flowText(flowOf({ ...quiet, task: planned(0), isWorking: true, mainTier: 'SONNET', agents: [{ tier: 'HAIKU', running: true }] }))
     expect(out).toContain('FLOW  ● INPUT → ● DISCOVERY → ● ROUTING → ◉ WORKERS → ○ VERIFY → ○ DONE')
-    expect(out).toContain('verified INPUT, DISCOVERY, ROUTING · active WORKERS · pending VERIFY, DONE')
+    expect(out).toContain('complete INPUT, DISCOVERY, ROUTING · active WORKERS · pending VERIFY, DONE')
     expect(out).toContain('observed running: HAIKU 1')
     expect(out).toContain('main model SONNET')
     // eslint-disable-next-line no-control-regex

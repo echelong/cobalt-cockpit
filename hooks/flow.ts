@@ -16,8 +16,11 @@
 
 import type { Gate, GateState, Task } from '../types'
 import { isAlignmentSatisfied } from './discovery'
+import { isGuardRequired } from './model'
 import { Grid, hex, pack } from './pixels'
 import type { Row } from './view'
+import { completionEvidenceOf, verificationLine } from './verification'
+import type { VerificationEvidence } from './verification'
 
 export type FlowTier = 'HAIKU' | 'SONNET' | 'OPUS'
 export type NodeId = 'input' | 'discovery' | 'routing' | 'workers' | 'verify' | 'done'
@@ -50,6 +53,11 @@ export type Flow = {
   mainTier: FlowTier | null
   /** The node the energy flows into: the first active one past INPUT, or -1. */
   head: number
+  /**
+   * What a recorded DONE claim rests on; null while the task claims no DONE. Optional so a consumer that builds or
+   * destructures the shape from an earlier release keeps type-checking: this is a presentation extension only.
+   */
+  completion?: VerificationEvidence | null
 }
 
 const WORK = ['RESEARCH', 'PLAN', 'IMPLEMENT', 'FIX']
@@ -92,8 +100,9 @@ export const flowOf = (i: FlowInput): Flow => {
     }
   }
   const head = states.findIndex((s, n) => n > 0 && s === 'active')
+  const completion = task?.status === 'done' ? completionEvidenceOf(task, isGuardRequired()) : null
 
-  return { states, live, running, mainTier: i.mainTier, head }
+  return { states, live, running, mainTier: i.mainTier, head, completion }
 }
 
 // ---------------------------------------------------------------------------
@@ -210,9 +219,11 @@ export const flowRow = (flow: Flow, width: number, draw: Draw & { light: boolean
 export const flowText = (flow: Flow): string => {
   const line = NODES.map((n, i) => `${GLYPH[flow.states[i]!]} ${n.full}`).join(' → ')
   const by = (s: NodeState) => NODES.filter((_, i) => flow.states[i] === s).map(n => n.full)
-  const words = (['verified', 'active', 'blocked', 'failed', 'pending'] as NodeState[]).map(s => (by(s).length === 0 ? null : `${s} ${by(s).join(', ')}`)).filter(Boolean).join(' · ')
+  // `verified` is an internal node state. In words it means the stage is complete, not that a check ran.
+  const words = (['verified', 'active', 'blocked', 'failed', 'pending'] as NodeState[]).map(s => (by(s).length === 0 ? null : `${s === 'verified' ? 'complete' : s} ${by(s).join(', ')}`)).filter(Boolean).join(' · ')
   const counts = ORDER.map(t => [t, flow.running.filter(r => r === t).length] as const).filter(([, n]) => n > 0).map(([t, n]) => `${t} ${n}`)
   const work = flow.running.length === 0 ? 'no agent observed running' : `observed running: ${counts.join(' · ')}`
+  const completion = flow.completion == null ? [] : [`COMPLETION ${verificationLine(flow.completion)}`]
 
-  return [`FLOW  ${line}`, words, `${work} · ${flow.live ? 'work is live' : 'idle'} · main model ${flow.mainTier ?? 'UNKNOWN'}`].join('\n')
+  return [`FLOW  ${line}`, words, `${work} · ${flow.live ? 'work is live' : 'idle'} · main model ${flow.mainTier ?? 'UNKNOWN'}`, ...completion].join('\n')
 }

@@ -21,6 +21,7 @@
 //     a failed consultation is retried at most once; three per task.
 
 import { redactSecrets, secretText } from './secrets'
+import { NOT_SECURITY_ATTESTED } from './verification'
 import type { ClearedGround, ConsultGround, Consultation, EvidencePacket, Profile, ReleaseOutcome, ReleaseRecord, ReviewRequirement, Swarm, SwarmTask, Task } from '../types'
 export type { ConsultGround, Consultation, EvidencePacket, ReviewRequirement } from '../types'
 
@@ -265,7 +266,9 @@ const releaseVerdict = (r: ConsultRequest, isMandatory: boolean): { ok: true; ke
   const mine = r.consults.filter(c => c.ground === 'release' && c.candidate === sha)
   const kept = (r.history ?? []).filter(h => h.candidate === sha)
   const answered = mine.find(c => statusOf(taskOf(r.swarm, c.id)) === 'returned') ?? kept.find(h => h.returned)
-  if (answered) return { ok: false, reason: `OPUS / DUPLICATE. Commit ${sha.slice(0, 12)} was already reviewed (${answered.id}); no second consultation is started. A verified GO for this exact commit is applied to this task by itself; a NO-GO, or a review not yet verified, is not an approval. A changed commit is a new candidate.` }
+  // A returned response says only that an answer exists: it may be unadjudicated, a NO-GO, a failed judgment or a GO.
+  // The refusal describes the duplicate and the rule, and never asserts that an approval was applied.
+  if (answered) return { ok: false, reason: `OPUS / DUPLICATE. Commit ${sha.slice(0, 12)} was already reviewed (${answered.id}); no second consultation is started. A consultation response for this commit has already been recorded; only a separately adjudicated qualifying GO may clear the release ground, and a NO-GO or an unadjudicated response is not approval. A changed commit is a new candidate.` }
   const attempts = new Set([...mine.map(c => c.id), ...kept.map(h => h.id)]).size
   if (attempts >= MAX_RELEASE_ATTEMPTS) return { ok: false, reason: `OPUS / RELEASE RETRY BUDGET. Commit ${sha.slice(0, 12)} has had ${attempts} release consultations that did not return; block with the reason.` }
   const inSession = r.consults.filter(c => c.ground === 'release').length
@@ -471,7 +474,8 @@ export const briefOf = (c: Consultation): string => {
 export const consultLine = (c: Consultation, swarm: Swarm): string => {
   const t = taskOf(swarm, c.id)
   const status = statusOf(t)
-  const verified = t?.verification ?? 'unknown'
+  const reported = t?.verification ?? 'unknown'
 
-  return `${c.id} ${c.ground.toUpperCase()}${c.isMandatory ? '*' : ''} · ${status}${status === 'returned' ? ` · verified ${verified}` : ''}`
+  // A commander's verification is a report, not an independent check.
+  return `${c.id} ${c.ground.toUpperCase()}${c.isMandatory ? '*' : ''} · ${status}${status === 'returned' ? ` · commander report ${reported} · SELF_REPORTED_UNCHECKED` : ''} · ${NOT_SECURITY_ATTESTED}`
 }
