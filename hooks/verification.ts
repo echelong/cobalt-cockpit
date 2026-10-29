@@ -212,4 +212,3 @@ export const completionEvidenceOf = (task: Task | null, guardRequired: boolean):
 /** `/cockpit ready` and the HUD: `STATE · why · not a security attestation`. */
 export const verificationLine = (evidence: VerificationEvidence): string =>
   `${evidence.state} · ${evidence.why} · ${NOT_SECURITY_ATTESTED}`
-
