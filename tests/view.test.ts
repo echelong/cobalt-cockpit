@@ -5,10 +5,11 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { gateOfCommand, readBash } from '../hooks/classify'
 import { aheadBehindLabel, branchLabel, dirtyLabel, parseStatus, shaLabel } from '../hooks/git'
-import { applyAction, newTask, setGate, settle } from '../hooks/model'
+import { applyAction, GATES, isGuardRequired, newTask, setGate, setGuardRequired, settle, uidOf } from '../hooks/model'
+import { completionEvidenceOf } from '../hooks/verification'
 import { hudRows, paneRows, rowText, statusWord, waveCells, waveLevels, waveText } from '../hooks/view'
 import type { HudInput } from '../hooks/view'
-import type { Activity, GitState, Meter, Task } from '../types'
+import type { Activity, Gate, GateName, GitState, Meter, Task } from '../types'
 
 const IDLE: Activity = { kind: 'IDLE', detail: '', isWorking: false, toolUseId: null, agents: [], at: 0 }
 const METER: Meter = { percent: 39, tokens: 78_000, window: 200_000, model: 'claude-opus-5-5', effort: 'high' }
@@ -151,6 +152,74 @@ describe('the wide HUD', () => {
     expect(middle).toContain('--%')
     expect(middle).toContain('░'.repeat(20))
     expect(middle).not.toContain('█')
+  })
+})
+
+// A finished task's word carries the evidence its DONE rests on, but only at rest: while a turn runs it names what the turn is
+// doing, for every evidence state. Blocked and unverified tasks keep their word in front of the live activity.
+describe('the status word of a finished task', () => {
+  const live = (kind: Activity['kind'], detail = '', agents: string[] = []): Partial<HudInput> => ({ isWorking: true, activity: { ...IDLE, kind, detail, isWorking: true, agents } })
+  const allGates = (source: Gate['source'], evidence: string | null): Record<GateName, Gate> =>
+    Object.fromEntries(GATES.map(name => [name, { state: 'pass', isRequired: true, evidence, source, at: 10 } satisfies Gate])) as Record<GateName, Gate>
+  // a LIGHT goal, so no goal check stands between the milestones and DONE
+  const finishedWith = (gates: Record<GateName, Gate>, guard?: 'unchanged'): Task => {
+    const planned = applyAction(newTask(1, 'goal', 0, null), { action: 'plan', milestones: ['Inspect', 'Implement', 'Verify'].map(title => ({ title })) }, 0, null).task
+    const t = { ...planned, milestones: planned.milestones.map(one => ({ ...one, state: 'done' as const })), gates }
+    return settle(guard === undefined ? t : { ...t, guardDone: { uid: uidOf(t), tree: 'h:1@project', check: 'check.sh@10', outcome: guard, at: 11 } }).task
+  }
+  const withGuard = <T>(on: boolean, f: () => T): T => {
+    const before = isGuardRequired()
+    setGuardRequired(on)
+    try { return f() } finally { setGuardRequired(before) }
+  }
+  // Each case is a DONE task and the Stop-guard setting under which its evidence reads as the named state.
+  const cases: { state: string; guard: boolean; task: () => Task }[] = [
+    { state: 'SELF_REPORTED_UNCHECKED', guard: false, task: () => finishedWith(allGates('model', 'checked')) },
+    { state: 'PROVISIONAL_CHECKED', guard: false, task: () => finishedWith(allGates('auto', 'npm test (exit 0)')) },
+    { state: 'PROVENANCE_UNKNOWN', guard: false, task: () => finishedWith(allGates('auto', null)) },
+    { state: 'UNCHANGED_UNCHECKED', guard: true, task: () => finishedWith(allGates('model', 'checked'), 'unchanged') },
+    // settled DONE with the guard off, then read with the guard required and no guard record
+    { state: 'UNKNOWN_INVALIDATED', guard: true, task: () => withGuard(false, () => finishedWith(allGates('model', 'checked'))) },
+  ]
+
+  for (const c of cases) {
+    test(`${c.state}: at rest the word is DONE with its evidence; in a live turn it is the activity alone`, () => {
+      withGuard(c.guard, () => {
+        const task = c.task()
+        expect(task.status).toBe('done')
+        expect(completionEvidenceOf(task, c.guard).state).toBe(c.state)
+        expect(statusWord(input({ task }))).toBe(`DONE · ${c.state}`)
+        expect(statusWord(input({ task, activity: { ...IDLE, agents: ['a1'] } }))).toBe(`DONE · ${c.state} +1 agent`)
+        expect(statusWord(input({ task, ...live('THINK') }))).toBe('THINK')
+        expect(statusWord(input({ task, ...live('IDLE') }))).toBe('THINK')
+        expect(statusWord(input({ task, ...live('TEST', 'npm test') }))).toBe('TEST npm test')
+        expect(statusWord(input({ task, ...live('EDIT', 'src/limiter.ts') }))).toBe('EDIT src/limiter.ts')
+        expect(statusWord(input({ task, ...live('AGENT', '', ['a1', 'a2']) }))).toBe('AGENT +2 agents')
+        for (const word of [statusWord(input({ task })), statusWord(input({ task, ...live('THINK') }))]) {
+          expect(word).not.toContain('SECURITY_ATTESTED')
+          expect(word).not.toMatch(/\bVERIFIED\b/)
+        }
+      })
+    })
+  }
+
+  test('an unverified task keeps its word in front of the live activity', () => {
+    withGuard(false, () => {
+      const task = taskAt(5)
+      expect(task.status).toBe('unverified')
+      expect(statusWord(input({ task }))).toBe('UNVERIFIED')
+      expect(statusWord(input({ task, ...live('THINK') }))).toBe('UNVERIFIED · THINK')
+      expect(statusWord(input({ task, ...live('BUILD', 'npm run build') }))).toBe('UNVERIFIED · BUILD npm run build')
+      expect(statusWord(input({ task, ...live('AGENT', '', ['a1']) }))).toBe('UNVERIFIED · AGENT +1 agent')
+    })
+  })
+
+  test('a blocked task keeps its word in front of the live activity', () => {
+    const task = settle(applyAction(taskAt(2), { action: 'block', milestone: 'm3', note: 'waiting on credentials' }, 0, null).task).task
+    expect(task.status).toBe('blocked')
+    expect(statusWord(input({ task }))).toBe('BLOCKED')
+    expect(statusWord(input({ task, ...live('THINK') }))).toBe('BLOCKED · THINK')
+    expect(statusWord(input({ task, ...live('READ', 'src/api.ts', ['a1', 'a2', 'a3']) }))).toBe('BLOCKED · READ src/api.ts +3 agents')
   })
 })
 

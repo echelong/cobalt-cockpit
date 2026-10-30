@@ -198,7 +198,9 @@ export const statusWord = (input: HudInput): string => {
     const doing = activity.kind === 'IDLE' ? 'THINK' : activity.kind
     const now = activity.detail !== '' ? `${doing} ${activity.detail}` : doing
 
-    return withAgents(verdict !== '' && verdict !== 'DONE' ? `${verdict} · ${now}` : now)
+    // A finished task's live turn names only what it is doing; its DONE word and evidence return at rest. Read off the
+    // task's status, never off the verdict's text, which carries the evidence state.
+    return withAgents(verdict !== '' && task?.status !== 'done' ? `${verdict} · ${now}` : now)
   }
   if (verdict !== '') return withAgents(verdict)
 
