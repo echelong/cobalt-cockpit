@@ -34,7 +34,7 @@ Cobalt Cockpit adds a cyberpunk HUD, orchestration controls, and a local Run Led
 
 - **Observe by default.** With `orchestration: false`, Cockpit observes your existing Claude Code activity without enforcing model routing, subagent budgets, Fable blocking, or subscription-only authentication.
 - **Enforce by opt-in.** `orchestration: true` enforces the Opus/Sonnet/Haiku policy, independent pool resource budgets, and explicit task ownership. `blockFable`, `subscriptionOnly`, `cobaltStrict`, the Stop-hook guard and owner alerts are separate switches, each off until you turn it on.
-- **Evidence before DONE.** A completed turn does not complete a task. A task reads 100% and DONE only when every milestone is complete and every required gate is pass or n/a; a coding task above the LIGHT discovery level also needs its goal check to report `ALIGNED`. Missing measurements stay unknown.
+- **Evidence before DONE.** A completed turn does not complete a task. A task reads 100% and DONE only when every milestone is complete and every required gate is pass or n/a; a coding task above the LIGHT discovery level also needs its goal check to report `ALIGNED`. Missing measurements stay unknown. DONE is a task-completion status. It is not an independent verification, and not a security attestation; on `main` it is shown with what it rests on ([What DONE rests on](docs/verification.md#what-done-rests-on)).
 - **Never an approval.** Cockpit does not take part in Claude Code's permission check. Its guards run before it and can only refuse a call or ask you about it, never approve one.
 - **Local, with one exception you choose.** It makes no network request of its own: no fetch, no model call, no MCP call. The one program it starts that can is the decision router in JEV mode, in a session where you selected it ([Session router](#session-router)). Its two prompt hooks add text to the request Claude Code already sends. The Run Ledger and the local model telemetry are local, and the telemetry is on by default.
 
@@ -70,6 +70,15 @@ The fail-closed rule has one structural exception, `turn.step`: see [SECURITY.md
 
 [Static frame](docs/assets/demo/cockpit-demo-poster.png) · [How it was captured, and how to regenerate it](docs/assets/README.md) · [The captured frames as data](docs/assets/demo/frames.json)
 
+**The captures show v0.6.1, not current `main`.** The animation and every captured block in this README are what v0.6.1 printed, and they have not been edited to match later code. Current `main` labels completion differently:
+
+- A finished task reads `STATE / DONE`, where the capture reads `VERIFIED`. Its status word (for example `DONE · PROVISIONAL_CHECKED`), the `COMPLETION` line of `/cockpit ready` and `/cockpit flow`, and the progress tool's reply add what the DONE claim rests on. Those lines add `not a security attestation`, which `/cockpit ready` can cut off at the terminal's width.
+- `/cockpit flow` says `complete` where the capture says `verified`.
+- Each gate pass in `/cockpit ready` and Mission Control names its evidence state: `SELF_REPORTED_UNCHECKED · reported by Claude, not read from a command`, or `PROVISIONAL_CHECKED · read from a command`.
+- A commander's verdict on an agent result reads `commander report PASS · SELF_REPORTED_UNCHECKED`.
+
+What each state means: [What DONE rests on](docs/verification.md#what-done-rests-on).
+
 On a narrow screen the loop is small: open the static frame, or read the main frames as text in the panels below.
 
 <details>
@@ -85,7 +94,7 @@ On a narrow screen the loop is small: open the static frame, or read the main fr
 <details>
 <summary><b>Read the captured frames as text</b></summary>
 
-The HUD band while a scout and two engineers run and a reviewer waits for them (100 columns; the `SWARM:` row is shown because that task is blocked; the last three rows are the per-agent strips). How the Braille and box-drawing rows line up depends on your font; the animation shows them exactly:
+The HUD band as v0.6.1 drew it while a scout and two engineers run and a reviewer waits for them (100 columns; the `SWARM:` row is shown because that task is blocked; the last three rows are the per-agent strips). How the Braille and box-drawing rows line up depends on your font; the animation shows them exactly:
 
 ```text
 OPUS ENGINEERING ─╼─ SONNET ×3 2 active !1 0 queued 0 done ─╼─ HAIKU ×1 1 active 0 queued 0 done
@@ -101,7 +110,7 @@ OPUS / MAIN · IMPLEMENT   HAIKU+SONNET / SUBAGENTS 3/16
                        03 worker      EDIT        9s · 1 tools       ⡬   ⡫    ⢗ ⡔   ⢱  ⠑⠞⣊⠹
 ```
 
-The top of Mission Control (`/cockpit`) once the task is verified (its first 27 rows):
+The top of Mission Control (`/cockpit`) once the task read DONE, as v0.6.1 drew it (its first 27 rows). Current `main` shows `STATE / DONE`, adds the evidence state after `DONE` and names it on each gate pass:
 
 ```text
 ━ VECTOR  CONSOLE / MISSION
@@ -146,7 +155,7 @@ The top of Mission Control (`/cockpit`) once the task is verified (its first 27 
   <a href="#run-ledger-and-replay"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/modules/06-ledger-dark.svg"><source media="(prefers-color-scheme: light)" srcset="docs/assets/modules/06-ledger-light.svg"><img src="docs/assets/modules/06-ledger-dark.svg" width="32%" alt="Module 06, Ledger: Run Ledger and replay"></picture></a>
 </p>
 
-Each key links to its module below. The captured blocks inside the panels come from the same synthetic demo as the animation.
+Each key links to its module below. The captured blocks inside the panels come from the same synthetic v0.6.1 demo as the animation; [Live interface](#live-interface) lists what current `main` prints differently.
 
 ### Agent orchestration
 
@@ -159,7 +168,7 @@ Opus remains the single commander: architecture, planning, decomposition, integr
 - **Bounded tools.** Scoped agents use Read/Grep/Glob for inspection and Edit/Write for changes. Shell or custom tools require exclusive wildcard ownership, except read-only Git inspection: a task that owns named paths can run `git diff`, `show`, `log`, `status`, `grep` and `ls-files` on those paths and nothing else ([the exact rules](docs/implementation-v0.6.1.md#scoped-read-only-git-inspection)). The command that runs is rebuilt behind safe flags, and your own permission rules still decide it.
 - **A route suggestion, not a router.** Each assignment records the tier Cockpit's own rule would suggest (from the mode, the role's class, a named effort and the wave). The commander's tier stands; `/cockpit agents` shows suggested, requested, admitted, spawned, completed and verified per tier.
 - **A line when the swarm needs you.** With orchestration enforced, while a task is blocked, quiet or escalated the HUD gives one of its agent-strip rows to a static line, `SWARM: 2 BLOCKED · 1 QUIET 5m+ · 1 ESCALATED · /cockpit agents`, and no row otherwise. QUIET is the swarm's stalled mark: no activity observed for the threshold, which is not a stopped agent.
-- **Reported is not verified.** Agents return concise conclusion/evidence/change/check/uncertainty artifacts; commanders verify claims independently.
+- **Reported is not verified.** Agents return concise conclusion/evidence/change/check/uncertainty artifacts; commanders verify claims independently. The commander's verdict (`swarm action verify`) is itself a report: on `main` it is shown as a commander report (`SELF_REPORTED_UNCHECKED`), never as a check Cockpit ran.
 
 <details>
 <summary><b>Explore the swarm</b></summary>
@@ -181,7 +190,7 @@ Run waves are reconnaissance → engineering → review → integration → veri
 
 `MODULE 02` `/cockpit flow` `/cockpit status` `on by default`
 
-One row of the HUD: `INPUT → DISCOVERY → ROUTING → WORKERS → VERIFY → DONE`. Every state comes from the task's real milestones and gates and the agents the host reported; the moving marker is drawn only while work is live. Reduced motion and narrow terminals are honoured. Amber is Haiku, cyan Sonnet, violet Opus, green a verified result, and each state is also carried by its glyph, never by colour alone. Evidence that goes stale regresses the flow by itself: a gate that reverts to pending takes VERIFY back to active and DONE back to pending.
+One row of the HUD: `INPUT → DISCOVERY → ROUTING → WORKERS → VERIFY → DONE`. Every state comes from the task's real milestones and gates and the agents the host reported; the moving marker is drawn only while work is live. Reduced motion and narrow terminals are honoured. Amber is Haiku, cyan Sonnet, violet Opus, green a completed stage, and each state is also carried by its glyph, never by colour alone. A completed stage means the stage is finished, not that a check ran: on `main`, `/cockpit flow` spells it `complete` and adds a `COMPLETION` line once the task reads DONE. Evidence that goes stale regresses the flow by itself: a gate that reverts to pending takes VERIFY back to active and DONE back to pending.
 
 Progress is completed milestones over all milestones. The HUD is in one of six states:
 
@@ -192,14 +201,14 @@ Progress is completed milestones over all milestones. The HUD is in one of six s
 | ACTIVE | Tool or agent activity observed |
 | QUERY | Waiting on a question put to you, or on one of Cockpit's own asks. Claude Code's permission dialog is not tracked |
 | FAULT | Failure or blocker |
-| VERIFIED | Milestones complete and required gates satisfied |
+| DONE | Milestones complete and required gates satisfied. This is a completion status, not an independent verification: the status word adds what it rests on, such as `DONE · SELF_REPORTED_UNCHECKED`. An installation of 0.6.5 made before this change, and the v0.6.1 captures here, call this state `VERIFIED` |
 
 A completed turn does not complete a task. Missing measurements stay unknown.
 
 <details>
 <summary><b>Read the flow in words</b></summary>
 
-`/cockpit flow` prints the row for a surface without colour. While the engineers run:
+`/cockpit flow` prints the row for a surface without colour. As v0.6.1 printed it while the engineers ran (current `main` says `complete` where this says `verified`):
 
 ```text
 FLOW  ● INPUT → ● DISCOVERY → ● ROUTING → ◉ WORKERS → ○ VERIFY → ○ DONE
@@ -207,7 +216,7 @@ verified INPUT, DISCOVERY, ROUTING · active WORKERS · pending VERIFY, DONE
 observed running: HAIKU 1 · SONNET 2 · work is live · main model OPUS
 ```
 
-After verification:
+After the task read DONE (v0.6.1; current `main` also adds a `COMPLETION` line saying what DONE rests on):
 
 ```text
 FLOW  ● INPUT → ● DISCOVERY → ● ROUTING → ● WORKERS → ● VERIFY → ● DONE
@@ -223,7 +232,7 @@ no agent observed running · work is live · main model OPUS
 
 Three read-only views of what Cockpit already records about multi-agent work. None of them changes state, starts, admits or cancels an agent, or clears a hold; none invents a figure the host did not report. The first two are here; the third is [Verification Readiness](#verification-readiness).
 
-- **`/cockpit agents`** lists the swarm's tasks, the ones that need attention first (stalled, escalated, blocked, queued), with the wave, the capacity in use (`3 of 4 slots · SONNET 2/2 · HAIKU 1/2`), the delegation funnel per tier (`ROUTE HAIKU · suggested 1 · requested 1 · admitted 1 · spawned 1 · completed 0 · verified 0`: six separate facts), and the host agents Cockpit did not assign. **`/cockpit agents <task>`** shows one task: objective, bound agent, model as observed (or "not observed"), the tier the route suggested beside the one the commander requested, effort as requested, as set on the launch, as applied and as the engine reported (four different things, each "not observed" when it was not), wave, ownership (shortened claims), dependencies, children, last observed activity, the outcome as reported versus as verified by the commander, any escalation, and the blocker.
+- **`/cockpit agents`** lists the swarm's tasks, the ones that need attention first (stalled, escalated, blocked, queued), with the wave, the capacity in use (`3 of 4 slots · SONNET 2/2 · HAIKU 1/2`), the delegation funnel per tier (`ROUTE HAIKU · suggested 1 · requested 1 · admitted 1 · spawned 1 · completed 0 · verified 0`: six separate facts), and the host agents Cockpit did not assign. **`/cockpit agents <task>`** shows one task: objective, bound agent, model as observed (or "not observed"), the tier the route suggested beside the one the commander requested, effort as requested, as set on the launch, as applied and as the engine reported (four different things, each "not observed" when it was not), wave, ownership (shortened claims), dependencies, children, last observed activity, the outcome as reported versus the commander's recorded verdict (on `main`, a commander report such as `commander report PASS · SELF_REPORTED_UNCHECKED`, never a check Cockpit ran), any escalation, and the blocker.
 - **Blockers** are explained from the swarm's own admission rule, not a second scheduler: waiting for another task, a resource ownership conflict (and over what), agent capacity exhausted (with the numbers admission uses), the commander or an architect occupied, a reservation waiting for the host, a stall (ownership retained), an escalation awaiting the commander, a cancellation awaiting the host, a failure, or a completed result not yet verified. A suggestion is labelled **information only; nothing was changed**, and appears only when the recorded state supports one.
 
 <details>
@@ -262,7 +271,7 @@ blocker (dependency): Waiting for task ENG-1 (running).
 suggestion (information only; nothing was changed): Wait for ENG-1; /cockpit agents ENG-1 shows whe…
 ```
 
-`/cockpit agents` later: every agent has reported, and only the result the commander checked is verified:
+`/cockpit agents` later (v0.6.1): every agent has reported, and the commander has recorded a pass for one result, which the route line counts as `verified`. That count is the commander's own report; `/cockpit agents ENG-1` on current `main` reads `commander report PASS · SELF_REPORTED_UNCHECKED`:
 
 ```text
 AGENTS · wave ENGINEERING · 0 active · 1 waiting · 0 stalled · 0 escalated · 3 completed of 4
@@ -286,13 +295,14 @@ Read-only. /cockpit agents <task> explains one; /cockpit ready, what is left bef
 `MODULE 04` `/cockpit ready` `read-only` `approves nothing`
 
 - **`/cockpit ready`** applies the existing completion rules to the recorded task: open milestones and blockers, the six gates (a pass reported by Claude is labelled as such and never called verified; a pass that went stale is STALE), the Stop guard's hold or missing completion, an unadjudicated Opus review, the goal check's acceptance criteria and open unknowns, and, as notes, pending agent escalations and reported-but-unverified agent results. It says `PERMITS DONE` exactly when the task's own status is DONE, and is otherwise `DOES NOT PERMIT DONE` with what stands in the way. It is an explanation, not an approval.
+- **What DONE rests on** (on `main`, not yet released). A `COMPLETION` line under the verdict names the evidence a DONE claim rests on, and each gate pass names its own. `SELF_REPORTED_UNCHECKED` was reported, not checked. `PROVISIONAL_CHECKED` was read from a command: limited evidence, not proof. `PROVENANCE_UNKNOWN` is an automatic pass with no recorded result, so it cannot be attributed. That is not the same as `UNKNOWN_INVALIDATED`, evidence that is stale, unqualified or no longer holds; before DONE, the line reads `UNKNOWN_INVALIDATED` because no DONE is claimed. A stored Stop-guard pass is history, and this view does not revalidate current script trust. The line ends `not a security attestation` (a narrow terminal can cut that off), and the labels change no gate, hold or decision.
 
-The six gates are CODE, TEST, TYPE, BUILD, SECURITY and GIT. Verification gates use observed exit status and explicit reported evidence, not proof of correctness. A coding task above LIGHT cannot read DONE until `align` reports `ALIGNED`: each acceptance criterion needs its own evidence, and for that goal-checked work an observed edit after DONE takes completion back (what can go unobserved is listed in [docs/verification.md](docs/verification.md)).
+The six gates are CODE, TEST, TYPE, BUILD, SECURITY and GIT. Verification gates use observed exit status and explicit reported evidence, not proof of correctness. An observed exit 0 shows that a command passed on the tree it ran on, not that the work is correct. A coding task above LIGHT cannot read DONE until `align` reports `ALIGNED`: each acceptance criterion needs its own evidence, and for that goal-checked work an observed edit after DONE takes completion back (what can go unobserved is listed in [docs/verification.md](docs/verification.md)).
 
 <details>
 <summary><b>Understand verification</b></summary>
 
-`/cockpit ready` after a scripted failing test command:
+`/cockpit ready` after a scripted failing test command, as v0.6.1 printed it. Current `main` adds a `COMPLETION` line under the first line and words the agent note `2 completed agent results without a commander-approved PASS`:
 
 ```text
 READY · DOES NOT PERMIT DONE · 40% · status ACTIVE
@@ -311,7 +321,7 @@ ALSO
 Read-only: approves nothing, clears nothing; a reported result is not a verified one.
 ```
 
-`/cockpit ready` after the commands pass, the agent results are verified and the goal check is aligned:
+`/cockpit ready` after the commands pass, the commander has recorded its verdicts on the agent results and the goal check is aligned, as v0.6.1 printed it. On current `main` each pass also names its evidence state (`CODE pass · SELF_REPORTED_UNCHECKED · reported by Claude, not read from a command`, `TEST pass · PROVISIONAL_CHECKED · read from a command`), and a `COMPLETION` line says what DONE rests on:
 
 ```text
 READY · PERMITS DONE · 100% · status DONE
@@ -327,7 +337,7 @@ HOLDS
 Read-only: approves nothing, clears nothing; a reported result is not a verified one.
 ```
 
-The completion gate is a hold on the progress model, not a proof of correctness. Discovery levels, decision records, the goal check, what happens after DONE and the full list of limits: [docs/verification.md](docs/verification.md).
+The completion gate is a hold on the progress model, not a proof of correctness. Discovery levels, decision records, the goal check, what happens after DONE and the full list of limits: [docs/verification.md](docs/verification.md). The evidence states, and what they do not claim: [What DONE rests on](docs/verification.md#what-done-rests-on).
 
 </details>
 
@@ -340,7 +350,7 @@ Cobalt Guard tells a person when a run needs one, and can hold a stop until your
 - **Owner alerts** (`guardAlerts`, off by default). When on, a terminal notification (through Claude Code's own notification channel) tells you when a run needs a person: verification retries exhausted, a security check failed, a release NO-GO, an open mandatory review, or a blocked run. It never approves, releases or clears anything, and it cannot confirm that you saw it. No webhook, email or push.
 - **The alert inbox.** `/cockpit alerts` lists what Cobalt Guard recorded, so you can recover it after stepping away. With `guardRecordOnly` on and alerts off, incidents are written down for `/cockpit alerts` and the digest; no notification, sound, bell or reminder is ever sent for them.
 - **Calibration** (v0.6.3). `/cockpit alerts review`, `label` and `calibration` let you say which recorded incidents you would have wanted a notification for, and report how the alert policy would have done against your labels, as a simulation that sends nothing. It is an evaluation, not an automatic optimizer: it changes no setting, no notification and no enforcement. Details: [docs/implementation-v0.6.3.md](docs/implementation-v0.6.3.md).
-- **Stop-hook verification guard** (`stopGuard`, `OBSERVE` by default). `ENFORCE` runs your `verifyScript` when the agent tries to finish a task that changed files, and refuses the stop (up to the attempt limit) until the script exits 0. The script is not trusted until you enroll its sha-256 with `/cockpit guard trust`; it is re-hashed before every run and a changed script is not run.
+- **Stop-hook verification guard** (`stopGuard`, `OBSERVE` by default). `ENFORCE` runs your `verifyScript` when the agent tries to finish a task that changed files, and refuses the stop (up to the attempt limit) until the script exits 0. The script is not trusted until you enroll its sha-256 with `/cockpit guard trust`; it is re-hashed before every run and a changed script is not run. On `main`, not yet released: a completion the guard recorded counts only while the trust its check ran under is in force. `untrust`, a new enrolment, or a changed script or pin withdraws it. A check that exits 0 on a working tree the guard cannot identify is recorded as a pending TEST gate, not a pass. A stored guard result is shown as history, not as a fresh check of current trust ([details](docs/verification.md#what-done-rests-on)).
 - **No verdict changes.** An alert, a reminder, an acknowledgment or a silence never changes a gate, a hold, a review, a release approval or the task's percentage.
 
 Two command guards are on by default and are described under [Safety and trust](#safety-and-trust): the blast-radius guard and the attribution guard.
@@ -377,7 +387,7 @@ ui.notify (Cobalt Guard)
 GUARD ▲ NORMAL run blocked · task 1 · notification SENT, not acknowledged · transport not confirmed
 ```
 
-Persistence, acknowledgment, the inbox, shared history, record-only mode, priorities, quiet hours and what a notification status does and does not claim: [docs/cobalt-guard.md](docs/cobalt-guard.md). The Stop guard's trust model: [docs/implementation-v0.5.2.md](docs/implementation-v0.5.2.md).
+Persistence, acknowledgment, the inbox, shared history, record-only mode, priorities, quiet hours and what a notification status does and does not claim: [docs/cobalt-guard.md](docs/cobalt-guard.md). The Stop guard's trust model: [docs/implementation-v0.5.2.md](docs/implementation-v0.5.2.md). How a stored guard result is reported, and when it stops counting: [What DONE rests on](docs/verification.md#what-done-rests-on).
 
 </details>
 
@@ -570,6 +580,8 @@ claude plugin install cobalt-cockpit@cobalt-cockpit
 
 **2. Restart** Claude Code, open `/cockpit`, and inspect `/cockpit version`. By default Cockpit **observes**; orchestration enforcement is opt-in.
 
+**Which code you have.** This page describes `main`. The manifest has read 0.6.5 since the 0.6.5 version commit, and the commits after it are not in a release, including the completion reporting and Stop-guard trust rule described here. An installation copies the repository as it was fetched, so one made from current `main` includes them while still reading 0.6.5, and one made from the 0.6.5 version commit does not. On the older code a finished task reads `VERIFIED`, not `DONE` followed by its evidence state. `claude plugin update` compares versions, so an installation of 0.6.5 is told it is up to date and receives none of these commits until the version changes ([CHANGELOG](CHANGELOG.md)).
+
 **3. Optional: enforce orchestration** with the supported configuration CLI:
 
 ```sh
@@ -657,7 +669,7 @@ The complete reference. The `/cockpit guard` and `/cockpit alerts` commands that
 | `/cockpit stats` / `/cockpit stats 7d\|30d\|all [--json\|--csv]` | Print the local model telemetry for a window; reads the telemetry files and nothing else |
 | `/cockpit doctor` | Read-only installation, host, Auto-mode, telemetry-storage and prompt-cache diagnostics |
 | `/cockpit guard` / `/cockpit guard ack\|silence\|unsilence\|trust [hash]\|untrust\|release` | Owner-alert status (open conditions, reminders used, persistence and sound, notification transport), acknowledgment and silence, and the Stop guard's script enrollment and release (typed by a person only) |
-| `/cockpit agents` / `/cockpit agents <task>` | The agent inspector: every swarm task with its tier, state, wave, ownership, dependencies, requested versus applied effort, last observed activity, reported versus verified outcome, and why it is waiting. Read-only |
+| `/cockpit agents` / `/cockpit agents <task>` | The agent inspector: every swarm task with its tier, state, wave, ownership, dependencies, requested versus applied effort, last observed activity, the reported outcome versus the commander's recorded verdict, and why it is waiting. Read-only |
 | `/cockpit ready` | Which recorded conditions stand between the task and DONE: milestones, the six gates (with stale and reported-only evidence called out), the Stop guard, the Opus review, the goal check, and pending agent escalations. Read-only; approves nothing |
 | `/cockpit alerts export` / `/cockpit alerts legacy [delete <code>]` | A bounded, closed-vocabulary JSON export of this project's alert occurrences (typed by you; printed, never written or sent), and a dry-run-first cleanup of the v0.5.7/v0.5.8 history keys that deletes only what exists elsewhere |
 | `/cockpit alerts [page]` / `/cockpit alerts digest` / `/cockpit alerts ack <id>` | The alert inbox: recorded alerts with their notification outcome, acknowledgment and whether the condition is still open (or UNKNOWN, when another session raised it); `digest` adds an Attention section for acknowledged incidents still open; acknowledge exactly one occurrence. Person-only to acknowledge; changes no gate, hold, review, approval or verdict |
@@ -749,6 +761,8 @@ Every option with its type and full description, including the Stop guard and al
 <summary><b>Known limits, and what is not verified</b></summary>
 
 - Verification gates use observed exit status and explicit reported evidence, not proof of correctness. Goal-check evidence is recorded as `reported`, never as independently verified.
+- DONE is a task-completion status, and no state Cockpit shows is a security attestation. On `main` the name `SECURITY_ATTESTED` is reserved and never produced. A self-reported pass is not a check, an observed exit 0 is limited evidence, and a commander's verdict on an agent result is a report. A stored Stop-guard result is history, not a fresh check of current trust.
+- On `main` (not yet released), the completion labels change no gate, hold, `ALIGNED` rule or release decision. Two rules do change behaviour. An exit 0 on a working tree that cannot be identified is not a pass, and a Stop-guard completion counts only under the trust in force. None of this changes how the working tree is measured, so it does not resolve the open findings on how nested repositories and submodules are measured (F01) or on the resource bounds of listing a working tree (A2) ([What DONE rests on](docs/verification.md#what-done-rests-on)).
 - The guards are heuristic and cannot recognize every shell program or obfuscated command. They are not a sandbox.
 - Redaction is heuristic: review exports before sharing, and never export secrets.
 - An effort level is requested, not guaranteed; the level the Ledger shows as applied is host-resolution evidence, not an independently captured wire receipt.

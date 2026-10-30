@@ -21,6 +21,8 @@ No option was added for [Guard Calibration](implementation-v0.6.3.md). With `gua
 
 43 options. "empty" is an empty string.
 
+The descriptions are the manifest's own words. Where one says "verified" (the `sounds` cue, `verifyScript`), it means the task reached DONE, or the enrolled script exited 0 (on `main`, on a working tree the Stop guard could identify). It does not mean independent verification or a security attestation: [What DONE rests on](verification.md#what-done-rests-on).
+
 | Option | Type | Default | What it does |
 | --- | --- | --- | --- |
 | `hud` | boolean | `true` | **Show the HUD.** Draw the compact particle progress band above the prompt. |

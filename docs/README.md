@@ -8,7 +8,7 @@ The root [README](../README.md) is the front page. These files hold the detail.
 | --- | --- |
 | [orchestration.md](orchestration.md) | Observation and enforcement, elastic execution, task ownership, waves and escalation, dynamic reasoning effort |
 | [sonnet-led.md](sonnet-led.md) | The `SONNET_LED` profile: Sonnet as the main loop, Opus as an admitted read-only consultation, setup and rollback |
-| [verification.md](verification.md) | Discovery levels, decision records, the goal check, what happens after DONE, and the limits of all of it |
+| [verification.md](verification.md) | Discovery levels, decision records, the goal check, what happens after DONE, what a DONE claim rests on, and the limits of all of it |
 | [cobalt-guard.md](cobalt-guard.md) | Owner alerts: persistence, the inbox, shared history, record-only mode, priorities, quiet hours, the pinned row, notification transport, calibration |
 | [session-router.md](session-router.md) | The optional per-session router (NobodyWho or JEV), what it may recommend, what JEV sends, and the read-only NobodyWho telemetry |
 | [configuration.md](configuration.md) | Every option with its type, default and description, printed from the manifest |
