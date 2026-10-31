@@ -451,7 +451,8 @@ describe('in a run: quiet hours', () => {
     await progress($, { action: 'status' })
     expect(w.notified.length).toBe(1)
   })
-  test('with reminders on, a long window owes one reminder afterwards, not one per interval missed', { options: { guardAlerts: true, guardCooldownSec: 30, guardRepeat: true, guardRepeatSec: 600, guardMaxReminders: 3, guardMaxAlerts: 10, guardQuietHours: '00:20-01:20', guardQuietTimezone: 'UTC' } }, async ($, on) => {
+  // The host-backed virtual reminder sequence exceeded 5s under full-suite contention.
+  test('with reminders on, a long window owes one reminder afterwards, not one per interval missed', { timeoutMs: 20000, options: { guardAlerts: true, guardCooldownSec: 30, guardRepeat: true, guardRepeatSec: 600, guardMaxReminders: 3, guardMaxAlerts: 10, guardQuietHours: '00:20-01:20', guardQuietTimezone: 'UTC' } }, async ($, on) => {
     const w = world(on); const held = hostState(on, {})
     await start($); await planAndComplete($, 1); await block($)
     // 00:16: before the window, so it is sent

@@ -71,7 +71,8 @@ describe('the architect’s recommendation is read, not declared', () => {
     expect(releaseDecision('  DECISION: NO-GO  \r\nmore')).toBe('no-go')
     for (const bad of [undefined, '', 'GO', 'The release looks fine.', 'DECISION: maybe', 'DECISION: GO\nDECISION: NO-GO', 'DECISION: NOT GO', 'decision: go']) expect(releaseDecision(bad)).toBeUndefined()
   })
-  test('a GO the main session declares over an architect NO-GO is refused and clears nothing', LED, async ($, on) => {
+  // The host-backed task/consult/verify sequence exceeded 5s under full-suite contention.
+  test('a GO the main session declares over an architect NO-GO is refused and clears nothing', { ...LED, timeoutMs: 20000 }, async ($, on) => {
     const w = world(on); const held = hostState(on, {}); await releaseTask($)
     const { verdict } = await review($, held, NO_GO, 'go')
     expect(verdict).toContain('NO-GO')

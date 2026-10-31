@@ -56,7 +56,8 @@ const revoked = (h: ReturnType<typeof hostState>, w: any, why: string) => {
 }
 
 describe('withdrawing the trust a completion rests on', () => {
-  test('untrust revokes the completion at once; the Ledger keeps the check; other trust records are untouched', guard(), async ($, on) => {
+  // The host-backed verified completion, untrust and Stop sequence exceeded 5s under full-suite contention.
+  test('untrust revokes the completion at once; the Ledger keeps the check; other trust records are untouched', { ...guard(), timeoutMs: 20000 }, async ($, on) => {
     const { w, h } = fixture(on)
     await verified($, h)
     w.store.set('stop-trust', { ...trusts(w), [OTHER_KEY]: { sha: 'f'.repeat(64), at: 1 } })

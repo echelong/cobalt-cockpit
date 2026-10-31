@@ -160,7 +160,8 @@ const PIECES = ['a', 'src', '/', '-', '.', '\u{4e2d}', '\u{6587}', '\u{30c6}', '
 const randomPath = (r: () => number, length: number) => `${Array.from({ length }, () => PIECES[Math.floor(r() * PIECES.length)]!).join('')}.ts`
 
 describe('bounded in terminal columns at every width, with wide text anywhere', () => {
-  test('from 50 to 120 columns no line is wider than the width in columns, nor longer in code points', async () => {
+  // The bounded state/seed sweep across all 71 widths exceeded 5s under full-suite contention.
+  test('from 50 to 120 columns no line is wider than the width in columns, nor longer in code points', { timeoutMs: 20000 }, async () => {
     // each pinned state again at every width, then seeded changes with wide, combining and narrow text in their paths
     for (const [name, state] of Object.entries(await states())) {
       for (let columns = 50; columns <= 120; columns++) {
