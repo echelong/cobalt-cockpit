@@ -105,7 +105,7 @@ Cockpit has no control over Claude Code's own transcripts, logs or history, whic
 What Cockpit provides:
 
 - `/cockpit reset` clears the current task from the session.
-- `/clear` in Claude Code ends the conversation; Cockpit then clears the task, activity, guard findings, HUD state and orchestration counters for the session.
+- `/clear` in Claude Code ends the conversation; Cockpit then clears the task, activity, guard findings, HUD state and orchestration counters for the session. This does not stop a running background agent, and Cockpit's ownership record does not carry over ([limits](docs/orchestration.md#what-task-ownership-does-and-does-not-guarantee)).
 - Setting `localControl` to false stops the NobodyWho reads.
 - Setting `telemetry` to false stops the local model telemetry from being written (restart Claude Code to apply it). It deletes nothing, and `/cockpit stats` still reads what exists.
 

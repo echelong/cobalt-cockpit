@@ -2,6 +2,8 @@
 // This does not establish host fencing or drain already admitted effects.
 import { expect, test } from 'claude-code/testing'
 import type { Ledger } from '../types'
+import { agentsText, swarmHint, taskText } from '../hooks/inspector'
+import { emptySwarm, spawnRefusal, submitTask } from '../hooks/swarm'
 import { command, hostState, mountHud, rowsOf, start, world } from './world'
 
 type Engine = Parameters<typeof start>[0]
@@ -98,17 +100,284 @@ test('failed durable claim persistence prevents dispatch and permits safe retry'
   fail = false; expect((await spawn($, 'retry')).agentId).toBeDefined()
 })
 
-test('authoritative downstream denial releases without claiming a stopped agent', options, async ($, on) => {
+// Past the dispatch boundary `next` may have reached the host: a chain answer does not show nothing started.
+const downstream = (on: Parameters<typeof world>[0], answer: (host: any, e: any, handler: (...args: any[]) => any) => any) => ((event: string, handler: (...args: any[]) => any) => {
+  if (event === 'agent.spawn') return on('agent.spawn', (host, e) => answer(host, e, handler))
+  return (on as any)(event, handler)
+}) as typeof on
+const noStartKeys = (w: ReturnType<typeof world>) => [...w.store.keys()].filter(k => k.startsWith('spawn-no-start:'))
+
+test('a true downstream refusal keeps ownership and cannot be retried into a second dispatch', options, async ($, on) => {
   let deny = true
+  const w = world(downstream(on, (host, e, handler) => deny ? { deny: 'Refused without next' } : handler(host, e)), { sessionId: 'mock-session' }); const h = hostState(on, {})
+  await start($); await assign($, 'held')
+  expect((await spawn($, 'held')).deny).toContain('Refused without next')
+  expect(w.spawns).toHaveLength(0)
+  expect(task(h, 'held').state).toBe('reserved')
+  expect(task(h, 'held').spawnUncertain).toBe(true)
+  expect(task(h, 'held').startedAt).not.toBeNull()
+  expect(task(h, 'held').reason).toContain('Refused without next')
+  expect(ledger(h).swarm!.events.some(ev => ev.kind === 'spawn_refused_after_dispatch' && ev.taskId === 'held')).toBe(true)
+  expect(noStartKeys(w)).toHaveLength(0)
+  deny = false
+  const again = (await spawn($, 'held')).deny!
+  expect(again).toContain('held is held: an agent may have started')
+  expect(again).toContain('this call did not dispatch it again')
+  expect(again).not.toContain('Nothing was started')
+  expect(again).not.toContain('retry after')
+  await assign($, 'replacement'); expect((await spawn($, 'replacement')).deny).toContain('ownership conflict')
+  expect(w.spawns).toHaveLength(0)
+})
+
+test('a refusal is kept on one line and bounded', options, async ($, on) => {
+  world(downstream(on, () => ({ deny: `Refused\nsecond line\t${'x'.repeat(600)}` })), { sessionId: 'mock-session' }); const h = hostState(on, {})
+  await start($); await assign($, 'held'); await spawn($, 'held')
+  expect(task(h, 'held').reason).not.toContain('\n')
+  expect(task(h, 'held').reason!.length).toBeLessThan(400)
+})
+
+test('a refusal cannot put control characters on the HUD or rejoin a secret', options, async ($, on) => {
+  const secret = `sk-${'a'.repeat(4)}\u0000${'b'.repeat(20)}`
+  world(downstream(on, () => ({ deny: `Refused\u001b[31m\u0007 \u009b1m \u202emoved ${secret}` })), { sessionId: 'mock-session' }); const h = hostState(on, {})
+  await start($); await assign($, 'held'); await spawn($, 'held')
+  const reason = task(h, 'held').reason!
+  expect(/[\p{Cc}\p{Cf}]/u.test(reason)).toBe(false)
+  expect(reason).not.toContain('aaaa')
+  expect(reason).not.toContain('bbbb')
+  const event = ledger(h).swarm!.events.find(ev => ev.kind === 'spawn_refused_after_dispatch')!
+  expect(/[\p{Cc}\p{Cf}]/u.test(event.detail)).toBe(false)
+})
+
+test('a refusal with nothing left after sanitising still reads as a refusal', options, async ($, on) => {
+  world(downstream(on, () => ({ deny: '\u0007\u0008' })), { sessionId: 'mock-session' }); const h = hostState(on, {})
+  await start($); await assign($, 'held'); await spawn($, 'held')
+  expect(task(h, 'held').reason).toContain('no reason given')
+  expect(task(h, 'held').state).toBe('reserved')
+})
+
+const legacy = ($: Engine, id: string) => $.agent.spawn({ prompt: 'Legacy work', description: `legacy work ${id}`, subagentType: 'cobalt-cockpit:worker', tool_use_id: id, parentModel: 'claude-opus-5-5' } as never)
+
+test('a legacy retry of a held spawn is told a retry cannot succeed', options, async ($, on) => {
+  let deny = true
+  const w = world(downstream(on, (host, e, handler) => deny ? { deny: 'Refused' } : handler(host, e)), { sessionId: 'mock-session' }); const h = hostState(on, {})
+  await start($)
+  expect((await legacy($, 'first')).deny).toBe('Refused')
+  deny = false
+  const retry = (await legacy($, 'second')).deny!
+  expect(retry).toContain('ownership conflict')
+  expect(retry).toContain('held after an uncertain spawn')
+  expect(retry).toContain('a retry cannot succeed')
+  expect(retry).not.toContain('retry after')
+  expect(w.spawns).toHaveLength(0)
+  expect(ledger(h).swarm!.tasks.filter(t => t.spawnUncertain)).toHaveLength(1)
+})
+
+test('a conflict with a task that can finish still invites a retry', options, async ($, on) => {
+  world(on, { sessionId: 'mock-session' }); hostState(on, {})
+  await start($); await assign($, 'running'); await assign($, 'second')
+  expect((await spawn($, 'running')).agentId).toBeDefined()
+  const refused = (await spawn($, 'second')).deny!
+  expect(refused).toContain('ownership conflict: running')
+  expect(refused).toContain('retry after dependency/ownership/resource clears')
+  expect(refused).not.toContain('uncertain')
+  expect((await $.tool.call({ tool: 'Bash', command: 'printf x > /elsewhere' } as never)).deny).not.toContain('uncertain')
+})
+
+test('work depending on a held task is told waiting does not clear it', options, async ($, on) => {
+  world(downstream(on, () => ({ deny: 'Refused' })), { sessionId: 'mock-session' }); hostState(on, {})
+  await start($); await assign($, 'held', 'write', ['/work/one.ts'])
+  await spawn($, 'held')
+  await control($, { action: 'assign', task_id: 'after', tier: 'SONNET', role: 'Engineer', objective: 'Bounded after', owned_resources: ['/work/two.ts'], mode: 'write', scope: 'after', dependencies: ['held'], spawn_reason: 'test' })
+  const refused = (await spawn($, 'after')).deny!
+  expect(refused).toContain('dependency held')
+  expect(refused).toContain('a retry cannot succeed')
+  expect(refused).not.toContain('retry after')
+})
+
+test('a full budget names the slots a hold keeps', { options: { orchestration: true, maxSubagents: 1, animation: false } }, async ($, on) => {
+  world(downstream(on, () => ({ deny: 'Refused' })), { sessionId: 'mock-session' }); hostState(on, {})
+  await start($); await assign($, 'held', 'write', ['/work/one.ts']); await assign($, 'other', 'write', ['/work/two.ts'])
+  await spawn($, 'held')
+  const refused = (await spawn($, 'other')).deny!
+  expect(refused).toContain('resource budget')
+  expect(refused).toContain('1 held after an uncertain spawn: waiting does not clear those')
+})
+
+test('a commander effect is told a hold is only part of what stops it', options, async ($, on) => {
+  world(downstream(on, (host, e, handler) => e.description.includes('[task:held]') ? { deny: 'Refused' } : handler(host, e)), { sessionId: 'mock-session' }); hostState(on, {})
+  await start($); await assign($, 'healthy', 'write', ['/work/healthy.ts']); await assign($, 'held', 'write', ['/work/held.ts'])
+  expect((await spawn($, 'healthy')).agentId).toBeDefined()
+  await spawn($, 'held')
+  const write = (await $.tool.call({ tool: 'Write', file_path: '/work/healthy.ts', content: 'x' } as never)).deny!
+  expect(write).toContain('conflicts with active ownership')
+  expect(write).not.toContain('uncertain')
+  const shell = (await $.tool.call({ tool: 'Bash', command: 'printf x > /elsewhere' } as never)).deny!
+  expect(shell).toContain('1 of 2 holders is an uncertain spawn')
+})
+
+test('a sibling refused while the claim is being written is not told waiting cannot help', options, async ($, on) => {
+  let entered!: () => void; let release!: () => void
+  const reached = new Promise<void>(r => { entered = r }); const gate = new Promise<void>(r => { release = r })
   const registering = ((event: string, handler: (...args: any[]) => any) => {
-    if (event === 'agent.spawn') return on('agent.spawn', (host, e) => deny ? { deny: 'Host refused before start' } : handler(host, e))
+    if (event === 'store.set') return on('store.set', async (host, e) => { if (String((e as { key?: unknown }).key).startsWith('spawn-claim:')) { entered(); await gate } return handler(host, e) })
     return (on as any)(event, handler)
   }) as typeof on
-  const w = world(registering, { sessionId: 'mock-session' }); const h = hostState(on, {}); await start($); await assign($, 'retry')
-  expect((await spawn($, 'retry')).deny).toContain('before start')
-  expect(task(h, 'retry').state).toBe('queued'); expect(task(h, 'retry').startedAt).toBeNull()
+  world(registering, { sessionId: 'mock-session' }); hostState(on, {})
+  await start($); await assign($, 'first'); await assign($, 'second')
+  const pending = spawn($, 'first'); await reached
+  const refused = (await spawn($, 'second')).deny!
+  expect(refused).toContain('ownership conflict')
+  expect(refused).toContain('retry after dependency/ownership/resource clears')
+  expect(refused).not.toContain('a retry cannot succeed')
+  release(); expect((await pending).agentId).toBeDefined()
+})
+
+test('an uncertain claim keeps its reason through a stall', options, async ($, on) => {
+  let first = true
+  const w = world(downstream(on, async (host, e, handler) => { const r = await handler(host, e); if (first) { first = false; return { model: r.model } } return r }), { sessionId: 'mock-session' }); const h = hostState(on, {})
+  await start($); await assign($, 'held'); await spawn($, 'held')
+  await w.clock.advance(600001); await control($, { action: 'status' })
+  expect(task(h, 'held').state).toBe('stalled')
+  expect(task(h, 'held').reason).toContain('Spawn outcome uncertain')
+})
+
+test('a held claim keeps its refusal through a stall', options, async ($, on) => {
+  const w = world(downstream(on, () => ({ deny: 'Plugin refused this' })), { sessionId: 'mock-session' }); const h = hostState(on, {})
+  await start($); await assign($, 'held'); await spawn($, 'held')
+  await w.clock.advance(600001); await control($, { action: 'status' })
+  expect(task(h, 'held').state).toBe('stalled')
+  expect((await command($, 'agents held')).text).toContain('Refusal: Plugin refused this')
+})
+
+const uncertainTask = (tier: 'OPUS' | 'SONNET', owned = ['/a']) => {
+  const s = submitTask(emptySwarm(), { id: 'held', tier, role: tier === 'OPUS' ? 'ARCHITECT' : 'WORKER', objective: 'Bounded', mode: 'write', owned, spawnReason: 'test' } as never, 1).swarm
+  return { ...s, config: { ...s.config, opus: 1 }, tasks: s.tasks.map(t => ({ ...t, state: 'reserved' as const, startedAt: 1, spawnUncertain: true })) }
+}
+
+test('an Opus claim is not said to hold commander effects', () => {
+  expect(swarmHint(uncertainTask('OPUS'), 120)).toBe('SWARM: 1 UNCERTAIN · ownership retained · /cockpit agents')
+  expect(swarmHint(uncertainTask('SONNET'), 120)).toContain('commander effects held')
+  expect(agentsText({ swarm: uncertainTask('OPUS'), agents: [], now: 2, columns: 120 })).not.toContain('commander shell')
+  expect(taskText({ swarm: uncertainTask('OPUS'), agents: [], now: 2, columns: 120 }, 'held')).toContain('Commander effects are not held')
+  expect(taskText({ swarm: uncertainTask('SONNET'), agents: [], now: 2, columns: 120 }, 'held')).toContain('Held now: commander shell')
+})
+
+for (const reason of ['task running', 'task stalled', 'task completed', 'task failed', 'task cancelled', 'task escalated', 'dependency x: failed', 'dependency x: cancelled', 'dependency x: unknown']) {
+  test(`${reason} is not told to retry after it clears`, () => {
+    const answer = spawnRefusal(emptySwarm(), 'n', reason, new Set())
+    expect(answer).toContain('A retry alone cannot succeed')
+    expect(answer).not.toContain('retry after')
+  })
+}
+
+test('a stuck overlap is named even when admission names a healthy task first', () => {
+  const held = uncertainTask('SONNET', ['/x'])
+  const s = { ...held, tasks: [{ ...held.tasks[0]!, id: 'healthy', spawnUncertain: false, state: 'running' as const, agentId: 'a' }, ...held.tasks, { ...held.tasks[0]!, id: 'new', spawnUncertain: false, state: 'queued' as const }] }
+  const answer = spawnRefusal(s, 'new', 'ownership conflict: healthy', new Set())
+  expect(answer).toContain('held is held after an uncertain spawn')
+  expect(answer).not.toContain('retry after')
+  expect(spawnRefusal(s, 'new', 'ownership conflict: healthy', new Set(['held']))).toContain('retry after')
+})
+
+test('a held claim is visible to the operator with its cost and its limits', options, async ($, on) => {
+  world(downstream(on, () => ({ deny: 'Plugin refused this' })), { sessionId: 'mock-session' }); hostState(on, {})
+  await start($); await assign($, 'held', 'write', ['/work/named.ts']); await spawn($, 'held')
+  const shell = (await $.tool.call({ tool: 'Bash', command: 'printf x > /elsewhere' } as never)).deny!
+  expect(shell).toContain('held until active ownership releases')
+  expect(shell).toContain('held by an uncertain spawn: waiting does not clear that and no command releases it')
+  expect(shell).toContain('/cockpit agents')
+  const write = (await $.tool.call({ tool: 'Write', file_path: '/work/named.ts', content: 'x' } as never)).deny!
+  expect(write).toContain('conflicts with active ownership')
+  expect(write).toContain('waiting does not clear that')
+  const hud = await mountHud($, 'terminal', 120, true)
+  expect((await rowsOf(hud)).join('\n')).toContain('1 UNCERTAIN · ownership retained · commander effects held · /cockpit agents')
+  await hud.unmount()
+  const list = (await command($, 'agents')).text!
+  expect(list).toContain('HELD · 1 UNCERTAIN')
+  expect(list).toContain('commander shell and custom tools refused')
+  const one = (await command($, 'agents held')).text!
+  expect(one).toContain('Plugin refused this')
+  for (const line of ['No command releases it', '--resume of this session restores it', 'A new session leaves it behind', 'Reads continue']) expect(one).toContain(line)
+  for (const line of one.split('\n').filter(l => /^(Not proof|Ends only|Held now|No command|A new session)/.test(l))) expect(line.length).toBeLessThanOrEqual(80)
+})
+
+test('a denial after the host started an agent is not a no-start', options, async ($, on) => {
+  const w = world(downstream(on, async (host, e, handler) => { await handler(host, e); return { deny: 'Started, then refused' } }), { sessionId: 'mock-session' }); const h = hostState(on, {})
+  await start($); await assign($, 'started')
+  expect((await spawn($, 'started')).deny).toContain('Started, then refused')
+  expect(w.spawns).toHaveLength(1)
+  expect(task(h, 'started').startedAt).not.toBeNull()
+  expect(task(h, 'started').endedAt).toBeNull()
+  expect(noStartKeys(w)).toHaveLength(0)
+  await assign($, 'replacement'); expect((await spawn($, 'replacement')).deny).toContain('ownership conflict')
+  expect(w.spawns).toHaveLength(1)
+})
+
+test('a downstream refusal survives restart with no settlement', options, async ($, on) => {
+  const w = world(downstream(on, () => ({ deny: 'Refused' })), { sessionId: 'settlement-session' }); const h = hostState(on, {})
+  await start($); await assign($, 'held'); await spawn($, 'held')
+  expect(noStartKeys(w)).toHaveLength(0)
+  h.delete('run-ledger'); await start($)
+  expect(task(h, 'held').startedAt).not.toBeNull()
+  await assign($, 'replacement')
+  expect((await spawn($, 'replacement')).deny).toContain('ownership conflict')
   expect(w.spawns).toHaveLength(0)
-  deny = false; expect((await spawn($, 'retry')).agentId).toBeDefined()
+})
+
+test('a downstream refusal keeps ownership when the ledger cannot be written', options, async ($, on) => {
+  let fail = false
+  const w = world(downstream(on, () => { fail = true; return { deny: 'Refused' } }), { sessionId: 'fault-session' }); const h = hostState(on, {}, { set: key => fail && key === 'run-ledger' })
+  await start($); await assign($, 'held')
+  expect((await spawn($, 'held')).deny).toContain('Refused')
+  fail = false; w.failStoreWrites = ['ledger:fault-session']; h.delete('run-ledger'); await start($)
+  await assign($, 'replacement')
+  expect((await spawn($, 'replacement')).deny).toContain('ownership conflict')
+  expect(noStartKeys(w)).toHaveLength(0)
+})
+
+test('a late downstream refusal keeps overlapping admissions blocked before and after it arrives', options, async ($, on) => {
+  let entered!: () => void; let release!: () => void
+  const reached = new Promise<void>(r => { entered = r }); const gate = new Promise<void>(r => { release = r })
+  const w = world(downstream(on, async () => { entered(); await gate; return { deny: 'Late refusal' } }), { sessionId: 'mock-session' }); const h = hostState(on, {})
+  await start($); await assign($, 'late'); await assign($, 'replacement')
+  const pending = spawn($, 'late'); await reached
+  // Still in flight, so it may yet bind: nothing says waiting cannot help.
+  const again = (await spawn($, 'late')).deny!
+  expect(again).toContain('late is being dispatched')
+  expect(again).not.toContain('No command releases')
+  const early = (await spawn($, 'replacement')).deny!
+  expect(early).toContain('ownership conflict')
+  expect(early).toContain('retry after dependency/ownership/resource clears')
+  expect(early).not.toContain('a retry cannot succeed')
+  await w.clock.advance(600001); await control($, { action: 'status' })
+  expect(task(h, 'late').state).toBe('stalled')
+  release(); expect((await pending).deny).toContain('Late refusal')
+  expect(task(h, 'late').startedAt).not.toBeNull()
+  expect(task(h, 'late').reason).toContain('Late refusal')
+  const late = (await spawn($, 'replacement')).deny!
+  expect(late).toContain('ownership conflict')
+  expect(late).toContain('a retry cannot succeed')
+})
+
+for (const [name, answer] of [['empty deny', { deny: '' }], ['blank deny', { deny: '   ' }]] as const) {
+  test(`${name} after dispatch binds nothing and releases nothing`, options, async ($, on) => {
+    const w = world(downstream(on, () => answer), { sessionId: 'mock-session' }); const h = hostState(on, {})
+    await start($); await assign($, 'held'); await spawn($, 'held').catch(() => undefined)
+    expect(task(h, 'held').agentId).toBeNull()
+    expect(task(h, 'held').startedAt).not.toBeNull()
+    expect(noStartKeys(w)).toHaveLength(0)
+    await assign($, 'replacement'); expect((await spawn($, 'replacement')).deny).toContain('ownership conflict')
+  })
+}
+
+test('liveness cost: a refused named-path spawn holds commander effects but not inspection', options, async ($, on) => {
+  const w = world(downstream(on, () => ({ deny: 'Refused' })), { sessionId: 'mock-session' }); hostState(on, {})
+  await start($); await assign($, 'held', 'write', ['/work/named.ts']); await spawn($, 'held')
+  const reached = w.ran.length
+  expect((await $.tool.call({ tool: 'Bash', command: 'printf x > /elsewhere' } as never)).deny).toContain('held until active ownership releases')
+  expect((await $.tool.call({ tool: 'Write', file_path: '/work/named.ts', content: 'x' } as never)).deny).toContain('conflicts with active ownership')
+  expect(w.ran).toHaveLength(reached)
+  expect((await $.tool.call({ tool: 'Read', file_path: '/work/named.ts' } as never)).deny).toBeUndefined()
 })
 
 test('late verified ID binds once while concurrent overlapping admissions stay blocked', options, async ($, on) => {
@@ -162,23 +431,6 @@ test('failed claim readback before dispatch settles a partial write and survives
   expect(w.spawns).toHaveLength(0); expect(task(h, 'retry').startedAt).toBeNull()
   fail = false; h.delete('run-ledger'); await start($)
   expect((await spawn($, 'retry')).agentId).toBeDefined()
-})
-
-test('denial with failed no-start settlement retains ownership through restart', options, async ($, on) => {
-  const registering = ((event: string, handler: (...args: any[]) => any) => {
-    if (event === 'agent.spawn') return on('agent.spawn', () => ({ deny: 'Definite no-start' }))
-    if (event === 'store.set') return on('store.set', (host, e) => {
-      if (e.key.startsWith('spawn-no-start:')) throw new Error('no-start persistence failed')
-      return handler(host, e)
-    })
-    return (on as any)(event, handler)
-  }) as typeof on
-  const w = world(registering, { sessionId: 'settlement-session' }); const h = hostState(on, {})
-  await start($); await assign($, 'held'); await spawn($, 'held')
-  expect(task(h, 'held').startedAt).not.toBeNull()
-  h.delete('run-ledger'); await start($); await assign($, 'replacement')
-  expect((await spawn($, 'replacement')).deny).toContain('ownership conflict')
-  expect(w.spawns).toHaveLength(0)
 })
 
 test('claim enumeration failure cannot permit replacement dispatch', options, async ($, on) => {

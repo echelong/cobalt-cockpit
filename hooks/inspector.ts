@@ -10,7 +10,7 @@
 // engine applied; a result an agent reported is not a result anyone verified; a task nobody has seen move has no "last activity".
 // What is unknown says so.
 
-import { admissionReason, limitsOf, occupancyOf, routingOf } from './swarm'
+import { admissionReason, limitsOf, occupancyOf, REFUSED_AFTER_DISPATCH, routingOf } from './swarm'
 import { shortenPaths, shortResource } from './paths'
 import type { LedgerAgent, ModelTier, RouteCounts, Swarm, SwarmTask } from '../types'
 
@@ -37,9 +37,21 @@ export type Blocker = {
   kind: BlockerKind
   /** Why it is not progressing, from recorded state only. */
   why: string
+  /** Lines of their own, under the suggestion, in `/cockpit agents <task>`. */
+  notes?: readonly string[]
   /** Information only: what could move it. Absent when the recorded state supports no suggestion. Nothing is done by it. */
   suggestion?: string
 }
+
+/** Each fits an 80-column line: a clipped line here would hide the cost or the way out. Only the refusal itself may be clipped. */
+const UNCERTAIN_NOTES = [
+  'Not proof of an end: no id, no listing, refusal, elapsed time, cancel request.',
+  "Ends only on a verified agent id followed by that agent's reported end.",
+] as const
+const UNCERTAIN_EXIT = [
+  'No command releases it, and --resume of this session restores it.',
+  'A new session leaves it behind and shows nothing about what the agent did.',
+] as const
 
 /**
  * Why this task is not progressing, or null when it is progressing (or finished and settled). For a task waiting for admission
@@ -47,8 +59,13 @@ export type Blocker = {
  * form fail rather than this explanation quietly going wrong.
  */
 export const blockerOf = (s: Swarm, t: SwarmTask, now: number): Blocker | null => {
-  if (t.spawnUncertain && isLive(t)) return { kind: 'awaiting-spawn', why: 'Spawn outcome uncertain; an agent may have started. Ownership is retained.', suggestion: 'A missing ID, absent listing, elapsed time or cancellation request does not establish termination. Wait for a verified spawn ID or positive no-start evidence.' }
-  if (t.cancellationRequested && isLive(t)) return { kind: 'cancelling', why: 'Cancellation was requested; ownership is held until the host confirms the agent stopped.', suggestion: 'Wait for the host to report the stop. Nothing here cancels or releases anything.' }
+  if (t.spawnUncertain && isLive(t)) return {
+    kind: 'awaiting-spawn',
+    why: 'Spawn outcome uncertain; an agent may have started. Ownership is retained.',
+    suggestion: 'Nothing here releases it.',
+    notes: [...UNCERTAIN_NOTES, t.tier === 'OPUS' ? 'Held now: its slot and overlapping tasks. Commander effects are not held.' : 'Held now: commander shell, custom tools, overlapping writes. Reads continue.', ...UNCERTAIN_EXIT, ...(t.reason?.startsWith(REFUSED_AFTER_DISPATCH) === true ? [`Refusal: ${t.reason.slice(REFUSED_AFTER_DISPATCH.length)}`] : [])],
+  }
+  if (t.cancellationRequested && isLive(t)) return { kind: 'cancelling', why: 'Cancellation was requested; ownership is held until the host reports the agent ended.', suggestion: 'Wait for that report; it does not show that effects stopped. Nothing here cancels or releases anything.' }
   if (t.state === 'queued' || t.state === 'blocked') {
     const reason = admissionReason(s, t.id)
     if (reason === null) return { kind: 'admissible', why: 'Nothing recorded stops it: it is admissible now and has not been admitted.', suggestion: 'The commander admits it; Cockpit does not start work by itself.' }
@@ -84,7 +101,7 @@ export const blockerOf = (s: Swarm, t: SwarmTask, now: number): Blocker | null =
   if (t.state === 'reserved') return { kind: 'awaiting-spawn', why: 'A slot and its ownership are reserved; the host has not yet reported the agent.', suggestion: 'Only positive no-start evidence permits release; an absent agent does not.' }
   if (t.state === 'stalled') {
     const quiet = ageOf(now - t.lastActivityAt)
-    return { kind: 'stalled', why: `No activity observed${quiet === null ? '' : ` since ${quiet}`} (stall threshold ${Math.round(s.config.stallMs / 60_000)} min); ownership is retained until the host confirms the agent stopped or recovers.`, suggestion: 'A stalled mark is not proof the agent stopped writing. Wait for the host, or ask the commander to check on it.' }
+    return { kind: 'stalled', why: `No activity observed${quiet === null ? '' : ` since ${quiet}`} (stall threshold ${Math.round(s.config.stallMs / 60_000)} min); ownership is retained until the host reports the agent ended or activity resumes.`, suggestion: 'A stalled mark is not proof the agent stopped writing. Wait for the host, or ask the commander to check on it.' }
   }
   if (t.state === 'escalated') {
     const to = t.escalation?.to ?? 'the commander'
@@ -178,7 +195,13 @@ const depText = (s: Swarm, t: SwarmTask): string => t.dependencies.map(d => `${d
 export const swarmHint = (s: Swarm, columns: number): string | null => {
   if (s.spawnClaimsUnavailable) return clip('SWARM: UNCERTAIN · ownership storage unavailable · effects held', Math.max(1, columns))
   const uncertain = s.tasks.filter(t => t.spawnUncertain && isLive(t)).length
-  if (uncertain > 0) return clip(`SWARM: ${uncertain} UNCERTAIN · ownership retained · /cockpit agents`, Math.max(1, columns))
+  if (uncertain > 0) {
+    // An Opus claim holds no commander effect, so that is said only when a Sonnet or Haiku claim is among them.
+    const effects = s.tasks.some(t => t.spawnUncertain && isLive(t) && t.tier !== 'OPUS')
+    const held = [...(effects ? [`SWARM: ${uncertain} UNCERTAIN · ownership retained · commander effects held · /cockpit agents`, `SWARM: ${uncertain} UNCERTAIN · effects held · /cockpit agents`] : [`SWARM: ${uncertain} UNCERTAIN · ownership retained · /cockpit agents`]), `SWARM: ${uncertain} UNCERTAIN · /cockpit agents`]
+
+    return held.find(form => form.length <= columns) ?? clip(held[held.length - 1] as string, Math.max(1, columns))
+  }
   const count = (state: string): number => s.tasks.filter(t => t.state === state).length
   const blocked = count('blocked')
   const quiet = count('stalled')
@@ -219,6 +242,8 @@ export const agentsText = (v: AgentsView): string => {
   lines.push(clip(`CAPACITY · ${used.counted} of ${lim.total} slots · SONNET ${used.sonnet}/${lim.sonnet} · HAIKU ${used.haiku}/${lim.haiku}${lim.opus > 0 ? ` · OPUS ${used.opus}/${lim.opus}` : ' · OPUS in the main loop'}${s.conflicts > 0 ? ` · ${s.conflicts} ownership conflict${s.conflicts === 1 ? '' : 's'} recorded` : ''}`, columns))
   if (s.tasks.length === 0) lines.push('No tasks assigned in this session. The commander assigns work with the swarm tool; Cockpit invents none.')
   lines.push(...routeLines(s, columns))
+  const uncertain = s.tasks.filter(t => t.spawnUncertain && isLive(t)).length
+  if (uncertain > 0) lines.push(clip(`HELD · ${uncertain} UNCERTAIN · no command releases${s.tasks.some(t => t.spawnUncertain && isLive(t) && t.tier !== 'OPUS') ? ' · commander shell and custom tools refused · reads continue' : ''}`, columns))
   const sorted = [...s.tasks].sort(byAttention)
   for (const t of sorted.slice(0, MAX_LISTED)) {
     const blocker = blockerOf(s, t, now)
@@ -270,6 +295,7 @@ export const taskText = (v: AgentsView, wanted: string): string => {
   if (t.result !== null && t.result.unresolved.length > 0) lines.push(clip(`unresolved by the agent: ${t.result.unresolved.length}`, columns))
   lines.push(blocker === null ? (t.state === 'running' || t.state === 'completed' ? 'blocker: none recorded' : 'blocker: none') : clip(`blocker (${blocker.kind}): ${blocker.why}`, Math.max(columns, 20)))
   if (blocker?.suggestion !== undefined) lines.push(clip(`suggestion (information only; nothing was changed): ${blocker.suggestion}`, Math.max(columns, 20)))
+  for (const note of blocker?.notes ?? []) lines.push(clip(note, Math.max(columns, 20)))
 
   return lines.join('\n')
 }

@@ -215,7 +215,7 @@
     "orchestration": {
       "type": "boolean",
       "title": "Orchestration rules",
-      "description": "Observe by default. Enable the Opus 5.5 commander at the effort you set, elastic Sonnet 5.5 engineering and Haiku 5.5 utility pools with task-aware effort, task ownership and resource admission.",
+      "description": "Observe by default. Enable the Opus 5.5 commander at the effort you set, elastic Sonnet 5.5 engineering and Haiku 5.5 utility pools with task-aware effort, task ownership within one session and resource admission.",
       "default": false
     },
     "profile": {
@@ -234,7 +234,7 @@
     "maxSubagents": {
       "type": "number",
       "title": "Parallel subagents",
-      "description": "Concurrent subagent resource budget: 0 selects AUTO (16 total); explicit values 1\u2013128. Tasks remain queued until dependencies and ownership are safe.",
+      "description": "Concurrent subagent resource budget: 0 selects AUTO (16 total); explicit values 1\u2013128. Tasks remain queued until their dependencies and ownership checks clear. Ownership holds within one session and does not stop a running agent.",
       "default": 0
     },
     "subscriptionOnly": {

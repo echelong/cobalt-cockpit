@@ -58,6 +58,10 @@ Cockpit has no hook on Claude Code's permission check (`tool.check`) and asks no
 
 With orchestration on, a bound helper may use two host control tools whatever its ownership: tool discovery (`ToolSearch`) and the report hand-back to its parent (`SubagentHandback`). Neither has a resource effect. Discovery grants no right to run what it finds: every tool still passes its own ownership guard and Claude Code's permission check, so a read-only helper's write, shell command and delegation are refused exactly as before. A hand-back records only the calling helper's own report. How a report arrived (`reported`, `host_accepted`, `answer_observed`, `unavailable`) is recorded on the task and is never verification; only the commander verifies.
 
+## Task ownership limits
+
+Task ownership is a Cockpit admission rule within one session, not a security boundary and not a lock. It does not survive `/clear`: on Claude Code 2.1.296 and 2.1.316, on commit `7d52ab2` (two runs per host), on released 0.6.5 (one run per host) and on the code after `7d52ab2`, a running agent kept running after `/clear` while a new exclusive task was admitted beside it. It does not cross sessions, and it ends on the host's report that a turn ended, which does not show that effects stopped: a deliberately detached process outlived a stop on both hosts. A refusal returned by another plugin's hook after dispatch does not show that no agent started. On `main`, not in any release, Cockpit holds that claim for the rest of the session; from its code, released 0.6.5 releases it. Cockpit provides no native fencing, effect drainage or verified termination. Do not use `/clear`, switch sessions, or replace overlapping tasks while an agent is running or ownership remains uncertain. Evidence and details: [docs/orchestration.md](docs/orchestration.md#what-task-ownership-does-and-does-not-guarantee).
+
 ## Read-only Git inspection by helpers
 
 With orchestration on, a helper's shell is refused unless its task owns `*`, with one exception: read-only Git inspection. Two rules apply, by what the task owns.

@@ -8,7 +8,7 @@
 // in variables (timers, the mounted waveform) is rebuilt as events arrive.
 // No bookkeeping in this file may fail a tool call: it runs under `quiet`.
 
-import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, uncertainSpawn, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, acknowledgeHandback, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, overlaps, ownershipAllows, hasActiveOwnership, setAppliedEffort, setLaunchEffort, SONNET_LED_SWARM } from './swarm'
+import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, uncertainSpawn, refusedAfterDispatch, spawnRefusal, uncertainHoldNote, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, acknowledgeHandback, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, overlaps, ownershipAllows, hasActiveOwnership, setAppliedEffort, setLaunchEffort, SONNET_LED_SWARM } from './swarm'
 import type { Swarm, SwarmTask, ModelTier, Wave, Verification } from './swarm'
 import { agentsText, shortResource, swarmHint, taskText } from './inspector'
 import { readyText } from './readiness'
@@ -247,8 +247,13 @@ const canonicalIn = async ($: EngineInterface, base: string, path: string): Prom
     return r.exitCode === 0 && !r.isStdoutTruncated ? normalizeOwned(r.stdout.trim()) : '*'
   } catch { return '*' }
 }
+const RESUME_REFUSED = 'SWARM / resuming an agent is refused while orchestration is on: nothing shows it may safely run again. This call started no run and opened or released no claim. Further work needs a new task; if that is refused, /cockpit agents shows what holds it.'
 const canonicalResource = async ($: EngineInterface, path: string): Promise<string> => canonicalIn($, cwd, path)
 const swarmState = (l: Ledger): Swarm => l.swarm ?? emptySwarm()
+/** Holds the commander's shell, custom tools and overlapping writes. An Opus task does not. */
+const holdsEffects = (t: SwarmTask): boolean => t.tier !== 'OPUS' && t.endedAt === null && (['reserved','running'].includes(t.state) || (!['completed','failed','cancelled'].includes(t.state) && (t.agentId !== null || t.startedAt !== null)))
+/** Reservations whose `next` has not answered. In this process only: it words a refusal and decides nothing. */
+const dispatching = new Set<string>()
 /** Only an explicit, unique binding grants authority; a description is not identity. */
 const boundTask = (s: Swarm, agentId: string): SwarmTask | undefined => {
   const matches = s.tasks.filter(t => t.agentId === agentId)
@@ -1117,11 +1122,13 @@ const guardSwarm = async ($: EngineInterface, e: Record<string, unknown>, plan: 
     for (const path of paths) {
       const canonical = await canonicalResource($,path)
       if (task && !ownershipAllows(s,task.id,canonical)) return 'SWARM / write outside owned resources'
-      if (!task && s.tasks.some(t=>t.tier !== 'OPUS' && t.endedAt === null && (['reserved','running'].includes(t.state) || (!['completed','failed','cancelled'].includes(t.state) && (t.agentId !== null || t.startedAt !== null))) && t.owned.some(p=>overlaps(p,canonical)))) return 'SWARM / commander write conflicts with active ownership'
+      const writers = task ? [] : s.tasks.filter(t => holdsEffects(t) && t.owned.some(p => overlaps(p, canonical)))
+      if (writers.length > 0) return `SWARM / commander write conflicts with active ownership${uncertainHoldNote(writers, dispatching)}`
     }
   } else if (!readTool) {
     if (task && !task.owned.includes('*')) return 'SWARM / shell/custom tools require exclusive wildcard ownership'
-    if (!task && s.tasks.some(t=>t.tier !== 'OPUS' && t.endedAt === null && (['reserved','running'].includes(t.state) || (!['completed','failed','cancelled'].includes(t.state) && (t.agentId !== null || t.startedAt !== null))))) return 'SWARM / shell/custom effects held until active ownership releases'
+    const holders = task ? [] : s.tasks.filter(holdsEffects)
+    if (holders.length > 0) return `SWARM / shell/custom effects held until active ownership releases${uncertainHoldNote(holders, dispatching)}`
   }
   return null
 }
@@ -4820,6 +4827,11 @@ export const register: Register = (on, options) => {
       return { deny: BLOCK_DENY }
     }
     if (!isSupported) return next(e)
+    // Nothing here can show that an agent may safely run again, and a resume with active
+    // ownership has not been seen on a real host, so every resume is refused. A stopped,
+    // killed, cancelled or absent agent shows nothing about its effects. The refusal comes
+    // before any read: it needs none, and it starts no run, opens no claim, releases nothing.
+    if (config.hasOrchestration && (e as { resume?: unknown }).resume !== undefined) return { deny: RESUME_REFUSED }
     const role = roleOf(e.subagentType)
     // The architect is Cobalt's own agent: the exact type AND a definition the host attributes to this plugin (`provider` is set by the host,
     // not by a plugin). A plugin of the same name from another source is not distinguishable by it; the human publication gate stays.
@@ -4894,7 +4906,7 @@ export const register: Register = (on, options) => {
         } else if (role === 'ARCHITECT' && isSonnetLed()) return { deny: 'OPUS / the architect runs only for an admitted consultation; its task must come from swarm action "consult". Nothing was started.' }
         let admission: ReturnType<typeof admitTask> | undefined
         await changeSwarm($, held => { admission = admitTask(held,assignedId!,at); return admission.swarm })
-        if (!admission!.ok) return { deny: `SWARM / queued ${assignedId}: ${admission!.reason}; retry after dependency/ownership/resource clears` }
+        if (!admission!.ok) return { deny: spawnRefusal(swarmState(await read($, ledgerAtom)), assignedId!, admission!.reason, dispatching) }
         reservedId = assignedId
       }
       const model = config.hasOrchestration ? (assigned?.tier === 'HAIKU' ? HAIKU_MODEL : assigned?.tier === 'OPUS' && isSonnetLed() ? OPUS_MODEL : AGENT_MODEL) : e.model
@@ -4904,6 +4916,8 @@ export const register: Register = (on, options) => {
       // request can arrive before the spawn below has returned and bound it.
       if (reservedId) await changeSwarm($, held => setLaunchEffort(held, reservedId!, launch?.level ?? null, launch?.named ?? null))
       if (reservedId) {
+        // Before the task reads as uncertain, so that no refusal in between calls a dispatch still under way stuck.
+        dispatching.add(reservedId)
         spawnAttemptId = crypto.randomUUID()
         claimSession = originLedger.sessionId
         const held = await changeSwarm($, s => uncertainSpawn(s, reservedId!, spawnAttemptId!, spawnAt))
@@ -4912,17 +4926,14 @@ export const register: Register = (on, options) => {
       // Set immediately before invoking next: any exception from here is an
       // uncertain dispatch, including synchronous throws and binding failures.
       dispatched = true
-      const spawned = model === undefined || model === e.model
-        ? await next(e)
-        : await next({ ...e, model })
+      const spawned = await (model === undefined || model === e.model ? next(e) : next({ ...e, model }))
       const verifiedId = spawned.deny === undefined && typeof spawned.agentId === 'string' && spawned.agentId.trim() !== ''
       if (reservedId && verifiedId) await changeSwarm($, held => bindAgent(held,reservedId!,spawned.agentId!,spawnAt))
-      else if (reservedId && typeof spawned.deny === 'string' && spawned.deny.trim() !== '' && spawned.agentId === undefined && spawned.model === undefined) {
-        // The host contract's denial variant positively says no agent started.
-        // Persist that fact before releasing, so resume cannot revive a retry.
-        await settleNoStart($, claimSession!, spawnAttemptId!)
-        await changeSwarm($, held => setLaunchEffort(releaseReservation(held,reservedId!,spawnAt,spawned.deny!), reservedId!, null))
-      }
+      // Past the dispatch boundary a refusal is not positive no-start: a hook beneath
+      // this one may have called next and then denied, and the host has started the
+      // agent. Only a verified id changes the reservation; nothing here releases it.
+      else if (reservedId && typeof spawned.deny === 'string') await quiet(() => changeSwarm($, held => refusedAfterDispatch(held,reservedId!,spawnAt,spawned.deny!)))
+      if (reservedId) dispatching.delete(reservedId)
       if (reservedId) await quiet(() => persist($))
       if (verifiedId) await quiet(() => ledgerSpawn($, e, spawned, originLedger, spawnAt))
       if (reservedId && verifiedId) await mutateLedger($, l => { const done = l.observedCompletions?.find(c=>c.agentId===spawned.agentId); return done ? { ...finishTurn(l,{ turnId:l.turns[spawned.agentId!] ?? UNKNOWN,agentId:spawned.agentId!,reason:done.reason },done.at), swarm:finishObserved(swarmState(l),reservedId!,done.reason,done.conclusion,done.at) } : l })
@@ -4939,6 +4950,7 @@ export const register: Register = (on, options) => {
 
       return spawned
     } catch (error) {
+      if (reservedId) dispatching.delete(reservedId)
       if (reservedId && !dispatched) {
         // next was never invoked. A partly written claim is settled before
         // release; if settlement itself fails the reservation stays held.
@@ -4951,7 +4963,7 @@ export const register: Register = (on, options) => {
     } finally {
       spawning.delete(token)
     }
-  }).catch(($, e, next) => next.called ? next(e) : { deny: 'COCKPIT / the agent-admission guard failed, so no subagent started. Nothing was sent; reload the plugin before retrying.' })
+  }).catch(($, e, next) => next.called ? next(e) : { deny: 'COCKPIT / the agent-admission guard failed, so this call started no subagent. Nothing was sent. A claim may still be held: see /cockpit agents before retrying.' })
 
   on('turn.step', async function* ($, e, next) {
     // The one place every model request passes, main's and a subagent's, with

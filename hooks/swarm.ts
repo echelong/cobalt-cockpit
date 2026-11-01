@@ -119,7 +119,42 @@ export const bindAgent = (s: Swarm, id: string, agentId: string, at: number, kin
 export const uncertainSpawn = (s: Swarm, id: string, attempt: string, at: number): Swarm => {
   const t = s.tasks.find(t => t.id === id)
   if (!t || t.state !== 'reserved' || t.agentId !== null) throw new Error('Dispatch requires an unbound reservation')
-  return event(update(s, id, { spawnAttempt: attempt, spawnUncertain: true, reason: 'Spawn outcome uncertain; ownership retained until verified identity or positive no-start' }), 'spawn_uncertain', id, at, 'Dispatch may start an agent; no verified ID bound')
+  return event(update(s, id, { spawnAttempt: attempt, spawnUncertain: true, reason: 'Spawn outcome uncertain; ownership retained until a verified agent id and its observed end' }), 'spawn_uncertain', id, at, 'Dispatch may start an agent; no verified ID bound')
+}
+/** Opens a reason recorded for a refusal after dispatch. Kept whole, because the inspector reads the refusal back from it. */
+export const REFUSED_AFTER_DISPATCH = 'Refused after dispatch; a start is not excluded and ownership is retained: '
+/** A refusal answered after dispatch is recorded, and releases nothing: it does not show that no agent started. */
+export const refusedAfterDispatch = (s: Swarm, id: string, at: number, refusal: string): Swarm => {
+  const t = s.tasks.find(t => t.id === id)
+  if (!t || !['reserved', 'stalled'].includes(t.state) || t.agentId !== null) return s
+  // Control and format characters go first: this reason comes from another plugin and `/cockpit agents` draws it, and removing
+  // one must not rejoin a secret after redaction. The refusal itself reaches the host and the model as it came.
+  const why = redactSecrets(refusal.replace(/\s+/g, ' ').replace(/[\p{Cc}\p{Cf}]/gu, '')).trim().slice(0, 300) || 'no reason given'
+  return event(update(s, id, { reason: `${REFUSED_AFTER_DISPATCH}${why}` }), 'spawn_refused_after_dispatch', id, at, why)
+}
+/**
+ * Holds an uncertain claim whose dispatch has come back unbound. Waiting does not clear one: only a verified agent id and that
+ * agent's reported end do. A dispatch still in flight (`inFlight`, this process only) is uncertain too, and may yet bind.
+ */
+const stuck = (t: SwarmTask | undefined, inFlight: ReadonlySet<string>): boolean => t !== undefined && t.spawnUncertain === true && occupied(t) && !inFlight.has(t.id)
+/** What a commander effect refused by `holders` adds when one of them is stuck. A healthy holder clears by finishing; a stuck one does not. */
+export const uncertainHoldNote = (holders: readonly SwarmTask[], inFlight: ReadonlySet<string>): string => {
+  const held = holders.filter(t => stuck(t, inFlight)).length
+  if (held === 0) return ''
+
+  return `; ${held === holders.length ? 'held by an uncertain spawn' : `${held} of ${holders.length} holders is an uncertain spawn`}: waiting does not clear that and no command releases it, see /cockpit agents`
+}
+/** What a refused spawn is told. A retry is invited only when what stopped it can clear: retrying a held claim could only start a second agent. */
+export const spawnRefusal = (s: Swarm, id: string, reason: string | null, inFlight: ReadonlySet<string>): string => {
+  const self = s.tasks.find(t => t.id === id)
+  if (self?.spawnUncertain === true && occupied(self)) return inFlight.has(id) ? `SWARM / ${id} is being dispatched, so this call did not dispatch it again. See /cockpit agents.` : `SWARM / ${id} is held: an agent may have started, so this call did not dispatch it again. No command releases this claim; see /cockpit agents.`
+  // Admission names only the first collision: a healthy task can be named while a stuck one overlaps too.
+  const collision = self !== undefined && reason?.startsWith('ownership conflict') === true ? s.tasks.find(t => t.id !== id && stuck(t, inFlight) && (self.mode === 'write' || t.mode === 'write') && self.owned.some(a => t.owned.some(b => overlaps(a, b)))) : undefined
+  const named = collision?.id ?? /^dependency (.+): \S+$/.exec(reason ?? '')?.[1]
+  if (stuck(s.tasks.find(t => t.id === named), inFlight)) return `SWARM / queued ${id}: ${reason}. ${named} is held after an uncertain spawn: waiting does not clear it and no command releases it, so a retry cannot succeed. See /cockpit agents.`
+  if (/^task (running|stalled|completed|failed|cancelled|escalated)$/.test(reason ?? '') || /^dependency .+: (failed|cancelled|unknown)$/.test(reason ?? '')) return `SWARM / queued ${id}: ${reason}. A retry alone cannot succeed.`
+  const slots = reason === 'resource budget' ? s.tasks.filter(t => stuck(t, inFlight)).length : 0
+  return `SWARM / queued ${id}: ${reason}; retry after dependency/ownership/resource clears${slots > 0 ? `. ${slots} held after an uncertain spawn: waiting does not clear those. See /cockpit agents.` : ''}`
 }
 const text = (s: string): string => redactSecrets(s).slice(0, 1500)
 const list = (s: readonly string[]): string[] => s.slice(0, 12).map(text)
@@ -129,11 +164,11 @@ export const finishTask = (s: Swarm, id: string, state: 'completed' | 'failed' |
   if (state === 'completed' && (!occupied(t) || dependencyReason(s, t) || s.tasks.some(child => child.parentTask === id && !terminal(child)))) throw new Error('Cannot complete unadmitted task, unresolved dependencies or active children')
   return event(update(s, id, { state: state === 'completed' && t.escalation !== null ? 'escalated' : state, result: result === null ? t.result : compressResult(result), endedAt: at, lastActivityAt: at, reason: null }), state === 'completed' && t.escalation !== null ? 'escalation_stopped' : state, id, at, result?.conclusion ?? '')
 }
-/** Call only after the host confirms stop/failure: terminal transitions release locks. */
+/** Call only on the host's report of a stop or failure: terminal transitions release locks, and that report does not show that effects stopped. */
 export const heartbeat = (s: Swarm, id: string, at: number): Swarm => update(s, id, { lastActivityAt: at, ...(s.tasks.find(t=>t.id===id)?.state === 'stalled' ? { state: s.tasks.find(t=>t.id===id)?.agentId ? 'running' as const : 'reserved' as const, reason:null } : {}) })
 export const markStalled = (s: Swarm, at: number): Swarm => {
   let stalled = s
-  for (const t of active(s)) if (t.state !== 'stalled' && at - t.lastActivityAt >= s.config.stallMs) stalled = event(update(stalled, t.id, { state: 'stalled', reason: 'Awaiting host cancellation or recovery; ownership retained' }), 'stalled', t.id, at, 'No observed activity')
+  for (const t of active(s)) if (t.state !== 'stalled' && at - t.lastActivityAt >= s.config.stallMs) stalled = event(update(stalled, t.id, { state: 'stalled', reason: t.spawnUncertain === true ? t.reason : 'Awaiting host cancellation or recovery; ownership retained' }), 'stalled', t.id, at, 'No observed activity')
   return stalled
 }
 const levelOf = (t: SwarmTask): EffortLevel => isEffortLevel(t.appliedEffort) ? t.appliedEffort : isEffortLevel(t.requestedEffort) ? t.requestedEffort : BASE_EFFORT[t.tier]
