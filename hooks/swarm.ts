@@ -32,6 +32,8 @@ export const overlaps = (a: string, b: string): boolean => { const x = normalize
 const terminal = (t: SwarmTask): boolean => ['completed', 'failed', 'cancelled'].includes(t.state)
 /** A stall/escalation is not proof that a live agent stopped writing. */
 const occupied = (t: SwarmTask): boolean => t.endedAt === null && (t.state === 'reserved' || t.state === 'running' || (!terminal(t) && (t.agentId !== null || (t.state === 'stalled' && t.startedAt !== null))))
+/** Permission for new calls, not proof that already admitted effects have drained. */
+export const hasActiveOwnership = (t: SwarmTask | undefined): boolean => t !== undefined && !t.cancellationRequested && ['reserved', 'running', 'stalled'].includes(t.state) && occupied(t)
 const active = (s: Swarm): SwarmTask[] => s.tasks.filter(occupied)
 const event = (s: Swarm, kind: string, id: string | null, at: number, detail: string): Swarm => {
   const item: SwarmEvent = { seq: s.sequence + 1, at, kind, taskId: id, agentId: s.tasks.find(t => t.id === id)?.agentId ?? null, wave: s.wave, detail: redactSecrets(detail).slice(0, 1500) }
@@ -259,7 +261,7 @@ export const acknowledgeHandback = (s: Swarm, agentId: string, message: string, 
 /** A shell/global operation uses '*'; a read never widens a write claim. */
 export const ownershipAllows = (s: Swarm, id: string, path: string, mode: 'read' | 'write' = 'write'): boolean => {
   const t = s.tasks.find(t => t.id === id)
-  if (!t || !occupied(t) || t.cancellationRequested || (mode === 'write' && t.mode !== 'write')) return false
+  if (!t || !hasActiveOwnership(t) || (mode === 'write' && t.mode !== 'write')) return false
   const claim = normalizeOwned(path)
   return t.owned.some(p => p === '*' || (claim !== '*' && (claim === p || claim.startsWith(`${p}/`))))
 }

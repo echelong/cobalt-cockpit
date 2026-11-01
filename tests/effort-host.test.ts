@@ -314,7 +314,7 @@ describe('a subagent is launched at its level natively', () => {
 })
 
 describe('a subagent whose first request arrives before its spawn has bound it', () => {
-  test('the task is found by the id its description carries, so the first request runs at the named level', async ($, on) => {
+  test('a description grants no early request; explicit binding restores the task named level', async ($, on) => {
     const w = world(on)
     const held = hostState(on, {})
     await start($)
@@ -322,19 +322,27 @@ describe('a subagent whose first request arrives before its spawn has bound it',
     // the engine lists the subagent as running; the spawn has not returned, so nothing is bound yet
     w.agents.push({ id: 'early-agent', description: '[task:early] bounded work', type: 'cobalt-cockpit:worker', status: 'running' })
     await step($, SONNET, { agentId: 'early-agent', effort: 'medium' })
-    // not the Sonnet baseline: the level the assignment names
+    expect(w.efforts).toEqual([])
+    expect(taskOf(held, 'early').appliedEffort).toBeNull()
+    expect((await $.tool.call({ tool: SWARM, action: 'adopt', task_id: 'early', agent_id: 'early-agent' } as never)).isError).not.toBe(true)
+    await step($, SONNET, { agentId: 'early-agent', effort: 'medium' })
+    // Once explicitly bound, preserve the assignment's level rather than the Sonnet baseline.
     expect(w.efforts[0]).toEqual({ model: SONNET, effort: 'high', agentId: 'early-agent' })
     expect(taskOf(held, 'early').appliedEffort).toBe('high')
   })
 
-  test('a natively launched one keeps the level it was launched with, and no policy mismatch is invented', async ($, on) => {
+  test('an unknown native identity is refused; an authorized native launch keeps its level', async ($, on) => {
     const w = world(on, NATIVE)
     const held = hostState(on, {})
     await start($)
     // an unassigned subagent the engine started at high: no task is known for it yet
     w.agents.push({ id: 'unknown-agent', description: 'unassigned bounded work', type: 'cobalt-cockpit:worker', status: 'running' })
     await step($, SONNET, { agentId: 'unknown-agent', effort: 'high' })
-    expect(w.efforts[0]).toEqual({ model: SONNET, effort: 'high', agentId: 'unknown-agent' })
+    expect(w.efforts).toEqual([])
+    await assign($, 'native-bound', { effort: 'high' })
+    const { agentId } = await launch($, w, 'native-bound')
+    await step($, SONNET, { agentId, effort: 'high' })
+    expect(w.efforts[0]).toEqual({ model: SONNET, effort: 'high', agentId })
     expect(ledgerOf(held).warnings.filter(warning => warning.includes('MODEL POLICY'))).toEqual([])
   })
 

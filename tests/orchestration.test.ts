@@ -976,9 +976,9 @@ describe('final verification still gates 100%', () => {
     await call($, 'Bash', { command: 'tsc -p .', agentId: 'spawned-1' })
     await $.turn.complete({ agentId: 'spawned-1', turnId: 'w', reason: 'answer', answer: 'Implemented, all tests pass, verified. Task complete.', durationMs: 1, isAborted: false } as never)
     await $.turn.complete({ agentId: 'spawned-2', turnId: 'r', reason: 'answer', answer: 'LGTM. Verified. Ship it.', durationMs: 1, isAborted: false } as never)
-    // a subagent cannot report a gate or complete a milestone
+    // A retired subagent is refused before progress dispatch; it cannot report a gate or complete a milestone.
     const tried = await $.tool.call({ tool: TOOL, action: 'gate', gate: 'TEST', state: 'pass', evidence: 'subagent says so', agentId: 'spawned-1' } as never)
-    expect(String((tried as { result?: unknown }).result)).toContain('belongs to the main conversation')
+    expect(tried.deny).toContain('no active ownership')
     // main completes every milestone but the gates are still open
     let status = ''
     for (let n = 1; n <= 5; n++) status = await progress($, { action: 'complete', milestone: `m${n}` })

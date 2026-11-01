@@ -8,7 +8,7 @@
 // in variables (timers, the mounted waveform) is rebuilt as events arrive.
 // No bookkeeping in this file may fail a tool call: it runs under `quiet`.
 
-import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, acknowledgeHandback, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, overlaps, ownershipAllows, setAppliedEffort, setLaunchEffort, SONNET_LED_SWARM } from './swarm'
+import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, acknowledgeHandback, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, overlaps, ownershipAllows, hasActiveOwnership, setAppliedEffort, setLaunchEffort, SONNET_LED_SWARM } from './swarm'
 import type { Swarm, SwarmTask, ModelTier, Wave, Verification } from './swarm'
 import { agentsText, shortResource, swarmHint, taskText } from './inspector'
 import { readyText } from './readiness'
@@ -249,6 +249,17 @@ const canonicalIn = async ($: EngineInterface, base: string, path: string): Prom
 }
 const canonicalResource = async ($: EngineInterface, path: string): Promise<string> => canonicalIn($, cwd, path)
 const swarmState = (l: Ledger): Swarm => l.swarm ?? emptySwarm()
+/** Only an explicit, unique binding grants authority; a description is not identity. */
+const boundTask = (s: Swarm, agentId: string): SwarmTask | undefined => {
+  const matches = s.tasks.filter(t => t.agentId === agentId)
+  return agentId !== '' && matches.length === 1 ? matches[0] : undefined
+}
+const agentRefusal = (s: Swarm, agentId: string): string | null => {
+  const task = boundTask(s, agentId)
+  if (!task) return 'SWARM / agent has no bound ownership; commander must assign before further calls'
+  if (task.cancellationRequested) return 'SWARM / cancellation requested; awaiting observed termination'
+  return hasActiveOwnership(task) ? null : 'SWARM / agent has no active ownership; retired agents cannot initiate new calls'
+}
 const changeSwarm = async ($: EngineInterface, f: (s: Swarm) => Swarm): Promise<Swarm> => {
   const l = await update($, ledgerAtom, old => ({ ...old, schema: 2 as const, swarm: f(swarmState(old)) }))
   return l.swarm!
@@ -799,8 +810,12 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
     const at = await $.clock.now()
     const str = (k: string) => textOf(e[k])
     const list = (k: string) => Array.isArray(e[k]) ? (e[k] as unknown[]).filter((v): v is string => typeof v === 'string').slice(0, 64).map(textOf) : []
-    const s = await changeSwarm($, held => markStalled(held,at)); const task = s.tasks.find(t => t.id === id)
-    if (agent && (!task || task.agentId !== agent || !['result','escalate','status'].includes(action))) throw new Error('Only commander assigns, verifies, cancels or changes waves; agents report their own task only')
+    const before = swarmState(await read($, ledgerAtom))
+    const owner = agent === undefined ? undefined : boundTask(before, agent)
+    if (agent !== undefined && (!owner || owner.id !== id || !['result','escalate','status'].includes(action))) throw new Error('Only commander assigns, verifies, cancels or changes waves; agents report their own task only')
+    if (agent !== undefined && action !== 'status' && !hasActiveOwnership(owner)) throw new Error('Agent has no active ownership')
+    // A bound agent may inspect its own status after retirement, without marking siblings stalled.
+    const s = agent !== undefined && action === 'status' ? before : await changeSwarm($, held => markStalled(held,at)); const task = s.tasks.find(t => t.id === id)
     if (action === 'status') {
       const selected = id ? s.tasks.filter(t=>t.id===id) : [...s.tasks.filter(t=>!['completed','failed','cancelled'].includes(t.state)), ...s.tasks.filter(t=>['completed','failed','cancelled'].includes(t.state)).slice(-8)].slice(0,32)
       return { result: JSON.stringify({ ...summarizeSwarm(s), tasks: selected.map(t => ({ id:t.id, tier:t.tier, suggested:t.suggestedTier ?? null, role:t.role, state:t.state, reason:t.reason, agent:t.agentId, effort:t.requestedEffort, launchEffort:t.launchEffort ?? null, appliedEffort:t.appliedEffort, effortReason:t.effortReason, result:t.result ? { conclusion:t.result.conclusion.slice(0,160), evidence:t.result.evidence.slice(0,3).map(x=>x.slice(0,160)), unresolved:t.result.unresolved.slice(0,3).map(x=>x.slice(0,160)) } : null, escalation:t.escalation ? { to:t.escalation.to, effort:t.escalation.effort ?? null, question:t.escalation.question.slice(0,160), risk:t.escalation.risk.slice(0,160) } : null, verification:t.verification, resultDelivery:t.resultDelivery ?? 'unavailable' })) }) }
@@ -838,6 +853,7 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
         await changeSwarm($, held => { const admitted = admitTask(held,id,at); if (!admitted.ok) throw new Error(admitted.reason!); return bindAgent(admitted.swarm,id,existingId,at,'adopt') })
       } else if (action === 'result') {
         await changeSwarm($, held => {
+          if (agent !== undefined) { const owner = boundTask(held, agent); if (!owner || !hasActiveOwnership(owner) || owner.id !== id) throw new Error('Agent has no active ownership') }
           let chain = held
           if (task.tier === 'OPUS' && (held.config.opus ?? 0) === 0 && ['queued','blocked'].includes(task.state)) { const admitted = admitTask(held,id,at); if (!admitted.ok) throw new Error(admitted.reason!); chain = admitted.swarm }
           chain = reportResult(chain, id, { conclusion:str('conclusion'), evidence:list('evidence'), changes:list('changes'), verification:list('verification'), unresolved:list('unresolved'), confidence: typeof e['confidence'] === 'string' ? str('confidence') : null }, at)
@@ -845,7 +861,10 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
         })
       } else if (action === 'escalate') {
         if (!['SONNET','OPUS'].includes(String(e['to']))) throw new Error('Valid escalation destination required')
-        await changeSwarm($, held => escalateTask(held,id,{ objective: task.objective, discoveries:list('discoveries'), evidence:list('evidence'), question:str('question'), risk:str('risk'), nextAction:str('next_action'), locations:list('locations'), to:e['to'] as ModelTier, effort: isEffortLevel(e['effort']) ? e['effort'] : null, effortReason: typeof e['effort_reason'] === 'string' ? str('effort_reason') : null },at))
+        await changeSwarm($, held => {
+          if (agent !== undefined) { const owner = boundTask(held, agent); if (!owner || !hasActiveOwnership(owner) || owner.id !== id) throw new Error('Agent has no active ownership') }
+          return escalateTask(held,id,{ objective: task.objective, discoveries:list('discoveries'), evidence:list('evidence'), question:str('question'), risk:str('risk'), nextAction:str('next_action'), locations:list('locations'), to:e['to'] as ModelTier, effort: isEffortLevel(e['effort']) ? e['effort'] : null, effortReason: typeof e['effort_reason'] === 'string' ? str('effort_reason') : null },at)
+        })
       } else if (action === 'resolve') await changeSwarm($, held => resolveEscalation(held,id,{ conclusion:str('conclusion'),evidence:list('evidence'), changes:list('changes'), verification:list('verification'), unresolved:list('unresolved') },at))
       else if (action === 'cancel') await changeSwarm($, held => requestCancel(held,id,at))
       else if (action === 'verify') { if (!['pending','pass','fail','unknown'].includes(String(e['state']))) throw new Error('Valid verification state required')
@@ -979,30 +998,22 @@ const hostSignals = async ($: EngineInterface, turnId: string, model: string): P
   return signals
 }
 /**
- * The task a subagent's request belongs to. A subagent's first request can
- * arrive before its spawn has bound it to its task; the task is then found by
- * the id its Agent call's description carries, so that request runs at the
- * task's level like every later one instead of at the tier's baseline.
+ * An unbound early request fails closed until its spawn or explicit adoption
+ * establishes identity. Listing descriptions never grant execution authority.
  */
 const taskOfAgent = async ($: EngineInterface, agentId: string): Promise<SwarmTask | undefined> => {
-  const tasks = swarmState(await read($, ledgerAtom)).tasks
-  const bound = tasks.find(t => t.agentId === agentId)
-  if (bound !== undefined || !config.hasOrchestration) return bound
-  const listed = (await $.agent.list().catch(() => [])).find(a => a.id === agentId)
-  const id = /\[task:([\w.-]+)\]/.exec(listed?.description ?? '')?.[1]
-
-  return id === undefined ? undefined : tasks.find(t => t.id === id && t.agentId === null && !['completed', 'failed', 'cancelled'].includes(t.state))
+  return boundTask(swarmState(await read($, ledgerAtom)), agentId)
 }
 const guardSwarm = async ($: EngineInterface, e: Record<string, unknown>, plan: GitPlan = {}): Promise<string | null> => {
   if (!config.hasOrchestration) return null
   const agent = typeof e['agentId'] === 'string' ? e['agentId'] : undefined
-  const s = swarmState(await read($, ledgerAtom)), task = s.tasks.find(t => t.agentId === agent && agent !== undefined)
-  if (task?.cancellationRequested) return 'SWARM / cancellation requested; awaiting observed termination'
+  const s = swarmState(await read($, ledgerAtom)), task = agent === undefined ? undefined : boundTask(s, agent)
+  const tool = String(e['tool'])
+  if (agent !== undefined && tool === SWARM_TOOL_NAME && e['action'] === 'status' && task?.id === e['task_id']) return null
+  if (agent !== undefined) { const refused = agentRefusal(s, agent); if (refused) return refused }
   const observedAt = await $.clock.now()
   if (task) await changeSwarm($, held => heartbeat(held,task.id,observedAt))
-  const tool = String(e['tool'])
   if (tool === SWARM_TOOL_NAME || tool === TOOL) return null
-  if (agent && !task) return 'SWARM / agent has no bound ownership; commander must assign before further tools'
   // Host control has no resource effects. Discovery grants no execution rights:
   // each discovered tool still passes its own ownership/native permission guard.
   // Handback returns only this bound helper's report to its native parent.
@@ -2720,12 +2731,12 @@ const reconcileTree = ($: EngineInterface): Promise<void> => {
 }
 
 const serveProgress = async ($: EngineInterface, e: ProgressInput & { agentId?: string }): Promise<{ result: string }> => {
-  await hush(() => adoptLegacyHold($))
   if (e.agentId !== undefined) {
     return {
       result: 'Cobalt Cockpit: the task state belongs to the main conversation. Report your result to it instead; nothing was changed.',
     }
   }
+  await hush(() => adoptLegacyHold($))
   const now = await $.clock.now()
   const sha = (await read($, gitAtom))?.sha ?? null
   await quiet(() => reconcileTree($))
@@ -4623,10 +4634,10 @@ export const register: Register = (on, options) => {
     if (effect) commanderEffects.add(effectToken)
     try {
     await ledgerToolStart($, call)
-    if (String(e.tool) === SWARM_TOOL_NAME) { const r = await serveSwarm($, call); await ledgerToolEnd($, call, r); await raiseAlerts($, false); return r }
     const gitPlan: GitPlan = {}
     const swarmRefusal = await guardSwarm($, call, gitPlan)
     if (swarmRefusal) { await ledgerToolEnd($, call, { deny: swarmRefusal }); return { deny: swarmRefusal } }
+    if (String(e.tool) === SWARM_TOOL_NAME) { const r = await serveSwarm($, call); await ledgerToolEnd($, call, r); if (e.agentId === undefined || call['action'] !== 'status') await raiseAlerts($, false); return r }
     if (e.tool === TOOL) { const r = await serveProgress($, call as ProgressInput & { agentId?: string }); await ledgerToolEnd($, call, r); await raiseAlerts($, false); return r }
 
     // A guard that fails refuses the call it guards (see `failClosed`) and nothing else. This catch is the last net: whatever
@@ -4662,7 +4673,15 @@ export const register: Register = (on, options) => {
       stopTicker()
     }
     let ran
-    try { ran = await next(isChanged() ? call : e) }
+    try {
+      // Recheck after asynchronous guards; this does not revoke an already admitted native effect.
+      if (config.hasOrchestration && e.agentId !== undefined) {
+        const current = swarmState(await read($, ledgerAtom))
+        const refused = agentRefusal(current, e.agentId)
+        if (refused) { await ledgerToolEnd($, call, { deny: refused }); return { deny: refused } }
+      }
+      ran = await next(isChanged() ? call : e)
+    }
     catch (error) { await ledgerToolEnd($, call, { isError: true }); throw error }
     finally {
       if (isQuestion) await quiet(() => e.agentId ? editAgent($, e.agentId, a => ({ ...a, state: 'running', tool: 'Thinking' })) : update($, visualAtom, old => ({ ...old, waiting: Math.max(0, old.waiting - 1) })))
@@ -4859,8 +4878,8 @@ export const register: Register = (on, options) => {
     // which for this one would send a request the policy exists to refuse.
     const agentId = e.agentId
     const task = agentId === undefined ? undefined : await quietly(() => taskOfAgent($, agentId))
-    if (config.hasOrchestration && task?.cancellationRequested) {
-      const text = 'SWARM / cancellation requested'
+    if (config.hasOrchestration && agentId !== undefined && !hasActiveOwnership(task)) {
+      const text = task?.cancellationRequested ? 'SWARM / cancellation requested' : 'SWARM / no active bound ownership; no model request sent'
       yield { kind: 'text', index: 0, text }; yield { kind: 'stop', stopReason: 'end_turn', usage: null }
       return { turnId: e.turnId, index:e.index, answer:text, toolUses:[], stopReason:'end_turn', usage:null }
     }
@@ -4943,6 +4962,14 @@ export const register: Register = (on, options) => {
     if (e.agentId) await quiet(() => editAgent($, e.agentId!, a => ({ ...a, model: constrained.model, effort: constrained.effort === undefined ? null : String(constrained.effort) })))
     // the main loop's effort, as the engine resolved it for this request
     else if (isSupported) await quiet(() => setMeter($, { model: constrained.model, effort: e.effort === undefined ? null : String(e.effort), reasoningMode: config.reasoningMode, effortSource: e.effort === undefined ? null : 'engine', requestedEffort: host?.selected ?? (e.effort === undefined ? null : String(e.effort)), effortReason: mainReason ?? null, hostSource: host?.source ?? null }))
+    if (config.hasOrchestration && agentId !== undefined) {
+      const current = await quietly(() => taskOfAgent($, agentId))
+      if (!hasActiveOwnership(current)) {
+        const text = 'SWARM / no active bound ownership; no model request sent'
+        yield { kind: 'text', index: 0, text }; yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+        return { turnId: e.turnId, index:e.index, answer:text, toolUses:[], stopReason:'end_turn', usage:null }
+      }
+    }
     const result = yield* next(constrained)
     const asked = host !== null ? { ...e, effort: host.selected ?? e.effort } : resolution === null ? e : { ...e, effort: resolution.selected }
     await quiet(() => ledgerRequest($, asked, { model: constrained.model, effort: constrained.effort, usage: result.usage, routingReason: host !== null ? mainReason : resolution?.reason, fallbackReason: host !== null ? host.capReason : launched === null ? resolution?.fallbackReason : hostReason, via }, mismatch))
