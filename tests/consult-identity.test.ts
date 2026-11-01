@@ -4,7 +4,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { roleOf } from '../hooks/orchestra'
 import type { Ledger, Task } from '../types'
-import { FIVE, GATE_NAMES, hostState, progress, prompt, start, world } from './world'
+import { FIVE, GATE_NAMES, hostState, progress, prompt, start, spawnWorld as world } from './world'
 
 type Engine = Parameters<typeof start>[0]
 const SONNET = 'claude-sonnet-5-5'

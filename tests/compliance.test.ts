@@ -10,7 +10,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { register } from '../hooks/register'
-import { hostState, start, world } from './world'
+import { hostState, start, spawnWorld as world } from './world'
 import { bash, prompt } from './world'
 
 type Hook = (...args: never[]) => unknown

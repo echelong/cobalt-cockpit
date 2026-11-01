@@ -7,7 +7,7 @@
 import { describe, expect, test as engineTest } from 'claude-code/testing'
 
 import type { Ledger } from '../types'
-import { command, hostState, mountHud, mountPane, rowsOf, start, world } from './world'
+import { command, hostState, mountHud, mountPane, rowsOf, start, spawnWorld as world } from './world'
 import type { World } from './world'
 
 const test: typeof engineTest = ((name: string, optionsOrRun: any, run?: any) => {

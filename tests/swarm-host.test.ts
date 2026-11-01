@@ -3,7 +3,7 @@ import { addAgent, checkpointOf, emptyLedger, jsonBytes, startRun, storageLedger
 import { admitTask, bindAgent, emptySwarm, finishTask, reportResult, submitTask } from '../hooks/swarm'
 import { replayTimeline } from '../hooks/replay'
 import type { Ledger } from '../types'
-import { bash, command, fieldRowsOf, hostState, mountHud, mountPane, passAllGates, planAndComplete, progress, prompt, rowsOf, start, world } from './world'
+import { bash, command, fieldRowsOf, hostState, mountHud, mountPane, passAllGates, planAndComplete, progress, prompt, rowsOf, start, spawnWorld as world } from './world'
 
 type Engine = Parameters<typeof start>[0]
 const SWARM = 'mcp__cobalt-cockpit__swarm'
@@ -67,7 +67,7 @@ describe('swarm ownership through real host hooks', () => {
 
 describe('swarm handoffs, end events and durable evidence', () => {
   test('read-only helper discovers tools and delivers its report through native handback', options, async ($, on) => {
-    const w = world(on); const held = hostState(on, {}); on('session.id', () => ({ value: 'reader-session' })); await start($)
+    const w = world(on, { sessionId: undefined }); const held = hostState(on, {}); on('session.id', () => ({ value: 'reader-session' })); await start($)
     await assign($, 'reader'); const a = (await spawn($, 'reader')).agentId!
     expect((await $.tool.call({ tool: 'ToolSearch', agentId: a, query: 'select:mcp__cobalt-cockpit__swarm' } as never)).deny).toBeUndefined()
     await report($, { action: 'result', task_id: 'reader', agentId: a, conclusion: 'Finding with uncertainty', evidence: ['shared.ts:1'], unresolved: ['Needs commander review'] })
@@ -240,7 +240,7 @@ test('parked ownership reconciles actual completed agents on resume', options, a
   swarm = bindAgent(swarm, 'parked-writer', 'prior-agent', 12)
   const seed = { ...startRun(emptyLedger('parked-session'), 'prior-turn', 10), swarm }
   const parked = { ...seed, checkpoint: checkpointOf(seed, null, null, 15) }
-  const w = world(on, { agents: [{ id: 'prior-agent', description: 'Scoped change', type: 'worker', status: 'completed' }] }, { 'ledger:parked-session': parked })
+  const w = world(on, { sessionId: undefined, agents: [{ id: 'prior-agent', description: 'Scoped change', type: 'worker', status: 'completed' }] }, { 'ledger:parked-session': parked })
   const held = hostState(on, {}); on('session.id', () => ({ value: 'parked-session' }))
   await start($)
   expect(task(held, 'parked-writer').state).toBe('completed')
@@ -255,7 +255,7 @@ test('schema-one parked resume preserves old replay without inventing agents', o
   const base = startRun(emptyLedger('legacy-session'), 'old-turn', 10)
   const { swarm: _swarm, ...fields } = base
   const parked = { ...fields, schema: 1, checkpoint: checkpointOf(base, null, null, 20) }
-  const w = world(on, {}, { 'ledger:legacy-session': parked }); const held = hostState(on, {})
+  const w = world(on, { sessionId: undefined }, { 'ledger:legacy-session': parked }); const held = hostState(on, {})
   on('session.id', () => ({ value: 'legacy-session' }))
   await start($)
   expect(current(held).schema).toBe(2)
@@ -318,7 +318,7 @@ test('wildcard read agents cannot launch an editor through git grep options', op
 
 test('unknown commander model is not presented as Opus in observation mode', async ($, on) => {
   const seed = addAgent(startRun(emptyLedger('unknown-session'), 'unknown-turn', 10), { agentId: 'observed', subagentType: 'explorer', description: 'Known agent, unknown commander', model: 'claude-sonnet-5-5' }, 12)
-  world(on); hostState(on, { 'run-ledger': seed }); on('session.id', () => ({ value: 'unknown-session' }))
+  world(on, { sessionId: undefined }); hostState(on, { 'run-ledger': seed }); on('session.id', () => ({ value: 'unknown-session' }))
   await start($)
   const hud = await mountHud($, 'terminal', 120, true)
   const field = (await fieldRowsOf(hud)).join('\n')

@@ -8,7 +8,7 @@ import { emptyLedger, migrateLedger, storageLedger } from '../hooks/ledger'
 import { resetStore } from '../hooks/telemetry-store'
 import { admitTask, bindAgent, configureSwarm, emptySwarm, finishTask, submitTask, SONNET_LED_SWARM } from '../hooks/swarm'
 import type { Consultation, EvidencePacket, Ledger, ReleaseRecord, Swarm, Task } from '../types'
-import { FIVE, GATE_NAMES, hostState, progress, prompt, start, world } from './world'
+import { FIVE, GATE_NAMES, hostState, progress, prompt, start, spawnWorld as world } from './world'
 
 type Engine = Parameters<typeof start>[0]
 const SONNET = 'claude-sonnet-5-5'

@@ -10,7 +10,7 @@ import { roleOf } from '../hooks/orchestra'
 import { parseShell } from '../hooks/shell'
 import { BLOCK_LINE } from '../hooks/policy'
 import { INSPECT_BSD, INSPECT_GNU } from '../hooks/git-integrity'
-import { FIVE, bash, command, hostState, mountHud, mountPane, passAllGates, planAndComplete, progress, prompt, rowsOf, start, TOOL, world } from './world'
+import { FIVE, bash, command, hostState, mountHud, mountPane, passAllGates, planAndComplete, progress, prompt, rowsOf, start, TOOL, spawnWorld as world } from './world'
 import type { World } from './world'
 
 const test: typeof engineTest = ((name: string, optionsOrRun: any, run?: any) => {

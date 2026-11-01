@@ -3,7 +3,7 @@ import { agentsText, taskText } from '../hooks/inspector'
 import { orchestrationText } from '../hooks/orchestra'
 import { admitTask, bindAgent, emptySwarm, finishTask, routeTask, routingOf, submitTask, suggestRoute, summarizeSwarm, verifyTask } from '../hooks/swarm'
 import type { EffortRequest, Ledger, ModelTier, Swarm, SwarmTask, Wave } from '../types'
-import { hostState, start, world } from './world'
+import { hostState, start, spawnWorld as world } from './world'
 
 // The route's suggestion: read from fields the commander set on purpose, recorded beside the commander's own choice, and
 // never acted on. The cases are assignments of the kinds a real engineering session makes.

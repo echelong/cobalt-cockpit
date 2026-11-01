@@ -576,6 +576,10 @@ export type SwarmTask = {
   cancellationRequested: boolean; wave: Wave; spawnReason: string; escalation: Handoff | null; result: SwarmResult | null; verification: Verification
   /** Report observation, independent of host lifecycle and commander verification. Absent in older ledgers. */
   resultDelivery?: 'reported' | 'host_accepted' | 'answer_observed' | 'unavailable'
+  /** Durable dispatch claim identity; absent in older ledgers. Not an agent identity. */
+  spawnAttempt?: string
+  /** Dispatch may have started an agent, but no unique valid ID has been bound. Ownership is retained. */
+  spawnUncertain?: boolean
   /** The effort the commander requested for this task: a level, or AUTO to choose from the task. */
   requestedEffort: EffortRequest; /** Why that effort (or the AUTO selection) was chosen. */ effortReason: string
   /** The level last applied to this task's live agent requests, where observable; null before any request. */ appliedEffort: string | null
@@ -587,7 +591,7 @@ export type SwarmTask = {
 }
 export type SwarmEvent = { seq: number; at: number; kind: string; taskId: string | null; agentId: string | null; wave: Wave; detail: string }
 export type SwarmConfig = { sonnet: number | 'AUTO'; haiku: number | 'AUTO'; total: number | 'AUTO'; /** Opus specialist subagents allowed at once; 0 (and absent, in older ledgers) keeps OPUS tasks in the main loop. Counted in `total` when above 0. */ opus?: number; maxTasks: number; maxEvents: number; stallMs: number }
-export type Swarm = { version: 2; wave: Wave; config: SwarmConfig; tasks: SwarmTask[]; events: SwarmEvent[]; sequence: number; requested: number; actual: number; highWater: number; conflicts: number; droppedEvents: number }
+export type Swarm = { /** Durable ownership could not be restored; effects and admissions must retry the read. */ spawnClaimsUnavailable?: boolean; version: 2; wave: Wave; config: SwarmConfig; tasks: SwarmTask[]; events: SwarmEvent[]; sequence: number; requested: number; actual: number; highWater: number; conflicts: number; droppedEvents: number }
 /** One tier's delegation funnel: what was suggested, what the commander requested, what admission reserved, what the host spawned, what completed and what the commander verified. */
 export type RouteCounts = { suggested: number; requested: number; admitted: number; spawned: number; completed: number; verified: number }
 export type TaskInput = Pick<SwarmTask, 'id' | 'tier' | 'role' | 'objective'> & Partial<Pick<SwarmTask, 'parentTask' | 'parentAgent' | 'scope' | 'dependencies' | 'owned' | 'mode' | 'wave' | 'spawnReason'>> & { /** Requested reasoning level, or AUTO to choose from the task. */ effort?: EffortRequest; /** Why the effort was chosen. */ effortReason?: string }

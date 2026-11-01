@@ -185,6 +185,8 @@ export type World = {
   /** Tools other than Bash that answer with an error, by name. */
   failingTools: string[]
   version: string
+  /** Explicit session identity for spawn tests; unset leaves identity failure tests intact. */
+  sessionId?: string
   /** What `prompt.submit` carried into the session. */
   submitted: { text: string; context: readonly string[] }[]
   /** Panes the plugin opened. */
@@ -684,6 +686,8 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
   })
 
   on('session.start', ($, e) => ({ cwd: e.cwd }))
+  const fixtureSession = w.sessionId
+  if (fixtureSession !== undefined) on('session.id', () => ({ value: fixtureSession }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
   on('prompt.submit', ($, e) => {
@@ -747,6 +751,9 @@ export const world = (on: On, overrides: Partial<World> = {}, stored: Readonly<R
 
   return w
 }
+
+/** Spawn fixtures model the host's session ID; explicit identity tests can opt out. */
+export const spawnWorld: typeof world = (on, overrides = {}, stored = {}) => world(on, { sessionId: 'mock-session', ...overrides }, stored)
 
 export const start = ($: Engine) => $.session.start({ cwd: '/work/example', surface: 'terminal', isInteractive: true })
 

@@ -6,7 +6,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { isInsideFolder } from '../hooks/guard-rules'
 import { instructionFilesWritten } from '../hooks/hygiene'
-import { bash, commandsRun, prompt, start, world } from './world'
+import { bash, commandsRun, prompt, start, spawnWorld as world } from './world'
 
 type Engine = Parameters<typeof start>[0]
 

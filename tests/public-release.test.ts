@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { command, hostState, mountHud, mountPane, planAndComplete, progress, prompt, rowsOf, start, world, bash , type World } from './world'
+import { command, hostState, mountHud, mountPane, planAndComplete, progress, prompt, rowsOf, start, spawnWorld as world, bash , type World } from './world'
 import { emptyLedger, exportJSON } from '../hooks/ledger'
 import { replayStep, secretText } from '../hooks/replay'
 import { carriesCredential, redactSecrets } from '../hooks/secrets'

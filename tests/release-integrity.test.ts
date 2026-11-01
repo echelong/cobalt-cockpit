@@ -5,7 +5,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { clearReview, fulfilsAsked, promptOrigin, releaseDecision, requireReview, revalidateRelease, withRelease } from '../hooks/consult'
 import type { Consultation, Ledger, ReleaseRecord, ReviewRequirement, Task } from '../types'
-import { FIVE, GATE_NAMES, hostState, progress, prompt, start, world } from './world'
+import { FIVE, GATE_NAMES, hostState, progress, prompt, start, spawnWorld as world } from './world'
 
 type Engine = Parameters<typeof start>[0]
 const SONNET = 'claude-sonnet-5-5'

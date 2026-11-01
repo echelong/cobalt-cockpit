@@ -5,7 +5,7 @@ import { FOLD_MS, GLIDE_MS, PALETTE, STATE_COLOR, STATE_GLOW, STATE_GLYPH, cells
 import { hex, pack } from '../hooks/pixels'
 import type { HudInput } from '../hooks/view'
 import type { AgentStrip, Task } from '../types'
-import { badgeLitOf, command, elementOf, elementsOf, hostState, mountHud, planAndComplete, progress, rowsOf, start, world } from './world'
+import { badgeLitOf, command, elementOf, elementsOf, hostState, mountHud, planAndComplete, progress, rowsOf, start, spawnWorld as world } from './world'
 
 const taskAt = (count = 2): Task => {
   let t = applyAction(newTask(1, 'Inspect → implement', 0, null), { action: 'plan', milestones: [

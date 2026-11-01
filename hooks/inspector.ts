@@ -47,6 +47,7 @@ export type Blocker = {
  * form fail rather than this explanation quietly going wrong.
  */
 export const blockerOf = (s: Swarm, t: SwarmTask, now: number): Blocker | null => {
+  if (t.spawnUncertain && isLive(t)) return { kind: 'awaiting-spawn', why: 'Spawn outcome uncertain; an agent may have started. Ownership is retained.', suggestion: 'A missing ID, absent listing, elapsed time or cancellation request does not establish termination. Wait for a verified spawn ID or positive no-start evidence.' }
   if (t.cancellationRequested && isLive(t)) return { kind: 'cancelling', why: 'Cancellation was requested; ownership is held until the host confirms the agent stopped.', suggestion: 'Wait for the host to report the stop. Nothing here cancels or releases anything.' }
   if (t.state === 'queued' || t.state === 'blocked') {
     const reason = admissionReason(s, t.id)
@@ -80,7 +81,7 @@ export const blockerOf = (s: Swarm, t: SwarmTask, now: number): Blocker | null =
     if (reason === 'architect occupied') return { kind: 'architect', why: 'An architect consultation is already running; only the configured number run at once.', suggestion: 'Wait for the running consultation to return.' }
     return { kind: 'unknown', why: `The swarm reports: ${clip(one(reason), 120)}.` }
   }
-  if (t.state === 'reserved') return { kind: 'awaiting-spawn', why: 'A slot and its ownership are reserved; the host has not yet reported the agent.', suggestion: 'If no agent ever appears, the commander releases the reservation; Cockpit does not.' }
+  if (t.state === 'reserved') return { kind: 'awaiting-spawn', why: 'A slot and its ownership are reserved; the host has not yet reported the agent.', suggestion: 'Only positive no-start evidence permits release; an absent agent does not.' }
   if (t.state === 'stalled') {
     const quiet = ageOf(now - t.lastActivityAt)
     return { kind: 'stalled', why: `No activity observed${quiet === null ? '' : ` since ${quiet}`} (stall threshold ${Math.round(s.config.stallMs / 60_000)} min); ownership is retained until the host confirms the agent stopped or recovers.`, suggestion: 'A stalled mark is not proof the agent stopped writing. Wait for the host, or ask the commander to check on it.' }
@@ -175,6 +176,9 @@ const depText = (s: Swarm, t: SwarmTask): string => t.dependencies.map(d => `${d
  * only a total fits.
  */
 export const swarmHint = (s: Swarm, columns: number): string | null => {
+  if (s.spawnClaimsUnavailable) return clip('SWARM: UNCERTAIN · ownership storage unavailable · effects held', Math.max(1, columns))
+  const uncertain = s.tasks.filter(t => t.spawnUncertain && isLive(t)).length
+  if (uncertain > 0) return clip(`SWARM: ${uncertain} UNCERTAIN · ownership retained · /cockpit agents`, Math.max(1, columns))
   const count = (state: string): number => s.tasks.filter(t => t.state === state).length
   const blocked = count('blocked')
   const quiet = count('stalled')

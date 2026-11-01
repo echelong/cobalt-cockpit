@@ -8,7 +8,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import { clearReview, consultVerdict, releaseEligible, releaseDecision, statusOf, withRelease } from '../hooks/consult'
 import { admitTask, bindAgent, configureSwarm, emptySwarm, finishTask, submitTask, SONNET_LED_SWARM } from '../hooks/swarm'
 import type { Consultation, Ledger, ReleaseRecord, ReviewRequirement, Swarm, Task } from '../types'
-import { FIVE, GATE_NAMES, hostState, progress, prompt, start, world } from './world'
+import { FIVE, GATE_NAMES, hostState, progress, prompt, start, spawnWorld as world } from './world'
 
 type Engine = Parameters<typeof start>[0]
 const SONNET = 'claude-sonnet-5-5'

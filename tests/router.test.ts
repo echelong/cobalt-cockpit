@@ -9,7 +9,7 @@ import type { ActiveMode, Feature, RouterAnswer, RouterDecision, RouterPolicy, R
 import type { ConsultFacts } from '../hooks/consult'
 import { ledgerLines, emptyLedger, exportJSON } from '../hooks/ledger'
 import type { Ledger, Task } from '../types'
-import { command, FIVE, GATE_NAMES, hostState, mountPane, progress, prompt, rowsOf, start, world } from './world'
+import { command, FIVE, GATE_NAMES, hostState, mountPane, progress, prompt, rowsOf, start, spawnWorld as world } from './world'
 
 type Engine = Parameters<typeof start>[0]
 type World = ReturnType<typeof world>

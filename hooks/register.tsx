@@ -8,7 +8,7 @@
 // in variables (timers, the mounted waveform) is rebuilt as events arrive.
 // No bookkeeping in this file may fail a tool call: it runs under `quiet`.
 
-import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, acknowledgeHandback, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, overlaps, ownershipAllows, hasActiveOwnership, setAppliedEffort, setLaunchEffort, SONNET_LED_SWARM } from './swarm'
+import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, uncertainSpawn, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, acknowledgeHandback, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, overlaps, ownershipAllows, hasActiveOwnership, setAppliedEffort, setLaunchEffort, SONNET_LED_SWARM } from './swarm'
 import type { Swarm, SwarmTask, ModelTier, Wave, Verification } from './swarm'
 import { agentsText, shortResource, swarmHint, taskText } from './inspector'
 import { readyText } from './readiness'
@@ -263,6 +263,68 @@ const agentRefusal = (s: Swarm, agentId: string): string | null => {
 const changeSwarm = async ($: EngineInterface, f: (s: Swarm) => Swarm): Promise<Swarm> => {
   const l = await update($, ledgerAtom, old => ({ ...old, schema: 2 as const, swarm: f(swarmState(old)) }))
   return l.swarm!
+}
+type Claim = { version: 1; task: SwarmTask; attempt: string }
+const prefix = (session: string): string => `spawn-claim:${encodeURIComponent(session)}:`
+const keyOf = (session: string, id: string): string => `${prefix(session)}${encodeURIComponent(id)}`
+const settledKey = (session: string, claimAttempt: string): string => `spawn-no-start:${encodeURIComponent(session)}:${encodeURIComponent(claimAttempt)}`
+
+const writeSpawnClaim = async ($: EngineInterface, session: string, task: SwarmTask): Promise<void> => {
+  if (!session || session === 'unknown' || !task.spawnAttempt || !task.spawnUncertain) throw new Error('Spawn requires a session and durable reservation')
+  const claim: Claim = { version: 1, task, attempt: task.spawnAttempt }
+  const key = keyOf(session, task.id)
+  await $.store.set(key, claim)
+  if (JSON.stringify(await $.store.get(key)) !== JSON.stringify(claim)) throw new Error('Spawn reservation did not read back')
+}
+
+/** Positive no-start only. Separate attempt key prevents a late write from
+ * settling a later retry. Kept as evidence; never overwritten by ledger saves. */
+const settleNoStart = async ($: EngineInterface, session: string, claimAttempt: string): Promise<void> => {
+  const key = settledKey(session, claimAttempt)
+  await $.store.set(key, { version: 1, noStart: true })
+  const back = await $.store.get(key) as { version?: unknown; noStart?: unknown } | undefined
+  if (back?.version !== 1 || back.noStart !== true) throw new Error('No-start settlement did not read back')
+}
+
+const readSpawnClaims = async ($: EngineInterface, session: string): Promise<Claim[]> => {
+  const claims: Claim[] = []
+  for (const key of (await $.store.keys()).filter(k => k.startsWith(prefix(session)))) {
+    const claim = await $.store.get(key) as Claim | undefined
+    if (claim?.version !== 1 || !claim.attempt || !claim.task?.id || claim.task.spawnAttempt !== claim.attempt || claim.task.state !== 'reserved' || claim.task.startedAt === null || claim.task.agentId !== null || !claim.task.spawnUncertain || key !== keyOf(session, claim.task.id)) throw new Error('Unreadable durable spawn reservation; dispatch held')
+    const settled = await $.store.get(settledKey(session, claim.attempt)) as { version?: unknown; noStart?: unknown } | undefined
+    if (settled?.version === 1 && settled.noStart === true) continue
+    claims.push(claim)
+  }
+  return claims
+}
+
+/** A matching bound or terminal record was written by the lifecycle hooks.
+ * Missing/stale snapshots restore the original claim, never an idle queue.
+ */
+const restoreSpawnClaims = (s: Swarm, claims: readonly Claim[]): Swarm => {
+  let tasks = s.tasks
+  for (const claim of claims) {
+    const current = tasks.find(t => t.id === claim.task.id)
+    if (current?.spawnAttempt === claim.attempt && (current.endedAt !== null || (current.startedAt !== null && ['reserved', 'running', 'stalled'].includes(current.state)))) continue
+    tasks = [...tasks.filter(t => t.id !== claim.task.id), { ...claim.task, reason: 'Spawn outcome uncertain after resume; ownership retained' }]
+  }
+  return tasks === s.tasks ? s : { ...s, tasks }
+}
+
+/** A failed read holds the current effect even if recording the warning fails. */
+const restoreSpawnOwnership = async ($: EngineInterface, sessionHint?: string): Promise<void> => {
+  try {
+    const session = sessionHint ?? (await $.session.id().catch(() => UNKNOWN))
+    if (!session || session === UNKNOWN) throw new Error('Spawn ownership requires a known session')
+    const claims = await readSpawnClaims($, session)
+    await update($, ledgerAtom, old => {
+      if (old.sessionId !== UNKNOWN && old.sessionId !== session) throw new Error('Spawn ownership session mismatch')
+      return { ...old, sessionId: session, swarm: { ...restoreSpawnClaims(swarmState(old), claims), spawnClaimsUnavailable: false } }
+    })
+  } catch (error) {
+    await quiet(() => changeSwarm($, held => ({ ...held, spawnClaimsUnavailable: true })))
+    throw error
+  }
 }
 const finishObserved = (s: Swarm, id: string, reason: string, conclusion: string, at: number): Swarm => {
   const task = s.tasks.find(t=>t.id===id)
@@ -818,7 +880,7 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
     const s = agent !== undefined && action === 'status' ? before : await changeSwarm($, held => markStalled(held,at)); const task = s.tasks.find(t => t.id === id)
     if (action === 'status') {
       const selected = id ? s.tasks.filter(t=>t.id===id) : [...s.tasks.filter(t=>!['completed','failed','cancelled'].includes(t.state)), ...s.tasks.filter(t=>['completed','failed','cancelled'].includes(t.state)).slice(-8)].slice(0,32)
-      return { result: JSON.stringify({ ...summarizeSwarm(s), tasks: selected.map(t => ({ id:t.id, tier:t.tier, suggested:t.suggestedTier ?? null, role:t.role, state:t.state, reason:t.reason, agent:t.agentId, effort:t.requestedEffort, launchEffort:t.launchEffort ?? null, appliedEffort:t.appliedEffort, effortReason:t.effortReason, result:t.result ? { conclusion:t.result.conclusion.slice(0,160), evidence:t.result.evidence.slice(0,3).map(x=>x.slice(0,160)), unresolved:t.result.unresolved.slice(0,3).map(x=>x.slice(0,160)) } : null, escalation:t.escalation ? { to:t.escalation.to, effort:t.escalation.effort ?? null, question:t.escalation.question.slice(0,160), risk:t.escalation.risk.slice(0,160) } : null, verification:t.verification, resultDelivery:t.resultDelivery ?? 'unavailable' })) }) }
+      return { result: JSON.stringify({ ...summarizeSwarm(s), tasks: selected.map(t => ({ id:t.id, tier:t.tier, suggested:t.suggestedTier ?? null, role:t.role, state:t.state, spawnUncertain:t.spawnUncertain ?? false, reason:t.reason, agent:t.agentId, effort:t.requestedEffort, launchEffort:t.launchEffort ?? null, appliedEffort:t.appliedEffort, effortReason:t.effortReason, result:t.result ? { conclusion:t.result.conclusion.slice(0,160), evidence:t.result.evidence.slice(0,3).map(x=>x.slice(0,160)), unresolved:t.result.unresolved.slice(0,3).map(x=>x.slice(0,160)) } : null, escalation:t.escalation ? { to:t.escalation.to, effort:t.escalation.effort ?? null, question:t.escalation.question.slice(0,160), risk:t.escalation.risk.slice(0,160) } : null, verification:t.verification, resultDelivery:t.resultDelivery ?? 'unavailable' })) }) }
     }
     if (action === 'assign') {
       if (typeof e['objective'] !== 'string' || !e['objective'].trim()) throw new Error('Bounded objective required')
@@ -1007,8 +1069,15 @@ const taskOfAgent = async ($: EngineInterface, agentId: string): Promise<SwarmTa
 const guardSwarm = async ($: EngineInterface, e: Record<string, unknown>, plan: GitPlan = {}): Promise<string | null> => {
   if (!config.hasOrchestration) return null
   const agent = typeof e['agentId'] === 'string' ? e['agentId'] : undefined
-  const s = swarmState(await read($, ledgerAtom)), task = agent === undefined ? undefined : boundTask(s, agent)
   const tool = String(e['tool'])
+  try { await restoreSpawnOwnership($) } catch {
+    // Inspection and queued assignments grant no ownership. Adoption and every
+    // effect need a successful read now, not just a previously recorded marker.
+    const inspection = ['Read','Grep','Glob','WebFetch','WebSearch','ToolSearch'].includes(tool) || (tool === 'Bash' && readOnlyShell(String(e['command'] ?? '')))
+    const control = tool === TOOL || (tool === SWARM_TOOL_NAME && ['status','assign','consult','wave'].includes(String(e['action']))) || ['Agent','Task','TaskOutput','TaskStop','SendMessage'].includes(tool)
+    if (!(agent === undefined && (inspection || control)) && !(tool === SWARM_TOOL_NAME && e['action'] === 'status')) return 'SWARM / durable spawn ownership unavailable; effects and admissions held. No termination inferred.'
+  }
+  const s = swarmState(await read($, ledgerAtom)), task = agent === undefined ? undefined : boundTask(s, agent)
   if (agent !== undefined && tool === SWARM_TOOL_NAME && e['action'] === 'status' && task?.id === e['task_id']) return null
   if (agent !== undefined) { const refused = agentRefusal(s, agent); if (refused) return refused }
   const observedAt = await $.clock.now()
@@ -3326,6 +3395,7 @@ const sample = async ($: EngineInterface) => {
 }
 const restore = async ($: EngineInterface) => {
   const id = (await $.session.id().catch(() => UNKNOWN)) || UNKNOWN
+  try {
   const held = await read($, ledgerAtom)
   const stored = await $.store.get(`ledger:${id}`) as Ledger | undefined
   if (held.sessionId !== id) {
@@ -3336,6 +3406,9 @@ const restore = async ($: EngineInterface) => {
     }
   } else if (!held.swarm || held.schema === 1) await mutateLedger($, migrateLedger)
   await hush(() => seedAlerts($))
+  } finally {
+    if (config.hasOrchestration) await restoreSpawnOwnership($, id)
+  }
 }
 export const ledgerStart = async ($: EngineInterface) => {
       await hush(() => restore($))
@@ -4753,6 +4826,9 @@ export const register: Register = (on, options) => {
     if (role === 'ARCHITECT' && (typeof e.provider !== 'object' || e.provider === null || e.provider.plugin !== 'cobalt-cockpit')) return { deny: 'OPUS / the architect must be the agent provided by this plugin (cobalt-cockpit:architect); this definition is attributed elsewhere. Nothing was started.' }
     let assignedId = /\[task:([\w.-]+)\]/.exec(e.description)?.[1]
     let reservedId: string | undefined
+    let spawnAttemptId: string | undefined
+    let claimSession: string | undefined
+    let dispatched = false
     // what this spawn's Agent call was launched with, taken once
     const launch = launches.get(e.tool_use_id)
     launches.delete(e.tool_use_id)
@@ -4763,6 +4839,9 @@ export const register: Register = (on, options) => {
     spawning.set(token, null)
     try {
       if (config.hasOrchestration) {
+        // A failed restore is a pre-dispatch denial, never permission to ignore
+        // durable reservations. Ordinary ledger snapshots may be stale.
+        await restoreSpawnOwnership($)
         if (commanderEffects.size) return { deny:'SWARM / commander effect in flight; assignment remains queued until it completes' }
         const running = await runningAgents($)
         // the spawns ahead of this one that the list does not show yet
@@ -4824,15 +4903,31 @@ export const register: Register = (on, options) => {
       // The launch level is on the task before the subagent exists: its first
       // request can arrive before the spawn below has returned and bound it.
       if (reservedId) await changeSwarm($, held => setLaunchEffort(held, reservedId!, launch?.level ?? null, launch?.named ?? null))
+      if (reservedId) {
+        spawnAttemptId = crypto.randomUUID()
+        claimSession = originLedger.sessionId
+        const held = await changeSwarm($, s => uncertainSpawn(s, reservedId!, spawnAttemptId!, spawnAt))
+        await writeSpawnClaim($, claimSession, held.tasks.find(t => t.id === reservedId)!)
+      }
+      // Set immediately before invoking next: any exception from here is an
+      // uncertain dispatch, including synchronous throws and binding failures.
+      dispatched = true
       const spawned = model === undefined || model === e.model
         ? await next(e)
         : await next({ ...e, model })
-      if (reservedId && spawned.agentId) await changeSwarm($, held => bindAgent(held,reservedId!,spawned.agentId!,spawnAt))
-      else if (reservedId) await changeSwarm($, held => setLaunchEffort(releaseReservation(held,reservedId!,spawnAt,spawned.deny ?? 'Host did not report agent ID'), reservedId!, null))
-      await quiet(() => ledgerSpawn($, e, spawned, originLedger, spawnAt))
-      if (reservedId && spawned.agentId) await mutateLedger($, l => { const done = l.observedCompletions?.find(c=>c.agentId===spawned.agentId); return done ? { ...finishTurn(l,{ turnId:l.turns[spawned.agentId!] ?? UNKNOWN,agentId:spawned.agentId!,reason:done.reason },done.at), swarm:finishObserved(swarmState(l),reservedId!,done.reason,done.conclusion,done.at) } : l })
-      if (spawned.agentId) {
-        spawning.set(token, spawned.agentId)
+      const verifiedId = spawned.deny === undefined && typeof spawned.agentId === 'string' && spawned.agentId.trim() !== ''
+      if (reservedId && verifiedId) await changeSwarm($, held => bindAgent(held,reservedId!,spawned.agentId!,spawnAt))
+      else if (reservedId && typeof spawned.deny === 'string' && spawned.deny.trim() !== '' && spawned.agentId === undefined && spawned.model === undefined) {
+        // The host contract's denial variant positively says no agent started.
+        // Persist that fact before releasing, so resume cannot revive a retry.
+        await settleNoStart($, claimSession!, spawnAttemptId!)
+        await changeSwarm($, held => setLaunchEffort(releaseReservation(held,reservedId!,spawnAt,spawned.deny!), reservedId!, null))
+      }
+      if (reservedId) await quiet(() => persist($))
+      if (verifiedId) await quiet(() => ledgerSpawn($, e, spawned, originLedger, spawnAt))
+      if (reservedId && verifiedId) await mutateLedger($, l => { const done = l.observedCompletions?.find(c=>c.agentId===spawned.agentId); return done ? { ...finishTurn(l,{ turnId:l.turns[spawned.agentId!] ?? UNKNOWN,agentId:spawned.agentId!,reason:done.reason },done.at), swarm:finishObserved(swarmState(l),reservedId!,done.reason,done.conclusion,done.at) } : l })
+      if (verifiedId) {
+        spawning.set(token, spawned.agentId!)
         await quiet(async () => {
           const now = await $.clock.now()
           const seq = (await update($, orchestraAtom, old => ({ ...old, spawned: old.spawned + 1 }))).spawned
@@ -4844,7 +4939,14 @@ export const register: Register = (on, options) => {
 
       return spawned
     } catch (error) {
-      if (reservedId) { const at = await $.clock.now(); await changeSwarm($, held => { const t = held.tasks.find(t=>t.id===reservedId); return t?.state === 'reserved' && !t.agentId ? setLaunchEffort(releaseReservation(held,reservedId!,at,'Host spawn failed'), reservedId!, null) : held }) }
+      if (reservedId && !dispatched) {
+        // next was never invoked. A partly written claim is settled before
+        // release; if settlement itself fails the reservation stays held.
+        if (spawnAttemptId && claimSession) await settleNoStart($, claimSession, spawnAttemptId)
+        const at = await $.clock.now()
+        await changeSwarm($, held => { const t = held.tasks.find(t=>t.id===reservedId); return t?.state === 'reserved' && !t.agentId ? setLaunchEffort(releaseReservation(held,reservedId!,at,'No dispatch: admission preparation failed'), reservedId!, null) : held })
+      }
+      await quiet(() => persist($))
       throw error
     } finally {
       spawning.delete(token)

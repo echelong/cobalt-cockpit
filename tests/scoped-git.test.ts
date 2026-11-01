@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { GIT_OVERRIDES, GIT_SAFE } from '../hooks/git-integrity'
 import { parseShell } from '../hooks/shell'
-import { start, world } from './world'
+import { start, spawnWorld as world } from './world'
 
 // A narrowly scoped helper's Git inspection, through the real tool hook: what reaches the host, and what never does.
 

@@ -112,8 +112,14 @@ export const admitTask = (s: Swarm, id: string, at: number): { swarm: Swarm; ok:
 }
 export const bindAgent = (s: Swarm, id: string, agentId: string, at: number, kind: 'spawn' | 'adopt' = 'spawn'): Swarm => {
   const t = s.tasks.find(t => t.id === id)
-  if ((!t || (t.state !== 'reserved' && !(t.state === 'stalled' && t.startedAt !== null && t.agentId === null))) || (t.tier === 'OPUS' && (s.config.opus ?? 0) === 0) || !agentId || s.tasks.some(t => t.agentId === agentId)) throw new Error('Agent binding requires a unique observed agent and reserved subagent task')
-  return event({ ...update(s, id, { agentId, state: 'running', lastActivityAt: at }), actual: s.actual + 1 }, kind, id, at, `${t.tier} ${t.role}${kind === 'adopt' ? ' · observed existing host agent; no new spawn' : ''}`)
+  if ((!t || (t.state !== 'reserved' && !(t.state === 'stalled' && t.startedAt !== null && t.agentId === null))) || (t.tier === 'OPUS' && (s.config.opus ?? 0) === 0) || !agentId.trim() || s.tasks.some(t => t.agentId === agentId)) throw new Error('Agent binding requires a unique observed agent and reserved subagent task')
+  return event({ ...update(s, id, { agentId, state: 'running', spawnUncertain: false, reason: null, lastActivityAt: at }), actual: s.actual + 1 }, kind, id, at, `${t.tier} ${t.role}${kind === 'adopt' ? ' · observed existing host agent; no new spawn' : ''}`)
+}
+/** Written before dispatch: neither an exception nor an absent ID proves no-start. */
+export const uncertainSpawn = (s: Swarm, id: string, attempt: string, at: number): Swarm => {
+  const t = s.tasks.find(t => t.id === id)
+  if (!t || t.state !== 'reserved' || t.agentId !== null) throw new Error('Dispatch requires an unbound reservation')
+  return event(update(s, id, { spawnAttempt: attempt, spawnUncertain: true, reason: 'Spawn outcome uncertain; ownership retained until verified identity or positive no-start' }), 'spawn_uncertain', id, at, 'Dispatch may start an agent; no verified ID bound')
 }
 const text = (s: string): string => redactSecrets(s).slice(0, 1500)
 const list = (s: readonly string[]): string[] => s.slice(0, 12).map(text)
@@ -173,7 +179,7 @@ export const resolveEscalation = (s: Swarm, id: string, result: Partial<SwarmRes
   if (!result.conclusion?.trim() || !result.evidence?.some(e => e.trim())) throw new Error('Resolution requires commander conclusion and evidence')
   return event(update(s, id, { state: 'completed', result: compressResult(result), verification: 'pending', reason: null }), 'escalation_resolved', id, at, result.conclusion)
 }
-export const summarizeSwarm = (s: Swarm) => ({ wave: s.wave, parallelism: active(s).length, queue: s.tasks.filter(t => t.state === 'queued').length, blocked: s.tasks.filter(t => t.state === 'blocked').length, stalled: s.tasks.filter(t => t.state === 'stalled').length, escalated: s.tasks.filter(t => t.state === 'escalated').length, completed: s.tasks.filter(t => t.state === 'completed').length, total: s.tasks.length, sonnet: s.tasks.filter(t => t.tier === 'SONNET' && occupied(t)).length, haiku: s.tasks.filter(t => t.tier === 'HAIKU' && occupied(t)).length, opus: (s.config.opus ?? 0) > 0 ? s.tasks.filter(t => t.tier === 'OPUS' && occupied(t)).length : 0, escalations: s.tasks.filter(t => t.escalation !== null).map(t => ({ task: t.id, from: t.tier, to: t.escalation!.to })), effortEscalations: s.tasks.filter(t => t.effortEscalation !== null).map(t => ({ task: t.id, from: t.effortEscalation!.from, to: t.effortEscalation!.to })), conflicts: s.conflicts, requested: s.requested, actual: s.actual, highWater: s.highWater, routing: routingOf(s), tokens: null, cost: null })
+export const summarizeSwarm = (s: Swarm) => ({ spawnClaimsUnavailable: s.spawnClaimsUnavailable ?? false, uncertain: s.tasks.filter(t => t.spawnUncertain && occupied(t)).length, wave: s.wave, parallelism: active(s).length, queue: s.tasks.filter(t => t.state === 'queued').length, blocked: s.tasks.filter(t => t.state === 'blocked').length, stalled: s.tasks.filter(t => t.state === 'stalled').length, escalated: s.tasks.filter(t => t.state === 'escalated').length, completed: s.tasks.filter(t => t.state === 'completed').length, total: s.tasks.length, sonnet: s.tasks.filter(t => t.tier === 'SONNET' && occupied(t)).length, haiku: s.tasks.filter(t => t.tier === 'HAIKU' && occupied(t)).length, opus: (s.config.opus ?? 0) > 0 ? s.tasks.filter(t => t.tier === 'OPUS' && occupied(t)).length : 0, escalations: s.tasks.filter(t => t.escalation !== null).map(t => ({ task: t.id, from: t.tier, to: t.escalation!.to })), effortEscalations: s.tasks.filter(t => t.effortEscalation !== null).map(t => ({ task: t.id, from: t.effortEscalation!.from, to: t.effortEscalation!.to })), conflicts: s.conflicts, requested: s.requested, actual: s.actual, highWater: s.highWater, routing: routingOf(s), tokens: null, cost: null })
 /** Semantic evidence, not keyword routing. Explicit commander choice wins. */
 export const routeTask = (facts: { commanderChoice?: ModelTier; trivial?: boolean; coupled?: boolean; architecture?: boolean; ambiguous?: boolean; highRisk?: boolean; extractive?: boolean; bounded?: boolean }): ModelTier => facts.commanderChoice ?? (facts.trivial || facts.coupled || facts.architecture || facts.ambiguous || facts.highRisk ? 'OPUS' : facts.extractive && facts.bounded ? 'HAIKU' : 'SONNET')
 // What a role's label says about the work. The commander writes it, so it is read as written: by whole word, anywhere
@@ -242,7 +248,7 @@ export const requestCancel = (s: Swarm, id: string, at: number): Swarm => {
 export const releaseReservation = (s: Swarm, id: string, at: number, reason: string): Swarm => {
   const t = s.tasks.find(t => t.id === id)
   if ((!t || !['reserved','stalled'].includes(t.state) || t.startedAt === null) || t.agentId !== null) throw new Error('Only unbound reservations can be released')
-  return event(update(s, id, { state: t.cancellationRequested ? 'cancelled' : 'queued', startedAt: null, reason }), 'spawn_denied', id, at, reason)
+  return event(update(s, id, { state: t.cancellationRequested ? 'cancelled' : 'queued', startedAt: null, spawnAttempt: undefined, spawnUncertain: false, reason }), 'spawn_denied', id, at, reason)
 }
 /** Agent claims are evidence pending commander verification; reporting does not release ownership. */
 export const reportResult = (s: Swarm, id: string, result: Partial<SwarmResult>, at: number): Swarm => {

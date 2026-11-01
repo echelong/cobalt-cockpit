@@ -7,7 +7,7 @@ import { eventOf } from '../hooks/nwho'
 import { desiredRequest, policyMismatch } from '../hooks/model-policy'
 import { advance, orchestrationGraph, orchestrationTape, RESTING } from '../hooks/field'
 import { newTask, applyAction } from '../hooks/model'
-import { hostState, world, start, prompt, rowsOf, fieldRowsOf, mountHud, progress } from './world'
+import { hostState, spawnWorld as world, start, prompt, rowsOf, fieldRowsOf, mountHud, progress } from './world'
 const run = () => startRun(emptyLedger('s1'), 't1', 1000)
 const agent = (l = run(), id = 'a1', parentAgentId?: string) => addAgent(l, { agentId: id, subagentType: 'explorer', description: 'Inspect auth', requestedModel: 'sonnet', model: 'claude-sonnet-5-5', parentAgentId, background: true }, 1200)
 const usage = { model: 'claude-opus-5-5', input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 4, cache_creation_input_tokens: 2 }
@@ -185,7 +185,7 @@ describe('ledger through the installed engine test harness', () => {
     expect((held.get('run-ledger')?.value as Ledger).checkpoint?.goal).toBe('Fix auth')
   })
   test('hot reload retains background agents and deduplication state', async ($, on) => {
-    world(on); const seed = agent(); const held = hostState(on, { 'run-ledger': { ...seed, sessionId: 'mock-session' } })
+    world(on, { sessionId: undefined }); const seed = agent(); const held = hostState(on, { 'run-ledger': { ...seed, sessionId: 'mock-session' } })
     // Seed the host with its own session id, as a reload does.
     on('session.id', () => ({ value: 'mock-session' }))
     await start($); expect((held.get('run-ledger')?.value as Ledger).agents[0]?.id).toBe('a1')
@@ -203,7 +203,7 @@ describe('ledger through the installed engine test harness', () => {
 describe('durable resume and dossier surfaces', () => {
   test('a persisted checkpoint appears on resume and collapses on a prompt', async ($, on) => {
     const l = { ...agent(), checkpoint: checkpointOf(agent(), null, null, 2000) }
-    const w = world(on, {}, { 'ledger:s1': l })
+    const w = world(on, { sessionId: undefined }, { 'ledger:s1': l })
     on('session.id', () => ({ value: 's1' }))
     await start($)
     const hud = await mountHud($, 'terminal', 120)
@@ -229,7 +229,7 @@ describe('durable resume and dossier surfaces', () => {
     expect(w.outbound).toEqual([]); expect(w.requests).toEqual([])
   })
   test('ledger persists through the host store at /park', async ($, on) => {
-    world(on); const held = hostState(on, {}); on('session.id', () => ({ value: 'durable-session' }))
+    world(on, { sessionId: undefined }); const held = hostState(on, {}); on('session.id', () => ({ value: 'durable-session' }))
     await start($); await $.turn.start({ turnId: 't1', text: '' }); await slash($, 'park')
     held.get('run-ledger')!.value = emptyLedger()
     await start($)

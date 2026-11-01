@@ -13,7 +13,7 @@ import { orchestrationText, orchestraRows, roleOf } from '../hooks/orchestra'
 import type { OrchestraView } from '../hooks/orchestra'
 import { usageByTier, usageLine, ledgerLines, emptyLedger, storageLedger } from '../hooks/ledger'
 import type { Consultation, EvidencePacket, Ledger, Swarm, Task } from '../types'
-import { FIVE, GATE_NAMES, hostState, progress, prompt, start, world } from './world'
+import { FIVE, GATE_NAMES, hostState, progress, prompt, start, spawnWorld as world } from './world'
 
 type Engine = Parameters<typeof start>[0]
 const SWARM = 'mcp__cobalt-cockpit__swarm'

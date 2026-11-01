@@ -1,7 +1,7 @@
 // Future-call authorization only: these tests do not establish native fencing or drain admitted effects.
 import { expect, test } from 'claude-code/testing'
 import type { Ledger } from '../types'
-import { hostState, start, world } from './world'
+import { hostState, start, spawnWorld as world } from './world'
 
 type Engine = Parameters<typeof start>[0]
 const SWARM = 'mcp__cobalt-cockpit__swarm'

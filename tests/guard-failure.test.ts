@@ -9,7 +9,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { failClosed, guardFailure } from '../hooks/guard-rules'
 import type { GuardName } from '../hooks/guard-rules'
-import { bash, commandsRun, start, world } from './world'
+import { bash, commandsRun, start, spawnWorld as world } from './world'
 
 // built at run time from parts, as the other fixtures are, so no scanner-shaped value sits in the source
 const SECRET = ['sk', 'test', 'SECRET', '0123456789'].join('-')
