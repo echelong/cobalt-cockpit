@@ -34,6 +34,9 @@ never prints them).
 cd ~/code/app && cockpit-cline            # or: cockpit-cline --repo ~/code/app --gate test="npm test"
 ```
 
+On this machine `cline-cockpit` (a personal launcher in `~/.local/bin` that runs `bin/cockpit-cline`) opens the
+same shell; any wrapper that execs `bin/cockpit-cline` with your arguments works the same way.
+
 With no command, on a terminal, `cockpit-cline` opens the integrated Cockpit: a persistent live HUD on top, the
 conversation in the middle, an input line at the bottom. Type a request as you would in Cline. **Every message is
 one supervised task**: it is classified (question, change, debugging, UI, scouting, architecture), routed by the
@@ -46,23 +49,47 @@ design never reroutes the tasks it planned. Answers from turns that did not pass
 such in later turns' context. Reopening `cockpit-cline` in the same repository resumes the conversation: transcript, mission state and
 any interrupted work are reconciled by process identity first (`--new` starts a fresh conversation).
 
-The HUD shows, from live supervisor state only: the five roles with their model, requested→effective reasoning
-(`✓` once confirmed on the wire) and state (RUNNING, QUEUED, RETRY Ns, BLOCKED, done/failed); agent counts; the
-current turn's milestones; gates of the last task and of the integrated branch; spend against the budget; Guard
-alerts; ownership claims; and the mission lifecycle separate from its outcome (RUNNING, VERIFYING, RETRYING,
-WAITING, BLOCKED, `FINISHED · VERIFIED` only when every condition passed, otherwise `FINISHED · PARTIAL`/
-`UNVERIFIED`/…). A new turn never shows the previous turn's verdict while it works, and the branch gates are shown
-only for the head they ran on ("pending" once newer work is integrated). A completed write turn that changed
-nothing reads `NO CHANGES`; a write turn that changed nothing but claims it did is a misreported completion and
-goes through the correction ladder.
+### HUD 2.0
+
+The HUD uses the Claude Code Cockpit's design language: its palette (`hooks/theme.ts`: red for activity, amber
+for waiting, green for done, deep red for failure, cyan only for scanning and checks), numbered dossier sections
+and `NAME / VALUE` labels. Every figure comes from the supervisor's live state, its hash-chained ledger (tailed
+by byte offset) or the worker's own Cline event stream. Nothing is estimated for display, and an unknown value
+reads `—` or `?`, never zero or ✓.
+
+| Section | What it shows |
+|---|---|
+| header | mission state pill (RUNNING, VERIFYING, RETRYING, WAITING, BLOCKED, `FINISHED · VERIFIED` only on a DONE verdict, otherwise `FINISHED · PARTIAL`/`UNVERIFIED`/…), `◈ KIMI ORCHESTRATING` while a plan runs, elapsed time, spend of budget, repo, branch@head, profile, Cline version, ownership claims |
+| `01 SWARM / FIVE MODELS` | one row per role: model (DeepSeek 1017 marked `★` as the default coder), provider, reasoning requested→effective (`✓` confirmed on the wire, `?` unconfirmed or not sent yet, `~` inferred for MiMo's toggle, `✗` mismatch, `◌` expected but not yet observed), state (RUNNING with a spinner, VERIFYING, RETRY Ns, WAITING with the admission reason, QUEUED, BLOCKED, DONE, FAILED, UNAVAILABLE), the task and what the worker is doing now (its last tool call), escalation origin, tokens in/out, cost (`~` estimated, `—` not reported), elapsed |
+| `02 VERIFY / GATES` | TEST, TYPE, BUILD, SECURITY, GIT: PASS, FAIL, PENDING, SKIPPED (not configured), UNVERIFIABLE (the change edits its own gate definition), NOT RUN, each with where it ran (task attempt or branch@head) and the OUTCOME line, which says "an ended run is not a verified task" until the supervisor's verdict |
+| `03 SPEND / BUDGET` | session spend and bar, what is left after reservations for running workers, reported vs estimated vs unmetered, spend by model family, crossed alerts and a reached cap |
+| `04 ACTIVITY / LIVE` | the latest real events: routing, sandbox start, edits, commands and test runs, gates, integration, failures, retries, escalations, budget alerts, verdicts, each with the agent and task |
+
+**Mission Control** (Tab, or `/cockpit <view>`) is full screen with seven views: `1` OVERVIEW (mission, status,
+verdict reasons, turn milestones, problems, alerts, ownership), `2` AGENTS (every attempt: Enter expands routing
+rules and signals, reasoning evidence, token breakdown incl. cache and reasoning tokens, cost basis, tools,
+changes, gates, commit, sandbox census, worktree, prompt), `3` TIMELINE (the whole history, scrollable, Enter for
+details, `f` filters by agent), `4` ROUTING (the fixed role policy and every decision with its rules, signals,
+retries and escalations), `5` VERIFY (the five gates with their evidence and the DONE rules), `6` COSTS (session,
+by model, by task), `?` KEYS.
+
+Rendering is flicker-free: frames are written inside a synchronized-update block and only changed rows are
+rewritten; a resize repaints once at the new size; nothing ever reaches the last column, so a frame can never
+wrap or scroll. Model output is stripped of escape sequences before it is shown. Wide, medium (80–119 columns),
+narrow (under 80) and very small terminals each get their own layout, down to 40×12. `NO_COLOR=1` draws no colour
+(state pills keep their shape as `[READY]`), `COCKPIT_COLOR=none|16|256|truecolor` forces a mode, and
+`COCKPIT_REDUCED_MOTION=1` turns off the spinner and waveform (the screen then changes only when state does, plus
+a once-a-second clock while work runs). One 120 ms timer drives the screen; a frame with 2000 records and 5000
+events renders in a few milliseconds, so the display never holds up the supervisor.
 
 | Input | Effect |
 |---|---|
 | text, Enter | a supervised turn (Alt+Enter inserts a newline; ↑/↓ history) |
 | `/swarm <goal>` | Kimi plans; Cockpit routes and admits every planned task |
-| `/cockpit` or Tab | full Mission Control overlay (Esc returns) |
-| `/cockpit agents` · `routing` · `costs` · `ready` · `doctor` | every task and attempt · routing decisions and rules · spend per model · go/no-go · checks |
-| `/route <text>` · `/models` · `/diff` · `/new` | explain a route without running it · roles · branch diff · new conversation |
+| Tab · `/cockpit` | open or close Mission Control |
+| `/cockpit overview\|agents\|timeline\|routing\|gates\|costs` | open that view; `/cockpit ready` and `/cockpit doctor` print their checks |
+| Mission Control: ←/→, `1`–`6`, `?` · ↑/↓ or j/k · Enter/Space · PgUp/PgDn, Home/End · `f` · Esc | switch view · select · expand details · page · timeline agent filter · back |
+| `/keys` · `/route <text>` · `/models` · `/diff` · `/new` | keyboard help · explain a route without running it · roles · branch diff · new conversation |
 | Esc / `/cancel` | cancel the running turn (its sandbox is accounted for before ownership is released) |
 | Ctrl+C | clear the input; on a running turn cancel it, twice to stop and quit; on an empty line quit |
 | Ctrl+D / `/quit` | quit (a running turn is stopped first) |

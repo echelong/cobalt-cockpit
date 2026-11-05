@@ -29,6 +29,8 @@ export { EFFORT_LEVELS, effortRank, isEffortLevel } from '../../../hooks/effort'
 export { lexicalFeatures } from '../../../hooks/router'
 export { CLAIMABLE_STATES, STATE_MEANING, NOT_SECURITY_ATTESTED } from '../../../hooks/verification'
 export type { ClaimedVerification } from '../../../hooks/verification'
+// The Claude Code Cockpit's palette: both cockpits draw in the same colours.
+export { PALETTE } from '../../../hooks/theme'
 
 import type { ModelTier } from '../../../hooks/swarm'
 

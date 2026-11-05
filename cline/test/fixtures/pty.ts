@@ -9,9 +9,9 @@ import { FAKE, HERE, tmp } from '../helpers.ts'
 
 export const BIN = join(HERE, '..', 'bin', 'cockpit-cline')
 
-export type Pty = { child: ChildProcess; frame: () => string; raw: () => string; send: (s: string) => void; waitFor: (re: RegExp, ms?: number) => Promise<string>; exited: Promise<number | null>; pid: () => number | null; stateDir: string }
+export type Pty = { child: ChildProcess; frame: () => string; raw: () => string; send: (s: string) => void; waitFor: (re: RegExp, ms?: number) => Promise<string>; exited: Promise<number | null>; pid: () => number | null; stateDir: string; resize: (cols: number, rows: number) => void }
 
-export const KEYS = { enter: '\r', esc: '\x1b', tab: '\t', ctrlC: '\x03', ctrlD: '\x04', up: '\x1b[A' }
+export const KEYS = { enter: '\r', esc: '\x1b', tab: '\t', ctrlC: '\x03', ctrlD: '\x04', up: '\x1b[A', down: '\x1b[B', right: '\x1b[C', left: '\x1b[D', pgUp: '\x1b[5~', pgDn: '\x1b[6~' }
 
 /** A hermetic test config: fast retry backoff, nothing hidden, small budgets. */
 export const testConfigFile = (over: Record<string, unknown> = {}): string => {
@@ -20,11 +20,11 @@ export const testConfigFile = (over: Record<string, unknown> = {}): string => {
   return f
 }
 
-export const openShell = (o: { repo: string; root: string; data: string; cols?: number; rows?: number; args?: string[]; config?: string }): Pty => {
+export const openShell = (o: { repo: string; root: string; data: string; cols?: number; rows?: number; args?: string[]; config?: string; env?: Record<string, string> }): Pty => {
   const frameFile = join(tmp('frame'), 'frame.txt')
   const args = ['shell', '--repo', o.repo, '--state', o.root, '--config', o.config ?? testConfigFile(), ...(o.args ?? [])]
   const cmd = `stty cols ${o.cols ?? 160} rows ${o.rows ?? 46}; exec ${[BIN, ...args].map(a => `'${a.replace(/'/g, `'\\''`)}'`).join(' ')}`
-  const child = spawn('script', ['-qfec', cmd, '/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, COCKPIT_SHELL_FRAME: frameFile, COCKPIT_CLINE_BIN: FAKE, COCKPIT_CLINE_DATA: o.data, NO_COLOR: '' } })
+  const child = spawn('script', ['-qfec', cmd, '/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, COCKPIT_SHELL_FRAME: frameFile, COCKPIT_CLINE_BIN: FAKE, COCKPIT_CLINE_DATA: o.data, NO_COLOR: '', COCKPIT_COLOR: '', COCKPIT_REDUCED_MOTION: '', ...(o.env ?? {}) } })
   let raw = ''
   child.stdout?.on('data', d => { raw += d.toString() }); child.stderr?.on('data', d => { raw += d.toString() })
   const exited = new Promise<number | null>(r => child.on('exit', c => r(c)))
@@ -45,7 +45,13 @@ export const openShell = (o: { repo: string; root: string; data: string; cols?: 
     for (const line of out.split('\n')) { const m = /^\s*(\d+)\s+(\S+)\s(.*)$/.exec(line); if (m && /(?:^|\/)node$/.test(m[2]) && m[3].includes('src/cli.ts shell') && m[3].includes(o.root)) return Number(m[1]) }
     return null
   }
-  const p: Pty = { child, frame, raw: () => raw, send, waitFor, exited, pid, stateDir: o.root }
+  /** A real window resize: sets the terminal size on the shell's pty, so the kernel sends it SIGWINCH. */
+  const resize = (cols: number, rows: number): void => {
+    const node = pid(); if (!node) throw new Error('shell process not found')
+    const tty = execFileSync('ps', ['-o', 'tty=', '-p', String(node)], { encoding: 'utf8' }).trim()
+    execFileSync('stty', ['-F', `/dev/${tty}`, 'cols', String(cols), 'rows', String(rows)])
+  }
+  const p: Pty = { child, frame, raw: () => raw, send, waitFor, exited, pid, stateDir: o.root, resize }
   OPEN.add(p); void exited.then(() => OPEN.delete(p))
   return p
 }
