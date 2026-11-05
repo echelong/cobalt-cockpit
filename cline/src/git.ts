@@ -2,7 +2,7 @@
 // policy refuses git mutations). Nothing here touches the person's branch or main:
 // work lands on the mission branch cockpit/<mission>, and only after verification.
 import { execFile } from 'node:child_process'
-import { existsSync, lstatSync, readlinkSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, readlinkSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
 
 export type Git = (args: string[], opts?: { cwd?: string; env?: Record<string, string>; allowFail?: boolean; timeoutMs?: number }) => Promise<{ code: number; stdout: string; stderr: string }>
@@ -30,6 +30,26 @@ export const repoInfo = async (dir: string): Promise<RepoInfo> => {
   return { root, commonDir: isAbsolute(common) ? common : resolve(root, common), head, branch: b.code === 0 ? b.stdout.trim() : null, dirty: st.length > 0 }
 }
 
+/**
+ * Host-side git on a worktree a worker wrote to. The repository's config and the
+ * worktree's admin dir are read-only to workers, and these options keep host git
+ * from running anything the working tree can name: no fsmonitor, no hooks, no
+ * optional locks, and the git dir pinned instead of discovered from the tree.
+ */
+export const pinned = (dir: string, admin: string | null): string[] => [...(admin ? ['--git-dir', admin, '--work-tree', dir] : []), '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '--no-optional-locks']
+
+/** The worktree's .git link must still name its own admin dir. */
+export const gitLinkProblem = (dir: string, admin: string | null): string | null => {
+  if (!admin) return null
+  try {
+    const st = lstatSync(join(dir, '.git'))
+    if (!st.isFile()) return '.git is no longer a file'
+    const text = readFileSync(join(dir, '.git'), 'utf8').trim()
+    if (text !== `gitdir: ${admin}`) return `.git now points to ${text.slice(0, 200)}`
+    return null
+  } catch (e) { return `.git unreadable: ${(e as Error).message}` }
+}
+
 export const missionBranch = (missionId: string): string => `cockpit/${missionId}`
 
 /** Creates the mission branch at `base` (never moves an existing ref) and its integration worktree. */
@@ -49,23 +69,24 @@ export const headOf = (dir: string): Promise<string> => must(['rev-parse', 'HEAD
 
 export type Change = { path: string; status: string }
 /** Every tracked and untracked change in a worktree relative to its HEAD (ignored files excluded). */
-export const changesOf = async (dir: string): Promise<Change[]> => {
+export const changesOf = async (dir: string, admin: string | null = null): Promise<Change[]> => {
   // Not trimmed: a porcelain entry starts with a status column that may be a space (" M path").
-  const r = await git(['status', '--porcelain=v1', '-z', '--untracked-files=all'], { cwd: dir })
+  const r = await git([...pinned(dir, admin), 'status', '--porcelain=v1', '-z', '--untracked-files=all'], { cwd: dir })
   if (r.code !== 0) throw new Error(`git status: ${r.stderr.trim().slice(0, 400)}`)
   const out = r.stdout
   const parts = out.split('\0').filter(Boolean); const changes: Change[] = []
   for (let i = 0; i < parts.length; i++) {
     const status = parts[i].slice(0, 2); const path = parts[i].slice(3)
     changes.push({ path, status })
-    if (status.startsWith('R') || status.startsWith('C')) i++ // rename source follows
+    // A rename or copy names its source next; the source is changed too and must be owned.
+    if ((status.startsWith('R') || status.startsWith('C')) && parts[i + 1] !== undefined) { i++; if (status.startsWith('R')) changes.push({ path: parts[i], status: 'D ' }) }
   }
   return changes
 }
 
 export type ScopeProblem = { path: string; why: string }
 /** Structural checks on a worktree's changes: ownership, Git metadata, gitlinks, escaping symlinks, hook injection. */
-export const scopeProblems = async (dir: string, changes: Change[], covers: (rel: string) => boolean): Promise<ScopeProblem[]> => {
+export const scopeProblems = async (dir: string, changes: Change[], covers: (rel: string) => boolean, admin: string | null = null): Promise<ScopeProblem[]> => {
   const problems: ScopeProblem[] = []
   for (const c of changes) {
     const p = c.path.replace(/\/$/, '')
@@ -79,21 +100,21 @@ export const scopeProblems = async (dir: string, changes: Change[], covers: (rel
       if (st.isDirectory() && existsSync(join(abs, '.git'))) problems.push({ path: p, why: 'nested repository or gitlink' })
     } catch { /* deleted path */ }
   }
-  const ls = await git(['ls-files', '-s'], { cwd: dir })
+  const ls = await git([...pinned(dir, admin), 'ls-files', '-s'], { cwd: dir })
   for (const line of ls.stdout.split('\n')) if (line.startsWith('160000 ')) problems.push({ path: line.split('\t')[1] ?? '?', why: 'gitlink (submodule) in index' })
   return problems
 }
 
-export const diffText = async (dir: string): Promise<string> => {
-  await must(['add', '-A', '--', '.'], dir)
-  return must(['diff', '--cached', '--no-color', '--no-ext-diff', 'HEAD'], dir)
+export const diffText = async (dir: string, admin: string | null = null): Promise<string> => {
+  await must([...pinned(dir, admin), 'add', '-A', '--', '.'], dir)
+  return must([...pinned(dir, admin), 'diff', '--cached', '--no-color', '--no-ext-diff', '--no-textconv', 'HEAD'], dir)
 }
 
 /** Commits the staged worktree changes as the person's own Git identity; no tool attribution is added. */
-export const commitTask = async (dir: string, message: string): Promise<string> => {
-  await must(['add', '-A', '--', '.'], dir)
-  await must(['-c', 'commit.gpgsign=false', 'commit', '--no-verify', '-q', '-m', message], dir)
-  return headOf(dir)
+export const commitTask = async (dir: string, message: string, admin: string | null = null): Promise<string> => {
+  await must([...pinned(dir, admin), 'add', '-A', '--', '.'], dir)
+  await must([...pinned(dir, admin), '-c', 'commit.gpgsign=false', 'commit', '--no-verify', '-q', '-m', message], dir)
+  return must([...pinned(dir, admin), 'rev-parse', 'HEAD'], dir)
 }
 
 /** Serial integration onto the mission branch. A conflict aborts the pick and reports it. */

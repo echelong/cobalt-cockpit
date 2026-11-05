@@ -43,6 +43,10 @@ const startedAtMs = (start: string): number | null => {
  *    started through a service manager).
  * 3. Without a known init, a process of this user that cannot be inspected and started
  *    after the attempt began makes the answer 'unknown', never 'gone'.
+ * The pid namespace inode is NOT used to find processes: the kernel reuses namespace
+ * inode numbers once a namespace is freed, so a stale inode can name another worker's
+ * live sandbox (observed: a lingering kill loop for an ended attempt killed the next
+ * attempt). It is kept in the record for evidence only.
  */
 export const census = (t: Target): Census => {
   const uid = process.getuid?.() ?? -1
@@ -57,14 +61,13 @@ export const census = (t: Target): Census => {
     try { owner = statSync(`/proc/${n}`).uid } catch { continue }
     if (owner !== uid || isZombie(pid)) continue
     let hit = false; let read = false
-    if (t.pidNs) { const ns = pidNamespaceOf(pid); if (ns !== null) { read = true; if (ns === t.pidNs) hit = true } }
-    if (!hit && t.marker) { try { const env = readFileSync(`/proc/${n}/environ`, 'latin1'); read = true; if (env.split('\0').includes(t.marker)) hit = true } catch { /* not inspectable */ } }
+    if (t.marker) { try { const env = readFileSync(`/proc/${n}/environ`, 'latin1'); read = true; if (env.split('\0').includes(t.marker)) hit = true } catch { /* not inspectable */ } }
     if (hit) { found.push(pid); continue }
     if (!read && t.initStart === null) { const st = startTimeOf(pid); const at = st === null ? null : startedAtMs(st); if (at === null || at >= t.since - 2000) unknown++ }
   }
   if (found.length) return { state: 'alive', pids: found, detail: `${found.length} process(es) of this attempt still running` }
   if (unknown) return { state: 'unknown', pids: [], detail: `sandbox init unknown and ${unknown} uninspectable process(es) started during the attempt` }
-  return { state: 'gone', pids: [], detail: t.initStart !== null ? 'sandbox init reaped (namespace empty) and no marked process remains' : 'no marked or namespaced process remains' }
+  return { state: 'gone', pids: [], detail: t.initStart !== null ? 'sandbox init reaped (namespace empty) and no marked process remains' : 'no marked process remains and nothing uninspectable started during the attempt' }
 }
 
 export const killAll = (pids: readonly number[]): void => { for (const p of pids) { try { process.kill(p, 'SIGKILL') } catch { /* already gone */ } } }

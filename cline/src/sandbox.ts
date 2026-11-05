@@ -36,13 +36,24 @@ export const bwrapArgs = (s: SandboxSpec): string[] => {
   if (s.gitCommonDir) a.push('--ro-bind', s.gitCommonDir, s.gitCommonDir)
   for (const p of s.readOnly) a.push('--ro-bind', p, p)
   a.push(s.writable ? '--bind' : '--ro-bind', s.workdir, s.workdir)
-  if (s.writable && s.gitAdminDir) a.push('--bind', s.gitAdminDir, s.gitAdminDir)
+  // The worktree's .git link stays read-only (and, being a mount point, cannot be replaced),
+  // and its admin dir stays inside the read-only git common dir: host git later trusts both.
+  if (s.writable && existsSync(`${s.workdir}/.git`)) a.push('--ro-bind', `${s.workdir}/.git`, `${s.workdir}/.git`)
   for (const b of s.binds ?? []) if (existsSync(b.from)) a.push('--ro-bind', b.from, b.to)
   for (const p of s.readWrite) a.push('--bind', p, p)
   a.push('--setenv', MARKER_VAR, s.marker)
   for (const [k, v] of Object.entries(s.env)) a.push('--setenv', k, v)
   a.push('--chdir', s.workdir, '--info-fd', '3')
   return a
+}
+
+/** Environment a worker inherits: an allowlist, so credentials in the supervisor's environment do not leak in. */
+const ENV_KEEP = /^(?:PATH|HOME|USER|LOGNAME|SHELL|LANG|LANGUAGE|LC_[A-Z]+|TERM|COLORTERM|TZ|NVM_DIR|NVM_BIN|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|HTTPS?_PROXY|https?_proxy|NO_PROXY|no_proxy|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_CACHE_HOME|XDG_STATE_HOME|CLINE_[A-Z_]+)$/
+const ENV_SECRET = /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i
+export const workerEnv = (env: NodeJS.ProcessEnv): Record<string, string> => {
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(env)) if (v !== undefined && ENV_KEEP.test(k) && !ENV_SECRET.test(k)) out[k] = v
+  return out
 }
 
 export type Identity = { supervisor: ProcessIdentity; outer: ProcessIdentity; initPid: number | null; initStart: string | null; pidNs: string | null; marker: string; startedAt: string; since: number }
@@ -53,7 +64,7 @@ export type Launched = { child: ChildProcess; identity: Promise<Identity> }
 export const launch = (s: SandboxSpec, argv: string[], bwrap = process.env.COCKPIT_CLINE_BWRAP ?? 'bwrap'): Launched => {
   const child = spawn(bwrap, [...bwrapArgs(s), '--', ...argv], {
     stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
-    env: { ...process.env, [MARKER_VAR]: s.marker },
+    env: { ...workerEnv(process.env), [MARKER_VAR]: s.marker },
     detached: false,
   })
   const supervisor = processIdentity(process.pid)

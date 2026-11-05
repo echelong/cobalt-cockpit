@@ -13,8 +13,9 @@ import type { Census, Target } from './proc.ts'
 import type { Policy } from './hook/policy.ts'
 import { judgeWire, readWireCaptures } from './reasoning.ts'
 import type { WireVerdict } from './reasoning.ts'
-import { ZERO_USAGE } from './cost.ts'
+import { estimateUsd, ZERO_USAGE } from './cost.ts'
 import type { Usage } from './cost.ts'
+import type { Pricing } from './config.ts'
 
 export type WorkerSpec = {
   attemptId: string; runDir: string; workdir: string; writable: boolean
@@ -24,6 +25,10 @@ export type WorkerSpec = {
   hide: string[]; network: boolean; clineBin: string; clineDataDir: string
   /** Live limits: crossing either ends the attempt at once. */
   budgetUsd: number | null; budgetTokens: number
+  /** Pricing for the estimate that enforces budgetUsd when Cline reports no cost; null when unknown. */
+  pricing: Pricing | null
+  /** When false, a run whose cost cannot be measured is stopped instead of running unmetered. */
+  allowUnmetered: boolean
 }
 export type StreamFacts = {
   usage: Usage; usageEvents: number; toolCalls: Record<string, number>; iterations: number
@@ -34,8 +39,27 @@ export type StreamFacts = {
 export type WorkerOutcome = {
   identity: Identity | null; exitCode: number | null; signal: string | null
   facts: StreamFacts; wire: WireVerdict; census: Census
-  stoppedBy: 'exit' | 'timeout' | 'budget' | 'cancel' | 'spawn_error'
+  stoppedBy: 'exit' | 'timeout' | 'budget' | 'unmetered' | 'cancel' | 'spawn_error'
   stopDetail: string | null; hookRefusals: { tool: string; reason: string }[]
+  /** The first error a `facts` observer threw; the stream kept being read regardless. */
+  observerError: string | null
+}
+
+/**
+ * The live budget decision for one stream position. Missing cost telemetry never passes
+ * silently: a reported cost is used when present, else an estimate from known pricing,
+ * else the run is unmeasurable and is stopped unless unmetered runs are allowed. A model
+ * turn that ended without any usage event is unmeasurable too.
+ */
+export const budgetVerdict = (f: Pick<StreamFacts, 'usage' | 'usageEvents' | 'iterations'>, w: Pick<WorkerSpec, 'budgetUsd' | 'budgetTokens' | 'pricing' | 'allowUnmetered'>): { stop: 'budget' | 'unmetered'; detail: string } | null => {
+  const tokens = f.usage.inputTokens + f.usage.outputTokens
+  if (tokens > w.budgetTokens) return { stop: 'budget', detail: `${tokens} tokens exceeded the task token budget ${w.budgetTokens}` }
+  if (f.usageEvents === 0 && f.iterations > 0 && !w.allowUnmetered) return { stop: 'unmetered', detail: `${f.iterations} model turn(s) ended without a usage event: cost cannot be measured` }
+  if (w.budgetUsd === null || f.usageEvents === 0) return null
+  const charged = f.usage.reportedUsd ?? (w.pricing ? estimateUsd(f.usage, w.pricing) : null)
+  if (charged === null) return w.allowUnmetered ? null : { stop: 'unmetered', detail: 'Cline reported no cost and no pricing is configured for this model: the task budget cannot be enforced' }
+  if (charged > w.budgetUsd) return { stop: 'budget', detail: `${f.usage.reportedUsd !== null ? 'reported' : 'estimated'} cost $${charged.toFixed(5)} exceeded the task budget $${w.budgetUsd.toFixed(2)}` }
+  return null
 }
 
 const emptyFacts = (): StreamFacts => ({ usage: { ...ZERO_USAGE }, usageEvents: 0, toolCalls: {}, iterations: 0, finishReason: null, aborted: null, resultText: null, reportedModel: null, reportedProvider: null, agentErrors: 0, lines: 0, badLines: 0, sessionIds: [], firstEventAt: null, lastEventAt: null })
@@ -91,7 +115,7 @@ exec "${process.execPath}" --experimental-transform-types --no-warnings --import
 
 export type Control = { cancel: (why: string) => void }
 
-export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) => void; facts?: (f: StreamFacts) => void; control?: (c: Control) => void } = {}): Promise<WorkerOutcome> => {
+export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) => void; facts?: (f: StreamFacts) => void; control?: (c: Control) => void } = {}, io: { launch?: typeof launch } = {}): Promise<WorkerOutcome> => {
   const ro = join(w.runDir, 'ro'), rw = join(w.runDir, 'rw'), cap = join(rw, 'capture'), cfg = join(rw, 'cline-config')
   for (const d of [join(ro, 'hooks'), cap, cfg]) mkdirSync(d, { recursive: true, mode: 0o700 })
   writeFileSync(join(ro, 'policy.json'), JSON.stringify(w.policy, null, 1), { mode: 0o400 })
@@ -112,22 +136,29 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   const facts = emptyFacts()
   let stoppedBy: WorkerOutcome['stoppedBy'] = 'exit'; let stopDetail: string | null = null
   let identity: Identity | null = null
+  let observerError: string | null = null
 
-  const launched = (() => { try { return launch(sandbox, argv) } catch (e) { stopDetail = (e as Error).message; return null } })()
-  if (!launched) return { identity: null, exitCode: null, signal: null, facts, wire: judgeWire([], w.model, w.expectedWire), census: census({ initPid: null, initStart: null, pidNs: null, marker, since: Date.now() - 60_000 }), stoppedBy: 'spawn_error', stopDetail, hookRefusals: [] }
+  const start = io.launch ?? launch
+  const launched = (() => { try { return start(sandbox, argv) } catch (e) { stopDetail = (e as Error).message; return null } })()
+  if (!launched) return { identity: null, exitCode: null, signal: null, facts, wire: judgeWire([], w.model, w.expectedWire), census: census({ initPid: null, initStart: null, pidNs: null, marker, since: Date.now() - 60_000 }), stoppedBy: 'spawn_error', stopDetail, hookRefusals: [], observerError: null }
   const { child } = launched
   const started = Date.now()
   const stopNow = (why: WorkerOutcome['stoppedBy'], detail: string): void => {
     if (stoppedBy !== 'exit') return
     stoppedBy = why; stopDetail = detail
-    void terminate(targetOf(identity, marker, started))
+    // One kill pass only: the census that ends this attempt runs after exit and does the waiting.
+    // A lingering loop would outlive the attempt and act on whatever the target later names.
+    void terminate(targetOf(identity, marker, started), true, 0)
   }
   on.control?.({ cancel: why => stopNow('cancel', why) })
   const exited = new Promise<{ code: number | null; signal: string | null }>(res => {
     child.on('exit', (code, signal) => res({ code, signal }))
     child.on('error', e => { stopDetail = e.message; stoppedBy = 'spawn_error'; res({ code: null, signal: null }) })
   })
-  void launched.identity.then(id => { identity = id; on.identity?.(id) })
+  // The identity callback binds ownership. Once this attempt has returned it never runs:
+  // a late identity is kept for the record only, so a retired claim cannot be rewritten.
+  let returned = false
+  void launched.identity.then(id => { identity = id; if (!returned) on.identity?.(id) })
   const streamFile = createWriteStream(join(rw, 'stream.jsonl'), { mode: 0o600 })
   const errFile = createWriteStream(join(rw, 'stderr.txt'), { mode: 0o600 })
   child.stderr?.pipe(errFile)
@@ -137,10 +168,11 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
     for await (const line of rl) {
       streamFile.write(`${line}\n`)
       foldLine(facts, line)
-      const tokens = facts.usage.inputTokens + facts.usage.outputTokens
-      if (w.budgetUsd !== null && facts.usage.reportedUsd !== null && facts.usage.reportedUsd > w.budgetUsd) stopNow('budget', `reported cost $${facts.usage.reportedUsd.toFixed(5)} exceeded the task budget $${w.budgetUsd.toFixed(2)}`)
-      if (tokens > w.budgetTokens) stopNow('budget', `${tokens} tokens exceeded the task token budget ${w.budgetTokens}`)
-      on.facts?.(facts)
+      const b = budgetVerdict(facts, w)
+      if (b) stopNow(b.stop, b.detail)
+      // A failing observer (for example a full disk while persisting) must not stop the
+      // stream being read: budget enforcement and the run result depend on it.
+      try { on.facts?.(facts) } catch (e) { observerError ??= (e as Error).message }
     }
   })() : Promise.resolve()
   const ex = await exited
@@ -149,6 +181,8 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   await Promise.all([new Promise(r => streamFile.end(r)), new Promise(r => errFile.end(r))])
   const id = identity ?? await Promise.race([launched.identity, new Promise<null>(r => setTimeout(() => r(null), 1000))])
   if (id) identity = id
+  returned = true
+  if (observerError) writeFileSync(join(rw, 'observer-error.txt'), observerError, { mode: 0o600 })
   // The outer bwrap has exited. Nothing is declared ended until the census is clean.
   // A clean exit is not proof: the census reads the sandbox init and the marker.
   const final = await terminate(targetOf(identity, marker, started), true, 5000)
@@ -158,7 +192,7 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   const wire = judgeWire(readWireCaptures(cap), w.model, w.expectedWire)
   let hookRefusals: { tool: string; reason: string }[] = []
   try { hookRefusals = readFileSync(join(rw, 'hook.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l) as { tool: string; allow: boolean; reason: string }).filter(e => !e.allow).map(e => ({ tool: e.tool, reason: e.reason })) } catch { /* no refusals */ }
-  return { identity, exitCode: ex.code, signal: ex.signal, facts, wire, census: final, stoppedBy, stopDetail, hookRefusals }
+  return { identity, exitCode: ex.code, signal: ex.signal, facts, wire, census: final, stoppedBy, stopDetail, hookRefusals, observerError }
 }
 
 export const targetOf = (id: Identity | null, marker: string, since: number): Target => ({ initPid: id?.initPid ?? null, initStart: id?.initStart ?? null, pidNs: id?.pidNs ?? null, marker, since: id?.since ?? since })

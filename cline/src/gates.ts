@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { secretText } from './core/engine.ts'
 import { launch } from './sandbox.ts'
 import { terminate } from './proc.ts'
-import { changesOf, diffText, scopeProblems } from './git.ts'
+import { changesOf, diffText, gitLinkProblem, scopeProblems } from './git.ts'
 import type { Change } from './git.ts'
 
 export type GateSpec = { name: string; command: string; required: boolean }
@@ -35,28 +35,42 @@ export const runCommandGate = async (g: GateSpec, workdir: string, outDir: strin
   return { name: g.name, kind: 'command', command: g.command, exitCode: code, durationMs: Date.now() - t0, state: timedOut ? 'error' : code === 0 ? 'pass' : 'fail', evidence: timedOut ? `timed out after ${env.timeoutSeconds}s` : `exit ${code}${tail ? `\n${tail}` : ''}`, outputSha256: createHash('sha256').update(text).digest('hex') }
 }
 
-export const gitGate = async (workdir: string, covers: (rel: string) => boolean, mode: 'read' | 'write'): Promise<{ result: GateResult; changes: Change[] }> => {
+export const gitGate = async (workdir: string, covers: (rel: string) => boolean, mode: 'read' | 'write', admin: string | null = null, label = 'GIT'): Promise<{ result: GateResult; changes: Change[] }> => {
   const t0 = Date.now()
   try {
-    const changes = await changesOf(workdir)
-    if (mode === 'read' && changes.length) return { changes, result: { name: 'GIT', kind: 'git', state: 'fail', durationMs: Date.now() - t0, evidence: `read-only task changed ${changes.length} path(s): ${changes.slice(0, 5).map(c => c.path).join(', ')}` } }
-    const problems = await scopeProblems(workdir, changes, covers)
-    return { changes, result: { name: 'GIT', kind: 'git', state: problems.length ? 'fail' : 'pass', durationMs: Date.now() - t0, evidence: problems.length ? problems.slice(0, 8).map(p => `${p.path}: ${p.why}`).join('; ') : `${changes.length} changed path(s), all inside ownership; no gitlinks, escaping symlinks or hook files` } }
-  } catch (e) { return { changes: [], result: { name: 'GIT', kind: 'git', state: 'error', durationMs: Date.now() - t0, evidence: `git inspection failed: ${(e as Error).message}` } } }
+    const link = gitLinkProblem(workdir, admin)
+    if (link) return { changes: [], result: { name: label, kind: 'git', state: 'fail', durationMs: Date.now() - t0, evidence: `worktree git link tampered: ${link}` } }
+    const changes = await changesOf(workdir, admin)
+    if (mode === 'read' && changes.length) return { changes, result: { name: label, kind: 'git', state: 'fail', durationMs: Date.now() - t0, evidence: `read-only task changed ${changes.length} path(s): ${changes.slice(0, 5).map(c => c.path).join(', ')}` } }
+    const problems = await scopeProblems(workdir, changes, covers, admin)
+    return { changes, result: { name: label, kind: 'git', state: problems.length ? 'fail' : 'pass', durationMs: Date.now() - t0, evidence: problems.length ? problems.slice(0, 8).map(p => `${p.path}: ${p.why}`).join('; ') : `${changes.length} changed path(s), all inside ownership; no gitlinks, escaping symlinks or hook files` } }
+  } catch (e) { return { changes: [], result: { name: label, kind: 'git', state: 'error', durationMs: Date.now() - t0, evidence: `git inspection failed: ${(e as Error).message}` } } }
 }
 
 /** Scans added lines in chunks the engine's narrow credential patterns accept. */
-export const securityGate = async (workdir: string): Promise<GateResult> => {
+export const securityGate = async (workdir: string, admin: string | null = null, label = 'SECURITY'): Promise<GateResult> => {
   const t0 = Date.now()
   try {
-    const diff = await diffText(workdir)
+    const diff = await diffText(workdir, admin)
     const added = diff.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).map(l => l.slice(1))
     const hits: number[] = []; let chunk: string[] = []; let size = 0; let start = 0
     const flush = (at: number): void => { if (chunk.length && secretText(chunk.join('\n'))) hits.push(start); chunk = []; size = 0; start = at }
     added.forEach((l, i) => { if (size + l.length > 15_000) flush(i); chunk.push(l.slice(0, 15_000)); size += l.length })
     flush(added.length)
-    return { name: 'SECURITY', kind: 'security', state: hits.length ? 'fail' : 'pass', durationMs: Date.now() - t0, evidence: hits.length ? `credential-like text in added lines (chunks starting at added line ${hits.slice(0, 5).join(', ')})` : `${added.length} added line(s) scanned; no credential pattern` }
-  } catch (e) { return { name: 'SECURITY', kind: 'security', state: 'error', durationMs: Date.now() - t0, evidence: `scan failed: ${(e as Error).message}` } }
+    return { name: label, kind: 'security', state: hits.length ? 'fail' : 'pass', durationMs: Date.now() - t0, evidence: hits.length ? `credential-like text in added lines (chunks starting at added line ${hits.slice(0, 5).join(', ')})` : `${added.length} added line(s) scanned; no credential pattern` }
+  } catch (e) { return { name: label, kind: 'security', state: 'error', durationMs: Date.now() - t0, evidence: `scan failed: ${(e as Error).message}` } }
+}
+
+/**
+ * Files a gate's own command runs or reads its definition from. When a worker changed one,
+ * the gate passing is the worker's word about itself, not independent evidence.
+ */
+export const gateDefinitionFiles = (g: GateSpec): string[] => {
+  const files = new Set<string>()
+  if (/\b(?:npm|pnpm|yarn|bun|npx)\b/.test(g.command)) files.add('package.json')
+  if (/\bmake\b/.test(g.command)) files.add('Makefile')
+  for (const tok of g.command.split(/[\s;&|()'"]+/)) if (/^[\w./-]+\.(?:m?[jt]sx?|c?js|py|sh|rb|go|json|toml|ya?ml|cfg|ini)$/.test(tok) && !tok.startsWith('/') && !tok.includes('..')) files.add(tok.replace(/^\.\//, ''))
+  return [...files]
 }
 
 /** package.json scripts that exist become gates; nothing is invented when none exist. */

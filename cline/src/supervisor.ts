@@ -56,7 +56,7 @@ export type Verdict = { state: 'DONE' | 'PARTIAL' | 'BLOCKED' | 'FAILED' | 'STOP
 export type Live = {
   version: 1; missionId: string; epoch: string; state: 'planning' | 'running' | 'finalizing' | 'done' | 'stopped'
   supervisor: ProcessIdentity | null; tasks: Record<string, TaskRecord>; swarm: Swarm
-  session: { spentUsd: number; tokens: number; archivedUsd: number; archivedTokens: number; unmetered: boolean; alertsFired: number[]; capReached: boolean; unmeteredTasks: string[] }
+  session: { spentUsd: number; tokens: number; archivedUsd: number; archivedTokens: number; unmetered: boolean; alertsFired: number[]; capReached: boolean; unmeteredTasks: string[]; /** attempts whose cost is an estimate from configured pricing, not a reported figure */ estimatedTasks?: string[] }
   health: Health; aimd: Record<string, number>; spawnTimes: number[]
   counters: { created: number; completed: number; failed: number; cancelled: number; refused: number; archived: number; attempts: number }
   recent: { id: string; title: string; state: TaskState; role: Role | null; model: string | null; usd: number | null; at: string }[]
@@ -123,7 +123,7 @@ export class Mission {
     const live: Live = {
       version: 1, missionId: id, epoch, state: 'planning', supervisor: null, tasks: {},
       swarm: emptySwarm({ total: pools, sonnet: pools, haiku: pools, opus: Math.max(1, o.config.limits.concurrency.commander), maxTasks: 4096, maxEvents: 256 }),
-      session: { spentUsd: 0, tokens: 0, archivedUsd: 0, archivedTokens: 0, unmetered: false, alertsFired: [], capReached: false, unmeteredTasks: [] }, health: {}, aimd: {}, spawnTimes: [],
+      session: { spentUsd: 0, tokens: 0, archivedUsd: 0, archivedTokens: 0, unmetered: false, alertsFired: [], capReached: false, unmeteredTasks: [], estimatedTasks: [] }, health: {}, aimd: {}, spawnTimes: [],
       counters: { created: 0, completed: 0, failed: 0, cancelled: 0, refused: 0, archived: 0, attempts: 0 }, recent: [],
       integration: { dir: integrationDir, branch: missionBranch(id), base: repo.head, head: repo.head },
       finalGates: [], review: null, verdict: null, alerts: [], stopRequested: null, updatedAt: new Date().toISOString(),
@@ -410,6 +410,8 @@ export class Mission {
       timeoutSeconds: this.config.limits.workerTimeoutSeconds, clineRetries: this.config.limits.clineRetries,
       hide: this.config.sandbox.hide, network: this.config.sandbox.allowNetwork, clineBin: this.deps.clineBin, clineDataDir: this.deps.clineDataDir,
       budgetUsd: this.config.budgets.taskUsd[a.role], budgetTokens: this.config.budgets.taskTokens[a.role],
+      pricing: (() => { const p = pricingFor(this.config, a.model, (this.resolutions[a.role] as { info?: never }).info); return p.source === 'none' ? null : p.pricing })(),
+      allowUnmetered: this.config.budgets.allowUnmetered,
     }
     const out = await this.deps.runWorker(spec, {
       identity: id => {
@@ -463,8 +465,16 @@ export class Mission {
 
   private classify(t: TaskRecord, a: AttemptRecord, out: WorkerOutcome): { cls: FailureClass | 'cancelled'; detail: string; evidence: string[] } | null {
     const f = out.facts
+    if (out.observerError) { this.live.alerts.push(`${a.id}: state observer failed during the run (${out.observerError}); the stream was still read to the end`); this.ledger.append('observer_error', t.spec.id, { attempt: a.id, error: out.observerError }) }
+    if (a.charge.basis === 'estimate') { const est = (this.live.session.estimatedTasks ??= []); if (!est.includes(a.id)) est.push(a.id) }
+    // Any outcome, not only success: an attempt that ran but reported no usage leaves the session unmetered.
+    if ((f.lines > 0 || f.iterations > 0) && (f.usageEvents === 0 || a.charge.basis === 'unmetered') && !this.live.session.unmeteredTasks.includes(a.id)) {
+      this.live.session.unmetered = true; this.live.session.unmeteredTasks.push(a.id)
+      this.ledger.append('unmetered', t.spec.id, { attempt: a.id, detail: 'run reported no usable cost; session admissions stop' })
+    }
     if (out.stoppedBy === 'cancel') return { cls: 'cancelled', detail: out.stopDetail ?? 'cancelled', evidence: [] }
     if (out.stoppedBy === 'budget') return { cls: 'budget_exceeded', detail: out.stopDetail ?? 'budget', evidence: [] }
+    if (out.stoppedBy === 'unmetered') return { cls: 'unmetered', detail: out.stopDetail ?? 'cost cannot be measured', evidence: [] }
     if (out.stoppedBy === 'timeout') return { cls: 'timeout', detail: out.stopDetail ?? 'timeout', evidence: [] }
     if (out.stoppedBy === 'spawn_error') return { cls: 'sandbox_error', detail: out.stopDetail ?? 'sandbox failed to start', evidence: [] }
     if (out.hookRefusals.length) return { cls: 'policy_abort', detail: `Cockpit policy refused ${out.hookRefusals.map(r => `${r.tool}: ${r.reason}`).join('; ').slice(0, 600)}`, evidence: [] }
@@ -474,11 +484,6 @@ export class Mission {
     if (out.wire.state === 'unconfirmed' && this.header.strict && (f.finishReason === 'completed')) return { cls: 'wire_mismatch', detail: `strict: ${out.wire.detail}`, evidence: [] }
     if (f.finishReason === 'error') return { cls: 'provider_error', detail: (f.resultText ?? 'provider error').slice(0, 300), evidence: [] }
     if (f.finishReason !== 'completed') return { cls: 'unknown_outcome', detail: `finish ${f.finishReason ?? 'none'}${f.aborted ? ` (${f.aborted})` : ''}, exit ${out.exitCode}`, evidence: [] }
-    if (f.usageEvents === 0 || (a.charge.basis === 'unmetered')) {
-      this.live.session.unmetered = true; this.live.session.unmeteredTasks.push(a.id)
-      this.ledger.append('unmetered', t.spec.id, { attempt: a.id, detail: 'run reported no usage; session admissions stop' })
-    }
-    void t
     return null
   }
 
@@ -652,7 +657,9 @@ export class Mission {
     if (this.live.stopRequested) return { state: 'STOPPED', reasons, at }
     if (c.completed === 0) return { state: 'FAILED', reasons: reasons.length ? reasons : ['nothing completed'], at }
     if (reasons.length) return { state: noGates && reasons.length === 1 ? 'UNVERIFIED' : 'PARTIAL', reasons, at }
-    return { state: 'DONE', reasons: [`${c.completed} task(s) verified by supervisor gates and integrated on ${this.live.integration.branch}; final gates pass; costs metered; ledger intact`], at }
+    const estimated = this.live.session.estimatedTasks ?? []
+    const cost = estimated.length ? `usage measured; cost of ${estimated.length} attempt(s) estimated from configured pricing (Cline reported no cost): ${estimated.join(', ')}` : 'costs metered (Cline-reported)'
+    return { state: 'DONE', reasons: [`${c.completed} task(s) verified by supervisor gates and integrated on ${this.live.integration.branch}; final gates pass; ${cost}; ledger intact`], at }
   }
 
   writeReport(): void {

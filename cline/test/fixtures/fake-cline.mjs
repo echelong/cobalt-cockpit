@@ -32,8 +32,11 @@ const request = (u = [9000, 100, 0.001]) => {
   if (has('nousage')) return
   const [i, o, c] = u
   totals = { inputTokens: totals.inputTokens + i, outputTokens: totals.outputTokens + o, cacheReadTokens: totals.cacheReadTokens + Math.floor(i / 2), totalCost: totals.totalCost + c }
-  out({ type: 'agent_event', event: { type: 'usage', inputTokens: i, outputTokens: o, cacheReadTokens: Math.floor(i / 2), cost: c, totalInputTokens: totals.inputTokens, totalOutputTokens: totals.outputTokens, totalCacheReadTokens: totals.cacheReadTokens, totalCost: totals.totalCost } })
+  // [[nocost]]: tokens are reported but no cost field at all (a provider without cost telemetry)
+  const cost = has('nocost') ? {} : { cost: c, totalCost: totals.totalCost }
+  out({ type: 'agent_event', event: { type: 'usage', inputTokens: i, outputTokens: o, cacheReadTokens: Math.floor(i / 2), totalInputTokens: totals.inputTokens, totalOutputTokens: totals.outputTokens, totalCacheReadTokens: totals.cacheReadTokens, ...cost } })
 }
+const finalUsage = () => has('nousage') ? {} : has('nocost') ? { inputTokens: totals.inputTokens, outputTokens: totals.outputTokens, cacheReadTokens: totals.cacheReadTokens, cacheWriteTokens: 0 } : { ...totals, cacheWriteTokens: 0 }
 
 const hook = (toolName, parameters) => {
   const file = hooksDir && ['PreToolUse.sh', 'PreToolUse'].map(n => join(hooksDir, n)).find(existsSync)
@@ -54,7 +57,13 @@ out({ type: 'hook_event', hookEventName: 'agent_start', agentId: 'agent_fake', t
 if (has('crash-early')) process.exit(137)
 const usage = argOf('usage') ? argOf('usage').split(',').map(Number) : undefined
 const repeat = Number(argOf('repeat') ?? 1)
-for (let n = 0; n < repeat; n++) { out({ type: 'agent_event', event: { type: 'iteration_start', iteration: n + 1 } }); request(usage); if (argOf('delay')) await sleep(Number(argOf('delay'))) }
+for (let n = 0; n < repeat; n++) {
+  out({ type: 'agent_event', event: { type: 'iteration_start', iteration: n + 1 } })
+  request(usage)
+  if (argOf('delay')) await sleep(Number(argOf('delay')))
+  // like Cline: each model turn ends with iteration_end
+  out({ type: 'agent_event', event: { type: 'iteration_end', iteration: n + 1, hadToolCalls: false, toolCallCount: 0 } })
+}
 
 for (const s of steps) {
   if (s.op === 'write') {
@@ -91,4 +100,4 @@ if (has('error')) {
 const planB64 = argOf('plan-b64'); const reqB64 = argOf('request-b64')
 const text = argOf('say') ?? (planB64 !== undefined ? `Plan:\n\`\`\`json\n${Buffer.from(planB64, 'base64').toString()}\n\`\`\`` : reqB64 !== undefined ? `Done.\nCOCKPIT_REQUEST\n\`\`\`json\n${Buffer.from(reqB64, 'base64').toString()}\n\`\`\`` : argOf('plan') !== undefined ? `Plan:\n\`\`\`json\n${argOf('plan')}\n\`\`\`` : argOf('request') !== undefined ? `Done.\nCOCKPIT_REQUEST\n\`\`\`json\n${argOf('request')}\n\`\`\`` : 'Done. All changes made and tests pass.')
 out({ type: 'agent_event', event: { type: 'done', reason: 'completed', text, iterations: req, usage: totals } })
-out({ type: 'run_result', finishReason: 'completed', iterations: req, usage: has('nousage') ? {} : { ...totals, cacheWriteTokens: 0 }, aggregateUsage: has('nousage') ? {} : { ...totals, cacheWriteTokens: 0 }, durationMs: 10, text, model: { id: reportedModel, provider, info: { id: reportedModel } } })
+out({ type: 'run_result', finishReason: 'completed', iterations: req, usage: finalUsage(), aggregateUsage: finalUsage(), durationMs: 10, text, model: { id: reportedModel, provider, info: { id: reportedModel } } })
