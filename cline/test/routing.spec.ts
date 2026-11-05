@@ -87,9 +87,12 @@ describe('role rules', () => {
 
 describe('fail-closed refusals', () => {
   test('an unhealthy provider refuses the route; no other model is substituted', async () => {
-    const r = await route({}, { health: { 'cline/deepseek/deepseek-v4.1-flash-1017': { consecutiveErrors: 2, unhealthy: true } } })
+    const r = await route({}, { health: { 'cline/deepseek/deepseek-v4.1-flash-1017': { consecutiveErrors: 2, unhealthy: true, until: Date.now() + 60_000 } } })
     assert.equal(r.ok, false); assert.match(r.refusal ?? '', /no substitute model/)
     assert.equal(r.model, 'deepseek/deepseek-v4.1-flash-1017')
+    // an unhealthy entry without a cool-down end (older state) is half-open: one try, not a permanent block
+    const legacy = await route({}, { health: { 'cline/deepseek/deepseek-v4.1-flash-1017': { consecutiveErrors: 2, unhealthy: true } } })
+    assert.equal(legacy.ok, true); assert.equal(legacy.model, 'deepseek/deepseek-v4.1-flash-1017')
   })
   test('an estimate over the remaining session budget refuses', async () => {
     const r = await route({}, { spentSessionUsd: 2.99 })

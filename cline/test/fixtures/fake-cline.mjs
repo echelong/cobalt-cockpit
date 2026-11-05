@@ -81,6 +81,17 @@ if (failTimes) {
   }
 }
 const correction = /did not pass Cockpit's verification/.test(prompt)
+// [[fail-on-correction:N]]: the first N correction/escalation runs hit a transient provider error
+const failCorr = argOf('fail-on-correction')
+if (failCorr && correction) {
+  const key = join(opt('--data-dir') ?? '/tmp', `fake-corr-${Buffer.from(prompt.slice(0, 200)).toString('hex').slice(0, 24)}`)
+  let count = 0; try { count = Number((await import('node:fs')).readFileSync(key, 'utf8')) } catch { /* first */ }
+  writeFileSync(key, String(count + 1))
+  if (count < Number(failCorr)) {
+    out({ type: 'run_result', finishReason: 'error', iterations: 0, usage: {}, aggregateUsage: {}, text: 'Provider error: 503 upstream overloaded', model: { id: reportedModel, provider } })
+    process.exit(1)
+  }
+}
 if (has('crash-early')) process.exit(137)
 const usage = argOf('usage') ? argOf('usage').split(',').map(Number) : undefined
 const repeat = Number(argOf('repeat') ?? 1)

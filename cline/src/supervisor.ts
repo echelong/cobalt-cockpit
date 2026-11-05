@@ -70,6 +70,10 @@ export type Live = {
   verdict: Verdict | null; alerts: string[]; stopRequested: string | null; updatedAt: string
   /** Durable verdict reasons found along the way: rejected or partly dropped plans, refused requests, gate taint, head drift. */
   problems?: string[]
+  /** The head the branch-level final gates ran on: shown only while the branch is still at it. */
+  finalGatesHead?: string | null
+  /** A closed conversation is never resumed by the interactive shell. */
+  closed?: boolean
 }
 export type Header = {
   id: string; repoRoot: string; commonDir: string; base: string; createdAt: string; profile: string; strict: boolean
@@ -237,7 +241,7 @@ export class Mission {
     const now = this.deps.now()
     this.live.tasks[spec.id] = { spec, state: 'queued', attempts: [], transientRetries: 0, escalations: 0, escalateTo: null, evidence: [], createdAt: now, updatedAt: now, reason: null, verification: null, integratedHead: null, children: [], requestsRefused: [] }
     this.live.counters.created++
-    this.ledger.append('task_added', spec.id, { source, spec: { ...spec, prompt: spec.prompt.slice(0, 2000) } })
+    this.ledger.append('task_added', spec.id, { source, spec: { ...spec, prompt: spec.prompt.slice(0, 2000), ...(spec.context ? { context: spec.context.slice(0, 2000) } : {}) } })
     return { ok: true, reason: null }
   }
 
@@ -290,9 +294,18 @@ export class Mission {
   async run(): Promise<Verdict> {
     this.acquire()
     const onSignal = (sig: string) => () => { this.requestStop(`signal ${sig}`) }
-    const handlers = { SIGINT: onSignal('SIGINT'), SIGTERM: onSignal('SIGTERM') }
-    process.on('SIGINT', handlers.SIGINT); process.on('SIGTERM', handlers.SIGTERM)
+    const handlers = { SIGINT: onSignal('SIGINT'), SIGTERM: onSignal('SIGTERM'), SIGHUP: onSignal('SIGHUP') }
+    process.on('SIGINT', handlers.SIGINT); process.on('SIGTERM', handlers.SIGTERM); process.on('SIGHUP', handlers.SIGHUP)
     try {
+      // A conversation's stop belongs to the run it was made in (a shell that quit mid-turn): the
+      // next turn starts clean. Batch missions keep a stop until the person recovers them explicitly.
+      if (this.header.mode === 'conversation' && this.live.stopRequested) {
+        this.ledger.append('stop_cleared', null, { was: this.live.stopRequested })
+        this.live.stopRequested = null
+      }
+      // a new run never shows the previous run's verdict while it works
+      this.live.verdict = null; this.live.state = 'running'
+      this.persist(true)
       await this.reconcile()
       for (;;) {
         this.readControl()
@@ -318,15 +331,36 @@ export class Mission {
       this.live.verdict = this.verdict()
       this.live.state = this.live.stopRequested ? 'stopped' : 'done'
       this.ledger.append('mission_verdict', null, this.live.verdict)
-      // the repository marker guards claims; with none of this mission's left, it can go
-      if (!listClaims(this.header.commonDir).claims.some(c => c.missionId === this.header.id) && !Object.values(this.live.tasks).some(t => t.state === 'held')) retireMarker(this.header.commonDir, this.header.id)
+      // the repository marker guards claims; with none of this mission's left, it can go. A
+      // conversation keeps it between turns and retires it when the conversation is closed.
+      if (this.header.mode !== 'conversation') this.retireMarkerIfFree()
       this.persist(true)
       this.writeReport()
       return this.live.verdict
     } finally {
-      process.off('SIGINT', handlers.SIGINT); process.off('SIGTERM', handlers.SIGTERM)
+      process.off('SIGINT', handlers.SIGINT); process.off('SIGTERM', handlers.SIGTERM); process.off('SIGHUP', handlers.SIGHUP)
       this.release()
     }
+  }
+
+  private retireMarkerIfFree(): boolean {
+    if (listClaims(this.header.commonDir).claims.some(c => c.missionId === this.header.id) || Object.values(this.live.tasks).some(t => t.state === 'held')) return false
+    retireMarker(this.header.commonDir, this.header.id)
+    return true
+  }
+
+  /**
+   * Closes a conversation: refused while any of its tasks still holds ownership (recovery first).
+   * The closed mission keeps its state and branch; only the repository marker is retired.
+   */
+  closeConversation(): { ok: true } | { ok: false; reason: string } {
+    const held = Object.values(this.live.tasks).filter(t => t.state === 'held' || t.attempts.some(a => a.phase !== 'ended'))
+    if (held.length) return { ok: false, reason: `${held.length} task(s) still hold ownership (${held.map(t => t.spec.id).join(', ')}); recover them first` }
+    this.live.closed = true
+    this.ledger.append('conversation_closed', null, {})
+    this.retireMarkerIfFree()
+    this.persist(true)
+    return { ok: true }
   }
 
   /**
@@ -342,6 +376,8 @@ export class Mission {
     if (!r.startsWith('waiting: ')) return false
     if (/^waiting: (?:memory|cpu|rate):/.test(r)) return false
     if (/^waiting: repository claim held by /.test(r)) return /orphaned/.test(r)
+    // an open provider breaker always has a cool-down end, after which one half-open try is made
+    if (r.startsWith('waiting: provider health')) return false
     // Called only when nothing of this mission runs: a slot still taken then belongs to a held
     // attempt (or a zero limit), and neither clears by waiting.
     if (/^waiting: (?:concurrency|provider)\b/.test(r)) return true
@@ -611,16 +647,18 @@ export class Mission {
     if (out.stoppedBy === 'cancel') return { cls: 'cancelled', detail: out.stopDetail ?? 'cancelled', evidence: [] }
     if (out.stoppedBy === 'budget') return { cls: 'budget_exceeded', detail: out.stopDetail ?? 'budget', evidence: [] }
     if (out.stoppedBy === 'unmetered') return { cls: 'unmetered', detail: out.stopDetail ?? 'cost cannot be measured', evidence: [] }
+    // A safety refusal, a different model or a downgraded request is final evidence about the run,
+    // whatever ended it afterwards: a timeout or a sandbox fault never turns it into a retryable failure.
+    if (out.hookRefusals.length) return { cls: 'policy_abort', detail: `Cockpit policy refused ${out.hookRefusals.map(r => `${r.tool}: ${r.reason}`).join('; ').slice(0, 600)}`, evidence: [] }
+    if (f.reportedModel !== null && f.reportedModel !== a.model) return { cls: 'model_mismatch', detail: `Cline reported model ${f.reportedModel}, routed ${a.model}`, evidence: [] }
+    if (f.reportedProvider !== null && f.reportedProvider !== a.provider) return { cls: 'model_mismatch', detail: `Cline reported provider ${f.reportedProvider}, routed ${a.provider}`, evidence: [] }
+    if (out.wire.state === 'mismatch') return { cls: 'wire_mismatch', detail: out.wire.detail, evidence: [] }
     if (out.stoppedBy === 'timeout') return { cls: 'timeout', detail: out.stopDetail ?? 'timeout', evidence: [] }
     // the run's own error text decides between authentication, rate limits, resources and provider faults
     const errText = `${f.resultText ?? ''}\n${f.aborted ?? ''}\n${out.stderrHead ?? ''}\n${out.stopDetail ?? ''}`
     const textClass = classifyFailureText(errText)
     const errLine = (errText.split('\n').map(s => s.trim()).find(s => s && classifyFailureText(s)) ?? errText.trim().split('\n')[0] ?? '').slice(0, 300)
     if (out.stoppedBy === 'spawn_error') return textClass === 'resource_error' ? { cls: 'resource_error', detail: `sandbox could not start: ${errLine}`, evidence: [] } : { cls: 'sandbox_error', detail: out.stopDetail ?? 'sandbox failed to start', evidence: [] }
-    if (out.hookRefusals.length) return { cls: 'policy_abort', detail: `Cockpit policy refused ${out.hookRefusals.map(r => `${r.tool}: ${r.reason}`).join('; ').slice(0, 600)}`, evidence: [] }
-    if (f.reportedModel !== null && f.reportedModel !== a.model) return { cls: 'model_mismatch', detail: `Cline reported model ${f.reportedModel}, routed ${a.model}`, evidence: [] }
-    if (f.reportedProvider !== null && f.reportedProvider !== a.provider) return { cls: 'model_mismatch', detail: `Cline reported provider ${f.reportedProvider}, routed ${a.provider}`, evidence: [] }
-    if (out.wire.state === 'mismatch') return { cls: 'wire_mismatch', detail: out.wire.detail, evidence: [] }
     if (out.wire.state === 'unconfirmed' && this.header.strict && (f.finishReason === 'completed')) return { cls: 'wire_mismatch', detail: `strict: ${out.wire.detail}`, evidence: [] }
     if (f.finishReason === 'error') return { cls: textClass ?? 'provider_error', detail: errLine || 'provider error', evidence: [] }
     if (f.finishReason !== 'completed') return { cls: textClass ?? 'unknown_outcome', detail: `${textClass ? `${errLine} · ` : ''}finish ${f.finishReason ?? 'none'}${f.aborted ? ` (${f.aborted})` : ''}, exit ${out.exitCode}`, evidence: [] }
@@ -637,7 +675,8 @@ export class Mission {
       if (h.unhealthy) h.until = this.deps.now() + backoffMs(h.consecutiveErrors - l.providerUnhealthyAfter + 1, l.retryBaseMs, l.retryMaxMs)
       this.live.aimd[a.provider] = Math.max(1, Math.floor((this.live.aimd[a.provider] ?? l.concurrency.total) / 2))
       this.ledger.append('provider_health', null, { key, ...h, concurrency: this.live.aimd[a.provider] })
-    } else if (!cls || cls.cls !== 'cancelled') {
+    } else if (!cls) {
+      // only a run that finished cleanly closes the breaker; a timeout, cancel or policy stop says nothing about the provider
       h.consecutiveErrors = 0; h.unhealthy = false; delete h.until
       this.live.aimd[a.provider] = Math.min(l.perProvider[a.provider] ?? l.concurrency.total, (this.live.aimd[a.provider] ?? l.concurrency.total) + 1)
     }
@@ -691,16 +730,24 @@ export class Mission {
     const structural = bad.find(x => x.kind === 'git' || x.kind === 'security')
     if (structural) { await this.failed(t, a, 'policy_abort', `${structural.name} gate: ${structural.evidence}`, []); return }
     const claimed = SUCCESS_CLAIM.test(a.resultExcerpt ?? '')
-    if (t.spec.mode === 'write' && g.changes.length === 0 && !['review', 'scout'].includes(t.spec.kind) && !t.spec.allowNoChanges) { await this.failed(t, a, claimed ? 'misreported_completion' : 'no_changes', `write task finished with no changes${claimed ? ' while claiming success' : ''}`, [`previous attempt made no changes${claimed ? ' but reported success' : ''}`]); return }
+    // A conversation turn may honestly need no change; claiming done work without any change is still a misreport.
+    if (t.spec.mode === 'write' && g.changes.length === 0 && !['review', 'scout'].includes(t.spec.kind) && (!t.spec.allowNoChanges || claimed)) { await this.failed(t, a, claimed ? 'misreported_completion' : 'no_changes', `write task finished with no changes${claimed ? ' while claiming success' : ''}`, [`previous attempt made no changes${claimed ? ' but reported success' : ''}`]); return }
     if (bad.length) { await this.failed(t, a, claimed ? 'misreported_completion' : 'gate_failed', `${bad.map(x => `${x.name} ${x.state}`).join(', ')}${claimed ? ' (worker claimed success)' : ''}`, bad.map(x => `${x.name} (${x.command ?? x.kind}) ${x.state}: ${x.evidence.slice(-800)}`)); return }
     if (this.header.requireGates && t.spec.mode === 'write' && this.header.gates.length === 0) this.live.alerts.push(`${t.spec.id}: no command gates configured; change is checked for scope and secrets only`)
     // Integration is serial: one pick at a time, onto the mission branch only.
     if (a.gateTaint?.length) this.problem(`${t.spec.id}: the change touches what its gates are defined by: ${a.gateTaint.join(', ')}; those gate results are the worker's word about itself, review them`)
+    // A cancel of this task that arrived while the gates ran wins over integration. A mission stop
+    // does not: work that already passed verification is kept rather than thrown away.
+    const cancelled = (): string | null => this.pendingCancel.has(t.spec.id) ? 'cancelled by the person during verification' : null
+    { const why = cancelled(); if (why) { await this.failed(t, a, 'cancelled', why, []); return } }
     if (t.spec.mode === 'write' && a.changes.length) {
       const r = await this.serial(async () => {
+        // checked again inside the serial section: an earlier pick may have taken a while
+        const why = cancelled(); if (why) return { ok: false as const, cancelled: why, conflict: '' }
         a.commit = await commitTask(wt, `cockpit(${this.header.id}): ${t.spec.title} [${t.spec.id}]`, admin)
         return integrate(this.live.integration.dir, a.commit)
       })
+      if (!r.ok && 'cancelled' in r && r.cancelled) { await this.failed(t, a, 'cancelled', r.cancelled, []); return }
       if (!r.ok) { await this.failed(t, a, 'integration_conflict', r.conflict, [`integration conflict: ${r.conflict.slice(0, 300)}`]); return }
       this.live.integration.head = r.head; t.integratedHead = r.head
       this.ledger.append('integrated', t.spec.id, { attempt: a.id, commit: a.commit, head: r.head })
@@ -728,8 +775,9 @@ export class Mission {
     if (!p.ok) { this.ledger.append('plan_rejected', t.spec.id, { reason: p.reason }); t.verification = 'SELF_REPORTED_UNCHECKED'; this.problem(`commander plan rejected: ${p.reason}`); return }
     const dropped: string[] = []
     // the commander's architecture is written once, in the plan, and handed to every planned task
-    const design = p.design ? `Architecture from the commander's plan (follow it):\n${p.design}\n\n` : ''
-    for (const s of p.tasks) { const r = this.addTask({ ...s, prompt: `${design}${s.prompt}` }, 'commander-plan'); if (r.ok) t.children.push(s.id); else dropped.push(`${s.id}: ${r.reason}`) }
+    // as context only: the design describes the whole mission, so it must not steer each task's route
+    const design = p.design ? `Architecture from the commander's plan (follow it):\n${p.design}` : undefined
+    for (const s of p.tasks) { const r = this.addTask({ ...s, ...(design ? { context: design } : {}) }, 'commander-plan'); if (r.ok) t.children.push(s.id); else dropped.push(`${s.id}: ${r.reason}`) }
     this.ledger.append('plan_accepted', t.spec.id, { tasks: t.children, dropped, design: p.design ? p.design.slice(0, 2000) : null })
     if (dropped.length) { this.live.counters.refused += dropped.length; this.problem(`commander plan partly dropped (${dropped.length} of ${p.tasks.length}): ${dropped.join('; ')}`) }
   }
@@ -793,9 +841,15 @@ export class Mission {
     const lead = step.action === 'escalate'
       ? ['Earlier attempts did not pass Cockpit\'s verification. First diagnose the root cause from the evidence below, then fix it; keep what was correct.']
       : step.action === 'correct' ? ['Your previous attempt did not pass Cockpit\'s verification. Correct it using the evidence below (the checkout starts from the mission head again).'] : []
-    t.evidence = [...lead, ...evidence.slice(0, 6), ...(diff ? [`Diff of the previous attempt:\n${diff}`] : [])]
-    if (step.action === 'retry_same') { t.transientRetries++; t.retryAt = this.deps.now() + (step.delayMs ?? backoffMs(t.transientRetries, l.retryBaseMs, l.retryMaxMs)) }
-    else t.retryAt = null
+    // A transient retry repeats the same request: a correction's evidence stays with it.
+    if (step.action !== 'retry_same') t.evidence = [...lead, ...evidence.slice(0, 6), ...(diff ? [`Diff of the previous attempt:\n${diff}`] : [])]
+    else if (cls === 'integration_conflict') t.evidence = [...t.evidence.filter(e => !e.startsWith('integration conflict')), ...evidence.slice(0, 2)]
+    if (step.action === 'retry_same') {
+      t.transientRetries++; t.retryAt = this.deps.now() + (step.delayMs ?? backoffMs(t.transientRetries, l.retryBaseMs, l.retryMaxMs))
+      // never before the model's breaker would let it through: the retry is a half-open try, not a refusal
+      const h = this.live.health[`${a.provider}/${a.model}`]
+      if (h?.unhealthy && h.until !== undefined) t.retryAt = Math.max(t.retryAt, h.until)
+    } else t.retryAt = null
     if (step.action === 'correct') t.corrections = (t.corrections ?? 0) + 1
     if (step.action === 'escalate') { t.escalations++; t.escalateTo = step.to ?? null }
     t.state = 'queued'; t.reason = step.reason; t.updatedAt = this.deps.now()
@@ -860,9 +914,12 @@ export class Mission {
     }
     this.live.state = 'finalizing'
     this.live.finalGates = [] // each run judges the branch as it is now, not an earlier run's result
+    this.live.finalGatesHead = null
     if (this.live.integration.head !== this.live.integration.base) {
+      const head = this.live.integration.head
       for (const g of this.header.gates) this.live.finalGates.push(await runCommandGate(g, this.live.integration.dir, join(this.dir, 'final-gates'), { hide: this.config.sandbox.hide, shareDirs: this.deps.shareDirs.map(s => ({ from: s.from, to: join(this.live.integration.dir, s.to) })), timeoutSeconds: this.config.limits.gateTimeoutSeconds, gitCommonDir: this.header.commonDir }, `${this.header.id}-final`))
-      this.ledger.append('final_gates', null, this.live.finalGates.map(x => ({ name: x.name, state: x.state, sha: x.outputSha256 })))
+      this.live.finalGatesHead = head
+      this.ledger.append('final_gates', null, { head, gates: this.live.finalGates.map(x => ({ name: x.name, state: x.state, sha: x.outputSha256 })) })
     }
     return false
   }

@@ -2,7 +2,7 @@
 // limit were judged "sent model (empty)", failing a correct DeepSeek run; and commander overhead.
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { headFields, judgeWire, previewBodyHead, readWireCaptures } from '../src/reasoning.ts'
 import { parsePlan, plannerPrompt, workerPrompt } from '../src/planner.ts'
@@ -71,8 +71,11 @@ describe('commander overhead', () => {
     const plan = JSON.stringify({ design: 'Use a pure core module with a thin CLI wrapper.', tasks: [{ id: 'core', title: 'core', kind: 'implement', risk: 'medium', complexity: 3, mode: 'write', owned: ['src/core'], dependencies: [], prompt: '[[write:src/core/a.ts=x]]' }] })
     const m = await mission(e, { goal: `[[plan-b64:${Buffer.from(plan).toString('base64')}]] Redesign the architecture`, swarm: true })
     await m.run()
-    const prompt = byId(m, 'core').spec.prompt
-    assert.match(prompt, /Architecture from the commander's plan/); assert.match(prompt, /pure core module/)
+    // handed over as context (which routing never reads), and present in what the worker was sent
+    const spec = byId(m, 'core').spec
+    assert.match(spec.context ?? '', /Architecture from the commander's plan/); assert.match(spec.context ?? '', /pure core module/)
+    assert.doesNotMatch(spec.prompt, /pure core module/)
+    assert.match(readFileSync(join(m.dir, 'runs', 'core', '1', 'ro', 'prompt.txt'), 'utf8'), /Architecture from the commander's plan \(follow it\):\nUse a pure core module[\s\S]*\[\[write:src\/core\/a\.ts=x\]\]/)
   })
   test('design text is bounded and validated', () => {
     const long = '```json\n' + JSON.stringify({ design: 'd'.repeat(7000), tasks: [{ id: 'a', title: 'a', kind: 'implement', risk: 'low', complexity: 1, mode: 'write', owned: ['src'], dependencies: [], prompt: 'x' }] }) + '\n```'

@@ -27,7 +27,7 @@ export const render = (h: Header, live: Live, claims: Claim[], now = Date.now(),
   line(`${C.b}COBALT COCKPIT · CLINE${C.r}  mission ${h.id}  ${stColor}${C.b}${st.label}${C.r}`)
   line(`${C.d}repo ${h.repoRoot} · branch ${live.integration.branch} @ ${live.integration.head.slice(0, 10)} · profile ${h.profile} · ${h.strict ? 'strict' : 'non-strict'} · ${h.mode} (${h.modeReason}) · updated ${ago(live.updatedAt, now)} ago${C.r}`)
   const barW = 30; const fill = total ? Math.round((done / total) * barW) : 0
-  line(`progress ${C.g}${'█'.repeat(fill)}${C.d}${'░'.repeat(barW - fill)}${C.r} ${done}/${total} tasks verified+integrated  · failed ${live.counters.failed} · refused ${live.counters.refused} · cancelled ${live.counters.cancelled} · attempts ${live.counters.attempts}`)
+  line(`progress ${C.g}${'█'.repeat(fill)}${C.d}${'░'.repeat(barW - fill)}${C.r} ${done}/${total} tasks completed  · failed ${live.counters.failed} · refused ${live.counters.refused} · cancelled ${live.counters.cancelled} · attempts ${live.counters.attempts}`)
   const s = live.session
   line(`cost ${C.b}${usd(s.unmetered ? null : s.spentUsd)}${C.r}${s.unmetered ? ` ${C.red}UNMETERED (${s.unmeteredTasks.length})${C.r}` : ''} · tokens ${num(s.tokens)}${s.capReached ? ` · ${C.red}SESSION CAP REACHED${C.r}` : ''}`)
   line('')
@@ -55,7 +55,7 @@ export const render = (h: Header, live: Live, claims: Claim[], now = Date.now(),
     for (const r of recent) line(`  ${stateColor(r.state)}${pad(r.state, 10)}${C.r}${pad(r.id, 22)}${pad(r.role ?? '—', 11)}${pad(r.model ?? '—', 38)}${pad(usd(r.usd), 10)}${r.gates.map(g => `${g.name}:${g.state}`).join(' ')}`)
   }
   line('')
-  line(`${C.b}GATES (mission branch)${C.r} ${live.finalGates.length ? live.finalGates.map(g => `${stateColor(g.state === 'pass' ? 'completed' : 'failed')}${g.name}:${g.state}${C.r}`).join('  ') : `${C.d}not run yet${C.r}`}   ${C.b}configured${C.r} ${h.gates.length ? h.gates.map(g => g.name).join(', ') : `${C.y}none${C.r}`}`)
+  line(`${C.b}GATES (mission branch)${C.r} ${live.finalGates.length && (live.finalGatesHead ?? null) !== live.integration.head ? `${C.d}pending: the branch moved past the head they ran on${C.r}` : live.finalGates.length ? live.finalGates.map(g => `${stateColor(g.state === 'pass' ? 'completed' : 'failed')}${g.name}:${g.state}${C.r}`).join('  ') : `${C.d}not run yet${C.r}`}   ${C.b}configured${C.r} ${h.gates.length ? h.gates.map(g => g.name).join(', ') : `${C.y}none${C.r}`}`)
   line(`${C.b}CLAIMS (repository)${C.r} ${claims.length ? claims.map(c => `${c.missionId === h.id ? '' : `${c.missionId}/`}${c.taskId}#${c.attempt}:${c.state}[${c.owned.join(',')}]`).join('  ') : `${C.d}none${C.r}`}`)
   if (live.alerts.length) { line(''); line(`${C.b}ALERTS${C.r}`); for (const a of live.alerts.slice(-6)) line(`  ${C.y}${a.slice(0, width - 4)}${C.r}`) }
   if (v) { line(''); line(`${C.b}OUTCOME ${stColor}${st.lifecycle === 'FINISHED' ? st.label : `last run: ${v.state === 'DONE' ? 'VERIFIED' : v.state}`}${C.r}`); for (const r of v.reasons.slice(0, 8)) line(`  - ${r.slice(0, width - 6)}`) }

@@ -25,6 +25,11 @@ export type TaskSpec = {
   /** Expected context the task must hold, in tokens, when known. */ contextTokens?: number
   /** Delegation depth: 0 for the person's task, 1 for planner tasks, +1 per worker request. */ depth?: number
   /** The task that requested this one, if any. */ parent?: string | null
+  /**
+   * Background handed to the worker before its request (the conversation so far, the commander's
+   * design). Routing never reads it: a task is routed on its own title and request only.
+   */
+  context?: string
   /** A conversation turn may legitimately end with no edits (it is reported as such, not escalated). Never set from model output. */ allowNoChanges?: boolean
 }
 export type FailureHistory = { attempts: number; gateFailures: number; escalated: boolean; lastFailure: FailureClass | null }
@@ -106,7 +111,8 @@ export const routeTask = (input: RouteInput): RouteDecision => {
   const h = input.health[healthKey(spec)]
   const now = input.now ?? Date.now()
   // an open breaker delays work on this model; it never moves the work to another model
-  if (h?.unhealthy && (h.until === undefined || h.until > now)) return refuse(`provider health: ${healthKey(spec)} failed ${h.consecutiveErrors} times in a row; cooling down${h.until !== undefined ? ` for ${Math.ceil((h.until - now) / 1000)}s` : ''}; no substitute model is chosen automatically`)
+  // an open breaker always has a cool-down end; an entry without one (older state) is half-open, never a permanent block
+  if (h?.unhealthy && h.until !== undefined && h.until > now) return refuse(`provider health: ${healthKey(spec)} failed ${h.consecutiveErrors} times in a row; cooling down for ${Math.ceil((h.until - now) / 1000)}s; no substitute model is chosen automatically`)
   const plan = planReasoning(spec.reasoning, res.reasoningValues, res.reasoningToggle)
   if (!plan.ok) return refuse(plan.reason)
   const price = pricingFor(config, spec.model, res.info)

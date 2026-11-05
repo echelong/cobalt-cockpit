@@ -195,7 +195,7 @@ describe('mission control renders only measured state', () => {
     const attempt = { n: 1, id: 'm-x.a.1', role: 'coder', provider: 'cline', model: 'deepseek/deepseek-v4.1-flash-1017', requestedReasoning: 'xhigh', cliThinking: 'xhigh', expectedWire: 'max', mapping: 'xhigh->max', phase: 'running', startedAt: new Date().toISOString(), endedAt: null, identity: { initPid: 42, pidNs: 'pid:[123]' }, usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: null, reportedUsd: null }, usageEvents: 0, toolCalls: {}, iterations: 0, charge: { usd: null, basis: 'unmetered' }, wire: null, gates: [] }
     const live = { state: 'running', counters: { created: 2, completed: 0, failed: 0, refused: 0, cancelled: 0, attempts: 1, archived: 0 }, session: { spentUsd: 0, tokens: 0, unmetered: false, capReached: false, unmeteredTasks: [] }, integration: { branch: 'cockpit/m-x', head: 'h'.repeat(40), base: 'b', dir: '/i' }, tasks: { a: { spec: task('a'), state: 'running', attempts: [attempt], reason: null }, b: { spec: task('b'), state: 'held', attempts: [], reason: 'worker processes not accounted for' } }, recent: [], finalGates: [], alerts: ['b: HELD'], verdict: null, updatedAt: new Date().toISOString() }
     const out = render(header as never, live as never, [{ missionId: 'other', taskId: 't', attempt: 1, owned: ['/src'], state: 'bound' } as never])
-    assert.match(out, /0\/2 tasks verified\+integrated/)
+    assert.match(out, /0\/2 tasks completed/)
     assert.match(out, /cline\/deepseek\/deepseek-v4\.1-flash-1017\s+xhigh→max\?/)
     assert.match(out, /a#1.*running.*42\/123.*—.*unknown/)
     assert.match(out, /held\s+b.*not accounted for/)

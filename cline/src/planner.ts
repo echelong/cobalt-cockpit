@@ -90,6 +90,8 @@ export const parseRequest = (text: string, parent: TaskSpec, maxChildren: number
   if (block === null) return null
   let doc: unknown
   try { doc = JSON.parse(block) } catch (e) { return { ok: false, reason: `request JSON invalid: ${(e as Error).message}` } }
+  // an empty list ([] or {"tasks": []}) asks for nothing: it is not a request, so nothing is refused
+  if ((Array.isArray(doc) && doc.length === 0) || (doc && typeof doc === 'object' && Array.isArray((doc as { tasks?: unknown }).tasks) && (doc as { tasks: unknown[] }).tasks.length === 0)) return null
   return validateTasks(doc, { max: maxChildren, depth: (parent.depth ?? 0) + 1, parent: parent.id, existing, idPrefix: `${parent.id}.` })
 }
 
@@ -125,7 +127,7 @@ export const repoSummaryText = (root: string, head: string, files: readonly stri
   return `${root} at ${head.slice(0, 12)}, ${files.length} tracked file(s)${files.length > shown.length ? ` (first ${shown.length} shown)` : ''}:\n${shown.join('\n') || '(empty)'}${scriptLine}`
 }
 
-export const workerPrompt = (t: TaskSpec, ctx: { evidence?: string[]; readOnly: boolean; allowedTools: string[]; dependencyResults?: { id: string; text: string }[] }): string => `${t.prompt}
+export const workerPrompt = (t: TaskSpec, ctx: { evidence?: string[]; readOnly: boolean; allowedTools: string[]; dependencyResults?: { id: string; text: string }[] }): string => `${t.context ? `${t.context.slice(0, 12_000)}\n\n` : ''}${t.prompt}
 ${ctx.dependencyResults?.length ? `\nResults of the tasks this one depends on (their code changes are already in this checkout):\n${ctx.dependencyResults.map(d => `[${d.id}]\n${d.text}`).join('\n\n')}\n` : ''}
 
 -- Cobalt Cockpit worker contract --
@@ -133,5 +135,5 @@ Task: ${t.id}${t.prompt.includes(t.title) ? '' : ` · ${t.title}`}
 ${ctx.readOnly ? 'This task is READ-ONLY: do not modify files.' : `You may modify only: ${t.owned.join(', ')} (repository-relative; "*" means the whole tree).`}
 Allowed tools: ${ctx.allowedTools.join(', ')}. Any other tool, launching agents, or Git commits/branches aborts the run.
 Cockpit runs the tests, type checks and Git checks itself after you finish; your own claims are not accepted as verification.
-If more independent work is needed, do not start it: end your reply with a line ${REQUEST_MARKER} followed by a \`\`\`json block {"tasks":[...]} in the commander's task format.
+Only if more independent work is needed that no other task already covers, do not start it: end your reply with a line ${REQUEST_MARKER} followed by a \`\`\`json block {"tasks":[...]} in the commander's task format. When nothing more is needed, do not write ${REQUEST_MARKER} at all.
 ${ctx.evidence?.length ? `\nEvidence from the previous attempt (fix these):\n${ctx.evidence.map(e => `- ${e}`).join('\n')}` : ''}`

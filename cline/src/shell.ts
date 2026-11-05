@@ -14,7 +14,7 @@ import type { AttemptRecord, Deps, Header, Live, TaskRecord } from './supervisor
 import type { GateSpec } from './gates.ts'
 import { breakStaleLock, listClaims, readJson, tryLock, unlock } from './store.ts'
 import { render as missionControl, reasoningCell } from './hud.ts'
-import { classifyTurn, turnPrompt } from './turn.ts'
+import { classifyTurn, turnContext, turnRequest } from './turn.ts'
 import type { Entry } from './turn.ts'
 import { routeTask } from './router.ts'
 import { plannerPrompt } from './planner.ts'
@@ -184,23 +184,25 @@ export class Shell {
   private nextTurnId(): string { return `t${this.transcript.filter(e => e.role === 'user').length + 1}` }
   private integratedFiles(): string[] {
     const files = new Set<string>()
-    // live and archived tasks: a finished turn's changes count too
-    for (const [, t] of this.taskRecords()) for (const a of t.attempts) if (a.commit) for (const f of a.changes) files.add(f)
+    // live and archived tasks: a finished turn's changes count too, but only work that was accepted
+    for (const [, t] of this.taskRecords()) if (t.state === 'completed') for (const a of t.attempts) if (a.commit && t.integratedHead) for (const f of a.changes) files.add(f)
     return [...files]
   }
 
   private async submit(text: string, swarm = false): Promise<void> {
     const id = this.nextTurnId()
     const user: Entry = { role: 'user', text, turn: id, at: new Date().toISOString() }
-    const prompt = turnPrompt(text, this.transcript, this.integratedFiles())
+    // the conversation is background (context); only this turn's own request is routed
+    const context = turnContext(this.transcript, this.integratedFiles())
     this.record(user); this.view.push(...this.entryLines(user))
     this.turn = { id, lines: [], text: '', startedAt: Date.now(), endedAt: null }
     if (swarm) {
-      this.mission.addTask({ id: `${id}.plan`, title: `Commander plan: ${text.slice(0, 80)}`, kind: 'architecture', risk: 'medium', complexity: 4, mode: 'read', owned: ['*'], dependencies: [], prompt: plannerPrompt(prompt, await this.mission.repoSummary()), priority: 9, depth: 0, parent: null }, 'interactive /swarm')
+      const r = this.mission.addTask({ id: `${id}.plan`, title: `Commander plan: ${text.slice(0, 80)}`, kind: 'architecture', risk: 'medium', complexity: 4, mode: 'read', owned: ['*'], dependencies: [], prompt: plannerPrompt(turnRequest(text), await this.mission.repoSummary()), ...(context ? { context } : {}), priority: 9, depth: 0, parent: null }, 'interactive /swarm')
+      if (!r.ok) { this.system(`${id} refused: ${r.reason}`, 'red'); this.turn = null; this.dirty = true; return }
       this.system(`${id}: commander plans; Cockpit routes each planned task`, 'magenta')
     } else {
       const c = classifyTurn(text, id)
-      const r = this.mission.addTask({ ...c.spec, prompt }, 'interactive')
+      const r = this.mission.addTask({ ...c.spec, prompt: turnRequest(text), ...(context ? { context } : {}) }, 'interactive')
       if (!r.ok) { this.system(`${id} refused: ${r.reason}`, 'red'); this.turn = null; this.dirty = true; return }
       const preview = this.mission.route(this.mission.live.tasks[id] as TaskRecord)
       this.system(`${id}: ${c.reason} → ${preview.ok ? `${preview.role} ${preview.model} (${preview.rules.at(-1)})` : `refused: ${preview.refusal}`}`, preview.ok ? 'cyan' : 'red')
@@ -223,16 +225,23 @@ export class Shell {
       const final = [...this.taskRecords()].find(([tid]) => tid === id)?.[1].attempts.at(-1)?.resultExcerpt?.trim() ?? ''
       if (final) { text = final; this.view.push(...final.split('\n').map(t => ({ text: `  ${t}` }))) }
     }
-    if (text) this.record({ role: 'assistant', text, turn: id, at: new Date().toISOString() })
-    for (const [tid, t] of this.taskRecords()) {
-      if (tid !== id && !tid.startsWith(`${id}.`)) continue
+    const mine = [...this.taskRecords()].filter(([tid]) => tid === id || tid.startsWith(`${id}.`))
+    // an answer whose turn produced nothing accepted is marked, so later turns do not build on it
+    const rejected = mine.length > 0 && !mine.some(([, t]) => t.state === 'completed')
+    if (text) this.record({ role: 'assistant', text, turn: id, at: new Date().toISOString(), ...(rejected ? { rejected: true } : {}) })
+    // a turn the previous session recorded but never handed to the supervisor (it ended first)
+    if (!mine.length) this.system(`${id} ✗ not started: the session ended before this turn reached the supervisor; send it again if it is still wanted`, 'yellow')
+    for (const [tid, t] of mine) {
       const a = t.attempts.at(-1)
       const gates = (a?.gates ?? []).map(g => `${g.name} ${g.state}`).join(' · ')
       const cost = t.attempts.reduce((s, x) => s + (x.charge.usd ?? 0), 0)
       const basis = t.attempts.some(x => x.charge.basis === 'estimate') ? ' est.' : t.attempts.some(x => x.charge.basis === 'unmetered') ? ' unmetered' : ''
       const ok = t.state === 'completed'
-      const changed = a?.commit ? `integrated ${a.commit.slice(0, 8)} (${a.changes.length} file(s))` : t.spec.mode === 'read' ? 'read-only' : 'no changes'
-      this.system(`${tid} ${ok ? '✓' : '✗'} ${t.state}${t.reason && !ok ? `: ${t.reason}` : ''} · ${a ? `${a.role} ${a.model}` : 'not started'} · ${changed}${gates ? ` · ${gates}` : ''} · ${usd(cost)}${basis}`, ok ? 'green' : 'red')
+      const integrated = ok && a?.commit && t.integratedHead
+      // a completed write turn without changes is reported plainly, not as delivered work
+      const noChange = ok && !integrated && t.spec.mode === 'write'
+      const changed = integrated ? `integrated ${a.commit?.slice(0, 8)} (${a.changes.length} file(s))` : t.spec.mode === 'read' ? 'read-only' : noChange ? 'NO CHANGES' : 'nothing integrated'
+      this.system(`${tid} ${ok ? '✓' : '✗'} ${t.state}${t.reason && !ok ? `: ${t.reason}` : ''} · ${a ? `${a.role} ${a.model}` : 'not started'} · ${changed}${gates ? ` · ${gates}` : ''} · ${usd(cost)}${basis}`, !ok ? 'red' : noChange ? 'cyan' : 'green')
     }
     const v = this.mission.live.verdict
     if (v && v.state !== 'DONE' && v.state !== 'UNVERIFIED') for (const r of v.reasons.slice(0, 3)) this.system(`verdict ${v.state}: ${r}`, 'yellow')
@@ -269,9 +278,20 @@ export class Shell {
       }
       case 'new': {
         if (this.busy) { this.system('a turn is running (Esc cancels it)', 'yellow'); break }
-        ;(this.mission.live as Live & { closed?: boolean }).closed = true; this.mission.persist(true); unlock(this.shellLock)
+        // the old conversation is closed only once it holds nothing; the new one is opened before
+        // the old shell lock is released, so a failure leaves the current conversation usable
+        const old = { mission: this.mission, lock: this.shellLock, view: this.view, transcript: this.transcript }
+        const held = Object.values(old.mission.live.tasks).filter(t => t.state === 'held' || t.attempts.some(a => a.phase !== 'ended'))
+        if (held.length) { this.system(`cannot start a new conversation: ${held.length} task(s) still hold ownership (${held.map(t => t.spec.id).join(', ')}); run \`cockpit-cline recover\` first`, 'red'); break }
         this.view = []; this.transcript = []
-        await this.openMissionFresh(); break
+        try { await this.openMissionFresh() } catch (e) {
+          this.mission = old.mission; this.shellLock = old.lock; this.view = old.view; this.transcript = old.transcript
+          this.system(`could not start a new conversation: ${(e as Error).message}`, 'red'); break
+        }
+        const closed = old.mission.closeConversation()
+        if (!closed.ok) this.system(`previous conversation ${old.mission.header.id} left open: ${closed.reason}`, 'yellow')
+        unlock(old.lock)
+        break
       }
       case 'quit': case 'exit': await this.quit(); break
       default: this.system(`unknown command /${cmd}; /help lists them`, 'yellow')
@@ -389,10 +409,16 @@ export class Shell {
   }
   private async enter(line: string): Promise<void> {
     this.notice = null
-    if (line.startsWith('/')) { await this.command(line); return }
-    if (this.busy) { this.system('a turn is running; wait for it, or press Esc to cancel it', 'yellow'); return }
-    this.scroll = 0
-    await this.submit(line)
+    // an error in one command or turn is reported in the transcript; it never takes the shell down
+    try {
+      if (line.startsWith('/')) { await this.command(line); return }
+      if (this.busy) { this.system('a turn is running; wait for it, or press Esc to cancel it', 'yellow'); return }
+      this.scroll = 0
+      await this.submit(line)
+    } catch (e) {
+      if (this.turn && !this.busy) this.turn = null
+      this.system(`error: ${(e as Error).message ?? String(e)}`, 'red')
+    }
   }
 
   // ----- rendering -----------------------------------------------------------------------------------
@@ -436,7 +462,9 @@ export class Shell {
     const lastTask = records.filter(t => t.attempts.length).at(-1)
     const gates = lastTask?.attempts.at(-1)?.gates ?? []
     const gateText = gates.length ? gates.map(g => `${g.name} ${g.state === 'pass' ? S.green('✓') : S.red('✗')}`).join('  ') : S.gray('no gates run yet')
-    const mainGates = live.finalGates.length ? live.finalGates.map(g => `${g.name} ${g.state === 'pass' ? S.green('✓') : S.red('✗')}`).join(' ') : S.gray('—')
+    // branch gates describe the head they ran on; after a newer integration they are stale until re-run
+    const gatesFresh = live.finalGates.length > 0 && (live.finalGatesHead ?? null) === live.integration.head
+    const mainGates = gatesFresh ? live.finalGates.map(g => `${g.name} ${g.state === 'pass' ? S.green('✓') : S.red('✗')}`).join(' ') : live.finalGates.length ? S.gray('pending (branch moved)') : S.gray('—')
     const sess = live.session; const budget = m.config.budgets.sessionUsd
     const spend = sess.unmetered ? S.red('UNMETERED') : `${usd(sess.spentUsd)}${(sess.estimatedTasks ?? []).length ? S.yellow(' (part estimated)') : ''}`
     const guard = [...live.alerts].reverse().find(a => /HELD|refused|policy|budget|unmetered|tampered|outside|not allowed|gates are defined/i.test(a))
@@ -464,7 +492,7 @@ export class Shell {
       ...ROLES.map(r => this.roleRow(r, records, queuedFor, cols)),
       rule('─'),
       fit(` ${S.bold('AGENTS')}   running ${agents.running} · queued ${agents.queued} · retrying ${agents.retrying} · blocked ${agents.blocked} · completed ${agents.completed} · failed ${agents.failed} · refused ${agents.refused}`, cols),
-      fit(` ${S.bold('PROGRESS')} ${bar(c.completed, c.created)} ${c.completed}/${c.created} verified+integrated · ${turns} turn(s)${milestones.length ? `  ${milestones.slice(-8).join('  ')}` : ''}`, cols),
+      fit(` ${S.bold('PROGRESS')} ${bar(c.completed, c.created)} ${c.completed}/${c.created} completed · ${turns} turn(s)${milestones.length ? `  ${milestones.slice(-8).join('  ')}` : ''}`, cols),
       fit(` ${S.bold('GATES')}    last task: ${gateText}   ${S.gray('branch:')} ${mainGates}`, cols),
       fit(` ${S.bold('SPEND')}    ${spend} of $${budget.toFixed(2)} ${bar(sess.spentUsd, budget, 12)} · ${Math.round(sess.tokens / 100) / 10}k tokens${sess.capReached ? S.red(' · CAP REACHED') : ''}`, cols),
       fit(` ${S.bold('GUARD')}    ${guard ? S.yellow(guard) : S.gray('no alerts')}`, cols),
@@ -513,6 +541,9 @@ export class Shell {
     this.inp.on('data', (b: Buffer) => this.onKey(b))
     this.out.on('resize', () => { this.dirty = true })
     process.on('SIGTERM', () => { void this.quit() })
+    // a closed terminal stops the running turn the same way /quit does
+    process.on('SIGHUP', () => { void this.quit() })
+    process.on('unhandledRejection', e => { this.system(`internal error: ${(e as Error)?.message ?? String(e)}`, 'red') })
     process.on('exit', () => { try { this.inp.setRawMode?.(false) } catch { /* ignore */ } })
     this.timer = setInterval(() => { if (this.dirty || this.busy || this.overlay) this.render() }, 120)
     try { await this.openMission() } catch (e) { this.teardown(); throw e }

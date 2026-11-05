@@ -54,11 +54,11 @@ describe('real-world regressions', () => {
 })
 
 describe('failure handling', () => {
-  test('provider error: one retry on the same model, then FAILED; no model substitution', T, async () => {
+  test('provider error: bounded transient retries on the same model (the breaker is waited out), then FAILED; no model substitution', T, async () => {
     const e = env(); const m = await mission(e, { tasks: [task('a', { prompt: '[[error]]' })] })
     const v = await m.run()
     assert.equal(v.state, 'FAILED')
-    const as = attempts(m, 'a'); assert.equal(as.length, 2)
+    const as = attempts(m, 'a'); assert.equal(as.length, 1 + m.config.limits.maxTransientRetries)
     assert.ok(as.every(a => a.model === 'deepseek/deepseek-v4.1-flash-1017' && a.failure === 'provider_error'))
   })
   test('misreported completion (says done, changes nothing): one DeepSeek correction, then Kimi with the evidence, which fixes it', T, async () => {
