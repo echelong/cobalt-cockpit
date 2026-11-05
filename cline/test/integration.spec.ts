@@ -2,12 +2,13 @@
 // the REAL Cockpit hook, and a fake Cline with deterministic streams.
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Mission } from '../src/supervisor.ts'
 import { listClaims, writeAtomic } from '../src/store.ts'
 import { census } from '../src/proc.ts'
+import { parsePlan } from '../src/planner.ts'
 import { allTasks, byId, config, deps, env, git, HERE, mission, resolutions, task, tmp } from './helpers.ts'
 
 const T = { timeout: 120_000 }
@@ -217,21 +218,39 @@ describe('ownership, concurrency and scheduling', () => {
 describe('delegation and the commander', () => {
   test('worker requests pass central admission: depth +1, prefixed ids, routed by Cockpit not the worker', T, async () => {
     const e = env()
-    const req = JSON.stringify({ tasks: [{ id: 'docs', title: 'inventory docs', kind: 'scout', risk: 'low', complexity: 1, mode: 'read', owned: ['src'], dependencies: [], prompt: 'list files' }] })
+    const req = JSON.stringify({ tasks: [{ id: 'docs', title: 'inventory docs', kind: 'scout', risk: 'low', complexity: 1, mode: 'read', owned: ['src/a'], dependencies: [], prompt: 'list files' }] })
     const m = await mission(e, { tasks: [task('a', { prompt: `[[write:src/a/x=1]] [[request:${req}]]` })] })
-    assert.equal((await m.run()).state, 'DONE')
+    const v = await m.run()
+    assert.equal(v.state, 'DONE', v.reasons.join('; '))
     const child = byId(m, 'a.docs') as unknown as { spec: { depth: number; parent: string }; attempts: { role: string; model: string }[] }
     assert.equal(child.spec.depth, 2); assert.equal(child.spec.parent, 'a')
     assert.deepEqual([child.attempts[0].role, child.attempts[0].model], ['utility', 'zai/glm-5.3-flash'])
   })
+  test('a request cannot widen its parent: wider ownership or write from a read-only parent is refused whole, and DONE is withheld', T, async () => {
+    const e = env()
+    const wide = JSON.stringify({ tasks: [{ id: 'grab', title: 'grab', kind: 'implement', risk: 'low', complexity: 1, mode: 'write', owned: ['*'], dependencies: [], prompt: 'x' }] })
+    const up = JSON.stringify({ tasks: [{ id: 'write', title: 'write', kind: 'implement', risk: 'low', complexity: 1, mode: 'write', owned: ['src/s'], dependencies: [], prompt: 'x' }] })
+    const m = await mission(e, { tasks: [task('a', { prompt: `[[write:src/a/x=1]] [[request:${wide}]]` }), task('s', { mode: 'read', kind: 'scout', risk: 'low', complexity: 1, owned: ['/src/s'], prompt: `[[request:${up}]]` })] })
+    const v = await m.run()
+    assert.notEqual(v.state, 'DONE')
+    assert.equal(allTasks(m).some(t => t.id === 'a.grab' || t.id === 's.write'), false)
+    assert.ok(v.reasons.some(r => /outside the requesting task's ownership/.test(r)))
+    assert.ok(v.reasons.some(r => /read-only task cannot request write/.test(r)))
+  })
+  test('a plan cannot claim a reserved supervisor id', () => {
+    const p = parsePlan('```json\n' + JSON.stringify({ tasks: [{ id: 'final-review', title: 'x', kind: 'review', risk: 'low', complexity: 1, mode: 'read', owned: ['*'], dependencies: [], prompt: 'x' }] }) + '\n```')
+    assert.ok(!p.ok && /reserved/.test(p.reason))
+  })
   test('requests beyond the delegation depth are refused (no fan-out loops)', T, async () => {
     const e = env(); const c = config({ limits: { maxDelegationDepth: 1 } })
-    const req = JSON.stringify({ tasks: [{ id: 'more', title: 'more', kind: 'implement', risk: 'low', complexity: 1, mode: 'write', owned: ['src/m'], dependencies: [], prompt: 'again' }] })
+    // inside the parent's ownership, so only the depth limit can refuse it
+    const req = JSON.stringify({ tasks: [{ id: 'more', title: 'more', kind: 'implement', risk: 'low', complexity: 1, mode: 'write', owned: ['src/a/m'], dependencies: [], prompt: 'again' }] })
     const m = await mission(e, { config: c, tasks: [task('a', { prompt: `[[write:src/a/x=1]] [[request:${req}]]` })] })
-    await m.run()
+    const v = await m.run()
     assert.equal(allTasks(m).some(t => t.id === 'a.more'), false)
     assert.ok(m.ledger.verify().ok)
     assert.ok([...m.ledger.entries()].some(x => x.kind === 'task_refused' && /depth/.test(JSON.stringify(x.data))))
+    assert.notEqual(v.state, 'DONE', 'a refused request is a verdict reason, not a silent drop')
   })
   test('commander plan: Kimi decomposes, Cockpit routes each task by rule', T, async () => {
     const e = env()
@@ -275,9 +294,15 @@ describe('crash recovery and lost state', () => {
     assert.ok([...m.ledger.entries()].some(x => x.kind === 'supervisor_takeover'))
   })
   test('deleted mission state: new missions on the repository are refused until recover --lost', T, async () => {
-    const e = env(); const m = await mission(e, { tasks: [task('a')] }); await m.run()
+    // an unfinished mission (created, never completed) keeps its repository marker
+    const e = env(); const m = await mission(e, { tasks: [task('a')] })
     rmSync(m.dir, { recursive: true })
     await assert.rejects(() => mission(e, { tasks: [task('b')] }), /mission state is missing/)
+    // the person acknowledges the loss; with no live claims the marker is retired and work can start again
+    const out = execFileSync(join(HERE, '..', 'bin', 'cockpit-cline'), ['recover', '--lost', m.header.id, '--repo', e.repo, '--state', e.root], { encoding: 'utf8' })
+    assert.match(out, /lost state acknowledged/)
+    const next = await mission(e, { tasks: [task('b')] })
+    assert.equal((await next.run()).state, 'DONE')
   })
   test('thousands of sequential tasks through the bounded queue: live state stays small, history pages, reload is fast', { timeout: 600_000 }, async () => {
     const e = env(); const N = Number(process.env.COCKPIT_SCALE_N ?? 2000); const WAVE = 50

@@ -180,9 +180,12 @@ const recover = async (a: Args): Promise<number> => {
     print(`mission ${lost}: lost state acknowledged; its claims are retired after a clean census. Its worktrees and branch ${'cockpit/' + lost} are kept for inspection.`)
     return 0
   }
-  const { config, resolutions } = await setup(a)
   const v = loadView(a, a._[1])
-  const m = Mission.open(root(a), v.header.id, config, resolutions, deps(a, v.header.repoRoot))
+  // resume under the mission's own profile and strictness unless the person overrides them
+  if (!str(a, 'profile')) a.flags.profile = v.header.profile
+  if (a.flags['no-strict'] === undefined && !v.header.strict) a.flags['no-strict'] = true
+  const { config, catalog, resolutions } = await setup(a)
+  const m = Mission.open(root(a), v.header.id, config, resolutions, deps(a, v.header.repoRoot), { acceptConfigChange: !!a.flags['accept-config-change'], clineVersion: catalog.clineVersion })
   m.live.stopRequested = null; m.live.verdict = null; m.live.state = 'running'
   const verdict = await m.run()
   print(render(m.header, m.live, listClaims(m.header.commonDir).claims))
@@ -238,7 +241,7 @@ const HELP = `cockpit-cline — Cobalt Cockpit for Cline
   route --kind K --risk R --complexity N --mode read|write [--prompt TEXT]   explain one routing decision
   run [--repo DIR] [--plan F | --single | --swarm] [--gate name=cmd]... [--share node_modules] [--watch] "goal"
   status [MISSION] [--json] · watch [MISSION] · cancel MISSION [TASK...] · list
-  recover [MISSION] | recover --lost MISSION --repo DIR
+  recover [MISSION] [--accept-config-change] | recover --lost MISSION --repo DIR
   replay [MISSION]               ledger timeline and hash-chain verification
   smoke --yes [--roles coder,utility] [--max-usd 0.25]   LIVE: spends real credits
 Global: --profile cline|cline-pass · --config FILE · --no-strict · --budget-usd N · --state DIR`

@@ -7,6 +7,10 @@ import type { Kind, Risk, TaskSpec } from './router.ts'
 
 export const MAX_PLAN_TASKS = 12
 const ID = /^[a-z0-9][a-z0-9-]{0,39}$/
+/** Ids the supervisor itself uses; model output may not claim them (a task named final-review would capture the review slot). */
+export const RESERVED_IDS: ReadonlySet<string> = new Set(['plan', 'task', 'final-review'])
+/** Anything that can answer whether an id is taken: live tasks and the paginated archive. */
+export type IdSet = { has(id: string): boolean }
 
 export type Parsed = { ok: true; tasks: TaskSpec[] } | { ok: false; reason: string }
 
@@ -26,7 +30,7 @@ const relOwned = (p: unknown): string | null => {
   return n === '*' && p.trim() !== '*' ? null : n
 }
 
-export const validateTasks = (raw: unknown, opts: { max: number; depth: number; parent: string | null; existing: ReadonlySet<string>; idPrefix?: string }): Parsed => {
+export const validateTasks = (raw: unknown, opts: { max: number; depth: number; parent: string | null; existing: IdSet; idPrefix?: string }): Parsed => {
   const list = (raw && typeof raw === 'object' && Array.isArray((raw as { tasks?: unknown }).tasks)) ? (raw as { tasks: unknown[] }).tasks : null
   if (!list) return { ok: false, reason: 'document has no "tasks" array' }
   if (list.length === 0) return { ok: false, reason: 'no tasks' }
@@ -37,6 +41,7 @@ export const validateTasks = (raw: unknown, opts: { max: number; depth: number; 
     const where = `task ${i + 1}`
     if (typeof o.id !== 'string' || !ID.test(o.id)) return { ok: false, reason: `${where}: id must match ${ID}` }
     const id = `${opts.idPrefix ?? ''}${o.id}`
+    if (RESERVED_IDS.has(id)) return { ok: false, reason: `${where}: id "${id}" is reserved by the supervisor` }
     if (ids.has(id) || opts.existing.has(id)) return { ok: false, reason: `${where}: duplicate id ${id}` }
     if (typeof o.title !== 'string' || !o.title.trim() || o.title.length > 200) return { ok: false, reason: `${where}: title required (max 200)` }
     if (!(KINDS as readonly string[]).includes(o.kind as string)) return { ok: false, reason: `${where}: kind must be one of ${KINDS.join('|')}` }
@@ -62,7 +67,7 @@ export const validateTasks = (raw: unknown, opts: { max: number; depth: number; 
   return { ok: true, tasks: out }
 }
 
-export const parsePlan = (text: string, existing: ReadonlySet<string> = new Set()): Parsed => {
+export const parsePlan = (text: string, existing: IdSet = new Set<string>()): Parsed => {
   const block = lastJsonBlock(text)
   if (!block) return { ok: false, reason: 'no ```json plan block in the commander output' }
   let doc: unknown
@@ -72,7 +77,7 @@ export const parsePlan = (text: string, existing: ReadonlySet<string> = new Set(
 
 export const REQUEST_MARKER = 'COCKPIT_REQUEST'
 /** A worker's request for more work; validated like a plan, one level deeper, prefixed by its parent id. */
-export const parseRequest = (text: string, parent: TaskSpec, maxChildren: number, existing: ReadonlySet<string>): Parsed | null => {
+export const parseRequest = (text: string, parent: TaskSpec, maxChildren: number, existing: IdSet): Parsed | null => {
   const block = lastJsonBlock(text, REQUEST_MARKER)
   if (block === null) return null
   let doc: unknown

@@ -12,7 +12,7 @@
 // live work, not by history. Claims are never deleted to save space: a claim is retired
 // only after the worker it covers is verified gone (see sandbox.ts).
 import { createHash, randomBytes } from 'node:crypto'
-import { appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { homedir, hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 import { redactSecrets } from './core/engine.ts'
@@ -54,12 +54,24 @@ export const tryLock = (file: string, purpose: string): { ok: true } | { ok: fal
 export const unlock = (file: string): void => {
   try { const b = readJson<LockBody>(file); if (b.holder.pid === process.pid) unlinkSync(file) } catch { /* not ours or gone */ }
 }
-/** Takes a lock whose holder is verified gone. Returns false if the holder still runs. */
-export const breakStaleLock = (file: string): boolean => {
-  const r = tryLock(file, 'probe')
-  if (r.ok) { unlinkSync(file); return true }
-  if (!r.stale) return false
-  unlinkSync(file); return true
+const sameBody = (a: LockBody, b: LockBody): boolean => a.holder.pid === b.holder.pid && a.holder.start === b.holder.start && a.at === b.at && a.host === b.host
+
+/**
+ * Removes a lock only if it is still the stale lock `seen` described. The file is renamed
+ * aside first (atomic, one contender wins), then checked: if what was moved is a different
+ * lock (another contender broke the stale one and took the lock meanwhile), it is put back.
+ * Returns true when the stale lock was removed. A third contender racing in the same instant
+ * can still lose its lock here; every caller re-acquires through tryLock afterwards.
+ */
+export const breakStaleLock = (file: string, seen: LockBody): boolean => {
+  const aside = `${file}.stale-${process.pid}-${randomBytes(4).toString('hex')}`
+  try { renameSync(file, aside) } catch { return false }
+  let moved: LockBody | null = null
+  try { moved = readJson<LockBody>(aside) } catch { /* torn */ }
+  if (moved !== null && sameBody(moved, seen) && !sameProcess(moved.holder)) { unlinkSync(aside); return true }
+  try { linkSync(aside, file) } catch { /* a newer lock already exists */ }
+  unlinkSync(aside)
+  return false
 }
 /** Runs fn under a short critical-section lock, retrying while another live holder has it. */
 export const withLock = async <T>(file: string, purpose: string, fn: () => T | Promise<T>, timeoutMs = 10_000): Promise<T> => {
@@ -67,7 +79,7 @@ export const withLock = async <T>(file: string, purpose: string, fn: () => T | P
   for (;;) {
     const r = tryLock(file, purpose)
     if (r.ok) { try { return await fn() } finally { unlock(file) } }
-    if (r.stale) { breakStaleLock(file); continue }
+    if (r.stale && r.holder) { breakStaleLock(file, r.holder); continue }
     if (Date.now() > until) throw new Error(`lock ${file} held by ${r.holder ? `pid ${r.holder.holder.pid} (${r.holder.purpose})` : 'an unreadable holder'}`)
     await new Promise(res => setTimeout(res, 25))
   }

@@ -21,14 +21,14 @@ import type { Identity } from './sandbox.ts'
 import { census, processIdentity, sameProcess, terminate } from './proc.ts'
 import type { Census, ProcessIdentity } from './proc.ts'
 import type { WireVerdict } from './reasoning.ts'
-import { gitGate, runCommandGate, securityGate } from './gates.ts'
+import { gateDefinitionFiles, gitGate, runCommandGate, securityGate } from './gates.ts'
 import type { GateResult, GateSpec } from './gates.ts'
 import { addTaskWorktree, changesOf, commitTask, createIntegration, headOf, integrate, missionBranch, repoInfo } from './git.ts'
 import type { RepoInfo } from './git.ts'
 import { needsCommander, parsePlan, parseRequest, plannerPrompt, workerPrompt } from './planner.ts'
 import { ownedCovers } from './hook/policy.ts'
 import {
-  Archive, Ledger, claimsLock, epochToken, listClaims, lostMissions, newId, readJson, retireClaim, retireMarker,
+  Archive, Ledger, breakStaleLock, claimsLock, epochToken, listClaims, lostMissions, newId, readJson, retireClaim, retireMarker,
   storeBytes, tryLock, unlock, withLock, writeAtomic, writeClaim, writeMarker,
 } from './store.ts'
 
@@ -45,6 +45,8 @@ export type AttemptRecord = {
   failure: FailureClass | 'cancelled' | 'integration_conflict' | null; failureDetail: string | null
   gates: GateResult[]; changes: string[]; commit: string | null; resultExcerpt: string | null
   hookRefusals: { tool: string; reason: string }[]; alerts: number[]
+  /** The git admin dir of this attempt's worktree: host git is pinned to it. */ adminDir?: string | null
+  /** Gate definition files (e.g. package.json, a test entry point) this attempt changed. */ gateTaint?: string[]
 }
 export type TaskState = 'queued' | 'running' | 'verifying' | 'completed' | 'failed' | 'cancelled' | 'held' | 'refused'
 export type TaskRecord = {
@@ -63,6 +65,8 @@ export type Live = {
   integration: { dir: string; branch: string; base: string; head: string }
   finalGates: GateResult[]; review: { text: string | null; attempt: string | null } | null
   verdict: Verdict | null; alerts: string[]; stopRequested: string | null; updatedAt: string
+  /** Durable verdict reasons found along the way: rejected or partly dropped plans, refused requests, gate taint, head drift. */
+  problems?: string[]
 }
 export type Header = {
   id: string; repoRoot: string; commonDir: string; base: string; createdAt: string; profile: string; strict: boolean
@@ -82,15 +86,24 @@ const SUCCESS_CLAIM = /\b(?:all\s+tests?\s+pass|tests?\s+(?:pass|passed|passing)
 
 export const missionDir = (root: string, id: string): string => join(root, 'missions', id)
 
+/** Stable digest of the effective configuration (keys sorted), fixed at mission creation. */
+export const configDigest = (c: Config): string => {
+  const sorted = (v: unknown): unknown => Array.isArray(v) ? v.map(sorted) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v as Record<string, unknown>).sort().map(k => [k, sorted((v as Record<string, unknown>)[k])])) : v
+  return createHash('sha256').update(JSON.stringify(sorted(c))).digest('hex').slice(0, 16)
+}
+
 // ---------------------------------------------------------------------------
 export class Mission {
   readonly ledger: Ledger
   readonly archive: Archive
   private controls = new Map<string, Control>()
+  /** Task ids the person cancelled; checked again right before any launch. */
+  private pendingCancel = new Set<string>()
   private running = new Map<string, Promise<void>>()
   private integrating: Promise<unknown> = Promise.resolve()
   private lastPersist = 0
   private lockFile: string
+  private storeChecked = { at: 0, bytes: 0 }
 
   constructor(readonly dir: string, readonly header: Header, public live: Live, readonly config: Config, readonly resolutions: Record<Role, Resolution>, readonly deps: Deps) {
     this.ledger = new Ledger(join(dir, 'ledger'))
@@ -111,7 +124,7 @@ export class Mission {
     const decision = o.tasks ? { commander: false, reason: 'plan file supplied' } : needsCommander(o.goal, { swarm: o.swarm, single: o.single })
     const header: Header = {
       id, repoRoot: repo.root, commonDir: repo.commonDir, base: repo.head, createdAt: new Date().toISOString(), profile: o.config.profile, strict: o.config.strict,
-      goal: o.goal, epoch, configDigest: createHash('sha256').update(JSON.stringify(o.config)).digest('hex').slice(0, 16), gates: o.gates, clineVersion: o.clineVersion,
+      goal: o.goal, epoch, configDigest: configDigest(o.config), gates: o.gates, clineVersion: o.clineVersion,
       mode: o.tasks ? 'plan-file' : decision.commander ? 'commander' : 'single', modeReason: decision.reason, review: o.review ?? decision.commander, requireGates: o.requireGates ?? true,
     }
     const integrationDir = join(o.stateRoot, 'worktrees', id, '_integration')
@@ -138,13 +151,28 @@ export class Mission {
     return m
   }
 
-  static open(stateRoot: string, id: string, config: Config, resolutions: Record<Role, Resolution>, deps: Deps): Mission {
+  /**
+   * Reopens a mission. The configuration it was created with (models, reasoning, budgets,
+   * strictness, limits) is fixed: a different config is refused unless the person accepts the
+   * change explicitly, and the acceptance is written to the ledger.
+   */
+  static open(stateRoot: string, id: string, config: Config, resolutions: Record<Role, Resolution>, deps: Deps, opts: { acceptConfigChange?: boolean; clineVersion?: string } = {}): Mission {
     const dir = missionDir(stateRoot, id)
     if (!existsSync(join(dir, 'mission.json'))) throw new Error(`mission ${id} not found under ${stateRoot}`)
     const header = readJson<Header>(join(dir, 'mission.json'))
     const live = readJson<Live>(join(dir, 'live.json'))
     if (live.epoch !== header.epoch) throw new Error(`mission ${id}: live state epoch differs from header (store replaced); refusing`)
-    return new Mission(dir, header, live, config, resolutions, deps)
+    const digest = configDigest(config)
+    const versionChanged = opts.clineVersion !== undefined && opts.clineVersion !== header.clineVersion
+    if ((digest !== header.configDigest || versionChanged) && !opts.acceptConfigChange) {
+      throw new Error(`mission ${id} was created with config ${header.configDigest} on Cline ${header.clineVersion}; now config ${digest}${opts.clineVersion ? ` on Cline ${opts.clineVersion}` : ''}. Resume with the original profile, flags and config, or pass --accept-config-change to continue under the new one (recorded in the ledger).`)
+    }
+    const m = new Mission(dir, header, live, config, resolutions, deps)
+    if (digest !== header.configDigest || versionChanged) {
+      m.ledger.append('config_changed', null, { from: header.configDigest, to: digest, clineFrom: header.clineVersion, clineTo: opts.clineVersion ?? header.clineVersion, accepted: 'by --accept-config-change' })
+      m.problem(`resumed under a different configuration (${header.configDigest} -> ${digest}) accepted by the person`)
+    }
+    return m
   }
 
   // ----- supervisor exclusivity ------------------------------------------------
@@ -152,7 +180,7 @@ export class Mission {
     const r = tryLock(this.lockFile, `supervise ${this.header.id}`)
     if (!r.ok) {
       if (!r.stale) throw new Error(`mission ${this.header.id} is supervised by pid ${r.holder?.holder.pid ?? '?'}; a second supervisor is refused`)
-      unlinkSync(this.lockFile)
+      if (!r.holder || !breakStaleLock(this.lockFile, r.holder)) throw new Error(`mission ${this.header.id}: the stale supervisor lock changed while taking it over; retry`)
       const again = tryLock(this.lockFile, `supervise ${this.header.id}`)
       if (!again.ok) throw new Error('could not take over the supervisor lock')
       this.ledger.append('supervisor_takeover', null, { previous: r.holder })
@@ -177,7 +205,11 @@ export class Mission {
       delete this.live.tasks[id]
       this.live.counters.archived++
     }
-    this.live.swarm = { ...this.live.swarm, tasks: this.live.swarm.tasks.filter(t => !['completed', 'failed', 'cancelled'].includes(t.state)) }
+    // Engine tasks that hold nothing: finished ones, and queued/blocked reservations whose
+    // mission task is no longer waiting (refused, ended or archived). Anything that may hold
+    // ownership (reserved, running, stalled, uncertain) always stays.
+    const waiting = (engineId: string): boolean => this.live.tasks[engineId.slice(0, engineId.lastIndexOf('@'))]?.state === 'queued'
+    this.live.swarm = { ...this.live.swarm, tasks: this.live.swarm.tasks.filter(t => !['completed', 'failed', 'cancelled'].includes(t.state) && !((t.state === 'queued' || t.state === 'blocked') && !waiting(t.id))) }
     this.live.updatedAt = new Date(now).toISOString()
     writeAtomic(join(this.dir, 'live.json'), JSON.stringify(this.live))
   }
@@ -225,8 +257,8 @@ export class Mission {
     if (this.live.stopRequested) return `stop requested: ${this.live.stopRequested}`
     if (this.live.session.capReached) return 'session budget reached'
     if (this.live.session.unmetered && !this.config.budgets.allowUnmetered) return 'session usage is unmetered (a run reported no usage): admissions stopped'
-    if ((c.total ?? 0) >= l.concurrency.total) return `concurrency: ${c.total} of ${l.concurrency.total} workers running`
-    if ((c[role] ?? 0) >= l.concurrency[role]) return `concurrency: ${c[role]} ${role} worker(s) of ${l.concurrency[role]}`
+    if ((c.total ?? 0) >= l.concurrency.total) return `concurrency: ${c.total ?? 0} of ${l.concurrency.total} workers running`
+    if ((c[role] ?? 0) >= l.concurrency[role]) return `concurrency: ${c[role] ?? 0} ${role} worker(s) of ${l.concurrency[role]}`
     const provCap = Math.min(l.perProvider[provider] ?? l.concurrency.total, this.live.aimd[provider] ?? l.concurrency.total)
     if ((c[`p:${provider}`] ?? 0) >= provCap) return `provider ${provider}: ${c[`p:${provider}`]} of ${provCap} concurrent (adaptive)`
     const now = this.deps.now()
@@ -234,6 +266,8 @@ export class Mission {
     if (this.live.spawnTimes.length >= l.spawnsPerMinute) return `rate: ${this.live.spawnTimes.length} spawns in the last minute (limit ${l.spawnsPerMinute})`
     const freeMb = Math.floor(freemem() / 1048576)
     if (freeMb < l.minFreeMemoryMB && (c.total ?? 0) > 0) return `memory: ${freeMb} MB free, below ${l.minFreeMemoryMB} MB`
+    if (now - this.storeChecked.at > 30_000) this.storeChecked = { at: now, bytes: storeBytes(this.dir) }
+    if (this.storeChecked.bytes > l.maxStoreBytes) return `store capacity: mission state is ${this.storeChecked.bytes} bytes, above ${l.maxStoreBytes}; nothing is deleted automatically`
     const load = loadavg()[0] / CPU_COUNT
     if (load > l.maxLoadPerCpu && (c.total ?? 0) > 0) return `cpu: load ${load.toFixed(2)} per cpu above ${l.maxLoadPerCpu}`
     return null
@@ -265,8 +299,8 @@ export class Mission {
             if (this.live.stopRequested || !(await this.finalize())) break
             continue
           }
-          if (startable.length && this.capacityBlockedForever(startable)) {
-            for (const t of startable) this.endTask(t, 'refused', t.reason ?? 'not admissible')
+          if (startable.length && startable.every(t => this.cannotClear(t.reason))) {
+            for (const t of startable) this.endTask(t, 'refused', `blocked: ${t.reason ?? 'not admissible'}`)
             continue
           }
         }
@@ -277,6 +311,8 @@ export class Mission {
       this.live.verdict = this.verdict()
       this.live.state = this.live.stopRequested ? 'stopped' : 'done'
       this.ledger.append('mission_verdict', null, this.live.verdict)
+      // the repository marker guards claims; with none of this mission's left, it can go
+      if (!listClaims(this.header.commonDir).claims.some(c => c.missionId === this.header.id) && !Object.values(this.live.tasks).some(t => t.state === 'held')) retireMarker(this.header.commonDir, this.header.id)
       this.persist(true)
       this.writeReport()
       return this.live.verdict
@@ -286,8 +322,23 @@ export class Mission {
     }
   }
 
-  /** Nothing runs and the queue cannot start: e.g. a route refusal that no running work can clear. */
-  private capacityBlockedForever(ts: TaskRecord[]): boolean { return ts.every(t => t.reason?.startsWith('route refused') === true) }
+  /**
+   * With nothing of this mission running, whether a waiting reason can still clear by itself.
+   * Memory, cpu and rate limits, and another live mission's claim, clear with time. A route
+   * refusal, a conflict with this mission's own held work, a reached cap, unmetered usage, a
+   * stop, unreadable or orphaned claims and a zero concurrency limit never do: those tasks end
+   * refused so the mission reaches a verdict (BLOCKED when ownership is held) instead of polling.
+   */
+  private cannotClear(reason: string | null): boolean {
+    const r = reason ?? ''
+    if (r.startsWith('route refused')) return true
+    if (!r.startsWith('waiting: ')) return false
+    if (/^waiting: (?:memory|cpu|rate):/.test(r)) return false
+    if (/^waiting: repository claim held by /.test(r)) return /orphaned/.test(r)
+    if (/^waiting: concurrency: \d+ (?:\w+ worker\(s\) )?of 0\b|^waiting: concurrency: \d+ of 0 workers/.test(r)) return true
+    if (/^waiting: provider .*: \d+ of 0 /.test(r)) return true
+    return /ownership conflict|session budget reached|unmetered|stop requested|claims unreadable|store capacity/.test(r)
+  }
 
   requestStop(why: string): void {
     if (this.live.stopRequested) return
@@ -303,7 +354,8 @@ export class Mission {
       const c = readJson<{ cancel?: 'all' | string[]; nonce?: string }>(f)
       unlinkSync(f)
       if (c.cancel === 'all') this.requestStop('cancel requested by the person')
-      else if (Array.isArray(c.cancel)) for (const id of c.cancel) { const t = this.live.tasks[id]; if (!t) continue; this.ledger.append('cancel_requested', id, {}); if (t.state === 'queued') this.endTask(t, 'cancelled', 'cancelled by the person'); for (const a of t.attempts) if (a.phase !== 'ended') this.controls.get(a.id)?.cancel('cancelled by the person') }
+      // remembered per task, so an attempt still being prepared (no control yet) is cancelled too
+      else if (Array.isArray(c.cancel)) for (const id of c.cancel) { const t = this.live.tasks[id]; if (!t) continue; this.pendingCancel.add(id); this.ledger.append('cancel_requested', id, {}); if (t.state === 'queued') this.endTask(t, 'cancelled', 'cancelled by the person'); for (const a of t.attempts) if (a.phase !== 'ended') this.controls.get(a.id)?.cancel('cancelled by the person') }
     } catch { /* torn write: read next tick */ }
   }
   private async cancelAll(why: string): Promise<void> {
@@ -330,12 +382,23 @@ export class Mission {
     }
   }
 
+  /**
+   * Spend the session budget must already cover: what was charged, plus, for every worker
+   * still in flight, the rest of its pre-spawn estimate. Several admissions in one pass then
+   * cannot all see the same headroom.
+   */
+  committedUsd(): number {
+    let reserved = 0
+    for (const t of Object.values(this.live.tasks)) for (const a of t.attempts) if (a.phase !== 'ended') reserved += Math.max(0, (a.estimateUsd ?? 0) - (a.charge.usd ?? 0))
+    return this.live.session.spentUsd + reserved
+  }
+
   route(t: TaskRecord): RouteDecision {
     const last = t.attempts.at(-1)
     return routeTask({
       task: t.spec, config: this.config, resolutions: this.resolutions, health: this.live.health,
       history: { attempts: t.attempts.length, gateFailures: t.attempts.filter(a => a.failure === 'gate_failed' || a.failure === 'misreported_completion').length, escalated: t.escalations > 0, lastFailure: (last?.failure ?? null) as FailureClass | null },
-      spentSessionUsd: this.live.session.unmetered ? null : this.live.session.spentUsd,
+      spentSessionUsd: this.live.session.unmetered ? null : this.committedUsd(),
       ...(t.escalateTo ? { escalateTo: t.escalateTo } : {}),
     })
   }
@@ -357,7 +420,8 @@ export class Mission {
         const { claims, unreadable } = listClaims(this.header.commonDir)
         if (unreadable.length) return `repository claims unreadable (${unreadable.join(', ')}): writes held`
         const other = claims.find(c => !(c.missionId === this.header.id && c.taskId === t.spec.id) && (c.mode === 'write') && c.owned.some(a => t.spec.owned.some(b => overlaps(a, b))))
-        if (other) return `repository claim held by ${other.missionId}/${other.taskId} (${other.state})`
+        // a claim whose supervisor is verifiably gone will not clear by waiting: it needs recover
+        if (other) return `repository claim held by ${other.missionId}/${other.taskId} (${other.state})${sameProcess(other.supervisor) ? '' : `; orphaned: its supervisor is gone, run cockpit-cline recover ${other.missionId}`}`
         writeClaim(this.header.commonDir, { missionId: this.header.id, taskId: t.spec.id, attempt: n, owned: t.spec.owned, mode: t.spec.mode, state: 'reserved', identity: null, supervisor: processIdentity(process.pid), stateDir: this.dir, at: new Date().toISOString() })
         return null
       })
@@ -383,8 +447,14 @@ export class Mission {
     return true
   }
 
+  /**
+   * Keeps ownership (engine task and repo claim) and marks the task held, whatever stage it
+   * reached: a held task is never finished, so the mission cannot end DONE around it. An
+   * attempt whose processes ended keeps phase 'ended'; recovery releases it after re-checking.
+   */
   private hold(t: TaskRecord, a: AttemptRecord, why: string): void {
-    a.phase = a.phase === 'ended' ? 'ended' : 'held'; t.state = a.phase === 'ended' ? t.state : 'held'; t.reason = why
+    if (a.phase !== 'ended') a.phase = 'held'
+    t.state = 'held'; t.reason = why
     this.live.alerts.push(`${t.spec.id}: HELD ${why}`)
     this.ledger.append('attempt_held', t.spec.id, { attempt: a.id, why })
     this.persist(true)
@@ -399,7 +469,17 @@ export class Mission {
       workdir = join(this.dir.replace(/\/missions\/[^/]+$/, ''), 'worktrees', this.header.id, `${t.spec.id}-${a.n}`)
       admin = (await addTaskWorktree({ root: this.header.repoRoot } as RepoInfo, workdir, a.base)).adminDir
     }
-    a.worktree = workdir; a.phase = 'dispatching'; this.persist(true)
+    a.worktree = workdir; a.adminDir = admin; a.gateTaint = []
+    // A stop, a session cap or a cancel can arrive while the worktree was being created:
+    // nothing has been launched yet, so the attempt ends here with nothing to account for.
+    const why = this.live.stopRequested ?? (this.live.session.capReached ? 'session budget reached' : null) ?? (this.pendingCancel.has(t.spec.id) ? 'cancelled by the person' : null)
+    if (why) {
+      a.phase = 'ended'; a.endedAt = new Date(this.deps.now()).toISOString(); a.census = { state: 'gone', pids: [], detail: 'never launched' }
+      this.ledger.append('attempt_not_launched', t.spec.id, { attempt: a.id, why })
+      await this.failed(t, a, 'cancelled', `not launched: ${why}`, [])
+      return
+    }
+    a.phase = 'dispatching'; this.persist(true)
     const readOnly = t.spec.mode === 'read'
     const allowedTools = readOnly ? this.config.tools.readOnlyAllowed : this.config.tools.allowed
     const spec: WorkerSpec = {
@@ -422,7 +502,12 @@ export class Mission {
         this.persist(true)
       },
       facts: f => { this.absorb(a, f); this.chargeSession(); this.persist() },
-      control: c => this.controls.set(a.id, c),
+      control: c => {
+        this.controls.set(a.id, c)
+        // a cancel, stop or cap that landed between admission and launch still applies
+        const late = this.live.stopRequested ?? (this.live.session.capReached && this.config.budgets.onSessionCap === 'cancel' ? 'session budget reached' : null) ?? (this.pendingCancel.has(t.spec.id) ? 'cancelled by the person' : null)
+        if (late) c.cancel(late)
+      },
     })
     this.controls.delete(a.id)
     this.absorb(a, out.facts)
@@ -436,7 +521,8 @@ export class Mission {
     const cls = this.classify(t, a, out)
     this.noteHealth(a, cls)
     if (cls) { await this.failed(t, a, cls.cls, cls.detail, cls.evidence); return }
-    await this.verifyAndIntegrate(t, a)
+    // the full answer, not the display excerpt, is what plans and delegation requests are read from
+    await this.verifyAndIntegrate(t, a, out.facts.resultText ?? '')
   }
 
   private absorb(a: AttemptRecord, f: StreamFacts): void {
@@ -504,14 +590,35 @@ export class Mission {
 
   private covers(t: TaskRecord): (rel: string) => boolean { return rel => ownedCovers(t.spec.owned, rel) }
 
-  private async verifyAndIntegrate(t: TaskRecord, a: AttemptRecord): Promise<void> {
+  /** Runs fn after every earlier integration step, whether that step succeeded or failed. */
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.integrating.catch(() => undefined).then(fn)
+    this.integrating = next.catch(() => undefined)
+    return next
+  }
+
+  private async verifyAndIntegrate(t: TaskRecord, a: AttemptRecord, fullText: string): Promise<void> {
     t.state = 'verifying'; this.persist(true)
     const gates: GateResult[] = []
-    const g = await gitGate(a.worktree as string, this.covers(t), t.spec.mode)
+    const wt = a.worktree as string; const admin = a.adminDir ?? null
+    // A read-only task looked at the shared integration worktree: check it between picks, not during one.
+    const g = t.spec.mode === 'read' ? await this.serial(() => gitGate(wt, this.covers(t), 'read', null)) : await gitGate(wt, this.covers(t), 'write', admin)
     gates.push(g.result); a.changes = g.changes.map(c => c.path)
     if (t.spec.mode === 'write') {
-      gates.push(await securityGate(a.worktree as string))
-      if (g.changes.length) for (const spec of this.header.gates) gates.push(await runCommandGate(spec, a.worktree as string, join(this.dir, 'runs', t.spec.id, String(a.n), 'gates'), { hide: this.config.sandbox.hide, shareDirs: this.deps.shareDirs.map(s => ({ from: s.from, to: join(a.worktree as string, s.to) })), timeoutSeconds: this.config.limits.gateTimeoutSeconds, gitCommonDir: this.header.commonDir }, a.id))
+      gates.push(await securityGate(wt, admin))
+      if (g.changes.length && g.result.state === 'pass') {
+        for (const spec of this.header.gates) gates.push(await runCommandGate(spec, wt, join(this.dir, 'runs', t.spec.id, String(a.n), 'gates'), { hide: this.config.sandbox.hide, shareDirs: this.deps.shareDirs.map(s => ({ from: s.from, to: join(wt, s.to) })), timeoutSeconds: this.config.limits.gateTimeoutSeconds, gitCommonDir: this.header.commonDir }, a.id))
+        // Command gates run worker-authored code with a writable tree: whatever they changed is
+        // re-checked for scope, hooks, links and credentials before anything is committed.
+        if (this.header.gates.length) {
+          const post = await gitGate(wt, this.covers(t), 'write', admin, 'GIT(after gates)')
+          gates.push(post.result, await securityGate(wt, admin, 'SECURITY(after gates)'))
+          a.changes = post.changes.map(c => c.path)
+        }
+        // A gate whose own definition the worker changed only reports the worker's word about itself.
+        const changed = new Set(a.changes)
+        a.gateTaint = [...new Set(this.header.gates.flatMap(s => gateDefinitionFiles(s)).filter(f => changed.has(f)))]
+      }
     }
     a.gates = gates
     this.ledger.append('gates', t.spec.id, { attempt: a.id, gates: gates.map(x => ({ name: x.name, state: x.state, exit: x.exitCode ?? null, sha: x.outputSha256 ?? null, evidence: x.evidence.slice(0, 600) })) })
@@ -523,39 +630,62 @@ export class Mission {
     if (bad.length) { await this.failed(t, a, claimed ? 'misreported_completion' : 'gate_failed', `${bad.map(x => `${x.name} ${x.state}`).join(', ')}${claimed ? ' (worker claimed success)' : ''}`, bad.map(x => `${x.name} (${x.command ?? x.kind}) ${x.state}: ${x.evidence.slice(-800)}`)); return }
     if (this.header.requireGates && t.spec.mode === 'write' && this.header.gates.length === 0) this.live.alerts.push(`${t.spec.id}: no command gates configured; change is checked for scope and secrets only`)
     // Integration is serial: one pick at a time, onto the mission branch only.
-    if (t.spec.mode === 'write' && g.changes.length) {
-      const res = await (this.integrating = this.integrating.then(async () => {
-        a.commit = await commitTask(a.worktree as string, `cockpit(${this.header.id}): ${t.spec.title} [${t.spec.id}]`)
+    if (a.gateTaint?.length) this.problem(`${t.spec.id}: the worker changed files its gates are defined by (${a.gateTaint.join(', ')}); those gate results are the worker's word about itself, review them`)
+    if (t.spec.mode === 'write' && a.changes.length) {
+      const r = await this.serial(async () => {
+        a.commit = await commitTask(wt, `cockpit(${this.header.id}): ${t.spec.title} [${t.spec.id}]`, admin)
         return integrate(this.live.integration.dir, a.commit)
-      }))
-      const r = res as Awaited<ReturnType<typeof integrate>>
+      })
       if (!r.ok) { await this.failed(t, a, 'integration_conflict', r.conflict, [`integration conflict: ${r.conflict.slice(0, 300)}`]); return }
       this.live.integration.head = r.head; t.integratedHead = r.head
       this.ledger.append('integrated', t.spec.id, { attempt: a.id, commit: a.commit, head: r.head })
+      this.persist(true) // the new head is durable before anything else can fail
     }
     t.verification = 'PROVISIONAL_CHECKED'
-    this.harvestRequests(t, a)
-    if (t.spec.id === 'plan') this.harvestPlan(t, a)
+    this.harvestRequests(t, fullText)
+    if (t.spec.id === 'plan') this.harvestPlan(t, fullText)
     if (t.spec.id === 'final-review') this.live.review = { text: a.resultExcerpt, attempt: a.id }
     this.endAttempt(t, a, 'completed')
     this.endTask(t, 'completed', null)
   }
 
-  private harvestPlan(t: TaskRecord, a: AttemptRecord): void {
-    const p = parsePlan(a.resultExcerpt ?? '', new Set(Object.keys(this.live.tasks)))
-    if (!p.ok) { this.live.alerts.push(`plan rejected: ${p.reason}`); this.ledger.append('plan_rejected', t.spec.id, { reason: p.reason }); t.verification = 'SELF_REPORTED_UNCHECKED'; this.planRejected = p.reason; return }
-    for (const s of p.tasks) { const r = this.addTask({ ...s, dependencies: s.dependencies }, 'commander-plan'); if (r.ok) t.children.push(s.id) }
-    this.ledger.append('plan_accepted', t.spec.id, { tasks: p.tasks.map(x => x.id) })
+  /** A durable verdict reason: survives restarts and keeps the mission from DONE. */
+  private problem(why: string): void {
+    (this.live.problems ??= []).push(why.slice(0, 600))
+    this.live.alerts.push(why.slice(0, 300))
   }
-  planRejected: string | null = null
+  /** Ids already used in this mission, live or archived: model output is validated against both. */
+  private known(): { has(id: string): boolean } { return { has: id => id in this.live.tasks || this.archive.stateOf(id) !== null } }
 
-  private harvestRequests(t: TaskRecord, a: AttemptRecord): void {
-    if (!a.resultExcerpt || t.spec.id === 'plan') return
-    const r = parseRequest(a.resultExcerpt, t.spec, this.config.limits.maxChildrenPerTask, new Set(Object.keys(this.live.tasks)))
+  /** Parses the commander's FULL answer (not the display excerpt). Any rejected or dropped task keeps DONE away. */
+  private harvestPlan(t: TaskRecord, text: string): void {
+    const p = parsePlan(text, this.known())
+    if (!p.ok) { this.ledger.append('plan_rejected', t.spec.id, { reason: p.reason }); t.verification = 'SELF_REPORTED_UNCHECKED'; this.problem(`commander plan rejected: ${p.reason}`); return }
+    const dropped: string[] = []
+    for (const s of p.tasks) { const r = this.addTask(s, 'commander-plan'); if (r.ok) t.children.push(s.id); else dropped.push(`${s.id}: ${r.reason}`) }
+    this.ledger.append('plan_accepted', t.spec.id, { tasks: t.children, dropped })
+    if (dropped.length) { this.live.counters.refused += dropped.length; this.problem(`commander plan partly dropped (${dropped.length} of ${p.tasks.length}): ${dropped.join('; ')}`) }
+  }
+
+  /**
+   * Parses a worker's FULL answer for COCKPIT_REQUEST. A child may not widen its parent:
+   * a read-only parent cannot request writes, and every owned path must lie inside the
+   * parent's ownership. Any violation refuses the whole request.
+   */
+  private harvestRequests(t: TaskRecord, text: string): void {
+    if (!text || t.spec.id === 'plan') return
+    const r = parseRequest(text, t.spec, this.config.limits.maxChildrenPerTask, this.known())
     if (r === null) return
-    if (!r.ok) { t.requestsRefused.push(r.reason); this.ledger.append('delegation_refused', t.spec.id, { reason: r.reason }); return }
+    let refusal = r.ok ? null : r.reason
+    if (r.ok) for (const s of r.tasks) {
+      if (s.mode === 'write' && t.spec.mode !== 'write') { refusal = `${s.id}: a read-only task cannot request write work`; break }
+      const wide = s.owned.find(o => !t.spec.owned.some(p => p === '*' || o === p || (o !== '*' && o.startsWith(`${p}/`))))
+      if (wide) { refusal = `${s.id}: owned path ${wide} is outside the requesting task's ownership (${t.spec.owned.join(', ')})`; break }
+    }
+    if (refusal !== null || !r.ok) { t.requestsRefused.push(refusal ?? 'invalid'); this.ledger.append('delegation_refused', t.spec.id, { reason: refusal }); this.problem(`delegation from ${t.spec.id} refused: ${refusal}`); return }
     for (const s of r.tasks) { const x = this.addTask(s, `request from ${t.spec.id}`); if (x.ok) t.children.push(s.id); else t.requestsRefused.push(`${s.id}: ${x.reason}`) }
     this.ledger.append('delegation', t.spec.id, { admitted: t.children, refused: t.requestsRefused })
+    if (t.requestsRefused.length) { this.live.counters.refused += t.requestsRefused.length; this.problem(`delegation from ${t.spec.id} partly refused: ${t.requestsRefused.join('; ')}`) }
   }
 
   /** Ends the engine task and retires the repo claim. Only called after a clean census. */
@@ -612,8 +742,25 @@ export class Mission {
         const sawResult = existsSync(stream) && readFileSync(stream, 'utf8').includes('"type":"run_result"')
         await this.failed(t, a, 'unknown_outcome', `supervisor ended while the attempt ran; ${sawResult ? 'a run result was written but was never verified' : 'no run result'}`, [])
       }
-      if (t.state === 'verifying') { t.state = 'queued'; t.reason = 'verification interrupted: re-run' }
+      // Processes ended (census gone when the attempt ended) but no outcome was recorded: a crash or
+      // an error during verification or integration. Its engine task and repo claim are still held;
+      // release them through the normal failure path, which also decides the bounded retry.
+      const last = t.attempts.at(-1)
+      if (last && last.phase === 'ended' && last.failure === null && ['verifying', 'running', 'held'].includes(t.state)) {
+        this.ledger.append('reconciled', t.spec.id, { attempt: last.id, census: last.census, outcome: 'interrupted after the worker ended' })
+        await this.failed(t, last, 'unknown_outcome', `verification or integration was interrupted (${t.reason ?? t.state}); the attempt is re-run on the current mission head`, [])
+      }
     }
+    // The mission branch is the integration record: if it moved past what was persisted (a crash
+    // right after a pick), adopt the real head and keep the mission from DONE until a person looks.
+    try {
+      const actual = await headOf(this.live.integration.dir)
+      if (actual !== this.live.integration.head) {
+        this.problem(`mission branch head ${actual.slice(0, 12)} differs from the recorded ${this.live.integration.head.slice(0, 12)} (interrupted integration); review ${this.live.integration.branch}`)
+        this.ledger.append('integration_head_drift', null, { recorded: this.live.integration.head, actual })
+        this.live.integration.head = actual
+      }
+    } catch (e) { this.problem(`mission branch unreadable after restart: ${(e as Error).message}`) }
     this.persist(true)
   }
 
@@ -626,6 +773,7 @@ export class Mission {
       if (r.ok) return true
     }
     this.live.state = 'finalizing'
+    this.live.finalGates = [] // each run judges the branch as it is now, not an earlier run's result
     if (this.live.integration.head !== this.live.integration.base) {
       for (const g of this.header.gates) this.live.finalGates.push(await runCommandGate(g, this.live.integration.dir, join(this.dir, 'final-gates'), { hide: this.config.sandbox.hide, shareDirs: this.deps.shareDirs.map(s => ({ from: s.from, to: join(this.live.integration.dir, s.to) })), timeoutSeconds: this.config.limits.gateTimeoutSeconds, gitCommonDir: this.header.commonDir }, `${this.header.id}-final`))
       this.ledger.append('final_gates', null, this.live.finalGates.map(x => ({ name: x.name, state: x.state, sha: x.outputSha256 })))
@@ -637,26 +785,34 @@ export class Mission {
     const reasons: string[] = []
     const live = Object.values(this.live.tasks)
     const held = live.filter(t => t.state === 'held')
+    // anything still running or verifying at the end was never finished: never DONE around it
+    const unfinished = live.filter(t => t.state === 'running' || t.state === 'verifying')
     const c = this.live.counters
     if (held.length) reasons.push(`${held.length} task(s) held with ownership retained: ${held.map(t => `${t.spec.id} (${t.reason})`).join('; ')}`)
+    if (unfinished.length) reasons.push(`${unfinished.length} task(s) never finished: ${unfinished.map(t => `${t.spec.id} (${t.state})`).join(', ')}`)
     if (this.live.stopRequested) reasons.push(`stopped: ${this.live.stopRequested}`)
     if (c.failed) reasons.push(`${c.failed} task(s) failed`)
     if (c.refused) reasons.push(`${c.refused} task(s) refused or never started`)
     if (c.cancelled) reasons.push(`${c.cancelled} task(s) cancelled`)
-    if (this.planRejected) reasons.push(`commander plan rejected: ${this.planRejected}`)
+    const problems = this.live.problems ?? []
+    for (const p of problems) reasons.push(p)
+    const weakOnly = (r: string): boolean => /gates are defined by|no test\/type\/build gate/.test(r)
     if (this.live.session.unmetered) reasons.push(`usage unmetered for ${this.live.session.unmeteredTasks.join(', ')}: cost not measured`)
     if (this.live.session.capReached) reasons.push('session budget reached')
     const finalBad = this.live.finalGates.filter(g => g.state !== 'pass')
     if (finalBad.length) reasons.push(`final gates on ${this.live.integration.branch}: ${finalBad.map(g => `${g.name} ${g.state}`).join(', ')}`)
     const ledger = this.ledger.verify()
     if (!ledger.ok) reasons.push(`ledger integrity: ${ledger.problem}`)
+    // a deleted or emptied ledger verifies trivially; a mission always has its creation entry
+    const ledgerEmpty = ledger.ok && ledger.entries === 0
+    if (ledgerEmpty) reasons.push('ledger integrity: the ledger has no entries (deleted or replaced)')
     const noGates = this.header.gates.length === 0 && this.live.integration.head !== this.live.integration.base
     if (noGates && this.header.requireGates) reasons.push('no test/type/build gate was configured: the change is scope- and secret-checked only')
     const at = new Date().toISOString()
-    if (held.length || !ledger.ok) return { state: 'BLOCKED', reasons, at }
+    if (held.length || unfinished.length || !ledger.ok || ledgerEmpty) return { state: 'BLOCKED', reasons, at }
     if (this.live.stopRequested) return { state: 'STOPPED', reasons, at }
     if (c.completed === 0) return { state: 'FAILED', reasons: reasons.length ? reasons : ['nothing completed'], at }
-    if (reasons.length) return { state: noGates && reasons.length === 1 ? 'UNVERIFIED' : 'PARTIAL', reasons, at }
+    if (reasons.length) return { state: reasons.every(weakOnly) ? 'UNVERIFIED' : 'PARTIAL', reasons, at }
     const estimated = this.live.session.estimatedTasks ?? []
     const cost = estimated.length ? `usage measured; cost of ${estimated.length} attempt(s) estimated from configured pricing (Cline reported no cost): ${estimated.join(', ')}` : 'costs metered (Cline-reported)'
     return { state: 'DONE', reasons: [`${c.completed} task(s) verified by supervisor gates and integrated on ${this.live.integration.branch}; final gates pass; ${cost}; ledger intact`], at }
