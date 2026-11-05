@@ -615,7 +615,7 @@ export class Mission {
   // ----- finalization ----------------------------------------------------------------
   /** Final gates on the mission branch and the commander's review. Returns true if new work was queued. */
   private async finalize(): Promise<boolean> {
-    if (this.header.review && !this.live.review && !this.live.tasks['final-review'] && !this.archive.stateOf('final-review') && this.live.counters.completed > 0) {
+    if (this.header.review && !this.live.review && !this.live.tasks['final-review'] && !this.archive.stateOf('final-review') && this.live.integration.head !== this.live.integration.base) {
       const diffBase = this.live.integration.base.slice(0, 12)
       const r = this.addTask({ id: 'final-review', title: 'Commander: critical review of the integrated change', kind: 'review', risk: 'high', complexity: 4, mode: 'read', owned: ['*'], dependencies: [], priority: 9, depth: 1, parent: null, prompt: `Review the mission's integrated change critically: run \`git diff ${diffBase}..HEAD\` and inspect the code. Goal of the mission:\n${this.header.goal}\nReport concrete defects with file and line. Do not edit files.` }, 'finalize')
       if (r.ok) return true

@@ -50,7 +50,10 @@ export const headOf = (dir: string): Promise<string> => must(['rev-parse', 'HEAD
 export type Change = { path: string; status: string }
 /** Every tracked and untracked change in a worktree relative to its HEAD (ignored files excluded). */
 export const changesOf = async (dir: string): Promise<Change[]> => {
-  const out = await must(['status', '--porcelain=v1', '-z', '--untracked-files=all'], dir)
+  // Not trimmed: a porcelain entry starts with a status column that may be a space (" M path").
+  const r = await git(['status', '--porcelain=v1', '-z', '--untracked-files=all'], { cwd: dir })
+  if (r.code !== 0) throw new Error(`git status: ${r.stderr.trim().slice(0, 400)}`)
+  const out = r.stdout
   const parts = out.split('\0').filter(Boolean); const changes: Change[] = []
   for (let i = 0; i < parts.length; i++) {
     const status = parts[i].slice(0, 2); const path = parts[i].slice(3)

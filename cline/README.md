@@ -1,0 +1,131 @@
+# Cobalt Cockpit for Cline
+
+A supervisor that runs Cline workers under Cobalt Cockpit's engine: deterministic model routing across five
+configured roles, OS-sandboxed workers in their own git worktrees, durable ownership, verification gates the
+model cannot satisfy for itself, measured cost and a live mission-control screen. The Claude Code plugin in
+this repository is unchanged: the adapter imports the engine's pure modules (`hooks/swarm.ts`, `guard.ts`,
+`effort.ts`, `verification.ts`, `secrets.ts`, `router.ts`) through `src/core/engine.ts` and modifies none of them.
+
+Status: **local prototype**, Linux only, tested against Cline CLI 3.0.74 (`@cline/core`/`@cline/llms` 0.2.0).
+It is not a Cline plugin and does not claim Cline feature parity; see [Limitations](#limitations).
+
+## Requirements
+
+- Linux with unprivileged user namespaces and `bwrap` (bubblewrap). `cockpit-cline doctor` checks both.
+- Node 24 (the one that runs `cline`), `git`, and the `cline` CLI on `PATH`, signed in (`cline auth`).
+- No npm install: the adapter has no dependencies. Type checking uses TypeScript 5.9.3 (`scripts/typecheck.sh`).
+
+## Setup
+
+```sh
+git -C /path/to/cobalt-cockpit switch cline-adapter          # or use the worktree that holds the branch
+/path/to/cobalt-cockpit/cline/bin/cockpit-cline doctor        # installed Cline, sandbox, auth, model ids, reasoning
+# optional: put the launcher on PATH under a name that does not collide with anything you already use
+ln -s /path/to/cobalt-cockpit/cline/bin/cockpit-cline ~/.local/bin/cockpit-cline
+```
+
+`doctor` must print `doctor: OK`. It resolves every role against the **installed** Cline model catalog, checks that
+the configured reasoning level exists for that model, and reports whether each provider has credentials (it
+never prints them).
+
+## Model roles (default profile `cline`, Cline billing)
+
+| Role | Model id (verified in the installed catalog) | Reasoning requested → sent on the wire | Used for |
+|---|---|---|---|
+| coder (default) | `deepseek/deepseek-v4.1-flash-1017` (pinned: id and name must carry `1017`) | `xhigh` → `max` (catalog lists none/low/high/max; Cline sends max) | all implementation work by default |
+| commander | `moonshotai/kimi-k3.1-pro` | `high` → `high` | planning substantial goals, architecture, critical review, escalation target |
+| specialist | `xiaomi/mimo-v2.6-pro` | `high` → `reasoning_effort=high` (toggle-only model: shown as "thinking on, inferred") | non-trivial debugging, independent review, complexity 4+ engineering |
+| frontend | `qwen/qwen3.8-max-0902` (pinned `0902`) | `xhigh` → `xhigh` | frontend/UI work, long-context tasks |
+| utility | `zai/glm-5.3-flash` | `low` → `low` | low-risk read-only scouting, narrow low-risk docs edits |
+
+No `1017 Fast` DeepSeek variant exists in either Cline catalog (checked 2026-11-05), so none is used; the alias
+`~deepseek/deepseek-flash-latest` and other checkpoints are refused. Every spawn passes `--thinking` explicitly,
+so a restart never falls back to the level last chosen in Cline's `/model`.
+
+**ClinePass:** `--profile cline-pass` (or `COCKPIT_CLINE_PROFILE=cline-pass`) switches every role to the
+`cline-pass/…` ids. ClinePass lists no version-pinned Qwen3.8 Max 0902, so in strict mode the frontend role is
+refused there (frontend tasks fail closed, nothing is substituted) until you add
+`"unpinnedAllowed": ["cline-pass/cline-pass/qwen3.8-max"]` to your config.
+
+Your own overrides go in `~/.config/cobalt-cockpit-cline/config.json` (merged over `config/default.json`), or
+`--config FILE`. Validation is strict: an unknown role or reasoning level is an error, not a default.
+
+## Usage
+
+```sh
+cockpit-cline run --repo ~/code/app --gate test="npm test" "Fix the off-by-one in src/pager.ts"       # one coder task
+cockpit-cline run --repo ~/code/app --swarm --gate test="npm test" --share node_modules "Parts: …"      # commander plans
+cockpit-cline run --repo ~/code/app --plan tasks.json --gate typecheck="npm run typecheck"             # your own plan
+cockpit-cline watch            # mission control for the latest mission (q quits, c then y cancels)
+cockpit-cline status [MISSION] [--json] · list · replay [MISSION] · cancel MISSION [TASK…]
+cockpit-cline recover [MISSION]                 # after a crash: reconcile by process identity, then continue
+cockpit-cline recover --lost MISSION --repo DIR # the mission's state directory was deleted
+cockpit-cline route --kind debug --complexity 3 --mode write --prompt "…"   # explain one routing decision
+cockpit-cline smoke --yes [--roles coder,utility] [--max-usd 0.25]           # LIVE, spends credits
+```
+
+- Small goals go straight to one coder task; `--swarm`, architecture wording or three or more listed parts make
+  the commander plan first. The commander proposes tasks; Cockpit validates the plan and picks every model.
+- Work lands on the branch `cockpit/<mission>` in your repository, one commit per verified task, created with your
+  own Git identity and no tool attribution. Your current branch, `main` and the working tree are never touched.
+  Review the branch and merge it yourself.
+- `--gate name=command` adds a required gate (repeatable). Without `--gate`, `package.json` scripts named
+  typecheck, lint, test and build are used; with none at all the verdict is `UNVERIFIED`, never `DONE`.
+- `--share node_modules` read-only-binds your checkout's dependency directory into gate sandboxes (gates run
+  without network, in fresh worktrees that have no `node_modules` of their own).
+- `--budget-usd N` sets the session cap; per-task caps are in the config.
+
+## What a mission guarantees, and how
+
+| Property | Mechanism | Test |
+|---|---|---|
+| Correct model per worker | deterministic rules (`src/router.ts`), every decision lists fired rules and rejected roles; Cline's reported model and the wire request are both compared with the route | `routing.spec.ts`, `integration.spec.ts` (wrong model version) |
+| Reasoning never silently downgraded | capability check against the catalog; every wire request's effort is read from Cline's capture; strict mode fails a run whose effort cannot be confirmed | downgrade, no-capture tests; live smoke |
+| Workers cannot write outside their task | bubblewrap: read-only root, writable worktree only, git dir read-only, secret dirs hidden, `/run/user/<uid>` hidden; PreToolUse hook refuses out-of-scope edits and dangerous commands; GIT gate re-checks the diff | adversarial tests |
+| No uncontrolled spawning | native `spawn_agent`/`team_*` and agent launchers are refused; workers can only *request* work (`COCKPIT_REQUEST`), which goes through central admission with depth, child and queue limits | delegation tests |
+| Cancellation is real | each worker is a pid namespace; ending it kills every process in it, detached ones included; ownership is released only after a process census of the namespace init and the attempt marker is clean | detached-children, cancel tests |
+| Crash safety | `--die-with-parent`; claims live in the repository's git dir, so a restarted supervisor (or another mission) sees them; `recover` reconciles by identity; unknown status keeps the claim and blocks overlapping work | crash `kill -9` test |
+| Cost is measured | Cline's per-request usage events (tokens, cache reads, reasoning tokens, reported cost); catalog pricing only for labelled estimates; no usage → `unmetered`, admissions stop, no DONE | budget, unmetered tests |
+| DONE means verified | every task: GIT, SECURITY and your command gates pass, run by the supervisor after the worker ended; mission branch: final gates; ledger chain intact; costs metered | verdict assertions throughout |
+
+## Evidence
+
+Each mission keeps, under `~/.local/state/cobalt-cockpit-cline/missions/<id>/` (0700): `mission.json`,
+`live.json`, `report.json`, the hash-chained `ledger/`, the paginated `archive/`, and per attempt `runs/<task>/<n>/`
+with the exact argv, the policy, the JSONL stream, stderr, the hook log, Cline's wire captures (full request
+bodies, kept as evidence; they contain your code and prompts, never credentials) and gate logs with SHA-256.
+
+## Tests
+
+```sh
+scripts/test.sh            # offline: fake providers, real bubblewrap, real git, the real hook (≈ 90 s)
+scripts/typecheck.sh       # TypeScript 5.9.3, strict
+bin/cockpit-cline smoke --yes --max-usd 0.25   # live, opt-in, budget bounded
+```
+
+`COCKPIT_SCALE_N` sets the sequential-task scale test (default 2000).
+
+## Limitations
+
+Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
+
+1. **Linux only**, and it needs unprivileged user namespaces for bubblewrap.
+2. **Network and loopback are shared.** Workers need the provider API, so they can reach the network and
+   localhost services, including a running Cline hub daemon (`doctor` warns). The hook refuses `cline` and other
+   agent launchers, but a determined model could talk to a local service directly. Stop local services you do
+   not trust a worker with, or run missions on a machine without them.
+3. **Cline's data directory (`~/.cline/data`) is writable inside the sandbox**: Cline needs it for its sessions
+   and to refresh OAuth tokens. A worker can therefore read the Cline credentials it is already using.
+4. **Evidence from inside a sandbox can be forged by an adversarial model**: the JSONL stream, wire captures and
+   reported cost are written by processes in that sandbox. Gates, the GIT scope check and the census are done by
+   the supervisor outside it; treat stream-derived figures as Cline-reported, not independently attested.
+5. **The spending cap is not exact.** A worker is stopped as soon as a usage event crosses its budget, so one
+   in-flight request can exceed it; the session cap stops admissions and, by default, cancels running workers.
+6. **Hook semantics**: a `PreToolUse` `cancel` aborts the whole Cline run (observed), so a policy violation ends
+   the attempt. Hooks are a second layer; bubblewrap is the boundary.
+7. **MiMo V2.6 Pro** is toggle-only in the catalog; Cline still sends `reasoning_effort`. Whether the provider
+   honours a level for it is not observable, so the HUD says "inferred".
+8. **Worker reuse** (`cline --id` resume) is not used: every attempt is a fresh process and worktree.
+9. **Retention**: archives and ledgers are kept; nothing is deleted automatically, and claims are never dropped
+   to save space. Worktrees under the state directory are kept for inspection.
+10. The native `@cline/sdk` plugin route was assessed and not built (see `docs/architecture-audit.md`).

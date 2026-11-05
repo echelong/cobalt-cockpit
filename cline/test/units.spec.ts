@@ -130,6 +130,16 @@ describe('durable store', () => {
   })
 })
 
+describe('git change detection', () => {
+  test('modified tracked files keep their full path (porcelain status column may be a space)', async () => {
+    const { changesOf } = await import('../src/git.ts')
+    const repo = mkRepo()
+    writeFileSync(join(repo, 'src', 'base.txt'), 'changed\n'); writeFileSync(join(repo, 'new.txt'), 'n')
+    const c = await changesOf(repo)
+    assert.deepEqual(c.map(x => x.path).sort(), ['new.txt', 'src/base.txt'])
+  })
+})
+
 describe('cost telemetry', () => {
   test('estimate: input includes cache reads (matches Cline\'s reported GLM figure within 1%)', () => {
     const est = estimateUsd({ inputTokens: 28417, outputTokens: 204, cacheReadTokens: 18688, cacheWriteTokens: 0 }, { input: 0.15, output: 0.5, cacheRead: 0.03, cacheWrite: 0 })
@@ -174,5 +184,22 @@ describe('planner and delegation parsing (untrusted model output)', () => {
     assert.equal(needsCommander('fix the off-by-one in src/a.ts', {}).commander, false)
     assert.equal(needsCommander('Redesign the module architecture for plugins', {}).commander, true)
     assert.equal(needsCommander('Do these:\n- a\n- b\n- c', {}).commander, true)
+  })
+})
+
+describe('mission control renders only measured state', () => {
+  test('a running attempt without usage shows unknown cost and "—" tokens, never an estimate; held work and claims are shown', async () => {
+    process.env.NO_COLOR = '1'
+    const { render } = await import('../src/hud.ts')
+    const header = { id: 'm-x', repoRoot: '/r', commonDir: '/r/.git', base: 'b'.repeat(40), createdAt: 'now', profile: 'cline', strict: true, goal: 'g', epoch: 'e', configDigest: 'd', gates: [{ name: 'test', command: 'npm test', required: true }], clineVersion: '3.0.74', mode: 'single' as const, modeReason: 'bounded goal', review: false, requireGates: true }
+    const attempt = { n: 1, id: 'm-x.a.1', role: 'coder', provider: 'cline', model: 'deepseek/deepseek-v4.1-flash-1017', requestedReasoning: 'xhigh', cliThinking: 'xhigh', expectedWire: 'max', mapping: 'xhigh->max', phase: 'running', startedAt: new Date().toISOString(), endedAt: null, identity: { initPid: 42, pidNs: 'pid:[123]' }, usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: null, reportedUsd: null }, usageEvents: 0, toolCalls: {}, iterations: 0, charge: { usd: null, basis: 'unmetered' }, wire: null, gates: [] }
+    const live = { state: 'running', counters: { created: 2, completed: 0, failed: 0, refused: 0, cancelled: 0, attempts: 1, archived: 0 }, session: { spentUsd: 0, tokens: 0, unmetered: false, capReached: false, unmeteredTasks: [] }, integration: { branch: 'cockpit/m-x', head: 'h'.repeat(40), base: 'b', dir: '/i' }, tasks: { a: { spec: task('a'), state: 'running', attempts: [attempt], reason: null }, b: { spec: task('b'), state: 'held', attempts: [], reason: 'worker processes not accounted for' } }, recent: [], finalGates: [], alerts: ['b: HELD'], verdict: null, updatedAt: new Date().toISOString() }
+    const out = render(header as never, live as never, [{ missionId: 'other', taskId: 't', attempt: 1, owned: ['/src'], state: 'bound' } as never])
+    assert.match(out, /0\/2 tasks verified\+integrated/)
+    assert.match(out, /cline\/deepseek\/deepseek-v4\.1-flash-1017\s+xhigh→max\?/)
+    assert.match(out, /a#1.*running.*42\/123.*—.*unknown/)
+    assert.match(out, /held\s+b.*not accounted for/)
+    assert.match(out, /other\/t#1:bound\[\/src\]/)
+    assert.doesNotMatch(out, /\d+%/, 'no percentage is invented for a running worker')
   })
 })

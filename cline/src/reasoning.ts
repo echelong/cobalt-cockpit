@@ -70,7 +70,9 @@ export const judgeWire = (requests: readonly WireRequest[], model: string, expec
     if (unknown.length) return { state: 'unconfirmed', requests: requests.length, effective: null, models, detail: `${unknown.length} request(s) do not state thinking on/off; effective reasoning cannot be confirmed` }
     const wrong = requests.filter(r => r.thinking !== expectedEffort)
     if (wrong.length) return { state: 'mismatch', requests: requests.length, effective: [...new Set(requests.map(r => r.thinking))].join(','), models, detail: `${wrong.length} of ${requests.length} request(s) sent thinking ${wrong[0].thinking} instead of ${expectedEffort}` }
-    return { state: 'confirmed', requests: requests.length, effective: `thinking ${expectedEffort}`, models, detail: `${requests.length} request(s) sent ${model} with thinking ${expectedEffort}` }
+    const inferred = requests.some(r => r.effort !== null)
+    const sent = [...new Set(requests.map(r => r.effort).filter(Boolean))].join(',')
+    return { state: 'confirmed', requests: requests.length, effective: inferred ? `thinking ${expectedEffort} (sent reasoning_effort=${sent})` : `thinking ${expectedEffort}`, models, detail: `${requests.length} request(s) sent ${model} with thinking ${expectedEffort}${inferred ? ` (inferred from reasoning_effort=${sent}: a toggle-only model has no levels, and whether the provider honours the level is not observable)` : ''}` }
   }
   const wrongEffort = requests.filter(r => r.effort !== expectedEffort)
   if (wrongEffort.length) return { state: 'mismatch', requests: requests.length, effective: efforts.join(','), models, detail: `${wrongEffort.length} of ${requests.length} request(s) sent reasoning ${[...new Set(wrongEffort.map(r => r.effort ?? 'none-sent'))].join(',')} instead of ${expectedEffort}` }

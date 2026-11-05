@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { Mission } from '../src/supervisor.ts'
 import { listClaims, writeAtomic } from '../src/store.ts'
 import { census } from '../src/proc.ts'
-import { allTasks, byId, config, deps, env, git, mission, resolutions, task, tmp } from './helpers.ts'
+import { allTasks, byId, config, deps, env, git, HERE, mission, resolutions, task, tmp } from './helpers.ts'
 
 const T = { timeout: 120_000 }
 const attempts = (m: Mission, id: string) => byId(m, id).attempts
@@ -40,6 +40,15 @@ describe('happy path and evidence', () => {
     const a = attempts(again, 'a')[0]
     assert.deepEqual([a.model, a.requestedReasoning, a.cliThinking, a.expectedWire], ['deepseek/deepseek-v4.1-flash-1017', 'xhigh', 'xhigh', 'max'])
     assert.equal(again.header.configDigest, m.header.configDigest)
+  })
+})
+
+describe('real-world regressions', () => {
+  test('a worker that edits an existing tracked file passes the GIT gate (found by the live swarm run)', T, async () => {
+    const e = env(); const m = await mission(e, { tasks: [task('a', { owned: ['/src'], prompt: '[[write:src/base.txt=edited]]' })] })
+    const v = await m.run()
+    assert.equal(v.state, 'DONE', v.reasons.join('; '))
+    assert.equal(git(e.repo, 'show', `${m.live.integration.branch}:src/base.txt`), 'edited')
   })
 })
 
@@ -246,7 +255,7 @@ describe('delegation and the commander', () => {
 })
 
 describe('crash recovery and lost state', () => {
-  const spawnSupervisor = (args: unknown) => spawn(process.execPath, ['--experimental-transform-types', '--no-warnings', '--import', join(import.meta.dirname, '..', 'loader', 'register.mjs'), join(import.meta.dirname, 'fixtures', 'run-mission.ts'), JSON.stringify(args)], { stdio: 'ignore' })
+  const spawnSupervisor = (args: unknown) => spawn(process.execPath, ['--experimental-transform-types', '--no-warnings', '--import', join(HERE, '..', 'loader', 'register.mjs'), join(HERE, 'fixtures', 'run-mission.ts'), JSON.stringify(args)], { stdio: 'ignore' })
   test('supervisor killed -9 mid-run: workers die with it, restart reconciles by identity, retries and finishes', T, async () => {
     const e = env(); const out = tmp('crash')
     const child = spawnSupervisor({ ...e, out, mode: 'create', tasks: [task('a', { prompt: '[[sleep:3000]] [[write:src/a/x=1]]' })] })

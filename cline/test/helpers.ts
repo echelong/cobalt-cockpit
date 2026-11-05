@@ -3,7 +3,8 @@
 import { execFileSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { DEFAULT_CONFIG_FILE, validateConfig } from '../src/config.ts'
 import type { Config } from '../src/config.ts'
 import { resolveRole, staticCatalog } from '../src/catalog.ts'
@@ -12,11 +13,12 @@ import { ROLES } from '../src/core/engine.ts'
 import type { Role } from '../src/core/engine.ts'
 import { runWorker } from '../src/worker.ts'
 import { Mission } from '../src/supervisor.ts'
-import type { Deps } from '../src/supervisor.ts'
+import type { Deps, TaskRecord } from '../src/supervisor.ts'
 import type { GateSpec } from '../src/gates.ts'
 import type { TaskSpec } from '../src/router.ts'
 
-export const FAKE = join(import.meta.dirname, 'fixtures', 'fake-cline.mjs')
+export const HERE = dirname(fileURLToPath(import.meta.url))
+export const FAKE = join(HERE, 'fixtures', 'fake-cline.mjs')
 
 export const tmp = (name: string): string => mkdtempSync(join(process.env.COCKPIT_TEST_TMP ?? tmpdir(), `ccl-${name}-`))
 
@@ -77,9 +79,10 @@ export const mission = async (e: Env, o: { tasks?: TaskSpec[]; goal?: string; co
   return Mission.create({ stateRoot: e.root, repoDir: e.repo, goal: o.goal ?? 'test mission', config: c, resolutions: await resolutions(c), deps: deps(e, o.deps), gates: o.gates ?? [{ name: 'sanity', command: 'true', required: true }], clineVersion: 'fixture', tasks: o.tasks, single: o.single, swarm: o.swarm, review: o.review ?? false })
 }
 
-export const allTasks = (m: Mission): { id: string; state: string; attempts: { role: string; model: string; failure: string | null; wire: { state: string; effective: string | null } | null; identity: unknown; startedAt: string; endedAt: string | null; census: { state: string } | null; charge: { usd: number | null } }[] }[] => {
-  const rows: unknown[] = [...Object.entries(m.live.tasks).map(([id, t]) => ({ id, ...t }))]
-  for (const p of m.archive.index().pages) rows.push(...m.archive.page(p.n))
-  return rows as ReturnType<typeof allTasks>
+export type Row = TaskRecord & { id: string }
+export const allTasks = (m: Mission): Row[] => {
+  const rows: Row[] = Object.entries(m.live.tasks).map(([id, t]) => ({ id, ...t }))
+  for (const p of m.archive.index().pages) rows.push(...(m.archive.page(p.n) as Row[]))
+  return rows
 }
-export const byId = (m: Mission, id: string): ReturnType<typeof allTasks>[number] => { const t = allTasks(m).find(x => x.id === id); if (!t) throw new Error(`no task ${id}`); return t }
+export const byId = (m: Mission, id: string): Row => { const t = allTasks(m).find(x => x.id === id); if (!t) throw new Error(`no task ${id}`); return t }
