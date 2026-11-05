@@ -56,9 +56,12 @@ export const budgetVerdict = (f: Pick<StreamFacts, 'usage' | 'usageEvents' | 'it
   if (tokens > w.budgetTokens) return { stop: 'budget', detail: `${tokens} tokens exceeded the task token budget ${w.budgetTokens}` }
   if (f.usageEvents === 0 && f.iterations > 0 && !w.allowUnmetered) return { stop: 'unmetered', detail: `${f.iterations} model turn(s) ended without a usage event: cost cannot be measured` }
   if (w.budgetUsd === null || f.usageEvents === 0) return null
-  const charged = f.usage.reportedUsd ?? (w.pricing ? estimateUsd(f.usage, w.pricing) : null)
+  const estimate = w.pricing ? estimateUsd(f.usage, w.pricing) : null
+  // a reported $0 for real tokens of a priced model is not a cost figure: hold the budget against the estimate
+  const reportedUsable = f.usage.reportedUsd !== null && !(f.usage.reportedUsd === 0 && tokens > 0 && (estimate ?? 0) > 0)
+  const charged = reportedUsable ? f.usage.reportedUsd : estimate
   if (charged === null) return w.allowUnmetered ? null : { stop: 'unmetered', detail: 'Cline reported no cost and no pricing is configured for this model: the task budget cannot be enforced' }
-  if (charged > w.budgetUsd) return { stop: 'budget', detail: `${f.usage.reportedUsd !== null ? 'reported' : 'estimated'} cost $${charged.toFixed(5)} exceeded the task budget $${w.budgetUsd.toFixed(2)}` }
+  if (charged > w.budgetUsd) return { stop: 'budget', detail: `${reportedUsable ? 'reported' : 'estimated'} cost $${charged.toFixed(5)} exceeded the task budget $${w.budgetUsd.toFixed(2)}` }
   return null
 }
 
@@ -158,7 +161,15 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   // The identity callback binds ownership. Once this attempt has returned it never runs:
   // a late identity is kept for the record only, so a retired claim cannot be rewritten.
   let returned = false
-  void launched.identity.then(id => { identity = id; if (!returned) on.identity?.(id) })
+  void launched.identity.then(id => {
+    identity = id
+    // A stop decided before the identity was known could only kill by marker, which may not have
+    // been visible yet: now that the sandbox init is known, apply the stop to it as well.
+    if (stoppedBy !== 'exit') void terminate(targetOf(id, marker, started), true, 0)
+    if (returned) return
+    // the callback writes claims and the ledger; its failure must not crash the supervisor unseen
+    try { on.identity?.(id) } catch (e) { observerError ??= `identity observer: ${(e as Error).message}` }
+  })
   const streamFile = createWriteStream(join(rw, 'stream.jsonl'), { mode: 0o600 })
   const errFile = createWriteStream(join(rw, 'stderr.txt'), { mode: 0o600 })
   child.stderr?.pipe(errFile)

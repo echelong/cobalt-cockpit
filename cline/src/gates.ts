@@ -65,12 +65,42 @@ export const securityGate = async (workdir: string, admin: string | null = null,
  * Files a gate's own command runs or reads its definition from. When a worker changed one,
  * the gate passing is the worker's word about itself, not independent evidence.
  */
-export const gateDefinitionFiles = (g: GateSpec): string[] => {
-  const files = new Set<string>()
+const fileTokens = (text: string): string[] => text.split(/[\s;&|()'"=]+/).filter(tok => /^[\w./-]+\.(?:m?[jt]sx?|c?js|py|sh|rb|go|json|toml|ya?ml|cfg|ini)$/.test(tok) && !tok.startsWith('/') && !tok.includes('..')).map(tok => tok.replace(/^\.\//, ''))
+
+export const gateDefinitionFiles = (g: GateSpec, scripts: Record<string, string> = {}): string[] => {
+  const files = new Set<string>(fileTokens(g.command))
   if (/\b(?:npm|pnpm|yarn|bun|npx)\b/.test(g.command)) files.add('package.json')
   if (/\bmake\b/.test(g.command)) files.add('Makefile')
-  for (const tok of g.command.split(/[\s;&|()'"]+/)) if (/^[\w./-]+\.(?:m?[jt]sx?|c?js|py|sh|rb|go|json|toml|ya?ml|cfg|ini)$/.test(tok) && !tok.startsWith('/') && !tok.includes('..')) files.add(tok.replace(/^\.\//, ''))
+  // `npm run test` runs package.json's script body: the files that body names define the gate too
+  for (const m of g.command.matchAll(/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:--silent\s+)?([\w:-]+)/g)) for (const f of fileTokens(scripts[m[1]] ?? '')) files.add(f)
   return [...files]
+}
+
+/** Test, type-check and lint configuration: changing it changes what the gates check. */
+const GATE_CONFIG = /(^|\/)(?:(?:jest|vitest|playwright|cypress|karma|mocha|ava|babel|vite|webpack|rollup|eslint|prettier|stylelint|tsup)\.config\.[cm]?[jt]s|\.eslintrc(?:\.\w+)?|\.mocharc(?:\.\w+)?|\.babelrc|tsconfig[\w.-]*\.json|jsconfig\.json|pytest\.ini|pyproject\.toml|tox\.ini|setup\.cfg|conftest\.py|noxfile\.py|\.coveragerc|go\.mod|Cargo\.toml|Makefile|justfile)$/
+/** Test files, by the common conventions. Adding or editing one is normal; deleting one is not. */
+const TEST_FILE = /(^|\/)(?:__tests__|tests?|spec|specs)\/|\.(?:test|spec)\.[cm]?[jt]sx?$|_test\.(?:py|go|rb)$|(^|\/)test_[\w-]+\.py$/
+
+/**
+ * What in a change weakens its own gates: a file a gate runs or is defined by, test or lint
+ * configuration, or a deleted test file. Each entry is shown to the person; the verdict for a
+ * change with any of them is UNVERIFIED, not DONE.
+ */
+export const gateTaint = (changes: readonly Change[], gates: readonly GateSpec[], scripts: Record<string, string> = {}): string[] => {
+  if (!gates.length) return []
+  const defs = new Set(gates.flatMap(g => gateDefinitionFiles(g, scripts)))
+  const out: string[] = []
+  for (const c of changes) {
+    const deleted = c.status.trim().startsWith('D')
+    if (defs.has(c.path)) out.push(`${c.path} (runs or defines a gate)`)
+    else if (GATE_CONFIG.test(c.path)) out.push(`${c.path} (test/lint/type configuration)`)
+    else if (deleted && TEST_FILE.test(c.path)) out.push(`${c.path} (test file deleted)`)
+  }
+  return [...new Set(out)]
+}
+
+export const packageScripts = (root: string): Record<string, string> => {
+  try { return (JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { scripts?: Record<string, string> }).scripts ?? {} } catch { return {} }
 }
 
 /** package.json scripts that exist become gates; nothing is invented when none exist. */

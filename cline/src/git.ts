@@ -2,7 +2,7 @@
 // policy refuses git mutations). Nothing here touches the person's branch or main:
 // work lands on the mission branch cockpit/<mission>, and only after verification.
 import { execFile } from 'node:child_process'
-import { existsSync, lstatSync, readFileSync, readlinkSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
 
 export type Git = (args: string[], opts?: { cwd?: string; env?: Record<string, string>; allowFail?: boolean; timeoutMs?: number }) => Promise<{ code: number; stdout: string; stderr: string }>
@@ -45,7 +45,12 @@ export const gitLinkProblem = (dir: string, admin: string | null): string | null
     const st = lstatSync(join(dir, '.git'))
     if (!st.isFile()) return '.git is no longer a file'
     const text = readFileSync(join(dir, '.git'), 'utf8').trim()
-    if (text !== `gitdir: ${admin}`) return `.git now points to ${text.slice(0, 200)}`
+    if (!text.startsWith('gitdir: ')) return `.git is not a gitdir link (${text.slice(0, 120)})`
+    // compared by real path: relative worktree links (worktree.useRelativePaths) and symlinked repos are the same dir
+    const target = text.slice('gitdir: '.length)
+    let a: string, b: string
+    try { a = realpathSync(isAbsolute(target) ? target : resolve(dir, target)); b = realpathSync(admin) } catch { return `.git now points to ${target.slice(0, 200)} (unresolvable)` }
+    if (a !== b) return `.git now points to ${target.slice(0, 200)}`
     return null
   } catch (e) { return `.git unreadable: ${(e as Error).message}` }
 }
@@ -123,6 +128,13 @@ export const integrate = async (integrationDir: string, commit: string): Promise
   if (r.code === 0) return { ok: true, head: await headOf(integrationDir) }
   await git(['cherry-pick', '--abort'], { cwd: integrationDir, allowFail: true })
   return { ok: false, conflict: (r.stderr || r.stdout).trim().slice(0, 600) }
+}
+
+/** The mission-branch commit (base..HEAD) whose subject carries this task's `[taskId]` tag, if any. */
+export const integratedCommitFor = async (integrationDir: string, base: string, taskId: string): Promise<string | null> => {
+  const out = await must(['log', '--format=%H%x00%s', `${base}..HEAD`], integrationDir)
+  for (const line of out.split('\n')) { const [sha, subject] = line.split('\x00'); if (subject?.endsWith(`[${taskId}]`)) return sha }
+  return null
 }
 
 export const removeWorktree = async (repoRoot: string, dir: string): Promise<void> => { await git(['worktree', 'remove', '--force', dir], { cwd: repoRoot, allowFail: true }) }

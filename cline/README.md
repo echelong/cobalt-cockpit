@@ -121,6 +121,9 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
    the supervisor outside it; treat stream-derived figures as Cline-reported, not independently attested.
 5. **The spending cap is not exact.** A worker is stopped as soon as a usage event crosses its budget, so one
    in-flight request can exceed it; the session cap stops admissions and, by default, cancels running workers.
+   Admission reserves each running worker's remaining pre-spawn estimate. When Cline reports tokens but no cost
+   (or a $0 cost for a priced model), the budget is enforced on the estimate from configured pricing and the
+   verdict says the cost was estimated; with no pricing either, the worker is stopped as unmetered.
 6. **Hook semantics**: a `PreToolUse` `cancel` aborts the whole Cline run (observed), so a policy violation ends
    the attempt. Hooks are a second layer; bubblewrap is the boundary.
 7. **MiMo V2.6 Pro** is toggle-only in the catalog; Cline still sends `reasoning_effort`. Whether the provider
@@ -129,3 +132,15 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
 9. **Retention**: archives and ledgers are kept; nothing is deleted automatically, and claims are never dropped
    to save space. Worktrees under the state directory are kept for inspection.
 10. The native `@cline/sdk` plugin route was assessed and not built (see `docs/architecture-audit.md`).
+11. **Gates run code the worker may have written.** Their side effects are re-checked (scope, hooks, links,
+    credentials) before anything is committed; new untracked files created only by the gates are treated as
+    build artifacts and removed from the attempt's worktree. A change that touches what its gates are defined by
+    (a file a gate runs, `package.json` scripts, test/lint/type configuration, or a deleted test) ends
+    `UNVERIFIED`, not `DONE`: review it. The heuristic covers common conventions, not every ecosystem.
+12. **Resuming a mission** (`recover`) uses the mission's own profile and strictness; any other difference in the
+    effective configuration (budgets, a `--config` file, a Cline or package upgrade) is refused unless you pass
+    `--accept-config-change`, which is recorded and keeps that mission from `DONE`.
+13. **Lock takeover** after a crash renames the stale lock aside and verifies it; three contenders racing in the
+    same instant can still both proceed (narrow, documented in `src/store.ts`).
+14. A worker that is **held** (its processes could not be accounted for) keeps its slot, its claim and its
+    reserved estimate until `recover` confirms it is gone; the mission ends `BLOCKED` instead of waiting.

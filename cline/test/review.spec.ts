@@ -21,11 +21,19 @@ describe('review 1: command gates run worker code, so their effects are re-check
     assert.equal(a.failure, 'policy_abort'); assert.match(a.failureDetail ?? '', /GIT\(after gates\)/)
     assert.equal(git(e.repo, 'show', `${m.live.integration.branch}:README.md`), '# fixture')
   })
-  test('a gate that writes a credential is caught after the gates', T, async () => {
+  test('a gate that writes a credential into the worker\'s change is caught after the gates', T, async () => {
     const e = env(); const secret = ['sk', 'ant', 'api03', 'R'.repeat(30) + '-' + 'y'.repeat(20)].join('-')
-    const m = await mission(e, { tasks: [task('a')], gates: [{ name: 'leak', command: `echo 'KEY=${secret}' > src/a/leak.txt`, required: true }] })
+    // src/a/out.txt is the worker's own new file; the gate appends to it
+    const m = await mission(e, { tasks: [task('a')], gates: [{ name: 'leak', command: `echo 'KEY=${secret}' >> src/a/out.txt`, required: true }] })
     assert.notEqual((await m.run()).state, 'DONE')
     assert.match(byId(m, 'a').attempts[0].failureDetail ?? '', /SECURITY\(after gates\)/)
+  })
+  test('a credential in a new file a gate creates never reaches the mission branch', T, async () => {
+    const e = env(); const secret = ['sk', 'ant', 'api03', 'S'.repeat(30) + '-' + 'w'.repeat(20)].join('-')
+    const m = await mission(e, { tasks: [task('a')], gates: [{ name: 'leak', command: `echo 'KEY=${secret}' > src/a/leak.txt`, required: true }] })
+    await m.run()
+    assert.doesNotMatch(git(e.repo, 'ls-tree', '-r', '--name-only', m.live.integration.branch), /leak\.txt/)
+    assert.ok([...m.ledger.entries()].some(x => x.kind === 'gate_artifacts_removed' && JSON.stringify(x.data).includes('leak.txt')))
   })
   test('a worker that edits the file its gate runs is UNVERIFIED, not DONE', T, async () => {
     const e = env()
@@ -72,9 +80,70 @@ describe('review 3 and 4: an interrupted verification keeps ownership, then reco
     assert.equal(v.state, 'BLOCKED', v.reasons.join('; '))
     assert.equal(listClaims(join(e.repo, '.git')).claims.length, 1, 'the claim is kept while held')
     const c = config(); const again = Mission.open(e.root, m.header.id, c, await resolutions(c), deps(e))
-    await again.run()
+    const v2 = await again.run()
     assert.equal(listClaims(join(e.repo, '.git')).claims.length, 0, 'recovery released the claim after re-checking')
-    assert.ok([...again.ledger.entries()].some(x => x.kind === 'reconciled' && JSON.stringify(x.data).includes('interrupted after the worker ended')))
+    // round 2 (M2): the pick had landed before the error, so the task is finished, never redone
+    assert.ok([...again.ledger.entries()].some(x => x.kind === 'reconciled' && JSON.stringify(x.data).includes('already integrated')))
+    const a = byId(again, 'a')
+    assert.equal(a.state, 'completed'); assert.equal(a.attempts.length, 1)
+    assert.equal(git(e.repo, 'log', '--format=%s', `main..${again.live.integration.branch}`).split('\n').length, 1, 'integrated exactly once')
+    assert.notEqual(v2.state, 'DONE', 'output of the interrupted run was not read: a person reviews it')
+  })
+})
+
+describe('round 2 regressions', () => {
+  test('M1: a provider error before any model turn keeps the session metered and gets its retry', T, async () => {
+    const e = env(); const m = await mission(e, { tasks: [task('a', { prompt: '[[repeat:0]] [[error]]' })] })
+    await m.run()
+    assert.equal(byId(m, 'a').attempts.length, 2, 'the bounded retry ran')
+    assert.equal(m.live.session.unmetered, false)
+  })
+  test('S1: a slot held by an unaccounted worker ends the mission (BLOCKED) instead of polling', { timeout: 30_000 }, async () => {
+    const e = env(); const c = config({ limits: { concurrency: { total: 1 } } })
+    const unknown = async (spec: { model: string; attemptId: string }) => ({ identity: null, exitCode: 0, signal: null, stoppedBy: 'exit' as const, stopDetail: null, hookRefusals: [], observerError: null, census: { state: 'unknown' as const, pids: [], detail: 'uninspectable processes (test)' }, wire: { state: 'confirmed' as const, requests: 1, effective: 'max', models: [spec.model], detail: 'fake' }, facts: { usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: null, reportedUsd: 0.0001 }, usageEvents: 1, toolCalls: {}, iterations: 1, finishReason: 'completed', aborted: null, resultText: 'ok', reportedModel: spec.model, reportedProvider: 'cline', agentErrors: 0, lines: 3, badLines: 0, sessionIds: [], firstEventAt: null, lastEventAt: null } })
+    const m = await mission(e, { config: c, tasks: [task('a'), task('b')], deps: { runWorker: unknown as never } })
+    const v = await m.run()
+    assert.equal(v.state, 'BLOCKED')
+    assert.match(byId(m, 'b').reason ?? '', /blocked: waiting: concurrency/)
+  })
+  test('S4: files the gates create are artifacts: removed, not committed, not blamed on the worker', T, async () => {
+    const e = env()
+    const m = await mission(e, { tasks: [task('a')], gates: [{ name: 'test', command: 'mkdir -p coverage && echo report > coverage/out.txt', required: true }] })
+    const v = await m.run()
+    assert.equal(v.state, 'DONE', v.reasons.join('; '))
+    assert.doesNotMatch(git(e.repo, 'ls-tree', '-r', '--name-only', m.live.integration.branch), /coverage/)
+    assert.ok([...m.ledger.entries()].some(x => x.kind === 'gate_artifacts_removed'))
+  })
+  test('S3: gate taint covers script bodies, test config and deleted tests, not ordinary test edits', async () => {
+    const { gateTaint } = await import('../src/gates.ts')
+    const gates = [{ name: 'test', command: 'npm run --silent test', required: true }]
+    const scripts = { test: 'node tests/run.js && vitest run' }
+    const t = (path: string, status = ' M') => gateTaint([{ path, status }], gates, scripts)
+    assert.equal(t('tests/run.js').length, 1, 'a file the script body runs')
+    assert.equal(t('vitest.config.ts').length, 1, 'test configuration')
+    assert.equal(t('tsconfig.build.json').length, 1, 'type-check configuration')
+    assert.equal(t('src/a.test.ts', 'D ').length, 1, 'a deleted test')
+    assert.equal(t('src/a.test.ts', '??').length, 0, 'an added test is ordinary work')
+    assert.equal(t('src/app.ts').length, 0)
+    assert.equal(gateTaint([{ path: 'jest.config.js', status: ' M' }], [], {}).length, 0, 'no gates, nothing to weaken')
+  })
+  test('S5: a reported $0 for real tokens of a priced model is treated as missing, not free', async () => {
+    const { chargeOf } = await import('../src/cost.ts')
+    const { budgetVerdict } = await import('../src/worker.ts')
+    const u = { inputTokens: 300_000, outputTokens: 10_000, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: null, reportedUsd: 0 }
+    const p = { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 }
+    assert.equal(chargeOf(u, { pricing: p, source: 'catalog' }).basis, 'estimate')
+    assert.equal(chargeOf(u, { pricing: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, source: 'catalog' }).basis, 'reported', 'a zero-priced (subscription) model may report $0')
+    assert.equal(budgetVerdict({ usage: u, usageEvents: 1, iterations: 1 }, { budgetUsd: 0.05, budgetTokens: 1e9, pricing: p, allowUnmetered: false })?.stop, 'budget')
+  })
+  test('N1: a relative worktree link that resolves to the admin dir is not tampering', () => {
+    const repo = mkRepo(); const wt = join(tmp('rel'), 'w')
+    execFileSync('git', ['worktree', 'add', '--detach', wt], { cwd: repo, stdio: 'ignore' })
+    const admin = readFileSync(join(wt, '.git'), 'utf8').trim().slice('gitdir: '.length)
+    writeFileSync(join(wt, '.git'), `gitdir: ${join('..', '..', admin.split('/').slice(-5).join('/')).replace(/^/, '')}\n`)
+    const rel = (execFileSync('realpath', ['--relative-to', wt, admin], { encoding: 'utf8' })).trim()
+    writeFileSync(join(wt, '.git'), `gitdir: ${rel}\n`)
+    assert.equal(gitLinkProblem(wt, admin), null)
   })
 })
 

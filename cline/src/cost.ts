@@ -33,7 +33,10 @@ export const preSpawnEstimate = (config: Config, role: Role, p: Pricing): number
 
 /** The figure a budget is held against: the reported cost when Cline gives one, else the estimate, flagged. */
 export const chargeOf = (u: Usage, p: PricingSource): { usd: number | null; basis: 'reported' | 'estimate' | 'unmetered' } => {
-  if (u.reportedUsd !== null) return { usd: u.reportedUsd, basis: 'reported' }
+  const tokens = u.inputTokens + u.outputTokens
+  // a reported $0 for real tokens of a priced model is a missing figure, not a free run
+  const bogusZero = u.reportedUsd === 0 && tokens > 0 && p.source !== 'none' && estimateUsd(u, p.pricing) > 0
+  if (u.reportedUsd !== null && !bogusZero) return { usd: u.reportedUsd, basis: 'reported' }
   if (p.source !== 'none' && (u.inputTokens > 0 || u.outputTokens > 0)) return { usd: estimateUsd(u, p.pricing), basis: 'estimate' }
   return { usd: null, basis: 'unmetered' }
 }

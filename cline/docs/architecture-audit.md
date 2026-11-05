@@ -88,12 +88,48 @@ process per worker inside its own bubblewrap sandbox. A native plugin remains a 
 | R10 | Gates in fresh worktrees lack dependencies | edge cases | high / low | `--share node_modules` read-only bind; gates run without network | person must pass `--share` |
 | R11 | Claude plugin test runner picks up adapter tests | compatibility | was high | adapter tests are `*.spec.ts`; `claude plugin test` runs `*.test.ts` only | covered |
 
-## 6. Test baseline
+## 6. Independent review
+
+Two fresh-context, read-only reviews (Sonnet, high effort), each given the code and the stated invariants, not
+the author's conclusions.
+
+- **Round 1** (on `18c5ca1`): NOT CLEAN, 9 MATERIAL and 3 SHOULD-FIX findings: gate side effects committed
+  unchecked; host git trusting worker-writable `.git` metadata (an fsmonitor command could run outside the
+  sandbox); a held-after-end task allowing DONE; ownership leaked on a crash during verification; stop and cancel
+  lost between admission and launch; polling without a verdict; silently dropped plan tasks; plans parsed from a
+  4000-character excerpt; `recover` adopting a changed config; budgets not fail-closed without cost telemetry;
+  delegation widening a parent's privileges; stale-lock TOCTOU. While writing their tests a further defect
+  surfaced: the pid-namespace inode is reused by the kernel, so a lingering kill loop killed the next worker. All
+  fixed in `4456dee` and `c84681a`, each with a regression test (`test/review.spec.ts`, `test/worker.spec.ts`).
+- **Round 2** (on `c84681a`): 9 of 12 closed; 2 new MATERIAL defects introduced by the fixes (unmetered marking
+  on any outcome stopped retries; recovery could re-run already-integrated work), 6 SHOULD-FIX and 4 NIT.
+  Fixed in the following commit with tests: M1, M2, S1 (held slots now end the mission), S2 (late cancel applied
+  once the sandbox identity is known), S3 (gate taint covers script bodies, configs, deleted tests), S4 (gate
+  artifacts), S5 ($0 reported cost), N1 (real-path comparison of the worktree link), N2 (identity observer
+  errors). Left documented: S6 (three-way lock race), N3 (config-diff message lists no keys), N4 (a held
+  attempt's estimate stays reserved).
+- The reviews found sound: the census logic after the inode fix, the ledger hash chain, claim overlap
+  normalisation, DeepSeek-never-substituted routing, bounded `nextStep`, wire judging, and that no stop or cancel
+  path releases ownership without a clean census.
+
+## 7. Test baseline
 
 Before any change, on `main` at `4e3b90a` with the isolated gate runner (Claude Code 2.1.296, TypeScript 5.9.3,
 gitleaks 8.30.1): strict validation of root, plugin.json, marketplace.json and agents passed; capability shape,
 public audit, whitespace, host type check and secret scan passed. `claude plugin test .` ran 3148 tests: 3114 and
 3115 passed with 34 and 33 failures in two runs, every failure a test over its 5 s budget (5.0–16.4 s) while
 another session ran the same suite on this machine (load average 28–38 on 16 cores). The suite is known to have
-tests above 4 s of its 5 s budget on a quiet machine. See the final gate record in the branch report for the
-post-change runs.
+tests above 4 s of its 5 s budget on a quiet machine. Re-run on a quiet machine (load about 1.5): `main` at
+`4e3b90a` 3148 pass / 0 fail, and the branch at `c84681a` 3148 pass / 0 fail with every other gate passing; the
+adapter's own tests are `*.spec.ts`, which `claude plugin test` does not collect.
+
+## 8. Live evidence (Cline billing, 2026-11-05)
+
+| Run | Result | Reported cost |
+|---|---|---|
+| `smoke --yes`, five roles, one request each | all PASS: DeepSeek 1017 xhigh→`max`, Kimi `high`, Qwen 0902 `xhigh`, GLM `low`, MiMo `reasoning_effort=high` (toggle, inferred on) | $0.0463 |
+| single task, demo repo, gate `node test.js` | DONE, DeepSeek 1017, 56.9k in (43.3k cache) / 1.7k out / 357 reasoning tokens | $0.00685 |
+| swarm, demo repo, three parts | first run PARTIAL: the GIT gate misread a modified tracked path (porcelain trim bug, fixed with a test); re-run DONE: Kimi plan, DeepSeek code, GLM docs, Kimi review | $0.0826, then $0.0946 |
+
+The probes before the adapter existed (GLM write, DeepSeek wire capture with a cancelling hook, GLM in bubblewrap)
+cost about $0.005 in total.

@@ -2,9 +2,9 @@
 // escalation and the mission verdict. Host-side policy is authoritative; models
 // propose, the supervisor decides. Everything durable goes through store.ts.
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync } from 'node:fs'
 import { cpus, freemem, loadavg } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import {
   emptySwarm, submitTask, admitTask, bindAgent, uncertainSpawn, finishTask, releaseReservation, overlaps, POOL_OF, ROLES,
 } from './core/engine.ts'
@@ -21,9 +21,9 @@ import type { Identity } from './sandbox.ts'
 import { census, processIdentity, sameProcess, terminate } from './proc.ts'
 import type { Census, ProcessIdentity } from './proc.ts'
 import type { WireVerdict } from './reasoning.ts'
-import { gateDefinitionFiles, gitGate, runCommandGate, securityGate } from './gates.ts'
+import { gateTaint, gitGate, packageScripts, runCommandGate, securityGate } from './gates.ts'
 import type { GateResult, GateSpec } from './gates.ts'
-import { addTaskWorktree, changesOf, commitTask, createIntegration, headOf, integrate, missionBranch, repoInfo } from './git.ts'
+import { addTaskWorktree, changesOf, commitTask, createIntegration, headOf, integrate, integratedCommitFor, missionBranch, repoInfo } from './git.ts'
 import type { RepoInfo } from './git.ts'
 import { needsCommander, parsePlan, parseRequest, plannerPrompt, workerPrompt } from './planner.ts'
 import { ownedCovers } from './hook/policy.ts'
@@ -335,9 +335,10 @@ export class Mission {
     if (!r.startsWith('waiting: ')) return false
     if (/^waiting: (?:memory|cpu|rate):/.test(r)) return false
     if (/^waiting: repository claim held by /.test(r)) return /orphaned/.test(r)
-    if (/^waiting: concurrency: \d+ (?:\w+ worker\(s\) )?of 0\b|^waiting: concurrency: \d+ of 0 workers/.test(r)) return true
-    if (/^waiting: provider .*: \d+ of 0 /.test(r)) return true
-    return /ownership conflict|session budget reached|unmetered|stop requested|claims unreadable|store capacity/.test(r)
+    // Called only when nothing of this mission runs: a slot still taken then belongs to a held
+    // attempt (or a zero limit), and neither clears by waiting.
+    if (/^waiting: (?:concurrency|provider)\b/.test(r)) return true
+    return /ownership conflict|resource budget|occupied|session budget reached|unmetered|stop requested|claims unreadable|store capacity/.test(r)
   }
 
   requestStop(why: string): void {
@@ -553,8 +554,12 @@ export class Mission {
     const f = out.facts
     if (out.observerError) { this.live.alerts.push(`${a.id}: state observer failed during the run (${out.observerError}); the stream was still read to the end`); this.ledger.append('observer_error', t.spec.id, { attempt: a.id, error: out.observerError }) }
     if (a.charge.basis === 'estimate') { const est = (this.live.session.estimatedTasks ??= []); if (!est.includes(a.id)) est.push(a.id) }
-    // Any outcome, not only success: an attempt that ran but reported no usage leaves the session unmetered.
-    if ((f.lines > 0 || f.iterations > 0) && (f.usageEvents === 0 || a.charge.basis === 'unmetered') && !this.live.session.unmeteredTasks.includes(a.id)) {
+    // Unmetered when the model demonstrably used tokens that were not reported: an explicit unmetered
+    // stop, a model turn that ended without a usage event, or a completed run without usable cost.
+    // A provider error before any turn, or a cancel or timeout before the first turn ended, spent
+    // nothing observable and must not stop the retry (or the rest of the mission).
+    const spentUnmeasured = out.stoppedBy === 'unmetered' || (f.usageEvents === 0 && f.iterations > 0) || (f.finishReason === 'completed' && (f.usageEvents === 0 || a.charge.basis === 'unmetered'))
+    if (spentUnmeasured && !this.live.session.unmeteredTasks.includes(a.id)) {
       this.live.session.unmetered = true; this.live.session.unmeteredTasks.push(a.id)
       this.ledger.append('unmetered', t.spec.id, { attempt: a.id, detail: 'run reported no usable cost; session admissions stop' })
     }
@@ -608,16 +613,25 @@ export class Mission {
       gates.push(await securityGate(wt, admin))
       if (g.changes.length && g.result.state === 'pass') {
         for (const spec of this.header.gates) gates.push(await runCommandGate(spec, wt, join(this.dir, 'runs', t.spec.id, String(a.n), 'gates'), { hide: this.config.sandbox.hide, shareDirs: this.deps.shareDirs.map(s => ({ from: s.from, to: join(wt, s.to) })), timeoutSeconds: this.config.limits.gateTimeoutSeconds, gitCommonDir: this.header.commonDir }, a.id))
+        let finalChanges = g.changes
         // Command gates run worker-authored code with a writable tree: whatever they changed is
         // re-checked for scope, hooks, links and credentials before anything is committed.
         if (this.header.gates.length) {
+          // New untracked paths that appeared only during the gates are their artifacts (coverage/,
+          // dist/, caches), not the worker's change: they are removed from this attempt's own
+          // temporary worktree. Tracked or pre-existing paths the gates modified still fail below.
+          const before = new Set(g.changes.map(c => c.path))
+          const artifacts = (await changesOf(wt, admin)).filter(c => c.status === '??' && !before.has(c.path)).map(c => c.path)
+          const removed: string[] = []
+          for (const p of artifacts) { const abs = resolve(wt, p); if (abs.startsWith(`${wt}/`) && !p.split('/').includes('.git')) { rmSync(abs, { force: true, recursive: true }); removed.push(p) } }
+          if (removed.length) this.ledger.append('gate_artifacts_removed', t.spec.id, { attempt: a.id, count: removed.length, paths: removed.slice(0, 50) })
           const post = await gitGate(wt, this.covers(t), 'write', admin, 'GIT(after gates)')
           gates.push(post.result, await securityGate(wt, admin, 'SECURITY(after gates)'))
+          finalChanges = post.changes
           a.changes = post.changes.map(c => c.path)
         }
-        // A gate whose own definition the worker changed only reports the worker's word about itself.
-        const changed = new Set(a.changes)
-        a.gateTaint = [...new Set(this.header.gates.flatMap(s => gateDefinitionFiles(s)).filter(f => changed.has(f)))]
+        // A change that weakens its own gates only reports the worker's word about itself.
+        a.gateTaint = gateTaint(finalChanges, this.header.gates, packageScripts(this.live.integration.dir))
       }
     }
     a.gates = gates
@@ -630,7 +644,7 @@ export class Mission {
     if (bad.length) { await this.failed(t, a, claimed ? 'misreported_completion' : 'gate_failed', `${bad.map(x => `${x.name} ${x.state}`).join(', ')}${claimed ? ' (worker claimed success)' : ''}`, bad.map(x => `${x.name} (${x.command ?? x.kind}) ${x.state}: ${x.evidence.slice(-800)}`)); return }
     if (this.header.requireGates && t.spec.mode === 'write' && this.header.gates.length === 0) this.live.alerts.push(`${t.spec.id}: no command gates configured; change is checked for scope and secrets only`)
     // Integration is serial: one pick at a time, onto the mission branch only.
-    if (a.gateTaint?.length) this.problem(`${t.spec.id}: the worker changed files its gates are defined by (${a.gateTaint.join(', ')}); those gate results are the worker's word about itself, review them`)
+    if (a.gateTaint?.length) this.problem(`${t.spec.id}: the change touches what its gates are defined by: ${a.gateTaint.join(', ')}; those gate results are the worker's word about itself, review them`)
     if (t.spec.mode === 'write' && a.changes.length) {
       const r = await this.serial(async () => {
         a.commit = await commitTask(wt, `cockpit(${this.header.id}): ${t.spec.title} [${t.spec.id}]`, admin)
@@ -747,8 +761,17 @@ export class Mission {
       // release them through the normal failure path, which also decides the bounded retry.
       const last = t.attempts.at(-1)
       if (last && last.phase === 'ended' && last.failure === null && ['verifying', 'running', 'held'].includes(t.state)) {
-        this.ledger.append('reconciled', t.spec.id, { attempt: last.id, census: last.census, outcome: 'interrupted after the worker ended' })
-        await this.failed(t, last, 'unknown_outcome', `verification or integration was interrupted (${t.reason ?? t.state}); the attempt is re-run on the current mission head`, [])
+        // Its pick may already be on the mission branch (the crash came after integrate): never redo it.
+        const landed = t.spec.mode === 'write' ? await integratedCommitFor(this.live.integration.dir, this.live.integration.base, t.spec.id).catch(() => null) : null
+        if (landed) {
+          this.ledger.append('reconciled', t.spec.id, { attempt: last.id, census: last.census, outcome: 'already integrated', commit: landed })
+          t.integratedHead = landed; t.verification = 'PROVISIONAL_CHECKED'
+          this.problem(`${t.spec.id}: finished after an interruption; its commit ${landed.slice(0, 12)} had already been integrated (gates passed before the pick), but plan or delegation output from that run was not read`)
+          this.endAttempt(t, last, 'completed'); this.endTask(t, 'completed', 'integrated before the interruption')
+        } else {
+          this.ledger.append('reconciled', t.spec.id, { attempt: last.id, census: last.census, outcome: 'interrupted after the worker ended' })
+          await this.failed(t, last, 'unknown_outcome', `verification or integration was interrupted (${t.reason ?? t.state}); the attempt is re-run on the current mission head`, [])
+        }
       }
     }
     // The mission branch is the integration record: if it moved past what was persisted (a crash
