@@ -90,7 +90,7 @@ process per worker inside its own bubblewrap sandbox. A native plugin remains a 
 
 ## 6. Independent review
 
-Two fresh-context, read-only reviews (Sonnet, high effort), each given the code and the stated invariants, not
+Three fresh-context, read-only reviews (Sonnet, high effort), each given the code and the stated invariants, not
 the author's conclusions.
 
 - **Round 1** (on `18c5ca1`): NOT CLEAN, 9 MATERIAL and 3 SHOULD-FIX findings: gate side effects committed
@@ -108,6 +108,18 @@ the author's conclusions.
   artifacts), S5 ($0 reported cost), N1 (real-path comparison of the worktree link), N2 (identity observer
   errors). Left documented: S6 (three-way lock race), N3 (config-diff message lists no keys), N4 (a held
   attempt's estimate stays reserved).
+- **Round 3** (on `3d1106d`, the recovery engine and the interactive shell): 3 MATERIAL, 8 SHOULD-FIX and NITs.
+  MATERIAL: an open provider breaker was treated as a refusal that could never clear, so a transient outage
+  ended tasks instead of waiting (M1); a stop left from a shell that quit mid-turn bricked every later turn of the
+  conversation (M2); a new run showed the previous run's verdict while it worked (M3). SHOULD-FIX: a timeout
+  masked a policy refusal or wire downgrade (S4); a transient retry lost the correction's evidence (S5); `/new`
+  released the old conversation before the new one existed (S6); conversations retired their repository marker
+  after every turn (S7); routing read the conversation history and the commander's design, so planned work could
+  land on the wrong role (S8, also seen live: a plain implementation task ran on Qwen); a cancel during the gates
+  still integrated (S9); a no-change turn claiming success was accepted (S10); misleading PROGRESS and stale
+  branch-gate labels (S11). All fixed in `4c21efc` with regression tests (`test/review3.spec.ts`); 13 of its 14
+  tests fail on the pre-fix source and pass after (the 14th guards that a malformed request stays refused). The
+  review found the truncated-capture parser sound and no path that runs Cline outside the supervisor.
 - The reviews found sound: the census logic after the inode fix, the ledger hash chain, claim overlap
   normalisation, DeepSeek-never-substituted routing, bounded `nextStep`, wire judging, and that no stop or cancel
   path releases ownership without a clean census.
@@ -131,5 +143,11 @@ adapter's own tests are `*.spec.ts`, which `claude plugin test` does not collect
 | single task, demo repo, gate `node test.js` | DONE, DeepSeek 1017, 56.9k in (43.3k cache) / 1.7k out / 357 reasoning tokens | $0.00685 |
 | swarm, demo repo, three parts | first run PARTIAL: the GIT gate misread a modified tracked path (porcelain trim bug, fixed with a test); re-run DONE: Kimi plan, DeepSeek code, GLM docs, Kimi review | $0.0826, then $0.0946 |
 
+| post-fix smoke (failed-mission analysis, truncated wire captures) | PASS | $0.00426 |
+| interactive acceptance, real `cockpit-cline` shell in a pty, `--budget-usd 1.00` | DeepSeek t1, MiMo t2 (seeded rounding bug), Qwen t3 (page), GLM t4 (scout) all completed and integrated; Kimi `/swarm` planned two tasks, both integrated; Esc cancelled t6 at $0. Exposed S8 live (a planned implementation task ran on Qwen) and false delegation problems from empty `COCKPIT_REQUEST` lists; verdict PARTIAL | $0.5107 |
+| re-check after `4c21efc`, `--budget-usd 0.50` | Ctrl+D mid-turn stopped t2; relaunch resumed and reconciled; new turn t3 completed (GLM); `/swarm` refused before spawn by the $0.63 commander reservation (fail-closed) | $0.00218 |
+| swarm re-check after `4c21efc`, `--budget-usd 1.00` | Kimi plan; planned implementation task on DeepSeek 1017 xhigh→max (rule D), docs on GLM (U2); `FINISHED · VERIFIED`, no problems | $0.0637 |
+
 The probes before the adapter existed (GLM write, DeepSeek wire capture with a cancelling hook, GLM in bubblewrap)
-cost about $0.005 in total.
+cost about $0.005 in total. All live runs together: $0.811 reported by Cline plus about $0.005 of probes. The
+run artifacts (frames, ledgers, live state) are kept under `~/.local/state/cobalt-cockpit-cline/acceptance/`.

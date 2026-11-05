@@ -40,14 +40,21 @@ one supervised task**: it is classified (question, change, debugging, UI, scouti
 fixed rules to its role's pinned model, run as a sandboxed `cline` worker in its own worktree, verified by the
 supervisor's gates and integrated on `cockpit/<mission>`. The worker's answer streams into the transcript. The
 next message carries the conversation (bounded) and starts from the integrated code, so the conversation continues
-normally. Reopening `cockpit-cline` in the same repository resumes the conversation: transcript, mission state and
+normally. The conversation reaches the worker as background context only: a turn is routed on its own words, so
+an earlier "React layout" turn never sends a later "add a flag" turn to the frontend model, and a commander's
+design never reroutes the tasks it planned. Answers from turns that did not pass verification are labelled as
+such in later turns' context. Reopening `cockpit-cline` in the same repository resumes the conversation: transcript, mission state and
 any interrupted work are reconciled by process identity first (`--new` starts a fresh conversation).
 
 The HUD shows, from live supervisor state only: the five roles with their model, requested→effective reasoning
 (`✓` once confirmed on the wire) and state (RUNNING, QUEUED, RETRY Ns, BLOCKED, done/failed); agent counts; the
 current turn's milestones; gates of the last task and of the integrated branch; spend against the budget; Guard
-alerts; ownership claims; and the mission lifecycle separate from its outcome (RUNNING, RETRYING, WAITING, BLOCKED,
-`FINISHED · VERIFIED` only when every condition passed, otherwise `FINISHED · PARTIAL`/`UNVERIFIED`/…).
+alerts; ownership claims; and the mission lifecycle separate from its outcome (RUNNING, VERIFYING, RETRYING,
+WAITING, BLOCKED, `FINISHED · VERIFIED` only when every condition passed, otherwise `FINISHED · PARTIAL`/
+`UNVERIFIED`/…). A new turn never shows the previous turn's verdict while it works, and the branch gates are shown
+only for the head they ran on ("pending" once newer work is integrated). A completed write turn that changed
+nothing reads `NO CHANGES`; a write turn that changed nothing but claims it did is a misreported completion and
+goes through the correction ladder.
 
 | Input | Effect |
 |---|---|
@@ -66,11 +73,24 @@ persistent HUD and no way to make typed turns run through Cockpit's routing, san
 unsupervised Cline session would be decorative. So the integrated experience is Cockpit's own terminal frontend over
 supervised `cline` runs. The stock `cline` command and installation are left exactly as they are.
 
+**Optional integration with the normal `cline` command: investigated, not built.** The only reversible hooks
+into `cline` itself are a plugin command (text replies only, see above) or a shell alias/wrapper named `cline`.
+A wrapper would also intercept every other tool that runs `cline`, including Cockpit itself (it finds `cline`
+on `PATH`, so its sandboxed workers would start the wrapper instead of Cline), and it would change a command you
+already rely on. So the interactive Cockpit stays a separate command, `cockpit-cline`. If you want one anyway, a personal
+alias such as `alias clc=cockpit-cline` is reversible and touches nothing else.
+
+`/new` opens the new conversation first and closes the old one only when none of its tasks holds ownership;
+quitting mid-turn (Ctrl+D, a closed terminal) stops the running worker, and the next launch resumes the
+conversation and accepts new turns.
+
 ## Recovery
 
 | Failure (classified from the run's own error text) | What follows |
 |---|---|
-| provider 5xx/network, rate limit, resource exhaustion, a lost run | retry on the same model, bounded (2), exponential backoff with jitter; a provider circuit breaker delays further work on that model, never reroutes it |
+| provider 5xx/network, rate limit, resource exhaustion, a lost run | retry on the same model, bounded (2), exponential backoff with jitter; a provider circuit breaker delays further work on that model, never reroutes it; the retry waits out the breaker's cool-down and is its half-open try, so an open breaker never turns into a refusal |
+| a correction attempt that hits a transient error | the retry keeps the correction's evidence (diff and gate output) |
+| cancel while the gates run | the task ends cancelled before anything is committed or integrated |
 | implementation (gates fail, claimed success without changes) | one correction on the same model with its diff and the gate output; then one escalation (MiMo for debugging, Kimi otherwise) told to diagnose first; then stop |
 | authentication or billing refused | stop at once: sign in with `cline auth`, then `cockpit-cline recover` |
 | budget, policy/sandbox/ownership refusal, model or reasoning mismatch | stop: a safety refusal stays a refusal |
@@ -176,6 +196,10 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
    Admission reserves each running worker's remaining pre-spawn estimate. When Cline reports tokens but no cost
    (or a $0 cost for a priced model), the budget is enforced on the estimate from configured pricing and the
    verdict says the cost was estimated; with no pricing either, the worker is stopped as unmetered.
+   The pre-spawn reservation is the role's configured worst case (`estimates` × pricing), not a forecast: with the
+   default figures a Kimi plan reserves about $0.63 while real plans have cost about $0.05, so a session cap
+   below $0.63 refuses `/swarm` before it starts (observed live with `--budget-usd 0.50`). Lower `estimates`
+   only if you accept a larger possible overrun of a single request.
 6. **Hook semantics**: a `PreToolUse` `cancel` aborts the whole Cline run (observed), so a policy violation ends
    the attempt. Hooks are a second layer; bubblewrap is the boundary.
 7. **MiMo V2.6 Pro** is toggle-only in the catalog; Cline still sends `reasoning_effort`. Whether the provider
@@ -201,7 +225,14 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
     conversations lose their oldest turns from the model's context (they stay in the transcript file).
 16. **Turn classification is rule-based** (keywords for questions, changes, debugging, UI, scouting, architecture).
     A message can land on a different role than you meant; `/route <text>` shows the decision first, and the
-    transcript always names the role, model and rule for every turn.
+    transcript always names the role, model and rule for every turn. Only the turn's own text is classified and
+    routed; the conversation and a commander's design are context the router never reads.
+18. **Workers sometimes misuse the delegation marker.** Models have ended answers with `COCKPIT_REQUEST` and an
+    empty list (now treated as no request) or with a duplicate request for work a sibling task already owns, in
+    the wrong format. A malformed non-empty request is refused and recorded, and it keeps the mission from `DONE`
+    (it may describe work that was not done): read the Guard line and the ledger's `delegation_refused` entry.
+19. **Verdicts are per conversation, not per turn.** A failed or cancelled turn keeps the conversation's outcome
+    `PARTIAL` for the rest of that conversation; `/new` starts a fresh one. Each turn's own result line is exact.
 17. The interactive shell needs a real terminal (it refuses to start otherwise) and has been tested in
     pseudo-terminals at 160×46 and 72×24; it is a line-oriented UI, not a full editor (no mouse, no syntax
     highlighting).
