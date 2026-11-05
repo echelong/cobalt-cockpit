@@ -3,8 +3,8 @@
 // the Claude Code Cockpit's: numbered dossier sections, `NAME / VALUE` labels, red for activity,
 // amber for waiting, green for completed, deep red for failure, cyan only for scanning and checks.
 import type { Paint, Token } from './term.ts'
-import { bar, duration, fit, midcut, money, right, shortName, spinner, spread, tokens, vlen, wave, wrap } from './term.ts'
-import type { AgentState, AttemptView, GateState, GateView, ReasoningView, RoleView, View } from './model.ts'
+import { bar, duration, fit, midcut, money, right, sanitize, shortName, spinner, spread, tokens, vlen, wave, wrap } from './term.ts'
+import type { AgentState, AttemptView, CostRow, GateState, GateView, ReasoningView, RoleView, View } from './model.ts'
 import { ROLE_LABEL } from './model.ts'
 import type { TimelineEvent } from './timeline.ts'
 import { glyphOf } from './timeline.ts'
@@ -139,17 +139,20 @@ export const spendLines = (v: View, w: number, p: Paint): string[] => {
   return [
     field('SESSION', `${c.unmetered ? p.fg('warn', 'UNMETERED ') : ''}${p.fg('head', money(c.spent))} ${p.dim(`of $${c.budget.toFixed(2)}`)} ${p.fg(tk, '█'.repeat(b.filled))}${p.fg('rule', '░'.repeat(b.empty))} ${p.dim(`${Math.round(frac * 100)}%`)}`, w, p, 9),
     field('LEFT', `${p.fg('head', money(c.remaining))} ${p.dim(inflight > 0 ? `· ${money(inflight)} reserved for running workers` : '· nothing reserved')}`, w, p, 9),
-    field('BASIS', `${p.dim('reported')} ${p.fg('head', money(c.reported))} ${p.dim('· estimated')} ${p.fg(c.estimated > 0 ? 'warn' : 'head', money(c.estimated))} ${p.dim('· unmetered')} ${c.unmeteredTasks.length ? p.fg('warn', `${c.unmeteredTasks.length} task(s)`) : p.fg('head', 'none')}`, w, p, 9),
-    field('BY MODEL', p.dim(top), w, p, 9),
+    field('BASIS', `${c.reported === null || c.estimated === null
+      ? `${p.dim('session total includes archived tasks ·')} ${c.estimatedAttempts ? p.fg('warn', `${c.estimatedAttempts} attempt(s) estimated`) : p.fg('head', 'all reported')}`
+      : `${p.dim('reported')} ${p.fg('head', money(c.reported))} ${p.dim('· estimated')} ${p.fg(c.estimated > 0 ? 'warn' : 'head', money(c.estimated))}`} ${p.dim('· unmetered')} ${c.unmeteredTasks.length ? p.fg('warn', `${c.unmeteredTasks.length} task(s)`) : p.fg('head', 'none')}`, w, p, 9),
+    field(c.coverage.shown < c.coverage.total ? 'RECENT' : 'BY MODEL', p.dim(`${top}${c.coverage.shown < c.coverage.total ? ` (last ${c.coverage.shown} of ${c.coverage.total} tasks)` : ''}`), w, p, 9),
     field('ALERTS', c.capReached ? p.fg('fail', 'SESSION CAP REACHED: admissions stopped', true) : c.alertsFired.length ? p.fg('warn', c.alertsFired.map(x => `${Math.round(x * 100)}% crossed`).join(' · ')) : p.dim('none'), w, p, 9),
   ]
 }
 
 // ----- activity --------------------------------------------------------------------------------------------
+/** The agent of an event: its attempt's role from the ledger, or the record in view; COCKPIT for mission events. */
 const roleOfEvent = (e: TimelineEvent, v: View): string => {
   if (!e.attempt) return 'COCKPIT'
-  const a = v.attempts.find(x => x.id === e.attempt)
-  return a ? ROLE_LABEL[a.role] : 'COCKPIT'
+  const r = e.role ?? v.attempts.find(x => x.id === e.attempt)?.role
+  return r && r in ROLE_LABEL ? ROLE_LABEL[r as keyof typeof ROLE_LABEL] : '—'
 }
 export const eventLine = (e: TimelineEvent, v: View, w: number, p: Paint, selected = false): string => {
   const who = roleOfEvent(e, v)
@@ -181,7 +184,7 @@ export const hudLines = (v: View, events: readonly TimelineEvent[], f: Frame): s
     const gates = v.gates.map(g => `${p.fg('head', w < 80 ? g.name.slice(0, 4) : g.name)} ${p.fg(GATE_TOKEN[g.state], GATE_GLYPH[g.state])}`).join('  ')
     out.push(fit(` ${p.dim('VERIFY')} ${gates}  ${p.dim('·')} ${(() => { const st = v.mission.status; return p.fg(st.outcome === 'VERIFIED' ? 'ok' : st.lifecycle === 'FINISHED' ? 'warn' : 'label', st.label) })()}`, w))
     const c = v.cost; const b = bar(c.budget ? c.spent / c.budget : 0, 10)
-    out.push(fit(` ${p.dim('SPEND')}  ${c.unmetered ? p.fg('warn', 'UNMETERED') : p.fg('head', money(c.spent))} ${p.dim(`of $${c.budget.toFixed(2)}`)} ${p.fg(c.capReached ? 'fail' : 'ok', '█'.repeat(b.filled))}${p.fg('rule', '░'.repeat(b.empty))} ${p.dim(`left ${money(c.remaining)}`)}${c.estimated > 0 ? p.fg('warn', ' · part estimated') : ''}${c.capReached ? p.fg('fail', ' · CAP REACHED', true) : ''}`, w))
+    out.push(fit(` ${p.dim('SPEND')}  ${c.unmetered ? p.fg('warn', 'UNMETERED') : p.fg('head', money(c.spent))} ${p.dim(`of $${c.budget.toFixed(2)}`)} ${p.fg(c.capReached ? 'fail' : 'ok', '█'.repeat(b.filled))}${p.fg('rule', '░'.repeat(b.empty))} ${p.dim(`left ${money(c.remaining)}`)}${(c.estimated ?? 0) > 0 || c.estimatedAttempts > 0 ? p.fg('warn', ' · part estimated') : ''}${c.capReached ? p.fg('fail', ' · CAP REACHED', true) : ''}`, w))
   }
   // the live activity strip: the latest real events
   const strip = tall ? 4 : mid ? 2 : 1
@@ -196,7 +199,7 @@ export const hudLines = (v: View, events: readonly TimelineEvent[], f: Frame): s
 // ----- Mission Control --------------------------------------------------------------------------------------------
 type Item = { line: (selected: boolean) => string; detail: string[] }
 const tabBar = (active: Tab, w: number, p: Paint): string => fit(` ${TABS.map(t => t.tab === active ? p.pill('accent', `${t.key} ${t.label}`) : p.dim(` ${t.key} ${t.label} `)).join(p.fg('rule', '│'))}`, w)
-const detailLines = (d: string[], w: number, p: Paint): string[] => d.flatMap(x => wrap(x, Math.max(10, w - 6)).map((l, i) => fit(`    ${i === 0 ? p.fg('rule', '│ ') : '  '}${p.dim(l)}`, w)))
+const detailLines = (d: string[], w: number, p: Paint): string[] => d.flatMap(x => wrap(sanitize(x), Math.max(10, w - 6)).map((l, i) => fit(`    ${i === 0 ? p.fg('rule', '│ ') : '  '}${p.dim(l)}`, w)))
 
 const attemptItem = (a: AttemptView, v: View, f: Frame, w: number): Item => {
   const p = f.paint; const tk = STATE_TOKEN[a.state]
@@ -266,7 +269,7 @@ const gatesTail = (v: View, w: number, p: Paint): string[] => [
   fit(`   ${p.dim('DONE needs every task verified by the supervisor\'s own gates, the branch gates passing on the integrated head, metered costs and an intact ledger. A worker that ended is not a verified task; a worker\'s own claims are never accepted.')}`, w),
 ]
 
-const costsHead = (v: View, w: number, p: Paint): string[] => [heading('01', 'SPEND / SESSION', w, p), ...spendLines(v, w, p), heading('02', 'BY MODEL / BY TASK', w, p, p.dim('Enter: tokens'))]
+const costsHead = (v: View, w: number, p: Paint): string[] => [heading('01', 'SPEND / SESSION', w, p), ...spendLines(v, w, p), heading('02', 'BY MODEL / BY TASK', w, p, p.dim(`${v.cost.coverage.shown < v.cost.coverage.total ? `last ${v.cost.coverage.shown} of ${v.cost.coverage.total} tasks (older ones are archived) · ` : ''}Enter: tokens`))]
 
 const keysLines = (w: number, p: Paint): string[] => {
   const k = (keys: string, what: string): string => fit(`   ${p.fg('head', keys.padEnd(26), true)}${p.dim(what)}`, w)
@@ -310,8 +313,13 @@ export const tabContent = (o: OverlayState, v: View, events: readonly TimelineEv
     }
     case 'gates': return { head: gatesHead(v, w, p), items: v.gates.map(g => ({ line: (sel: boolean) => `${sel ? p.fg('accent', '▸', true) : ''}${gateRow(g, sel ? w - 1 : w, p)}`, detail: g.evidence.length ? g.evidence : [g.summary] })), tail: gatesTail(v, w, p) }
     case 'costs': {
-      const row = (label: string, r: { attempts: number; tokensIn: number; tokensOut: number; cacheRead: number; usd: number; estimated: boolean; unmetered: number }, sel: boolean): string =>
-        fit(`${sel ? p.fg('accent', '▸', true) : ' '} ${fit(p.fg('head', label), Math.min(48, Math.floor(w / 2.6)))} ${right(p.dim(`${r.attempts} att`), 7)} ${right(tokText(r.tokensIn, r.tokensOut, p), 12)} ${right(costText(r.usd, r.estimated ? 'estimate' : 'reported', p), 10)}${r.unmetered ? p.fg('warn', `  ${r.unmetered} unmetered`) : ''}`, w)
+      // nothing reported → —; only some attempts reported → a lower bound (≥); never an unknown read as $0
+      const row = (label: string, r: CostRow, sel: boolean): string => {
+        const lower = r.known > 0 && r.known < r.attempts ? p.fg('warn', '≥') : ''
+        const tok = r.known === 0 ? p.dim('—') : `${lower}${tokText(r.tokensIn, r.tokensOut, p)}`
+        const usd = r.known === 0 ? (r.unmetered ? p.fg('warn', 'unmetered') : p.dim('—')) : `${lower}${costText(r.usd, r.estimated ? 'estimate' : 'reported', p)}`
+        return fit(`${sel ? p.fg('accent', '▸', true) : ' '} ${fit(p.fg('head', label), Math.min(48, Math.floor(w / 2.6)))} ${right(p.dim(`${r.attempts} att`), 7)} ${right(tok, 13)} ${right(usd, 11)}${r.unmetered ? p.fg('warn', `  ${r.unmetered} unmetered`) : ''}${r.known < r.attempts && r.known > 0 ? p.dim(`  ${r.attempts - r.known} not reported`) : ''}`, w)
+      }
       const items: Item[] = [
         ...v.cost.byModel.map(m => ({ line: (sel: boolean) => row(`${m.role ? ROLE_LABEL[m.role] : ''} ${m.model}`, m, sel), detail: [`input ${m.tokensIn} tokens (cache read ${m.cacheRead}) · output ${m.tokensOut} · ${m.estimated ? 'part estimated from configured pricing' : 'cost reported by Cline'}`] })),
         ...v.cost.byTask.map(t => ({ line: (sel: boolean) => row(`task ${t.key} · ${t.model}`, t, sel), detail: [`input ${t.tokensIn} tokens (cache read ${t.cacheRead}) · output ${t.tokensOut} · ${t.attempts} attempt(s)${t.estimated ? ' · part estimated' : ''}`] })),

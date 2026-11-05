@@ -275,4 +275,29 @@ describe('the integrated Cockpit shell', () => {
     p.send(KEYS.ctrlC); await p.waitFor(/cockpit ❯\s*$/m)
     p.send(KEYS.ctrlD); await p.exited
   })
+  test('terminal safety: a model answer with escape sequences and a malicious paste never reach the terminal', T, async () => {
+    const e = env(); const p = openShell({ ...e })
+    await p.waitFor(/type a request to start/)
+    const evil = 'Answer \x1b[2J\x1b]52;c;aGVsbG8=\x07\x9b2J\x1b]0;pwned\x07 rocket 🚀 ok'
+    await type(p, `[[say-b64:${Buffer.from(evil).toString('base64')}]] [[write:src/x.txt=x]] add x`)
+    const f = await p.waitFor(/t1 ✓ completed/)
+    assert.match(f, /Answer\s+rocket 🚀 ok/)
+    const raw = p.raw()
+    assert.doesNotMatch(raw, /\x1b\]52|\x1b\]0;pwned|\x9b/, 'no OSC clipboard/title write and no 8-bit CSI reaches the terminal')
+    assert.equal((raw.match(/\x1b\[2J/g) ?? []).length, 2, 'only the shell\'s own two clears (alternate screen and first frame)')
+    // bracketed paste: escape and control bytes are dropped, the text is kept
+    p.send('\x1b[200~pasted\x1b[31m red\x07\x1b]52;c;eA==\x07 text\x1b[201~')
+    await p.waitFor(/cockpit ❯ pasted red text/)
+    assert.doesNotMatch(p.raw().slice(raw.length), /\x1b\]52/)
+    p.send(KEYS.ctrlC); p.send(KEYS.ctrlD); await p.exited
+  })
+
+  test('a resize while the conversation is still opening repaints instead of crashing', T, async () => {
+    const e = env(); const p = openShell({ ...e })
+    // resize as early as the process exists, repeatedly, through the opening phase
+    for (let i = 0; i < 40 && !p.frame().includes('type a request'); i++) { try { p.resize(100 + (i % 2) * 40, 30 + (i % 2) * 10) } catch { /* process not up yet */ } await new Promise(r => setTimeout(r, 25)) }
+    await p.waitFor(/type a request to start/)
+    assert.doesNotMatch(p.raw(), /TypeError|Cannot read properties/)
+    p.send(KEYS.ctrlD); assert.equal(await p.exited, 0)
+  })
 })

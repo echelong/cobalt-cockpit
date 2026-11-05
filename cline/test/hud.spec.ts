@@ -4,7 +4,7 @@ import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { Paint, Screen, colorMode, fit, midcut, reducedMotion, sanitize, shortName, stripAnsi, vlen, wrap, xterm256 } from '../src/ui/term.ts'
+import { Paint, Screen, colorMode, fit, holdIncomplete, midcut, reducedMotion, sanitize, shortName, stripAnsi, vlen, wrap, xterm256 } from '../src/ui/term.ts'
 import { buildView, gateFamily, reasoningOf } from '../src/ui/model.ts'
 import type { View, ViewInput } from '../src/ui/model.ts'
 import { LedgerTail, Timeline, fromLedger, fromWorker } from '../src/ui/timeline.ts'
@@ -248,5 +248,119 @@ describe('rendering at every size', () => {
     }
     const per = (performance.now() - t0) / 10
     assert.ok(per < 60, `one frame took ${per.toFixed(1)} ms`)
+  })
+})
+
+describe('round 4 review: terminal safety and honest figures', () => {
+  const ESCAPES = ['\x1b[2J', '\x1b]52;c;aGk=\x07', '\x1b]0;title\x1b\\', '\x1bP1$qm\x1b\\', '\x9b2J', '\x9d0;t\x07', '\x1bc', '\x1b7', '\x07', '\x08', '\x7f']
+  test('M1: sanitize removes every escape form, C1 controls and the emoji presentation selector', () => {
+    for (const e of ESCAPES) { const s = sanitize(`a${e}b`); assert.equal(s, 'ab', JSON.stringify(e)); assert.doesNotMatch(s, /[\x00-\x08\x0b-\x1f\x7f-\x9f]/) }
+    assert.equal(sanitize('ok ✅️'), 'ok ✅')
+  })
+  test('M1: every rendered row keeps only our own SGR; injected sequences in data never survive fit()', () => {
+    for (const e of ESCAPES) {
+      const out = fit(`\x1b[31mred\x1b[0m x${e}y`, 30)
+      assert.equal(vlen(out), 30)
+      assert.doesNotMatch(out.replace(/\x1b\[[0-9;]*m/g, ''), /[\x00-\x1f\x7f-\x9f]/, JSON.stringify(e))
+      assert.match(out, /\x1b\[31mred/, 'our own styling is kept')
+    }
+  })
+  test('M1: tool names and paths chosen by the model are sanitized in the timeline and the activity', () => {
+    const tl = new Timeline()
+    tl.worker('t1', 'a', { type: 'agent_event', event: { type: 'content_start', contentType: 'tool', toolName: 'editor\x1b]52;c;x\x07', input: { path: 'src/\x1b[2Jevil.ts' } } })
+    tl.worker('t1', 'a', { type: 'agent_event', event: { type: 'content_start', contentType: 'tool', toolName: 'read\x9b2J', input: { paths: ['a\x07.ts'] } } })
+    tl.worker('t1', 'a', { type: 'agent_event', event: { type: 'content_start', contentType: 'tool', toolName: 'mystery\x1b[1A', input: { x: '\x1b[2K' } } })
+    for (const e of tl.events) for (const s of [e.text, ...e.detail]) assert.doesNotMatch(s, /[\x00-\x1f\x7f-\x9f]/, JSON.stringify(s))
+    assert.doesNotMatch(tl.activity.get('a')!.last, /[\x00-\x1f]/)
+    assert.equal(tl.events[0].text, 'editor src/evil.ts')
+  })
+  test('M1: gate output, failure text, alerts, titles and verdict reasons are sanitized in the view', async () => {
+    const bad = '\x1b[31mFAIL\x1b[0m\x1b[2K\x1b]8;;http://x\x07link'
+    const t = record('t1', 'failed', [attempt({ failureDetail: bad, gates: [{ name: 'test', kind: 'command', state: 'fail', command: 'npm test', exitCode: 1, durationMs: 1, evidence: bad }] })], { spec: task('t1', { title: `title ${bad}` }) })
+    const v = await viewOf([t], { alerts: [`alert ${bad}`], problems: [`problem ${bad}`], verdict: { state: 'PARTIAL', reasons: [`reason ${bad}`], at: '' }, state: 'done' })
+    const all = JSON.stringify([v.gates, v.attempts.map(a => [a.title, a.failureDetail, a.prompt]), v.mission.alerts, v.mission.problems, v.mission.verdict?.reasons, v.mission.milestones])
+    assert.doesNotMatch(all, /\\u001b|\\u0007/)
+    for (const { tab } of TABS) for (const l of missionControlLines({ tab, sel: 0, expanded: true, filter: null }, v, [], frame(120, 40, 'truecolor')).lines) assert.doesNotMatch(l.replace(/\x1b\[[0-9;]*m/g, ''), /[\x00-\x1f\x7f-\x9f]/, tab)
+  })
+  test('S4: emoji with emoji presentation are counted two columns wide', () => {
+    for (const ch of ['🚀', '✅', '❌', '⭐', '⚡', '🫠']) assert.equal(vlen(ch), 2, ch)
+    assert.equal(vlen('✓ ✗ ● ◆ ★ ⟳'), 11, 'our own glyphs stay narrow')
+    assert.equal(vlen(fit('🚀🚀🚀🚀🚀🚀 done', 9)), 9)
+  })
+  test('M3: unknown cost is never $0 in the COSTS view; a partly reported row is a lower bound', async () => {
+    const none = attempt({ id: 'm.t1.1', usageEvents: 0, iterations: 0, usage: ZERO_USAGE, charge: { usd: null, basis: 'unmetered' } })
+    const some = attempt({ id: 'm.t2.2', n: 2 })
+    const v = await viewOf([record('t1', 'failed', [none]), record('t2', 'completed', [{ ...none, id: 'm.t2.1' }, some])])
+    const t1 = v.cost.byTask.find(r => r.key === 't1')!; assert.equal(t1.known, 0)
+    const costs = stripAnsi(missionControlLines({ tab: 'costs', sel: 0, expanded: false, filter: null }, v, [], frame(160, 40)).lines.join('\n'))
+    assert.match(costs, /task t1 · deepseek\/deepseek-v4\.1-flash-1017\s+1 att\s+—\s+—/)
+    assert.match(costs, /task t2 · .*2 att\s+≥12k\/800\s+≥\$0\.012\s+1 not reported/)
+    // no per-model or per-task row reads $0 or 0/0 for an attempt that reported nothing
+    for (const l of costs.split('\n').filter(l => /^. (?:task |[A-Z]+ [a-z])/.test(l))) assert.doesNotMatch(l, /\s\$0\s|\s0\/0\s/, l)
+  })
+  test('S1: between the worker exiting and the supervisor classifying it, the task reads VERIFYING, not FAILED', async () => {
+    const v = await viewOf([record('t1', 'running', [attempt({ failure: null })])])
+    assert.equal(v.attempts[0].state, 'verifying'); assert.equal(v.roles.find(r => r.role === 'coder')!.state, 'verifying')
+  })
+  test('S2: a failing gate outside the five families gets an OTHER row; names decide before commands', async () => {
+    const lint = { name: 'lint', kind: 'command' as const, state: 'fail' as const, command: 'eslint .', exitCode: 1, durationMs: 1, evidence: '2 problems' }
+    const h = header(); h.gates = [{ name: 'lint', command: 'eslint .', required: true }]
+    const c = config(); const lv = liveOf([record('t1', 'failed', [attempt({ gates: [lint] })])])
+    const v = buildView({ header: h, live: lv, records: Object.values(lv.tasks), claims: [], config: c, resolutions: await resolutions(c), committedUsd: 0, activity: new Map(), turn: null, now: NOW })
+    const other = v.gates.find(g => g.name === 'OTHER'); assert.ok(other); assert.equal(other.state, 'fail'); assert.match(other.summary, /lint fail exit 1/)
+    assert.match(stripAnsi(hudLines(v, [], frame(160, 46)).join('\n')), /OTHER\s+✗ FAIL/)
+    assert.equal(gateFamily('test', 'node --test x/typecheck.spec.ts'), 'TEST')
+    assert.equal((await viewOf([])).gates.some(g => g.name === 'OTHER'), false, 'no OTHER row when every gate maps')
+  })
+  test('S3: with tasks archived out of view, the spend split is not invented and the lists say they are recent', async () => {
+    const v = await viewOf([record('t9', 'completed', [attempt()])], { counters: { created: 40, completed: 40, failed: 0, cancelled: 0, refused: 0, archived: 39, attempts: 40 }, session: { ...liveOf([]).session, spentUsd: 0.5, estimatedTasks: ['x', 'y'] } })
+    assert.equal(v.cost.reported, null); assert.equal(v.cost.estimated, null)
+    const hud = stripAnsi(hudLines(v, [], frame(160, 46)).join('\n'))
+    assert.match(hud, /session total includes archived tasks · 2 attempt\(s\) estimated/); assert.match(hud, /last 1 of 40 tasks/)
+  })
+  test('S9: events of an attempt name its agent from the ledger admission, even when the record is out of view', () => {
+    const tl = new Timeline()
+    tl.push(fromLedger({ seq: 1, at: '2026-11-05T12:00:00Z', kind: 'attempt_admitted', task: 'old', data: { attempt: 'm.old.1', route: { role: 'specialist', model: 'xiaomi/mimo-v2.6-pro', rules: [], signals: [] } } }))
+    tl.push(fromLedger({ seq: 2, at: '2026-11-05T12:00:01Z', kind: 'attempt_failed', task: 'old', data: { attempt: 'm.old.1', class: 'gate_failed', detail: 'x' } }))
+    tl.worker('old', 'm.old.1', { type: 'agent_event', event: { type: 'content_start', contentType: 'tool', toolName: 'editor', input: { path: 'a' } } })
+    assert.deepEqual(tl.events.map(e => e.role), ['specialist', 'specialist', 'specialist'])
+  })
+  test('S6: a resumed conversation reads only the end of a large ledger, from a line boundary', () => {
+    const dir = join(tmp('ledger'), 'ledger'); mkdirSync(dir, { recursive: true })
+    const line = (seq: number) => `${JSON.stringify({ seq, at: '2026-11-05T12:00:00Z', kind: 'stop_requested', task: null, data: { why: 'x'.repeat(200) } })}\n`
+    writeFileSync(join(dir, 'seg-000001.jsonl'), Array.from({ length: 5000 }, (_, i) => line(i + 1)).join(''))
+    const t = new LedgerTail(dir, 64 << 10)
+    const first = t.poll(); assert.ok(first.length > 100 && first.length < 400, `${first.length} entries`)
+    assert.equal(first.at(-1)?.seq, 5000); assert.ok(first.every(e => typeof e.seq === 'number'))
+  })
+})
+
+describe('round 4 review: the shell before its conversation is open', () => {
+  test('M2: render() with no mission yet (a resize during opening) draws an opening line and never throws', async () => {
+    const { Shell } = await import('../src/shell.ts')
+    let out = ''
+    const stream = { columns: 120, rows: 30, isTTY: true, write: (s: string) => { out += s; return true }, on: () => stream } as unknown as NodeJS.WriteStream
+    const c = config()
+    const sh = new Shell({ stateRoot: tmp('st'), repoDir: tmp('repo'), config: c, resolutions: await resolutions(c), clineVersion: 'x', deps: {} as never, gates: [], allowDirty: false, fresh: true, acceptConfigChange: false, output: stream })
+    assert.doesNotThrow(() => sh.render())
+    assert.match(stripAnsi(out), /opening the conversation/)
+    ;(stream as { columns: number }).columns = 30; (stream as { rows: number }).rows = 5
+    assert.doesNotThrow(() => sh.render())
+    ;(stream as { rows: number }).rows = 1
+    assert.doesNotThrow(() => sh.render())
+  })
+})
+
+describe('round 4 review: streamed escape sequences', () => {
+  test('an escape sequence split across stream chunks is removed whole, leaving none of its payload', () => {
+    const evil = 'Answer \x1b[2J\x1b]52;c;aGVsbG8=\x07\x9b2J\x1b]0;pwned\x1b\\ rocket ok \x1b['
+    for (const size of [1, 2, 3, 5, 7, 11, 24]) {
+      let hold = ''; let shown = ''
+      for (let i = 0; i < evil.length; i += size) { const [ready, pending] = holdIncomplete(hold + evil.slice(i, i + size)); hold = pending; shown += sanitize(ready) }
+      shown += sanitize(hold)
+      assert.equal(shown.replace(/\s+/g, ' '), 'Answer rocket ok ', `chunks of ${size}: ${JSON.stringify(shown)}`)
+    }
+    assert.deepEqual(holdIncomplete('plain text'), ['plain text', ''])
+    assert.equal(holdIncomplete(`x\x1b]52;${'a'.repeat(600)}`)[1], '', 'a runaway sequence is not held forever')
   })
 })

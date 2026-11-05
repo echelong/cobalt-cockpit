@@ -143,7 +143,8 @@ if (has('error')) {
   process.exit(1)
 }
 const planB64 = argOf('plan-b64'); const reqB64 = argOf('request-b64')
-const text = argOf('say') ?? (planB64 !== undefined ? `Plan:\n\`\`\`json\n${Buffer.from(planB64, 'base64').toString()}\n\`\`\`` : reqB64 !== undefined ? `Done.\nCOCKPIT_REQUEST\n\`\`\`json\n${Buffer.from(reqB64, 'base64').toString()}\n\`\`\`` : argOf('plan') !== undefined ? `Plan:\n\`\`\`json\n${argOf('plan')}\n\`\`\`` : argOf('request') !== undefined ? `Done.\nCOCKPIT_REQUEST\n\`\`\`json\n${argOf('request')}\n\`\`\`` : 'Done. All changes made and tests pass.')
+const sayB64 = argOf('say-b64')
+const text = (sayB64 !== undefined ? Buffer.from(sayB64, 'base64').toString() : undefined) ?? argOf('say') ?? (planB64 !== undefined ? `Plan:\n\`\`\`json\n${Buffer.from(planB64, 'base64').toString()}\n\`\`\`` : reqB64 !== undefined ? `Done.\nCOCKPIT_REQUEST\n\`\`\`json\n${Buffer.from(reqB64, 'base64').toString()}\n\`\`\`` : argOf('plan') !== undefined ? `Plan:\n\`\`\`json\n${argOf('plan')}\n\`\`\`` : argOf('request') !== undefined ? `Done.\nCOCKPIT_REQUEST\n\`\`\`json\n${argOf('request')}\n\`\`\`` : 'Done. All changes made and tests pass.')
 // like Cline: the answer streams as text deltas (content_start contentType text) before done
 if (!has('nostream')) { let acc = ''; for (const chunk of text.match(/.{1,24}/gs) ?? []) { acc += chunk; out({ type: 'agent_event', event: { type: 'content_start', contentType: 'text', text: chunk, accumulated: acc } }); if (argOf('stream-delay')) await sleep(Number(argOf('stream-delay'))) } }
 out({ type: 'agent_event', event: { type: 'done', reason: 'completed', text, iterations: req, usage: totals } })

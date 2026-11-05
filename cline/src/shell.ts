@@ -18,7 +18,7 @@ import type { Entry } from './turn.ts'
 import { routeTask } from './router.ts'
 import { plannerPrompt } from './planner.ts'
 import { repoInfo } from './git.ts'
-import { Paint, Screen, colorMode, fit, money, reducedMotion, sanitize, stripAnsi, vlen, wrap } from './ui/term.ts'
+import { Paint, Screen, colorMode, fit, holdIncomplete, money, reducedMotion, sanitize, stripAnsi, vlen, wrap } from './ui/term.ts'
 import type { Token } from './ui/term.ts'
 import { LedgerTail, Timeline, fromLedger } from './ui/timeline.ts'
 import { buildView } from './ui/model.ts'
@@ -67,6 +67,8 @@ export class Shell {
   private notice: string | null = null
   /** The attempt whose text is being appended to the last transcript line. */
   private streaming: string | null = null
+  /** Per attempt: the start of an escape sequence its stream chunk ended in, until the next chunk completes it. */
+  private escHold = new Map<string, string>()
   // HUD 2.0: the real-event timeline, the ledger it tails, and the frame writer
   private timeline = new Timeline()
   private tail: LedgerTail | null = null
@@ -159,7 +161,10 @@ export class Shell {
     const tag = taskId === this.turn.id ? '' : `[${taskId}] `
     if (e.type === 'agent_event' && ev.type === 'content_start' && ev.contentType === 'text' && typeof ev.text === 'string') {
       // model text never reaches the terminal raw: escape sequences and control characters are dropped
-      const clean = sanitize(ev.text)
+      // an escape sequence split across stream chunks is held until it is complete, then removed whole
+      const [ready, pending] = holdIncomplete((this.escHold.get(attemptId) ?? '') + ev.text)
+      if (pending) this.escHold.set(attemptId, pending); else this.escHold.delete(attemptId)
+      const clean = sanitize(ready)
       this.turn.text += clean
       const last = this.view.at(-1)
       const parts = clean.split('\n')
@@ -378,7 +383,8 @@ export class Shell {
   // ----- keyboard ----------------------------------------------------------------------------------
   private onKey(buf: Buffer): void {
     let s = buf.toString('utf8')
-    if (s.includes('\x1b[200~')) { const body = s.replace('\x1b[200~', '').replace('\x1b[201~', ''); this.insert(body.replace(/\r\n?/g, '\n')); return }
+    // a paste is text for the request: its escape and control bytes are dropped; it returns to the conversation
+    if (s.includes('\x1b[200~')) { const body = s.replace('\x1b[200~', '').replace('\x1b[201~', ''); this.overlay = false; this.insert(body.replace(/\r\n?/g, '\n')); return }
     while (s.length) {
       // Esc followed by a control key in the same read is two keys (Esc, then e.g. Ctrl-D), never an Alt chord;
       // only Alt+Enter and Alt+printable are chords
@@ -387,7 +393,7 @@ export class Shell {
       this.key(seq)
     }
   }
-  private insert(t: string): void { this.input = this.input.slice(0, this.cursor) + t + this.input.slice(this.cursor); this.cursor += t.length; this.dirty = true }
+  private insert(raw: string): void { const t = sanitize(raw); this.input = this.input.slice(0, this.cursor) + t + this.input.slice(this.cursor); this.cursor += t.length; this.dirty = true }
   /** Mission Control navigation. Returns false for keys it leaves to the conversation (Ctrl+C, Ctrl+D). */
   private overlayKey(k: string): boolean {
     const tabs = TABS.map(t => t.tab)
@@ -459,7 +465,8 @@ export class Shell {
   private claimsCache: { at: number; claims: ReturnType<typeof listClaims>['claims'] } = { at: 0, claims: [] }
   private styled(l: Line, w: number): string[] {
     const t = l.style ? STYLE[l.style] : undefined
-    return wrap(l.text, w).map(x => fit(t === 'bold' ? this.paint.bold(x) : t ? this.paint.fg(t, x) : x, w))
+    // transcript text includes model answers, tool paths and replayed history: sanitized before wrapping
+    return wrap(sanitize(l.text), w).map(x => fit(t === 'bold' ? this.paint.bold(x) : t ? this.paint.fg(t, x) : x, w))
   }
   /** The transcript wrapped to the width; settled lines are wrapped once, only the streaming tail per frame. */
   private bodyLines(w: number): string[] {
@@ -484,15 +491,27 @@ export class Shell {
     return { line: fit(`${prompt}${offset ? this.paint.dim('…') : ''}${visible}`, w), col: pw + 1 + before - offset + (offset ? 1 : 0) }
   }
 
+  /** Draws a frame; if building it fails, a minimal frame says so, so the screen never freezes on a stale image. */
   render(): void {
-    const cols = Math.max(20, this.out.columns ?? 120); const rows = Math.max(8, this.out.rows ?? 40)
-    const w = cols - 1
-    const input = this.inputLine(w)
+    try { this.renderFrame() } catch (e) {
+      const cols = Math.max(1, this.out.columns ?? 80); const rows = Math.max(1, this.out.rows ?? 24); const w = Math.max(1, cols - 1)
+      const lines = [fit(this.paint.fg('fail', ` display error: ${sanitize((e as Error)?.message ?? String(e))}`), w), fit(this.paint.dim(' the supervisor keeps running · Ctrl-D quits'), w)]
+      while (lines.length < rows) lines.push(' '.repeat(w))
+      this.screen.draw(lines.slice(0, rows), cols, rows, { row: rows, col: 1 })
+      this.dirty = false
+    }
+  }
+  private renderFrame(): void {
+    const cols = Math.max(1, this.out.columns ?? 120); const rows = Math.max(1, this.out.rows ?? 40)
+    const w = Math.max(1, cols - 1)
+    const input = this.overlay
+      ? { line: fit(this.paint.dim(' Mission Control · typing is paused · Tab or Esc returns to the conversation'), w), col: 1 }
+      : this.inputLine(w)
     let frame: string[]
-    if (cols < 40 || rows < 12) {
-      // too small for any HUD: say so, keep the conversation usable
-      frame = [fit(this.paint.fg('warn', `Cobalt Cockpit needs 40×12; this terminal is ${cols}×${rows}`), w), ...this.bodyLines(w).slice(-(rows - 3)), fit(this.paint.dim(' Ctrl-D quits'), w)]
-      frame = frame.slice(-(rows - 1))
+    if (!this.mission || cols < 40 || rows < 12) {
+      // opening, or too small for any HUD: say so and keep the conversation readable
+      const msg = !this.mission ? ' opening the conversation…' : ` Cobalt Cockpit needs 40×12; this terminal is ${cols}×${rows}`
+      frame = rows <= 1 ? [] : [fit(this.paint.fg('warn', msg), w), ...(this.mission ? this.bodyLines(w).slice(-Math.max(0, rows - 3)) : []), fit(this.paint.dim(' Ctrl-D quits'), w)].slice(-(rows - 1))
       while (frame.length < rows - 1) frame.unshift(' '.repeat(w))
     } else {
       if (this.claimsCache.at < Date.now() - 1000) this.claimsCache = { at: Date.now(), claims: listClaims(this.mission.header.commonDir).claims }
@@ -507,6 +526,7 @@ export class Shell {
         if (hud.length > rows - 6) hud = [...hud.slice(0, rows - 7), hud.at(-1) as string]
         const bodyRows = rows - hud.length - 2
         const body = this.bodyLines(w)
+        this.scroll = Math.min(this.scroll, Math.max(0, body.length - bodyRows))
         const end = Math.max(0, body.length - this.scroll); const start = Math.max(0, end - bodyRows)
         const shown = body.slice(start, end)
         while (shown.length < bodyRows) shown.unshift(' '.repeat(w))
@@ -517,7 +537,9 @@ export class Shell {
     frame.push(input.line)
     while (frame.length < rows) frame.push(' '.repeat(w))
     this.screen.draw(frame, cols, rows, { row: rows, col: input.col })
+    // test and evidence capture only: the frame as text, and (separately) with its styling
     if (process.env.COCKPIT_SHELL_FRAME) { const fl = process.env.COCKPIT_SHELL_FRAME; writeFileSync(`${fl}.tmp`, frame.slice(0, rows).map(stripAnsi).join('\n')); renameSync(`${fl}.tmp`, fl) }
+    if (process.env.COCKPIT_SHELL_FRAME_ANSI) { const fl = process.env.COCKPIT_SHELL_FRAME_ANSI; writeFileSync(`${fl}.tmp`, frame.slice(0, rows).join('\n')); renameSync(`${fl}.tmp`, fl) }
     this.dirty = false
   }
   /** One timer drives the screen: new ledger entries, the spinner (unless reduced motion) and the clocks. */
@@ -531,24 +553,31 @@ export class Shell {
     if (this.dirty) this.render()
   }
 
+  private torn = false
+  /** Gives the terminal back exactly as it was: main screen, cursor, autowrap, no paste mode. Safe to call twice. */
   private teardown(): void {
     if (this.timer) clearInterval(this.timer)
     try { this.inp.setRawMode?.(false) } catch { /* not a tty */ }
-    this.out.write(`${ESC}?2004l${ESC}?1049l${ESC}?25h`)
+    if (this.torn) return
+    this.torn = true
+    try { this.out.write(`${ESC}?2026l${ESC}?7h${ESC}?2004l${ESC}?1049l${ESC}?25h`) } catch { /* terminal gone */ }
   }
 
   async start(): Promise<void> {
     if (!this.inp.isTTY || !this.out.isTTY) throw new Error('the interactive shell needs a terminal; use `cockpit-cline run` for scripts')
-    this.out.write(`${ESC}?1049h${ESC}2J${ESC}?2004h`)
+    // alternate screen, bracketed paste, and no autowrap: a miscounted wide character can never wrap a row
+    this.out.write(`${ESC}?1049h${ESC}2J${ESC}?2004h${ESC}?7l`)
     this.inp.setRawMode?.(true); this.inp.resume()
     this.inp.on('data', (b: Buffer) => this.onKey(b))
-    // a resize repaints the whole screen once (the writer clears on a size change)
+    // a resize repaints the whole screen once (the writer clears on a size change); before the
+    // conversation is open render() draws only an "opening" line, and it never throws
     this.out.on('resize', () => { this.screen.invalidate(); this.dirty = true; this.render() })
     process.on('SIGTERM', () => { void this.quit() })
     // a closed terminal stops the running turn the same way /quit does
     process.on('SIGHUP', () => { void this.quit() })
     process.on('unhandledRejection', e => { this.system(`internal error: ${(e as Error)?.message ?? String(e)}`, 'red') })
-    process.on('exit', () => { try { this.inp.setRawMode?.(false) } catch { /* ignore */ } })
+    // however the process ends, the terminal is restored
+    process.on('exit', () => this.teardown())
     this.timer = setInterval(() => { try { this.pulse() } catch (e) { this.notice = `render error: ${(e as Error).message}` } }, 120)
     try { await this.openMission() } catch (e) { this.teardown(); throw e }
     this.system('type a request to start, or /help', 'dim')

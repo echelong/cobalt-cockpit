@@ -74,22 +74,70 @@ export class Paint {
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
 export const stripAnsi = (s: string): string => s.replace(ANSI, '')
 const zeroWidth = (cp: number): boolean => (cp >= 0x300 && cp <= 0x36f) || (cp >= 0x200b && cp <= 0x200f) || cp === 0xfe0f || cp === 0xfe0e || (cp >= 0x20d0 && cp <= 0x20ff)
+// BMP symbols with emoji presentation (drawn two columns wide by terminals)
+const WIDE_BMP = new Set([0x231a, 0x231b, 0x23e9, 0x23ea, 0x23eb, 0x23ec, 0x23f0, 0x23f3, 0x25fd, 0x25fe, 0x2614, 0x2615, 0x267f, 0x2693, 0x26a1, 0x26aa, 0x26ab, 0x26bd, 0x26be, 0x26c4, 0x26c5, 0x26ce, 0x26d4, 0x26ea, 0x26f2, 0x26f3, 0x26f5, 0x26fa, 0x26fd, 0x2705, 0x270a, 0x270b, 0x2728, 0x274c, 0x274e, 0x2753, 0x2754, 0x2755, 0x2757, 0x2795, 0x2796, 0x2797, 0x27b0, 0x27bf, 0x2b1b, 0x2b1c, 0x2b50, 0x2b55])
 const wide = (cp: number): boolean =>
+  WIDE_BMP.has(cp) || (cp >= 0x2648 && cp <= 0x2653) ||
   (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) ||
-  (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1f64f) ||
-  (cp >= 0x1f900 && cp <= 0x1f9ff) || (cp >= 0x20000 && cp <= 0x3fffd)
+  (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) ||
+  (cp >= 0x1f004 && cp <= 0x1f0cf) || (cp >= 0x1f18e && cp <= 0x1f19a) || (cp >= 0x1f1e6 && cp <= 0x1f2ff) || (cp >= 0x1f300 && cp <= 0x1f64f) ||
+  (cp >= 0x1f680 && cp <= 0x1f6ff) || (cp >= 0x1f7e0 && cp <= 0x1f7eb) || (cp >= 0x1f90c && cp <= 0x1f9ff) || (cp >= 0x1fa70 && cp <= 0x1faff) ||
+  (cp >= 0x20000 && cp <= 0x3fffd)
 export const charWidth = (ch: string): number => { const cp = ch.codePointAt(0) ?? 0; return cp < 32 ? 0 : zeroWidth(cp) ? 0 : wide(cp) ? 2 : 1 }
 /** Visible columns of a (possibly styled) string. */
 export const vlen = (s: string): number => { let n = 0; for (const ch of stripAnsi(s)) n += charWidth(ch); return n }
-/** Control characters a worker might print (bells, cursor moves, OSC) never reach the screen. */
+/**
+ * Text from models, files, tools and test runners never drives the terminal: OSC, DCS and CSI
+ * sequences, any other ESC, C0 and C1 control characters (U+0080–U+009F include 8-bit CSI and OSC)
+ * are removed; tabs become two spaces; the emoji presentation selector is dropped so widths are exact.
+ */
 // eslint-disable-next-line no-control-regex
-export const sanitize = (s: string): string => s.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, '').replace(ANSI, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').replace(/\t/g, '  ')
+const OSC_DCS = /\x1b[\]P_^][\s\S]*?(?:\x07|\x1b\\|$)|[\x90\x9d\x9e\x9f][\s\S]*?(?:\x07|\x9c|\x1b\\|$)/g
+// eslint-disable-next-line no-control-regex
+const ANY_ESC = /\x1b\[[0-9;?<=>!]*[ -/]*[@-~]?|\x9b[0-9;?<=>!]*[ -/]*[@-~]?|\x1b[ -/]*[0-~]?|\x1b/g
+// eslint-disable-next-line no-control-regex
+const CONTROLS = /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g
+export const sanitize = (s: string): string => s.replace(OSC_DCS, '').replace(ANY_ESC, '').replace(/\t/g, '  ').replace(CONTROLS, '').replace(/️/g, '')
+/**
+ * For streamed text: splits off an escape sequence that the chunk ends in the middle of, so the next
+ * chunk can complete it and the whole sequence is removed (not half of it, leaving its payload as text).
+ * A held tail longer than 512 characters is released (and then sanitized away) rather than held forever.
+ */
+export const holdIncomplete = (s: string): [string, string] => {
+  const i = Math.max(s.lastIndexOf('\x1b'), ...['\x90', '\x9b', '\x9d', '\x9e', '\x9f'].map(c => s.lastIndexOf(c)))
+  if (i < 0 || s.length - i > 512) return [s, '']
+  const tail = s.slice(i)
+  // the sequence type is decided by its second byte: CSI (ESC [), string sequences (ESC ] P _ ^), or a short escape
+  let complete: boolean
+  /* eslint-disable no-control-regex */
+  if (tail[0] === '\x1b') {
+    const t1 = tail[1]
+    complete = t1 === undefined ? false
+      : t1 === '[' ? /^\x1b\[[0-9;?<=>!]*[ -/]*[@-~]/.test(tail)
+      : ']P_^'.includes(t1) ? /^\x1b[\]P_^][\s\S]*?(?:\x07|\x1b\\)/.test(tail)
+      : /^\x1b[ -/]*[0-~]/.test(tail)
+  } else if (tail[0] === '\x9b') complete = /^\x9b[0-9;?<=>!]*[ -/]*[@-~]/.test(tail)
+  else complete = /^[\x90\x9d\x9e\x9f][\s\S]*?(?:\x07|\x9c|\x1b\\)/.test(tail)
+  /* eslint-enable no-control-regex */
+  if (complete) return [s, '']
+  // an ESC that may start the terminator (ESC \) of an earlier OSC/DCS: hold from that sequence's opener
+  const opener = Math.max(s.lastIndexOf('\x1b]', i - 1), s.lastIndexOf('\x1bP', i - 1))
+  if (tail === '\x1b' && opener >= 0 && !/\x07/.test(s.slice(opener)) && s.length - opener <= 512) return [s.slice(0, opener), s.slice(opener)]
+  return [s.slice(0, i), tail]
+}
+// eslint-disable-next-line no-control-regex
+const SGR_SPLIT = /(\x1b\[[0-9;]*m)/
+/** Keeps only our own SGR styling; everything else in the string is sanitized (the last line of defence). */
+const safeStyled = (s: string): string => s.split(SGR_SPLIT).map((part, i) => i % 2 ? part : sanitize(part)).join('')
 
 /** Pads or cuts a styled string to exactly n visible columns; a cut ends in `…` and resets style. */
 export const fit = (s: string, n: number): string => {
   if (n <= 0) return ''
   // one screen row: a line break or tab inside data never splits or shifts the row
   if (/[\n\r\t]/.test(s)) s = s.replace(/\r?\n|\r/g, ' ⏎ ').replace(/\t/g, ' ')
+  // every row passes here: no escape or control character other than our own SGR reaches the screen
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f-\x9f️]/.test(s.replace(/\x1b\[[0-9;]*m/g, ''))) s = safeStyled(s)
   const w = vlen(s)
   if (w <= n) return s + ' '.repeat(n - w)
   let out = ''; let seen = 0; let i = 0; let styled = false

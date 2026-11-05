@@ -2,7 +2,7 @@
 // admission, gates, integration, failures, retries, escalations, budget, verdicts), tailed by byte
 // offset, and the worker's own Cline event stream (tool calls, edits, commands). Nothing is
 // inferred or synthesised; an event the sources do not report is not shown.
-import { closeSync, existsSync, fstatSync, openSync, readdirSync, readSync } from 'node:fs'
+import { closeSync, existsSync, fstatSync, openSync, readdirSync, readSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import type { Token } from './term.ts'
@@ -15,6 +15,8 @@ export type EventKind =
 export type TimelineEvent = {
   seq: number; at: number; kind: EventKind; task: string | null; attempt: string | null
   source: 'supervisor' | 'worker'; text: string; detail: string[]; tone: Token
+  /** The role of the attempt, from its admission in the ledger (null for mission-level events). */
+  role?: string | null
 }
 
 const GLYPH: Record<EventKind, string> = {
@@ -38,7 +40,7 @@ export const fromLedger = (e: LedgerEntry): Omit<TimelineEvent, 'seq'> | null =>
   const ev = (kind: EventKind, text: string, tone: Token, detail: string[] = []): Omit<TimelineEvent, 'seq'> => ({ ...base, kind, text: clip(text, 220), tone, detail: detail.map(x => clip(x, 400)).filter(Boolean) })
   switch (e.kind) {
     case 'task_added': { const s = d.spec ?? {}; return ev('queued', `queued · ${s.kind}/${s.risk} ${s.mode} · ${d.source ?? ''}`, 'label', [`title: ${s.title ?? ''}`, `owns: ${(s.owned ?? []).join(', ')}`, s.dependencies?.length ? `after: ${s.dependencies.join(', ')}` : '']) }
-    case 'attempt_admitted': { const r = d.route ?? {}; return ev('admit', `${attemptNo(d.attempt)} routed → ${r.role} ${r.model} · ${r.requestedReasoning ?? '?'}→${r.expectedWireEffort ?? '?'}`, 'head', [`rules: ${(r.rules ?? []).join('; ')}`, r.signals?.length ? `signals: ${r.signals.join(', ')}` : '', r.estimateUsd != null ? `reserved estimate: $${Number(r.estimateUsd).toFixed(4)} (${r.pricingSource ?? 'pricing'})` : 'no pricing: cost would be unmetered']) }
+    case 'attempt_admitted': { const r = d.route ?? {}; return { ...ev('admit', `${attemptNo(d.attempt)} routed → ${r.role} ${r.model} · ${r.requestedReasoning ?? '?'}→${r.expectedWireEffort ?? '?'}`, 'head', [`rules: ${(r.rules ?? []).join('; ')}`, r.signals?.length ? `signals: ${r.signals.join(', ')}` : '', r.estimateUsd != null ? `reserved estimate: $${Number(r.estimateUsd).toFixed(4)} (${r.pricingSource ?? 'pricing'})` : 'no pricing: cost would be unmetered']), role: typeof r.role === 'string' ? clip(r.role, 20) : null } }
     case 'attempt_bound': return ev('start', `${attemptNo(d.attempt)} sandbox up · init pid ${d.initPid ?? '?'}`, 'label', [`pid namespace ${d.pidNs ?? '?'}`])
     case 'worker_exited': { const ok = d.finish === 'completed'; return ev('exit', `${attemptNo(d.attempt)} worker exited · ${d.finish ?? d.stoppedBy ?? '?'} · exit ${d.exit ?? '—'}${d.wire?.state ? ` · wire ${d.wire.state}` : ''}`, ok ? 'label' : 'warn', [d.wire?.detail ? `wire: ${d.wire.detail}` : '', d.census?.detail ? `census: ${d.census.detail}` : '', d.aborted ? `aborted: ${d.aborted}` : '']) }
     case 'gates': { const gs = (d.gates ?? []) as { name: string; state: string; exit: number | null; evidence: string }[]; const bad = gs.filter(g => g.state !== 'pass'); return ev('gate', `${attemptNo(d.attempt)} gates ${gs.map(g => `${g.name} ${g.state === 'pass' ? '✓' : '✗'}`).join(' ')}`, bad.length ? 'fail' : 'ok', gs.map(g => `${g.name}: ${g.state}${g.exit != null ? ` (exit ${g.exit})` : ''} · ${g.evidence ?? ''}`)) }
@@ -81,10 +83,11 @@ export const fromWorker = (task: string, attempt: string, e: Record<string, unkn
   const base = { at: now, task, attempt, source: 'worker' as const, detail: [] as string[] }
   if (e.type === 'run_aborted') return { ...base, kind: 'abort', text: `run aborted · ${clip(e.message ?? e.reason, 160)}`, tone: 'warn' }
   if (!(e.type === 'agent_event' && ev.type === 'content_start' && ev.contentType === 'tool' && typeof ev.toolName === 'string')) return null
-  const tool = ev.toolName as string
+  // tool names and paths are chosen by the model: they are sanitized like any other model text
+  const tool = clip(ev.toolName, 60)
   const input = (ev.input ?? {}) as Record<string, unknown>
-  const paths = Array.isArray(input.paths) ? input.paths.map(String) : typeof input.path === 'string' ? [input.path] : []
-  const shortPath = (p: string): string => p.replace(/^.*\/worktrees\/[^/]+\/[^/]+\//, '').replace(/^.*\/integration\//, '')
+  const paths = (Array.isArray(input.paths) ? input.paths.map(String) : typeof input.path === 'string' ? [input.path] : []).slice(0, 50)
+  const shortPath = (p: string): string => clip(p.replace(/^.*\/worktrees\/[^/]+\/[^/]+\//, '').replace(/^.*\/integration\//, ''), 200)
   if (Array.isArray(input.commands) || typeof input.command === 'string') {
     const cmds = (Array.isArray(input.commands) ? input.commands : [input.command]).map(c => clip(c, 200))
     const test = cmds.some(c => TEST_CMD.test(c))
@@ -102,11 +105,16 @@ export type Activity = { last: string; kind: EventKind; at: number; tools: numbe
 export class Timeline {
   readonly events: TimelineEvent[] = []
   readonly activity = new Map<string, Activity>()
+  /** attempt id → role, learned from each attempt's admission: every later event of it names its agent. */
+  readonly roles = new Map<string, string>()
   private seq = 0
   constructor(readonly max = 5000) {}
   push(e: Omit<TimelineEvent, 'seq'> | null): void {
     if (!e) return
-    this.events.push({ ...e, seq: ++this.seq })
+    if (e.attempt && e.role) this.roles.set(e.attempt, e.role)
+    const role = e.role ?? (e.attempt ? this.roles.get(e.attempt) ?? null : null)
+    this.events.push({ ...e, role, seq: ++this.seq })
+    if (this.roles.size > this.max * 2) { const keep = new Set(this.events.map(x => x.attempt)); for (const k of this.roles.keys()) if (!keep.has(k)) this.roles.delete(k) }
     if (this.events.length > this.max) this.events.splice(0, this.events.length - this.max)
   }
   /** A worker stream event: activity counters always; a timeline event when it is one. */
@@ -139,10 +147,24 @@ export class LedgerTail {
   private rest = ''
   // a read can end inside a multi-byte character; the decoder keeps it for the next read
   private dec = new StringDecoder('utf8')
-  constructor(readonly dir: string) {}
-  poll(limitBytes = 4 << 20): LedgerEntry[] {
+  private started = false
+  private skipPartial = false
+  /** `initialBytes`: how much history a first poll reads (a resumed conversation starts near its end). */
+  constructor(readonly dir: string, readonly initialBytes = 2 << 20) {}
+  poll(limitBytes = 512 << 10): LedgerEntry[] {
     if (!existsSync(this.dir)) return []
     const segs = readdirSync(this.dir).filter(f => /^seg-\d+\.jsonl$/.test(f)).sort()
+    if (!this.started) {
+      this.started = true
+      // start from the last `initialBytes` of the ledger, at a line boundary, instead of parsing all of it
+      let need = this.initialBytes
+      for (let i = segs.length - 1; i >= 0; i--) {
+        const size = statSync(join(this.dir, segs[i])).size
+        if (size >= need) { this.seg = segs[i]; this.offset = size - need; this.skipPartial = this.offset > 0; break }
+        need -= size
+        if (i === 0) { this.seg = segs[0]; this.offset = 0 }
+      }
+    }
     const out: LedgerEntry[] = []
     let budget = limitBytes
     for (const s of segs) {
@@ -158,6 +180,7 @@ export class LedgerTail {
         this.offset += n; budget -= n
         const text = this.rest + this.dec.write(Buffer.from(buf))
         const lines = text.split('\n'); this.rest = lines.pop() ?? ''
+        if (this.skipPartial && lines.length) { lines.shift(); this.skipPartial = false } // a seek lands mid-line
         for (const l of lines) { if (!l) continue; try { out.push(JSON.parse(l) as LedgerEntry) } catch { /* torn line */ } }
       } finally { closeSync(fd) }
       if (budget <= 0) break
