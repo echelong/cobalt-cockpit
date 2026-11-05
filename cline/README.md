@@ -28,6 +28,58 @@ ln -s /path/to/cobalt-cockpit/cline/bin/cockpit-cline ~/.local/bin/cockpit-cline
 the configured reasoning level exists for that model, and reports whether each provider has credentials (it
 never prints them).
 
+## The interactive Cockpit (one command)
+
+```sh
+cd ~/code/app && cockpit-cline            # or: cockpit-cline --repo ~/code/app --gate test="npm test"
+```
+
+With no command, on a terminal, `cockpit-cline` opens the integrated Cockpit: a persistent live HUD on top, the
+conversation in the middle, an input line at the bottom. Type a request as you would in Cline. **Every message is
+one supervised task**: it is classified (question, change, debugging, UI, scouting, architecture), routed by the
+fixed rules to its role's pinned model, run as a sandboxed `cline` worker in its own worktree, verified by the
+supervisor's gates and integrated on `cockpit/<mission>`. The worker's answer streams into the transcript. The
+next message carries the conversation (bounded) and starts from the integrated code, so the conversation continues
+normally. Reopening `cockpit-cline` in the same repository resumes the conversation: transcript, mission state and
+any interrupted work are reconciled by process identity first (`--new` starts a fresh conversation).
+
+The HUD shows, from live supervisor state only: the five roles with their model, requested→effective reasoning
+(`✓` once confirmed on the wire) and state (RUNNING, QUEUED, RETRY Ns, BLOCKED, done/failed); agent counts; the
+current turn's milestones; gates of the last task and of the integrated branch; spend against the budget; Guard
+alerts; ownership claims; and the mission lifecycle separate from its outcome (RUNNING, RETRYING, WAITING, BLOCKED,
+`FINISHED · VERIFIED` only when every condition passed, otherwise `FINISHED · PARTIAL`/`UNVERIFIED`/…).
+
+| Input | Effect |
+|---|---|
+| text, Enter | a supervised turn (Alt+Enter inserts a newline; ↑/↓ history) |
+| `/swarm <goal>` | Kimi plans; Cockpit routes and admits every planned task |
+| `/cockpit` or Tab | full Mission Control overlay (Esc returns) |
+| `/cockpit agents` · `routing` · `costs` · `ready` · `doctor` | every task and attempt · routing decisions and rules · spend per model · go/no-go · checks |
+| `/route <text>` · `/models` · `/diff` · `/new` | explain a route without running it · roles · branch diff · new conversation |
+| Esc / `/cancel` | cancel the running turn (its sandbox is accounted for before ownership is released) |
+| Ctrl+C | clear the input; on a running turn cancel it, twice to stop and quit; on an empty line quit |
+| Ctrl+D / `/quit` | quit (a running turn is stopped first) |
+
+**Why not inside the stock `cline` TUI.** Cline 3.0.74's terminal UI is OpenTUI compiled into the `cline` binary.
+Its plugin API (`registerCommand`) can return a text reply or submit a prompt, but has no rendering surface for a
+persistent HUD and no way to make typed turns run through Cockpit's routing, sandbox and gates; a HUD bolted onto an
+unsupervised Cline session would be decorative. So the integrated experience is Cockpit's own terminal frontend over
+supervised `cline` runs. The stock `cline` command and installation are left exactly as they are.
+
+## Recovery
+
+| Failure (classified from the run's own error text) | What follows |
+|---|---|
+| provider 5xx/network, rate limit, resource exhaustion, a lost run | retry on the same model, bounded (2), exponential backoff with jitter; a provider circuit breaker delays further work on that model, never reroutes it |
+| implementation (gates fail, claimed success without changes) | one correction on the same model with its diff and the gate output; then one escalation (MiMo for debugging, Kimi otherwise) told to diagnose first; then stop |
+| authentication or billing refused | stop at once: sign in with `cline auth`, then `cockpit-cline recover` |
+| budget, policy/sandbox/ownership refusal, model or reasoning mismatch | stop: a safety refusal stays a refusal |
+| a pinned model missing from the catalog | the task is refused with the permitted routes; no checkpoint is switched |
+
+Dependents wait while a dependency recovers and run once it has genuinely completed. Integrated work is never
+redone after a restart (recovery finds an already-integrated commit by its task tag). Every attempt is bounded by
+`limits.maxAttemptsPerTask` (4).
+
 ## Model roles (default profile `cline`, Cline billing)
 
 | Role | Model id (verified in the installed catalog) | Reasoning requested → sent on the wire | Used for |
@@ -144,3 +196,12 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
     same instant can still both proceed (narrow, documented in `src/store.ts`).
 14. A worker that is **held** (its processes could not be accounted for) keeps its slot, its claim and its
     reserved estimate until `recover` confirms it is gone; the mission ends `BLOCKED` instead of waiting.
+15. **Conversation memory between turns** is Cockpit's bounded transcript (about 6 000 characters) plus the
+    integrated code, not Cline's own message history: each turn is a fresh supervised `cline` run. Very long
+    conversations lose their oldest turns from the model's context (they stay in the transcript file).
+16. **Turn classification is rule-based** (keywords for questions, changes, debugging, UI, scouting, architecture).
+    A message can land on a different role than you meant; `/route <text>` shows the decision first, and the
+    transcript always names the role, model and rule for every turn.
+17. The interactive shell needs a real terminal (it refuses to start otherwise) and has been tested in
+    pseudo-terminals at 160×46 and 72×24; it is a line-oriented UI, not a full editor (no mouse, no syntax
+    highlighting).

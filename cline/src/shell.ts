@@ -127,7 +127,12 @@ export class Shell {
     if (resumed) {
       this.system(`resumed conversation ${this.mission.header.id} (${this.transcript.filter(e => e.role === 'user').length} earlier turn(s)); reconciling any work a previous session left open…`, 'cyan')
       this.render()
+      // a turn the previous session never reported (it crashed or was killed mid-turn) is reported now
+      const lastUser = [...this.transcript].reverse().find(e => e.role === 'user')
+      const reported = lastUser ? this.transcript.slice(this.transcript.lastIndexOf(lastUser) + 1).some(e => e.role === 'system' && new RegExp(`^${lastUser.turn}(?:\\.\\S+)? [✓✗]`).test(e.text)) : true
+      if (lastUser?.turn && !reported) this.turn = { id: lastUser.turn, lines: [], text: '', startedAt: Date.parse(lastUser.at), endedAt: null }
       await this.runMission()
+      if (this.turn) this.finishTurn(this.turn.id)
       this.system('reconciled', 'dim')
     } else this.system(`new conversation ${this.mission.header.id} on ${repo.root} @ ${repo.head.slice(0, 10)}; work lands on ${this.mission.live.integration.branch}`, 'cyan')
   }
@@ -179,7 +184,8 @@ export class Shell {
   private nextTurnId(): string { return `t${this.transcript.filter(e => e.role === 'user').length + 1}` }
   private integratedFiles(): string[] {
     const files = new Set<string>()
-    for (const t of Object.values(this.mission.live.tasks)) for (const a of t.attempts) if (a.commit) for (const f of a.changes) files.add(f)
+    // live and archived tasks: a finished turn's changes count too
+    for (const [, t] of this.taskRecords()) for (const a of t.attempts) if (a.commit) for (const f of a.changes) files.add(f)
     return [...files]
   }
 

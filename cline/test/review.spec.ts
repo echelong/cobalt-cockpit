@@ -95,7 +95,7 @@ describe('round 2 regressions', () => {
   test('M1: a provider error before any model turn keeps the session metered and gets its retry', T, async () => {
     const e = env(); const m = await mission(e, { tasks: [task('a', { prompt: '[[repeat:0]] [[error]]' })] })
     await m.run()
-    assert.equal(byId(m, 'a').attempts.length, 2, 'the bounded retry ran')
+    assert.equal(byId(m, 'a').attempts.length, 3, 'the bounded retries ran (one try, two backed-off retries)')
     assert.equal(m.live.session.unmetered, false)
   })
   test('S1: a slot held by an unaccounted worker ends the mission (BLOCKED) instead of polling', { timeout: 30_000 }, async () => {

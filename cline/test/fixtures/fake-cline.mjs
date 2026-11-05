@@ -10,7 +10,11 @@ const args = process.argv.slice(2)
 const opt = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : null }
 const provider = opt('-P'), model = opt('-m'), thinking = opt('--thinking'), cwd = opt('-c'), hooksDir = opt('--hooks-dir')
 const prompt = args[args.length - 1]
-const steps = [...prompt.matchAll(/\[\[([a-z0-9_-]+)(?::([\s\S]*?))?\]\]/g)].map(m => ({ op: m[1], arg: m[2] ?? '' }))
+// Like a model following the latest request: with a conversation transcript in the prompt, only the
+// current request's tokens are acted on (earlier turns are context, already carried out).
+const CURRENT = 'Current request from the person:\n'
+const scriptText = prompt.includes(CURRENT) ? prompt.slice(prompt.lastIndexOf(CURRENT)) : prompt
+const steps = [...scriptText.matchAll(/\[\[([a-z0-9_-]+)(?::([\s\S]*?))?\]\]/g)].map(m => ({ op: m[1], arg: m[2] ?? '' }))
 const has = (op) => steps.some(s => s.op === op)
 const argOf = (op) => steps.find(s => s.op === op)?.arg
 const out = (o) => process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), ...o })}\n`)
