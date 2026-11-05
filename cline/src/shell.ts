@@ -189,7 +189,7 @@ export class Shell {
     this.record(user); this.view.push(...this.entryLines(user))
     this.turn = { id, lines: [], text: '', startedAt: Date.now(), endedAt: null }
     if (swarm) {
-      this.mission.addTask({ id: `${id}.plan`, title: `Commander plan: ${text.slice(0, 80)}`, kind: 'architecture', risk: 'medium', complexity: 4, mode: 'read', owned: ['*'], dependencies: [], prompt: plannerPrompt(`${prompt}`, `${this.mission.header.repoRoot} at ${this.mission.live.integration.head.slice(0, 12)}`), priority: 9, depth: 0, parent: null }, 'interactive /swarm')
+      this.mission.addTask({ id: `${id}.plan`, title: `Commander plan: ${text.slice(0, 80)}`, kind: 'architecture', risk: 'medium', complexity: 4, mode: 'read', owned: ['*'], dependencies: [], prompt: plannerPrompt(prompt, await this.mission.repoSummary()), priority: 9, depth: 0, parent: null }, 'interactive /swarm')
       this.system(`${id}: commander plans; Cockpit routes each planned task`, 'magenta')
     } else {
       const c = classifyTurn(text, id)

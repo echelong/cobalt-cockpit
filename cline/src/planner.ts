@@ -12,7 +12,8 @@ export const RESERVED_IDS: ReadonlySet<string> = new Set(['plan', 'task', 'final
 /** Anything that can answer whether an id is taken: live tasks and the paginated archive. */
 export type IdSet = { has(id: string): boolean }
 
-export type Parsed = { ok: true; tasks: TaskSpec[] } | { ok: false; reason: string }
+export type Parsed = { ok: true; tasks: TaskSpec[]; design?: string } | { ok: false; reason: string }
+export const MAX_DESIGN_CHARS = 6000
 
 /** The last ```json fenced block after `marker` (or anywhere when marker is null). */
 export const lastJsonBlock = (text: string, marker: string | null = null): string | null => {
@@ -64,7 +65,9 @@ export const validateTasks = (raw: unknown, opts: { max: number; depth: number; 
   const byId = new Map(out.map(t => [t.id, t]))
   const cyc = (id: string): boolean => { if (done.has(id)) return false; if (visiting.has(id)) return true; visiting.add(id); const r = (byId.get(id)?.dependencies ?? []).some(cyc); visiting.delete(id); done.add(id); return r }
   if (out.some(t => cyc(t.id))) return { ok: false, reason: 'dependency cycle' }
-  return { ok: true, tasks: out }
+  const design = (raw as { design?: unknown }).design
+  if (design !== undefined && (typeof design !== 'string' || design.length > MAX_DESIGN_CHARS)) return { ok: false, reason: `"design" must be text of at most ${MAX_DESIGN_CHARS} characters` }
+  return { ok: true, tasks: out, ...(typeof design === 'string' && design.trim() ? { design: design.trim() } : {}) }
 }
 
 export const parsePlan = (text: string, existing: IdSet = new Set<string>(), idPrefix = ''): Parsed => {
@@ -104,16 +107,26 @@ export const needsCommander = (goal: string, flags: { swarm?: boolean; single?: 
 }
 
 export const plannerPrompt = (goal: string, repoSummary: string): string => `You are the commander of a Cobalt Cockpit mission. Decompose the GOAL into bounded tasks for separate workers.
-Do not edit files. Inspect the repository read-only as needed, then answer with ONE fenced \`\`\`json block:
-{"tasks":[{"id":"short-kebab-id","title":"...","kind":"${KINDS.join('|')}","risk":"${RISKS.join('|')}","complexity":1-5,"mode":"read|write","owned":["repo/relative/path"],"dependencies":["other-id"],"priority":0-9,"prompt":"complete self-contained instructions"}]}
+Do not edit files. The repository summary below lists its tracked files; read files only where the summary is not enough. Answer with ONE fenced \`\`\`json block:
+{"design":"the architecture: modules, interfaces, data flow, error handling and test strategy every worker must follow","tasks":[{"id":"short-kebab-id","title":"...","kind":"${KINDS.join('|')}","risk":"${RISKS.join('|')}","complexity":1-5,"mode":"read|write","owned":["repo/relative/path"],"dependencies":["other-id"],"priority":0-9,"prompt":"complete self-contained instructions"}]}
 Rules: at most ${MAX_PLAN_TASKS} tasks; prefer few; tasks that write must own disjoint paths unless one depends on the other;
 owned paths are repository-relative (no leading slash, no ..); use "*" only when a task truly needs the whole tree;
+put the architecture in "design" (Cockpit gives it to every task); do NOT add a separate read-only design or architecture task,
+only an architecture task that must WRITE a design document the repository needs;
 each prompt must be self-contained. Cockpit, not you, chooses each worker's model.
 Repository: ${repoSummary}
 GOAL:
 ${goal}`
 
-export const workerPrompt = (t: TaskSpec, ctx: { evidence?: string[]; readOnly: boolean; allowedTools: string[] }): string => `${t.prompt}
+/** A bounded, factual repository summary for the planner, so the commander need not explore with tool calls. */
+export const repoSummaryText = (root: string, head: string, files: readonly string[], scripts: Record<string, string>): string => {
+  const shown = files.slice(0, 150)
+  const scriptLine = Object.keys(scripts).length ? `\npackage.json scripts: ${Object.entries(scripts).slice(0, 12).map(([k, v]) => `${k}=${v.slice(0, 80)}`).join('; ')}` : ''
+  return `${root} at ${head.slice(0, 12)}, ${files.length} tracked file(s)${files.length > shown.length ? ` (first ${shown.length} shown)` : ''}:\n${shown.join('\n') || '(empty)'}${scriptLine}`
+}
+
+export const workerPrompt = (t: TaskSpec, ctx: { evidence?: string[]; readOnly: boolean; allowedTools: string[]; dependencyResults?: { id: string; text: string }[] }): string => `${t.prompt}
+${ctx.dependencyResults?.length ? `\nResults of the tasks this one depends on (their code changes are already in this checkout):\n${ctx.dependencyResults.map(d => `[${d.id}]\n${d.text}`).join('\n\n')}\n` : ''}
 
 -- Cobalt Cockpit worker contract --
 Task: ${t.id}${t.prompt.includes(t.title) ? '' : ` · ${t.title}`}

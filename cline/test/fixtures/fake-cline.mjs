@@ -27,7 +27,14 @@ const request = (u = [9000, 100, 0.001]) => {
     mkdirSync(cap, { recursive: true })
     const body = { model: reportedModel, ...(effortFor(thinking) ? { reasoning_effort: effortFor(thinking) } : {}), stream: true }
     if (has('toggle-off')) body.reasoning = { enabled: false }
-    writeFileSync(join(cap, `cap_run_fake_${req}.wire_request.1.provider-request.json`), JSON.stringify({ timestamp: new Date().toISOString(), captureStage: 'wire_request', payload: { url: 'https://fake.invalid/v1/chat/completions', method: 'POST', body: JSON.stringify(body) } }))
+    // the request carries the conversation after its top-level fields, as Cline's bodies do
+    body.messages = [{ role: 'user', content: has('bigbody') ? 'x'.repeat(90_000) + ' "model":"evil/other-model" ' : 'hello' }]
+    const wire = { url: 'https://fake.invalid/v1/chat/completions', method: 'POST', body: JSON.stringify(body) }
+    const text = JSON.stringify(wire)
+    // Cline 3.0.74 truncates captures above CLINE_CAPTURE_MAX_PREVIEW_BYTES (65 536 by default):
+    // the payload becomes {truncated, bytes, sha256, preview} with the serialised payload cut short
+    const payload = text.length > 65_536 ? { truncated: true, bytes: Buffer.byteLength(text), sha256: 'f'.repeat(64), preview: text.slice(0, 65_536) } : wire
+    writeFileSync(join(cap, `cap_run_fake_${req}.wire_request.1.provider-request.json`), JSON.stringify({ timestamp: new Date().toISOString(), captureStage: 'wire_request', payload }))
   }
   if (has('nousage')) return
   const [i, o, c] = u

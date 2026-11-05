@@ -23,9 +23,10 @@ import type { Census, ProcessIdentity } from './proc.ts'
 import type { WireVerdict } from './reasoning.ts'
 import { gateTaint, gitGate, packageScripts, runCommandGate, securityGate } from './gates.ts'
 import type { GateResult, GateSpec } from './gates.ts'
+import { git } from './git.ts'
 import { addTaskWorktree, changesOf, commitTask, createIntegration, headOf, integrate, integratedCommitFor, missionBranch, repoInfo } from './git.ts'
 import type { RepoInfo } from './git.ts'
-import { isPlanTask, needsCommander, parsePlan, parseRequest, planPrefix, plannerPrompt, workerPrompt } from './planner.ts'
+import { isPlanTask, needsCommander, parsePlan, parseRequest, planPrefix, plannerPrompt, repoSummaryText, workerPrompt } from './planner.ts'
 import { ownedCovers } from './hook/policy.ts'
 import {
   Archive, Ledger, breakStaleLock, claimsLock, epochToken, listClaims, lostMissions, newId, readJson, retireClaim, retireMarker,
@@ -147,7 +148,7 @@ export class Mission {
     m.ledger.append('mission_created', null, { header: { ...header, goal: header.goal.slice(0, 2000) }, models: Object.fromEntries(ROLES.map(r => [r, o.resolutions[r].ok ? `${o.resolutions[r].provider}/${o.resolutions[r].model}` : `UNRESOLVED: ${(o.resolutions[r] as { reason: string }).reason}`])) })
     if (o.conversation) { /* turns arrive one by one through addTask */ }
     else if (o.tasks) for (const t of o.tasks) m.addTask(t, 'plan-file')
-    else if (decision.commander) m.addTask({ id: 'plan', title: 'Commander: decompose the goal', kind: 'architecture', risk: 'medium', complexity: 4, mode: 'read', owned: ['*'], dependencies: [], prompt: plannerPrompt(o.goal, `${repo.root} at ${repo.head.slice(0, 12)}`), priority: 9, depth: 0, parent: null }, 'commander-planning')
+    else if (decision.commander) m.addTask({ id: 'plan', title: 'Commander: decompose the goal', kind: 'architecture', risk: 'medium', complexity: 4, mode: 'read', owned: ['*'], dependencies: [], prompt: plannerPrompt(o.goal, await m.repoSummary()), priority: 9, depth: 0, parent: null }, 'commander-planning')
     else m.addTask({ id: 'task', title: o.goal.split('\n')[0].slice(0, 120), kind: 'implement', risk: 'medium', complexity: 3, mode: 'write', owned: ['*'], dependencies: [], prompt: o.goal, priority: 5, depth: 0, parent: null }, 'single')
     m.live.state = 'running'
     m.persist(true)
@@ -401,6 +402,23 @@ export class Mission {
     }
   }
 
+  /** What the commander is told about the repository: tracked files at the mission head and package scripts (facts, bounded). */
+  async repoSummary(): Promise<string> {
+    const r = await git(['ls-files'], { cwd: this.live.integration.dir, allowFail: true })
+    return repoSummaryText(this.header.repoRoot, this.live.integration.head, r.code === 0 ? r.stdout.split('\n').filter(Boolean) : [], packageScripts(this.live.integration.dir))
+  }
+
+  /** Answers of completed tasks this one depends on (e.g. a scout's findings), bounded, for its prompt. */
+  private dependencyResults(t: TaskRecord): { id: string; text: string }[] {
+    const out: { id: string; text: string }[] = []
+    for (const d of t.spec.dependencies.slice(0, 6)) {
+      const rec = (this.live.tasks[d] ?? this.archive.get(d)) as TaskRecord | null
+      const text = rec?.state === 'completed' ? rec.attempts.at(-1)?.resultExcerpt?.trim() : undefined
+      if (text) out.push({ id: d, text: text.slice(0, 1500) })
+    }
+    return out
+  }
+
   /**
    * Spend the session budget must already cover: what was charged, plus, for every worker
    * still in flight, the rest of its pre-spawn estimate. Several admissions in one pass then
@@ -504,7 +522,7 @@ export class Mission {
     const spec: WorkerSpec = {
       attemptId: a.id, runDir, workdir, writable: !readOnly, gitCommonDir: this.header.commonDir, gitAdminDir: admin,
       provider: a.provider, model: a.model, cliThinking: a.cliThinking ?? 'none', expectedWire: a.expectedWire ?? 'none',
-      prompt: workerPrompt(t.spec, { evidence: t.evidence, readOnly, allowedTools }),
+      prompt: workerPrompt(t.spec, { evidence: t.evidence, readOnly, allowedTools, dependencyResults: this.dependencyResults(t) }),
       policy: { workdir, owned: t.spec.owned, mode: t.spec.mode, allowedTools },
       timeoutSeconds: this.config.limits.workerTimeoutSeconds, clineRetries: this.config.limits.clineRetries,
       hide: this.config.sandbox.hide, network: this.config.sandbox.allowNetwork, clineBin: this.deps.clineBin, clineDataDir: this.deps.clineDataDir,
@@ -695,8 +713,10 @@ export class Mission {
     const p = parsePlan(text, this.known(), planPrefix(t.spec.id))
     if (!p.ok) { this.ledger.append('plan_rejected', t.spec.id, { reason: p.reason }); t.verification = 'SELF_REPORTED_UNCHECKED'; this.problem(`commander plan rejected: ${p.reason}`); return }
     const dropped: string[] = []
-    for (const s of p.tasks) { const r = this.addTask(s, 'commander-plan'); if (r.ok) t.children.push(s.id); else dropped.push(`${s.id}: ${r.reason}`) }
-    this.ledger.append('plan_accepted', t.spec.id, { tasks: t.children, dropped })
+    // the commander's architecture is written once, in the plan, and handed to every planned task
+    const design = p.design ? `Architecture from the commander's plan (follow it):\n${p.design}\n\n` : ''
+    for (const s of p.tasks) { const r = this.addTask({ ...s, prompt: `${design}${s.prompt}` }, 'commander-plan'); if (r.ok) t.children.push(s.id); else dropped.push(`${s.id}: ${r.reason}`) }
+    this.ledger.append('plan_accepted', t.spec.id, { tasks: t.children, dropped, design: p.design ? p.design.slice(0, 2000) : null })
     if (dropped.length) { this.live.counters.refused += dropped.length; this.problem(`commander plan partly dropped (${dropped.length} of ${p.tasks.length}): ${dropped.join('; ')}`) }
   }
 
