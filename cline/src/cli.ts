@@ -235,7 +235,19 @@ const smoke = async (a: Args): Promise<number> => {
   return failures ? 1 : 0
 }
 
+/** The interactive Cockpit: HUD, conversation and supervised turns in one terminal. */
+const shell = async (a: Args): Promise<number> => {
+  const { config, catalog, resolutions } = await setup(a)
+  const info = await repoInfo(resolve(str(a, 'repo') ?? process.cwd()))
+  const { Shell } = await import('./shell.ts')
+  const s = new Shell({ stateRoot: root(a), repoDir: info.root, config, resolutions, clineVersion: catalog.clineVersion, deps: deps(a, info.root), gates: gatesOf(a, info.root), allowDirty: !!a.flags['allow-dirty'], fresh: !!a.flags.new, acceptConfigChange: !!a.flags['accept-config-change'] })
+  await s.start()
+  return new Promise<number>(() => { /* the shell exits the process itself */ })
+}
+
 const HELP = `cockpit-cline — Cobalt Cockpit for Cline
+  (no command, in a terminal)    the interactive Cockpit: live HUD, conversation, every turn supervised
+  shell [--repo DIR] [--new] [--gate name=cmd]... [--share node_modules] [--allow-dirty]
   doctor [--repo DIR]            installed Cline, sandbox, auth, model resolution and reasoning checks
   models                         configured role -> provider/model table
   route --kind K --risk R --complexity N --mode read|write [--prompt TEXT]   explain one routing decision
@@ -262,7 +274,10 @@ export const main = async (argv: string[]): Promise<number> => {
       case 'replay': return replay(a)
       case 'list': return list(a)
       case 'smoke': return await smoke(a)
-      default: print(HELP); return cmd ? 2 : 0
+      case 'shell': return await shell(a)
+      case undefined: if (process.stdin.isTTY && process.stdout.isTTY) return await shell(a); print(HELP); return 0
+      case 'help': case '--help': print(HELP); return 0
+      default: print(HELP); return 2
     }
   } catch (e) { process.stderr.write(`cockpit-cline: ${(e as Error).message}\n`); return 1 }
 }

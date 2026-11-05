@@ -67,13 +67,18 @@ export const validateTasks = (raw: unknown, opts: { max: number; depth: number; 
   return { ok: true, tasks: out }
 }
 
-export const parsePlan = (text: string, existing: IdSet = new Set<string>()): Parsed => {
+export const parsePlan = (text: string, existing: IdSet = new Set<string>(), idPrefix = ''): Parsed => {
   const block = lastJsonBlock(text)
   if (!block) return { ok: false, reason: 'no ```json plan block in the commander output' }
   let doc: unknown
   try { doc = JSON.parse(block) } catch (e) { return { ok: false, reason: `plan JSON invalid: ${(e as Error).message}` } }
-  return validateTasks(doc, { max: MAX_PLAN_TASKS, depth: 1, parent: null, existing })
+  return validateTasks(doc, { max: MAX_PLAN_TASKS, depth: 1, parent: null, existing, idPrefix })
 }
+
+/** A planning task: the mission's own `plan`, or a conversation turn's `<turn>.plan`. */
+export const isPlanTask = (id: string): boolean => id === 'plan' || id.endsWith('.plan')
+/** Task ids a plan produces are prefixed by the turn that asked for it, so turns never collide. */
+export const planPrefix = (id: string): string => id === 'plan' ? '' : `${id.slice(0, -'plan'.length)}`
 
 export const REQUEST_MARKER = 'COCKPIT_REQUEST'
 /** A worker's request for more work; validated like a plan, one level deeper, prefixed by its parent id. */
@@ -111,7 +116,7 @@ ${goal}`
 export const workerPrompt = (t: TaskSpec, ctx: { evidence?: string[]; readOnly: boolean; allowedTools: string[] }): string => `${t.prompt}
 
 -- Cobalt Cockpit worker contract --
-Task: ${t.id} · ${t.title}
+Task: ${t.id}${t.prompt.includes(t.title) ? '' : ` · ${t.title}`}
 ${ctx.readOnly ? 'This task is READ-ONLY: do not modify files.' : `You may modify only: ${t.owned.join(', ')} (repository-relative; "*" means the whole tree).`}
 Allowed tools: ${ctx.allowedTools.join(', ')}. Any other tool, launching agents, or Git commits/branches aborts the run.
 Cockpit runs the tests, type checks and Git checks itself after you finish; your own claims are not accepted as verification.

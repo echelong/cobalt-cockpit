@@ -11,7 +11,8 @@ import type { Resolution } from './catalog.ts'
 import { planReasoning } from './reasoning.ts'
 import { preSpawnEstimate, pricingFor } from './cost.ts'
 
-export const KINDS = ['scout', 'implement', 'frontend', 'test', 'debug', 'architecture', 'review', 'docs'] as const
+/** `ask`: a read-only conversational answer about the code; it takes the default (coder) rule. */
+export const KINDS = ['scout', 'implement', 'frontend', 'test', 'debug', 'architecture', 'review', 'docs', 'ask'] as const
 export type Kind = typeof KINDS[number]
 export const RISKS = ['low', 'medium', 'high', 'critical'] as const
 export type Risk = typeof RISKS[number]
@@ -24,6 +25,7 @@ export type TaskSpec = {
   /** Expected context the task must hold, in tokens, when known. */ contextTokens?: number
   /** Delegation depth: 0 for the person's task, 1 for planner tasks, +1 per worker request. */ depth?: number
   /** The task that requested this one, if any. */ parent?: string | null
+  /** A conversation turn may legitimately end with no edits (it is reported as such, not escalated). Never set from model output. */ allowNoChanges?: boolean
 }
 export type FailureHistory = { attempts: number; gateFailures: number; escalated: boolean; lastFailure: FailureClass | null }
 export type Health = Record<string, { consecutiveErrors: number; unhealthy: boolean }>

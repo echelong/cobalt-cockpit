@@ -118,7 +118,7 @@ exec "${process.execPath}" --experimental-transform-types --no-warnings --import
 
 export type Control = { cancel: (why: string) => void }
 
-export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) => void; facts?: (f: StreamFacts) => void; control?: (c: Control) => void } = {}, io: { launch?: typeof launch } = {}): Promise<WorkerOutcome> => {
+export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) => void; facts?: (f: StreamFacts) => void; control?: (c: Control) => void; event?: (e: Record<string, unknown>) => void } = {}, io: { launch?: typeof launch } = {}): Promise<WorkerOutcome> => {
   const ro = join(w.runDir, 'ro'), rw = join(w.runDir, 'rw'), cap = join(rw, 'capture'), cfg = join(rw, 'cline-config')
   for (const d of [join(ro, 'hooks'), cap, cfg]) mkdirSync(d, { recursive: true, mode: 0o700 })
   writeFileSync(join(ro, 'policy.json'), JSON.stringify(w.policy, null, 1), { mode: 0o400 })
@@ -179,6 +179,8 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
     for await (const line of rl) {
       streamFile.write(`${line}\n`)
       foldLine(facts, line)
+      // display passthrough only: what a worker prints is never trusted for decisions here
+      if (on.event) { try { const o = JSON.parse(line) as unknown; if (o && typeof o === 'object') on.event(o as Record<string, unknown>) } catch { /* not JSON, or a failing viewer */ } }
       const b = budgetVerdict(facts, w)
       if (b) stopNow(b.stop, b.detail)
       // A failing observer (for example a full disk while persisting) must not stop the

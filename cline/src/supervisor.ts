@@ -25,7 +25,7 @@ import { gateTaint, gitGate, packageScripts, runCommandGate, securityGate } from
 import type { GateResult, GateSpec } from './gates.ts'
 import { addTaskWorktree, changesOf, commitTask, createIntegration, headOf, integrate, integratedCommitFor, missionBranch, repoInfo } from './git.ts'
 import type { RepoInfo } from './git.ts'
-import { needsCommander, parsePlan, parseRequest, plannerPrompt, workerPrompt } from './planner.ts'
+import { isPlanTask, needsCommander, parsePlan, parseRequest, planPrefix, plannerPrompt, workerPrompt } from './planner.ts'
 import { ownedCovers } from './hook/policy.ts'
 import {
   Archive, Ledger, breakStaleLock, claimsLock, epochToken, listClaims, lostMissions, newId, readJson, retireClaim, retireMarker,
@@ -70,7 +70,7 @@ export type Live = {
 }
 export type Header = {
   id: string; repoRoot: string; commonDir: string; base: string; createdAt: string; profile: string; strict: boolean
-  goal: string; epoch: string; configDigest: string; gates: GateSpec[]; clineVersion: string; mode: 'single' | 'commander' | 'plan-file'
+  goal: string; epoch: string; configDigest: string; gates: GateSpec[]; clineVersion: string; mode: 'single' | 'commander' | 'plan-file' | 'conversation'
   modeReason: string; review: boolean; requireGates: boolean
 }
 export type Deps = {
@@ -78,6 +78,8 @@ export type Deps = {
   runWorker: typeof runWorker
   shareDirs: { from: string; to: string }[]
   log: (line: string) => void
+  /** Every parsed JSONL event of a worker, for live display (the interactive shell streams text from it). */
+  onEvent?: (taskId: string, attemptId: string, event: Record<string, unknown>) => void
 }
 
 const TERMINAL: TaskState[] = ['completed', 'failed', 'cancelled', 'refused']
@@ -112,7 +114,7 @@ export class Mission {
   }
 
   // ----- creation and loading --------------------------------------------------
-  static async create(o: { stateRoot: string; repoDir: string; goal: string; config: Config; resolutions: Record<Role, Resolution>; deps: Deps; gates: GateSpec[]; clineVersion: string; tasks?: TaskSpec[]; single?: boolean; swarm?: boolean; review?: boolean; allowDirty?: boolean; requireGates?: boolean }): Promise<Mission> {
+  static async create(o: { stateRoot: string; repoDir: string; goal: string; config: Config; resolutions: Record<Role, Resolution>; deps: Deps; gates: GateSpec[]; clineVersion: string; tasks?: TaskSpec[]; single?: boolean; swarm?: boolean; review?: boolean; allowDirty?: boolean; requireGates?: boolean; conversation?: boolean }): Promise<Mission> {
     const repo = await repoInfo(o.repoDir)
     const lost = lostMissions(repo.commonDir)
     if (lost.length) throw new Error(`mission state is missing for ${lost.map(l => `${l.marker.missionId} (${l.why})`).join('; ')}. Run: cockpit-cline recover --lost <id>. No new mission starts while a mission's claims cannot be accounted for.`)
@@ -121,11 +123,11 @@ export class Mission {
     const dir = missionDir(o.stateRoot, id)
     mkdirSync(join(dir, 'runs'), { recursive: true, mode: 0o700 })
     const epoch = epochToken()
-    const decision = o.tasks ? { commander: false, reason: 'plan file supplied' } : needsCommander(o.goal, { swarm: o.swarm, single: o.single })
+    const decision = o.conversation ? { commander: false, reason: 'interactive conversation: each turn is routed on its own' } : o.tasks ? { commander: false, reason: 'plan file supplied' } : needsCommander(o.goal, { swarm: o.swarm, single: o.single })
     const header: Header = {
       id, repoRoot: repo.root, commonDir: repo.commonDir, base: repo.head, createdAt: new Date().toISOString(), profile: o.config.profile, strict: o.config.strict,
       goal: o.goal, epoch, configDigest: configDigest(o.config), gates: o.gates, clineVersion: o.clineVersion,
-      mode: o.tasks ? 'plan-file' : decision.commander ? 'commander' : 'single', modeReason: decision.reason, review: o.review ?? decision.commander, requireGates: o.requireGates ?? true,
+      mode: o.conversation ? 'conversation' : o.tasks ? 'plan-file' : decision.commander ? 'commander' : 'single', modeReason: decision.reason, review: o.conversation ? false : (o.review ?? decision.commander), requireGates: o.requireGates ?? true,
     }
     const integrationDir = join(o.stateRoot, 'worktrees', id, '_integration')
     mkdirSync(join(o.stateRoot, 'worktrees', id), { recursive: true, mode: 0o700 })
@@ -143,7 +145,8 @@ export class Mission {
     }
     const m = new Mission(dir, header, live, o.config, o.resolutions, o.deps)
     m.ledger.append('mission_created', null, { header: { ...header, goal: header.goal.slice(0, 2000) }, models: Object.fromEntries(ROLES.map(r => [r, o.resolutions[r].ok ? `${o.resolutions[r].provider}/${o.resolutions[r].model}` : `UNRESOLVED: ${(o.resolutions[r] as { reason: string }).reason}`])) })
-    if (o.tasks) for (const t of o.tasks) m.addTask(t, 'plan-file')
+    if (o.conversation) { /* turns arrive one by one through addTask */ }
+    else if (o.tasks) for (const t of o.tasks) m.addTask(t, 'plan-file')
     else if (decision.commander) m.addTask({ id: 'plan', title: 'Commander: decompose the goal', kind: 'architecture', risk: 'medium', complexity: 4, mode: 'read', owned: ['*'], dependencies: [], prompt: plannerPrompt(o.goal, `${repo.root} at ${repo.head.slice(0, 12)}`), priority: 9, depth: 0, parent: null }, 'commander-planning')
     else m.addTask({ id: 'task', title: o.goal.split('\n')[0].slice(0, 120), kind: 'implement', risk: 'medium', complexity: 3, mode: 'write', owned: ['*'], dependencies: [], prompt: o.goal, priority: 5, depth: 0, parent: null }, 'single')
     m.live.state = 'running'
@@ -341,6 +344,21 @@ export class Mission {
     return /ownership conflict|resource budget|occupied|session budget reached|unmetered|stop requested|claims unreadable|store capacity/.test(r)
   }
 
+  /**
+   * Cancels one task (a conversation turn) without stopping the mission: a queued task ends
+   * cancelled, a task being prepared is cancelled before launch, a running worker is stopped and
+   * then accounted for by the usual census before its ownership is released.
+   */
+  cancelTask(id: string, why = 'cancelled by the person'): boolean {
+    const t = this.live.tasks[id]
+    if (!t || ['completed', 'failed', 'cancelled', 'refused'].includes(t.state)) return false
+    this.pendingCancel.add(id)
+    this.ledger.append('cancel_requested', id, { why })
+    if (t.state === 'queued') this.endTask(t, 'cancelled', why)
+    for (const a of t.attempts) if (a.phase !== 'ended') this.controls.get(a.id)?.cancel(why)
+    return true
+  }
+
   requestStop(why: string): void {
     if (this.live.stopRequested) return
     this.live.stopRequested = why
@@ -503,6 +521,7 @@ export class Mission {
         this.persist(true)
       },
       facts: f => { this.absorb(a, f); this.chargeSession(); this.persist() },
+      event: e => this.deps.onEvent?.(t.spec.id, a.id, e),
       control: c => {
         this.controls.set(a.id, c)
         // a cancel, stop or cap that landed between admission and launch still applies
@@ -640,7 +659,7 @@ export class Mission {
     const structural = bad.find(x => x.kind === 'git' || x.kind === 'security')
     if (structural) { await this.failed(t, a, 'policy_abort', `${structural.name} gate: ${structural.evidence}`, []); return }
     const claimed = SUCCESS_CLAIM.test(a.resultExcerpt ?? '')
-    if (t.spec.mode === 'write' && g.changes.length === 0 && !['review', 'scout'].includes(t.spec.kind)) { await this.failed(t, a, claimed ? 'misreported_completion' : 'no_changes', `write task finished with no changes${claimed ? ' while claiming success' : ''}`, [`previous attempt made no changes${claimed ? ' but reported success' : ''}`]); return }
+    if (t.spec.mode === 'write' && g.changes.length === 0 && !['review', 'scout'].includes(t.spec.kind) && !t.spec.allowNoChanges) { await this.failed(t, a, claimed ? 'misreported_completion' : 'no_changes', `write task finished with no changes${claimed ? ' while claiming success' : ''}`, [`previous attempt made no changes${claimed ? ' but reported success' : ''}`]); return }
     if (bad.length) { await this.failed(t, a, claimed ? 'misreported_completion' : 'gate_failed', `${bad.map(x => `${x.name} ${x.state}`).join(', ')}${claimed ? ' (worker claimed success)' : ''}`, bad.map(x => `${x.name} (${x.command ?? x.kind}) ${x.state}: ${x.evidence.slice(-800)}`)); return }
     if (this.header.requireGates && t.spec.mode === 'write' && this.header.gates.length === 0) this.live.alerts.push(`${t.spec.id}: no command gates configured; change is checked for scope and secrets only`)
     // Integration is serial: one pick at a time, onto the mission branch only.
@@ -657,7 +676,7 @@ export class Mission {
     }
     t.verification = 'PROVISIONAL_CHECKED'
     this.harvestRequests(t, fullText)
-    if (t.spec.id === 'plan') this.harvestPlan(t, fullText)
+    if (isPlanTask(t.spec.id)) this.harvestPlan(t, fullText)
     if (t.spec.id === 'final-review') this.live.review = { text: a.resultExcerpt, attempt: a.id }
     this.endAttempt(t, a, 'completed')
     this.endTask(t, 'completed', null)
@@ -673,7 +692,7 @@ export class Mission {
 
   /** Parses the commander's FULL answer (not the display excerpt). Any rejected or dropped task keeps DONE away. */
   private harvestPlan(t: TaskRecord, text: string): void {
-    const p = parsePlan(text, this.known())
+    const p = parsePlan(text, this.known(), planPrefix(t.spec.id))
     if (!p.ok) { this.ledger.append('plan_rejected', t.spec.id, { reason: p.reason }); t.verification = 'SELF_REPORTED_UNCHECKED'; this.problem(`commander plan rejected: ${p.reason}`); return }
     const dropped: string[] = []
     for (const s of p.tasks) { const r = this.addTask(s, 'commander-plan'); if (r.ok) t.children.push(s.id); else dropped.push(`${s.id}: ${r.reason}`) }
@@ -687,7 +706,7 @@ export class Mission {
    * parent's ownership. Any violation refuses the whole request.
    */
   private harvestRequests(t: TaskRecord, text: string): void {
-    if (!text || t.spec.id === 'plan') return
+    if (!text || isPlanTask(t.spec.id)) return
     const r = parseRequest(text, t.spec, this.config.limits.maxChildrenPerTask, this.known())
     if (r === null) return
     let refusal = r.ok ? null : r.reason
