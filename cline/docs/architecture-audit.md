@@ -90,7 +90,7 @@ process per worker inside its own bubblewrap sandbox. A native plugin remains a 
 
 ## 6. Independent review
 
-Three fresh-context, read-only reviews (Sonnet, high effort), each given the code and the stated invariants, not
+Four fresh-context, read-only reviews (Sonnet, high effort), each given the code and the stated invariants, not
 the author's conclusions.
 
 - **Round 1** (on `18c5ca1`): NOT CLEAN, 9 MATERIAL and 3 SHOULD-FIX findings: gate side effects committed
@@ -120,6 +120,32 @@ the author's conclusions.
   branch-gate labels (S11). All fixed in `4c21efc` with regression tests (`test/review3.spec.ts`); 13 of its 14
   tests fail on the pre-fix source and pass after (the 14th guards that a malformed request stays refused). The
   review found the truncated-capture parser sound and no path that runs Cline outside the supervisor.
+- **Round 4** (on `960c4bd`, HUD 2.0): NOT ready, 3 MATERIAL and 9 SHOULD-FIX. MATERIAL:
+  - model, tool, path, gate-output and pasted text reached the terminal unsanitized in several sinks, and C1
+    control characters were not stripped;
+  - a resize before the conversation opened crashed the shell;
+  - the COSTS view showed unknown cost as `$0`.
+
+  SHOULD-FIX:
+  - a transient FAILED label while a finished worker was being classified;
+  - failing gates outside TEST/TYPE/BUILD were invisible;
+  - the spend split was derived from a partial record set;
+  - emoji widths were miscounted;
+  - the cursor drifted on tabs;
+  - a first ledger read could be unbounded;
+  - Mission Control swallowed typing silently;
+  - a render error froze the screen;
+  - events of out-of-view attempts were attributed to COCKPIT.
+
+  All fixed in `3029ccc`, with regression tests in `test/hud.spec.ts` and `test/shell.spec.ts`. The fixes:
+  - every row keeps only the HUD's own SGR;
+  - escape sequences split across stream chunks are held and removed whole;
+  - autowrap is off while the shell runs, and the terminal is restored on any exit;
+  - unknown cost reads `—` and partial reporting reads `≥`;
+  - an OTHER gate row appears for unmapped gates.
+
+  The review found the DONE gating, read-only use of routing, claims and archive, the reasoning `✓` rule, frame
+  geometry, key handling and the ledger-tail offsets sound.
 - The reviews found sound: the census logic after the inode fix, the ledger hash chain, claim overlap
   normalisation, DeepSeek-never-substituted routing, bounded `nextStep`, wire judging, and that no stop or cancel
   path releases ownership without a clean census.
@@ -148,6 +174,8 @@ adapter's own tests are `*.spec.ts`, which `claude plugin test` does not collect
 | re-check after `4c21efc`, `--budget-usd 0.50` | Ctrl+D mid-turn stopped t2; relaunch resumed and reconciled; new turn t3 completed (GLM); `/swarm` refused before spawn by the $0.63 commander reservation (fail-closed) | $0.00218 |
 | swarm re-check after `4c21efc`, `--budget-usd 1.00` | Kimi plan; planned implementation task on DeepSeek 1017 xhigh→max (rule D), docs on GLM (U2); `FINISHED · VERIFIED`, no problems | $0.0637 |
 
+| HUD 2.0 (`3029ccc`), real shell in a pty at 170×50, `--budget-usd 1.00` | DeepSeek 1017 (xhigh→max ✓) added `milesToKm` with a test; Kimi `/swarm` planned two tasks, DeepSeek (rule D) added temperature conversions and GLM (U2) wrote the README; every task gated and integrated, `FINISHED · VERIFIED`, no problems; quit and reopened at 96×32 with the conversation and timeline restored; frames and PNG screenshots in `acceptance/20261105T201244Z-hud2/` | $0.0489 |
+
 The probes before the adapter existed (GLM write, DeepSeek wire capture with a cancelling hook, GLM in bubblewrap)
-cost about $0.005 in total. All live runs together: $0.811 reported by Cline plus about $0.005 of probes. The
+cost about $0.005 in total. All live runs together: $0.860 reported by Cline plus about $0.005 of probes. The
 run artifacts (frames, ledgers, live state) are kept under `~/.local/state/cobalt-cockpit-cline/acceptance/`.

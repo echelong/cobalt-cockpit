@@ -74,8 +74,11 @@ retries and escalations), `5` VERIFY (the five gates with their evidence and the
 by model, by task), `?` KEYS.
 
 Rendering is flicker-free: frames are written inside a synchronized-update block and only changed rows are
-rewritten; a resize repaints once at the new size; nothing ever reaches the last column, so a frame can never
-wrap or scroll. Model output is stripped of escape sequences before it is shown. Wide, medium (80–119 columns),
+rewritten; a resize repaints once at the new size; nothing reaches the last column and autowrap is off while the
+shell runs, so a frame can never wrap or scroll. Text from models, tools, file paths, test output and pastes is
+stripped of every escape and control sequence (CSI, OSC, DCS, 8-bit C1) before it is shown, including sequences a
+stream splits across chunks; only the HUD's own colour codes reach the terminal, and the terminal is restored
+however the shell exits. Wide, medium (80–119 columns),
 narrow (under 80) and very small terminals each get their own layout, down to 40×12. `NO_COLOR=1` draws no colour
 (state pills keep their shape as `[READY]`), `COCKPIT_COLOR=none|16|256|truecolor` forces a mode, and
 `COCKPIT_REDUCED_MOTION=1` turns off the spinner and waveform (the screen then changes only when state does, plus

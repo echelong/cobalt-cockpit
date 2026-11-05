@@ -43,6 +43,8 @@ describe('the integrated Cockpit shell', () => {
     assert.match(f, /SECURITY\s+✓ PASS/); assert.match(f, /GIT\s+✓ PASS/)
     assert.match(f, /OUTCOME\s+FINISHED · VERIFIED/)
     assert.match(f, /◉ verdict DONE/, 'the activity strip shows the ledger verdict')
+    // the idle screen catches up with the retired claim by itself (no key press, no new event)
+    await p.waitFor(/OWNERSHIP none held/, 5000)
     // the full timeline has the worker's own edit and the supervisor's gates and integration
     p.send(KEYS.tab); p.send('3'); const tl = await p.waitFor(/01 TIMELINE \/ REAL EVENTS/)
     assert.match(tl, /CODER\s+t1\s+✎ editor src\/hello\.txt/); assert.match(tl, /◆ #1 gates GIT ✓ SECURITY ✓ exists ✓/); assert.match(tl, /⇢ #1 integrated/)

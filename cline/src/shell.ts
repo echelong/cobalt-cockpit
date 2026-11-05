@@ -463,6 +463,7 @@ export class Shell {
   // ----- rendering -----------------------------------------------------------------------------------
   private bodyCache: { view: Line[] | null; w: number; n: number; lines: string[] } = { view: null, w: 0, n: 0, lines: [] }
   private claimsCache: { at: number; claims: ReturnType<typeof listClaims>['claims'] } = { at: 0, claims: [] }
+  private claimsKey = ''
   private styled(l: Line, w: number): string[] {
     const t = l.style ? STYLE[l.style] : undefined
     // transcript text includes model answers, tool paths and replayed history: sanitized before wrapping
@@ -546,6 +547,14 @@ export class Shell {
   private pulse(): void {
     if (!this.mission) return
     if (this.pumpLedger()) this.dirty = true
+    // ownership changes outside the ledger's rhythm (a claim retired after the last event): re-read each
+    // second and repaint when it changed, so an idle screen never shows a claim that no longer exists
+    if (this.claimsCache.at < Date.now() - 1000) {
+      const claims = listClaims(this.mission.header.commonDir).claims
+      const key = claims.map(c => `${c.missionId}/${c.taskId}#${c.attempt}:${c.state}`).join(',')
+      if (key !== this.claimsKey) { this.claimsKey = key; this.dirty = true }
+      this.claimsCache = { at: Date.now(), claims }
+    }
     const running = Object.values(this.mission.live.tasks).some(t => t.attempts.some(a => a.phase !== 'ended'))
     if (this.motion && (running || this.busy)) { this.tick++; this.dirty = true }
     const sec = Math.floor(Date.now() / 1000)

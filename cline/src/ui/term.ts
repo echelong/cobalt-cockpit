@@ -21,7 +21,8 @@ export const reducedMotion = (env: NodeJS.ProcessEnv = process.env): boolean => 
 // Semantic tokens. Foregrounds on a dark terminal use the bright partner of each state colour so
 // small monospace text keeps its contrast; the deep tones are kept for filled badges.
 const TOKENS = {
-  accent: PALETTE.red, accentGlow: PALETTE.redGlow, head: PALETTE.silver, label: PALETTE.steel, rule: '#2B313C',
+  // rules and empty bar cells: quiet, but visible on a near-black terminal (the theme's edge tone is too dark for glyphs)
+  accent: PALETTE.red, accentGlow: PALETTE.redGlow, head: PALETTE.silver, label: PALETTE.steel, rule: '#465061',
   ok: PALETTE.greenGlow, okFill: PALETTE.green, warn: PALETTE.amberGlow, warnFill: PALETTE.amber,
   fail: '#FF3352', failFill: PALETTE.redDeep, scan: PALETTE.cyan, scanFill: PALETTE.cyanDeep, idle: '#8A90A2', idleFill: '#646A7E',
 } as const
