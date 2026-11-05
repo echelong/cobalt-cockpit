@@ -20,6 +20,7 @@ import { routeTask } from './router.ts'
 import { plannerPrompt } from './planner.ts'
 import { usd } from './cost.ts'
 import { repoInfo } from './git.ts'
+import { statusOf } from './status.ts'
 
 // ---------------------------------------------------------------------------
 // Terminal primitives
@@ -243,8 +244,8 @@ export class Shell {
   private async command(line: string): Promise<void> {
     const [cmd, ...rest] = line.slice(1).split(' '); const arg = rest.join(' ').trim()
     switch (cmd) {
-      case 'cockpit': case 'mc': this.overlay = !this.overlay; break
-      case 'help': this.system('/cockpit (Tab) mission control · /swarm <goal> commander plans · /route <text> explain routing · /models · /cancel (Esc) · /diff · /new · /quit (Ctrl-D) · PgUp/PgDn scroll', 'cyan'); break
+      case 'cockpit': case 'mc': if (arg) await this.cockpit(arg); else this.overlay = !this.overlay; break
+      case 'help': this.system('/cockpit (Tab) mission control · /cockpit agents|routing|costs|ready|doctor · /swarm <goal> commander plans · /route <text> explain routing · /models · /cancel (Esc) · /diff · /new · /quit (Ctrl-D) · PgUp/PgDn scroll', 'cyan'); break
       case 'models': for (const r of ROLES) { const res = this.mission.resolutions[r]; const spec = this.mission.config.profiles[this.mission.config.profile].roles[r]; this.system(`${ROLE_LABEL[r].padEnd(10)} ${spec.provider}/${spec.model} reasoning ${spec.reasoning}${res.ok ? '' : ` UNRESOLVED: ${res.reason}`}`, res.ok ? 'cyan' : 'red') } break
       case 'route': {
         if (!arg) { this.system('usage: /route <message>', 'yellow'); break }
@@ -271,6 +272,57 @@ export class Shell {
     }
     this.dirty = true
   }
+  /** `/cockpit <view>`: real supervisor and system state, printed into the transcript. */
+  private async cockpit(sub: string): Promise<void> {
+    const recs = [...this.taskRecords()].map(([, t]) => t).sort((x, y) => x.createdAt - y.createdAt)
+    switch (sub.split(' ')[0]) {
+      case 'agents': {
+        if (!recs.length) { this.system('no agents yet', 'dim'); return }
+        for (const t of recs.slice(-20)) {
+          const retry = (t.retryAt ?? 0) > Date.now() ? ` retry in ${Math.ceil(((t.retryAt ?? 0) - Date.now()) / 1000)}s` : ''
+          this.system(`${t.spec.id.padEnd(18)} ${t.state.padEnd(9)}${retry} ${t.spec.kind}/${t.spec.risk} owns ${t.spec.owned.join(',')}${t.reason ? ` · ${t.reason.slice(0, 120)}` : ''}`, t.state === 'completed' ? 'green' : t.state === 'failed' || t.state === 'held' ? 'red' : 'cyan')
+          for (const a of t.attempts) this.system(`   #${a.n} ${a.role.padEnd(10)} ${a.provider}/${a.model} ${reasoningCell(a)} ${a.phase} ${a.usageEvents ? `${a.usage.inputTokens}/${a.usage.outputTokens} tok` : 'no usage'} ${usd(a.charge.usd)}${a.charge.basis === 'estimate' ? ' est.' : ''}${a.failure ? ` ✗ ${a.failure}: ${(a.failureDetail ?? '').slice(0, 100)}` : ''}`, 'dim')
+        }
+        return
+      }
+      case 'routing': {
+        const atts = recs.flatMap(t => t.attempts.map(a => ({ t, a }))).slice(-12)
+        if (!atts.length) { this.system('no routing decisions yet', 'dim'); return }
+        for (const { t, a } of atts) this.system(`${t.spec.id}#${a.n} → ${a.role} ${a.model} ${a.requestedReasoning}→${a.expectedWire} · ${a.route.rules.join('; ')}${a.route.signals.length ? ` · signals: ${a.route.signals.join(', ')}` : ''}`, 'cyan')
+        return
+      }
+      case 'costs': {
+        const by = new Map<string, { usd: number; inTok: number; outTok: number; cache: number; est: boolean; n: number }>()
+        for (const t of recs) for (const a of t.attempts) { const k = `${a.role} ${a.model}`; const x = by.get(k) ?? { usd: 0, inTok: 0, outTok: 0, cache: 0, est: false, n: 0 }; x.usd += a.charge.usd ?? 0; x.inTok += a.usage.inputTokens; x.outTok += a.usage.outputTokens; x.cache += a.usage.cacheReadTokens; x.est ||= a.charge.basis === 'estimate'; x.n++; by.set(k, x) }
+        for (const [k, x] of by) this.system(`${k.padEnd(48)} ${x.n} attempt(s) · in ${x.inTok} (cache ${x.cache}) · out ${x.outTok} · ${usd(x.usd)}${x.est ? ' (part estimated)' : ' (Cline-reported)'}`, 'cyan')
+        const s = this.mission.live.session
+        this.system(`session ${s.unmetered ? 'UNMETERED' : usd(s.spentUsd)} of $${this.mission.config.budgets.sessionUsd.toFixed(2)} · committed incl. in-flight ${usd(this.mission.committedUsd())}${s.capReached ? ' · CAP REACHED' : ''}`, s.capReached || s.unmetered ? 'red' : 'cyan')
+        return
+      }
+      case 'ready': case 'doctor': {
+        const { providerAuth } = await import('./catalog.ts')
+        const { bwrapAvailable } = await import('./sandbox.ts')
+        const { lostMissions } = await import('./store.ts')
+        const problems: string[] = []
+        const roles = this.mission.config.profiles[this.mission.config.profile].roles
+        for (const r of ROLES) { const res = this.mission.resolutions[r]; if (!res.ok) problems.push(`${r}: ${res.reason}`) }
+        for (const p of [...new Set(ROLES.map(r => roles[r].provider))]) { const a = providerAuth(p, this.mission.deps.clineDataDir); if (!a.configured) problems.push(`provider ${p}: ${a.note}`) }
+        const bw = await bwrapAvailable(); if (!bw.ok) problems.push(`sandbox: ${bw.detail}`)
+        const held = Object.values(this.mission.live.tasks).filter(t => t.state === 'held'); if (held.length) problems.push(`${held.length} task(s) hold ownership: ${held.map(t => t.spec.id).join(', ')}`)
+        const lost = lostMissions(this.mission.header.commonDir); if (lost.length) problems.push(`lost mission state: ${lost.map(l => l.marker.missionId).join(', ')}`)
+        if (this.mission.live.session.capReached) problems.push('session budget reached')
+        if (this.mission.live.session.unmetered) problems.push('session usage unmetered')
+        if (sub.startsWith('doctor')) {
+          this.system(`Cline ${this.mission.header.clineVersion} · profile ${this.mission.config.profile} · ${this.mission.config.strict ? 'strict' : 'non-strict'} · sandbox ${bw.detail}`, 'cyan')
+          for (const r of ROLES) { const res = this.mission.resolutions[r]; this.system(`${ROLE_LABEL[r].padEnd(10)} ${roles[r].provider}/${roles[r].model} reasoning ${roles[r].reasoning}${res.ok ? ` · catalog levels ${res.reasoningValues.join('|') || (res.reasoningToggle ? 'toggle' : 'none')}` : ` · UNRESOLVED ${res.reason}`}`, res.ok ? 'dim' : 'red') }
+        }
+        this.system(problems.length ? `NOT READY: ${problems.join(' · ')}` : 'READY: all five roles resolve, providers signed in, sandbox works, no held ownership, budget available', problems.length ? 'red' : 'green')
+        return
+      }
+      default: this.system(`unknown /cockpit view "${sub}"; use agents, routing, costs, ready or doctor`, 'yellow')
+    }
+  }
+
   private async openMissionFresh(): Promise<void> { const fresh = this.o.fresh; (this.o as { fresh: boolean }).fresh = true; try { await this.openMission() } finally { (this.o as { fresh: boolean }).fresh = fresh } }
 
   private cancelTurn(): void {
@@ -338,20 +390,32 @@ export class Shell {
   }
 
   // ----- rendering -----------------------------------------------------------------------------------
-  private roleRow(r: Role, records: readonly TaskRecord[], cols: number): string {
+  /** One crew row: the role's model, requested→effective reasoning and what it is doing now, all from live records. */
+  private roleRow(r: Role, records: readonly TaskRecord[], queuedFor: ReadonlyMap<Role, TaskRecord[]>, cols: number): string {
     const spec = this.mission.config.profiles[this.mission.config.profile].roles[r]
     const res = this.mission.resolutions[r]
     const atts: { t: TaskRecord; a: AttemptRecord }[] = []
     for (const t of records) for (const a of t.attempts) if (a.role === r) atts.push({ t, a })
-    const running = atts.filter(x => x.a.phase !== 'ended')
-    const last = atts.at(-1)?.a
-    const held = running.some(x => x.a.phase === 'held')
-    const state = !res.ok ? S.red('UNAVAILABLE') : held ? S.red('HELD') : running.length ? S.green(`RUNNING ×${running.length}`) : S.gray('idle')
-    const reasoning = last ? reasoningCell(last) : `${spec.reasoning}→${S.gray('?')}`
-    const job = running[0] ? `${running[0].t.spec.id}#${running[0].a.n} it${running[0].a.iterations || 0} ${Object.values(running[0].a.toolCalls).reduce((x, y) => x + y, 0)} tools ${running[0].a.usageEvents ? `${Math.round(running[0].a.usage.inputTokens / 100) / 10}k tok` : ''}` : ''
+    const running = atts.filter(x => x.a.phase !== 'ended' && x.a.phase !== 'held')
+    const held = atts.filter(x => x.a.phase === 'held')
+    const last = atts.at(-1)
+    const queued = queuedFor.get(r) ?? []
+    const retrying = queued.filter(t => (t.retryAt ?? 0) > Date.now())
+    const state = !res.ok ? S.red('UNAVAILABLE')
+      : held.length ? S.red(`BLOCKED ×${held.length}`)
+      : running.length ? S.green(`RUNNING ×${running.length}`)
+      : retrying.length ? S.yellow(`RETRY ${Math.ceil(((retrying[0].retryAt ?? 0) - Date.now()) / 1000)}s`)
+      : queued.length ? S.cyan(`QUEUED ×${queued.length}`)
+      : last ? (last.t.state === 'completed' ? S.green('✓ done') : last.t.state === 'failed' ? S.red('✗ failed') : S.gray(last.t.state)) : S.gray('idle')
+    const reasoning = last ? reasoningCell(last.a) : `${spec.reasoning}→${S.gray('?')}`
+    const cur = running[0] ?? held[0]
+    const job = cur ? `${cur.t.spec.id}#${cur.a.n} it${cur.a.iterations || 0} ${Object.values(cur.a.toolCalls).reduce((x, y) => x + y, 0)} tools ${cur.a.usageEvents ? `${Math.round((cur.a.usage.inputTokens + cur.a.usage.outputTokens) / 100) / 10}k tok` : ''}` : queued[0] ? `next ${queued[0].spec.id}` : ''
     const spent = atts.reduce((s, x) => s + (x.a.charge.usd ?? 0), 0)
     const name = res.ok ? res.info.name ?? spec.model : spec.model
-    return fit(` ${S.bold(ROLE_LABEL[r].padEnd(10))} ${fit(S.cyan(name ?? ''), 26)} ${fit(reasoning, 18)} ${fit(state, 12)} ${fit(job, 30)} ${atts.length ? usd(spent) : ''}`, cols)
+    const narrow = cols < 100
+    return narrow
+      ? fit(` ${S.bold(ROLE_LABEL[r].slice(0, 5).padEnd(5))} ${fit(S.cyan(name ?? ''), 18)} ${fit(reasoning, 14)} ${fit(state, 11)} ${atts.length ? usd(spent) : ''}`, cols)
+      : fit(` ${S.bold(ROLE_LABEL[r].padEnd(10))} ${fit(S.cyan(name ?? ''), 26)} ${fit(reasoning, 18)} ${fit(state, 13)} ${fit(job, 32)} ${atts.length ? usd(spent) : ''}`, cols)
   }
 
   private hudLines(cols: number): string[] {
@@ -371,20 +435,36 @@ export class Shell {
     const spend = sess.unmetered ? S.red('UNMETERED') : `${usd(sess.spentUsd)}${(sess.estimatedTasks ?? []).length ? S.yellow(' (part estimated)') : ''}`
     const guard = [...live.alerts].reverse().find(a => /HELD|refused|policy|budget|unmetered|tampered|outside|not allowed|gates are defined/i.test(a))
     const claims = listClaims(m.header.commonDir).claims
+    // queued work, by the role the router will give it (the route is a pure function of the task)
+    const queuedFor = new Map<Role, TaskRecord[]>()
+    for (const t of Object.values(live.tasks)) if (t.state === 'queued') { const r = m.route(t); if (r.role) queuedFor.set(r.role, [...(queuedFor.get(r.role) ?? []), t]) }
+    const st = statusOf(live)
+    const stText = st.outcome === 'VERIFIED' ? S.green(st.label) : st.lifecycle === 'BLOCKED' || st.outcome === 'FAILED' || st.outcome === 'BLOCKED' ? S.red(st.label) : st.lifecycle === 'FINISHED' ? S.yellow(st.label) : st.lifecycle === 'READY' ? S.gray(st.label) : S.green(st.label)
     const title = ` ${S.bold(S.blue('◆ COBALT COCKPIT'))} ${S.bold('· CLINE')}  ${S.gray(m.header.id)}  ${S.gray(`${m.header.profile} · ${m.header.strict ? 'strict' : 'non-strict'} · Cline ${m.header.clineVersion}`)}`
-    const status = this.busy ? S.green(`● ${phase}${elapsed}`) : S.gray(`○ ${phase}`)
-    return [
+    const status = `${stText}${this.busy ? S.gray(`  ${phase}${elapsed}`) : ''}`
+    // milestones of the current (or last) turn: its tasks in order, with their real states
+    const turnId = this.turn?.id ?? (this.transcript.filter(e => e.role === 'user').at(-1)?.turn ?? null)
+    const glyph = (t: TaskRecord): string => t.state === 'completed' ? S.green('✓') : t.state === 'failed' ? S.red('✗') : t.state === 'held' ? S.red('■') : t.state === 'refused' || t.state === 'cancelled' ? S.yellow('⊘') : (t.retryAt ?? 0) > Date.now() ? S.yellow('⟳') : t.attempts.some(a => a.phase !== 'ended') ? S.green('●') : S.gray('○')
+    const milestones = turnId ? records.filter(t => t.spec.id === turnId || t.spec.id.startsWith(`${turnId}.`)).map(t => `${glyph(t)} ${t.spec.id}`) : []
+    const all = records
+    const agents = { running: st.counts.running, queued: all.filter(t => t.state === 'queued').length, retrying: st.counts.retrying, blocked: st.counts.held, completed: c.completed, failed: c.failed, refused: c.refused }
+    const owned = Object.values(live.tasks).filter(t => t.attempts.some(a => a.phase !== 'ended')).flatMap(t => t.spec.mode === 'write' ? t.spec.owned : []).slice(0, 4)
+    const rule = (ch: string): string => fit(S.gray(` ${ch.repeat(Math.max(0, cols - 2))}`), cols)
+    const rows = this.out.rows ?? 40
+    const compact = rows < 30
+    const lines = [
       fit(`${title}   ${status}`, cols),
-      fit(` ${S.gray('repo')} ${m.header.repoRoot}  ${S.gray('branch')} ${live.integration.branch} @ ${live.integration.head.slice(0, 8)}  ${S.gray('claims')} ${claims.length}`, cols),
-      fit(S.gray(` ${'─'.repeat(Math.max(0, cols - 2))}`), cols),
-      ...ROLES.map(r => this.roleRow(r, records, cols)),
-      fit(S.gray(` ${'─'.repeat(Math.max(0, cols - 2))}`), cols),
-      fit(` ${S.bold('PROGRESS')} ${bar(c.completed, c.created)} ${c.completed}/${c.created} tasks verified+integrated · ${turns} turn(s) · failed ${c.failed} · refused ${c.refused} · cancelled ${c.cancelled}`, cols),
+      ...(compact ? [] : [fit(` ${S.gray('repo')} ${m.header.repoRoot}  ${S.gray('branch')} ${live.integration.branch} @ ${live.integration.head.slice(0, 8)}  ${S.gray('ownership')} ${claims.length} claim(s)${owned.length ? ` ${owned.join(', ')}` : ''}`, cols), rule('─')]),
+      ...ROLES.map(r => this.roleRow(r, records, queuedFor, cols)),
+      rule('─'),
+      fit(` ${S.bold('AGENTS')}   running ${agents.running} · queued ${agents.queued} · retrying ${agents.retrying} · blocked ${agents.blocked} · completed ${agents.completed} · failed ${agents.failed} · refused ${agents.refused}`, cols),
+      fit(` ${S.bold('PROGRESS')} ${bar(c.completed, c.created)} ${c.completed}/${c.created} verified+integrated · ${turns} turn(s)${milestones.length ? `  ${milestones.slice(-8).join('  ')}` : ''}`, cols),
       fit(` ${S.bold('GATES')}    last task: ${gateText}   ${S.gray('branch:')} ${mainGates}`, cols),
       fit(` ${S.bold('SPEND')}    ${spend} of $${budget.toFixed(2)} ${bar(sess.spentUsd, budget, 12)} · ${Math.round(sess.tokens / 100) / 10}k tokens${sess.capReached ? S.red(' · CAP REACHED') : ''}`, cols),
       fit(` ${S.bold('GUARD')}    ${guard ? S.yellow(guard) : S.gray('no alerts')}`, cols),
-      fit(S.gray(` ${'═'.repeat(Math.max(0, cols - 2))}`), cols),
+      rule('═'),
     ]
+    return lines
   }
 
   render(): void {

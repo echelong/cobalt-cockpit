@@ -43,6 +43,8 @@ export type WorkerOutcome = {
   stopDetail: string | null; hookRefusals: { tool: string; reason: string }[]
   /** The first error a `facts` observer threw; the stream kept being read regardless. */
   observerError: string | null
+  /** The first 2000 characters of the worker's stderr, for failure classification (never trusted for success). */
+  stderrHead?: string
 }
 
 /**
@@ -205,7 +207,9 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   const wire = judgeWire(readWireCaptures(cap), w.model, w.expectedWire)
   let hookRefusals: { tool: string; reason: string }[] = []
   try { hookRefusals = readFileSync(join(rw, 'hook.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l) as { tool: string; allow: boolean; reason: string }).filter(e => !e.allow).map(e => ({ tool: e.tool, reason: e.reason })) } catch { /* no refusals */ }
-  return { identity, exitCode: ex.code, signal: ex.signal, facts, wire, census: final, stoppedBy, stopDetail, hookRefusals, observerError }
+  let stderrText = ''
+  try { stderrText = readFileSync(join(rw, 'stderr.txt'), 'utf8').slice(0, 2000) } catch { /* none */ }
+  return { identity, exitCode: ex.code, signal: ex.signal, facts, wire, census: final, stoppedBy, stopDetail, hookRefusals, observerError, stderrHead: stderrText }
 }
 
 export const targetOf = (id: Identity | null, marker: string, since: number): Target => ({ initPid: id?.initPid ?? null, initStart: id?.initStart ?? null, pidNs: id?.pidNs ?? null, marker, since: id?.since ?? since })

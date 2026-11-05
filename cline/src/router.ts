@@ -28,11 +28,14 @@ export type TaskSpec = {
   /** A conversation turn may legitimately end with no edits (it is reported as such, not escalated). Never set from model output. */ allowNoChanges?: boolean
 }
 export type FailureHistory = { attempts: number; gateFailures: number; escalated: boolean; lastFailure: FailureClass | null }
-export type Health = Record<string, { consecutiveErrors: number; unhealthy: boolean }>
+/** Circuit breaker per provider/model: open after consecutive errors, until `until` (epoch ms); then one half-open try. */
+export type Health = Record<string, { consecutiveErrors: number; unhealthy: boolean; until?: number }>
 export type RouteInput = {
   task: TaskSpec; history: FailureHistory; config: Config
   resolutions: Record<Role, Resolution>; health: Health
   spentSessionUsd: number | null; escalateTo?: Role
+  /** A correction attempt stays on the role of the attempt it corrects. */ pinRole?: Role
+  now?: number
 }
 export type RouteDecision = {
   ok: boolean; taskId: string; role: Role | null; provider: string | null; model: string | null
@@ -73,6 +76,7 @@ export const routeTask = (input: RouteInput): RouteDecision => {
 
   let role: Role
   if (input.escalateTo) { role = input.escalateTo; rules.push(`escalation: evidence-backed escalation to ${input.escalateTo}`) }
+  else if (input.pinRole) { role = input.pinRole; rules.push(`correction: same role (${input.pinRole}) as the attempt it corrects`) }
   else if (task.kind === 'architecture') { role = 'commander'; rules.push('C1 architecture -> commander') }
   else if (task.kind === 'review' && (rank(risk) >= rank('high') || facts.security)) { role = 'commander'; rules.push(`C2 critical review (risk ${risk}${facts.security ? ', security' : ''}) -> commander`) }
   else if (task.kind === 'debug' && (risk === 'critical' || complexity >= 5)) { role = 'commander'; rules.push('C3 critical debugging -> commander') }
@@ -94,10 +98,15 @@ export const routeTask = (input: RouteInput): RouteDecision => {
   const base = { taskId: task.id, role, provider: spec.provider, model: spec.model, effectiveRisk: risk, signals, rules, rejected, inputDigest: digest }
   const refuse = (why: string): RouteDecision => ({ ...base, ok: false, requestedReasoning: spec.reasoning, cliThinking: null, expectedWireEffort: null, reasoningMapping: null, estimateUsd: null, pricingSource: null, refusal: why })
 
-  if (!res || !res.ok) return refuse(`model resolution failed: ${res && !res.ok ? res.reason : 'not resolved'}`)
+  if (!res || !res.ok) {
+    const others = (['coder', 'specialist', 'commander', 'frontend', 'utility'] as const).filter(r => r !== role && input.resolutions[r]?.ok).map(r => `${r} (${roles[r].model})`)
+    return refuse(`model resolution failed for the ${role} role: ${res && !res.ok ? res.reason : 'not resolved'}. Cockpit does not switch checkpoints by itself. Permitted routes: configure an available, version-pinned model for ${role}; opt in to an unpinned id explicitly through unpinnedAllowed; or restate the task so another configured role handles it${others.length ? ` (available: ${others.join(', ')})` : ''}`)
+  }
   if (res.model !== spec.model || res.provider !== spec.provider) return refuse(`resolved ${res.provider}/${res.model} differs from configured ${healthKey(spec)}`)
   const h = input.health[healthKey(spec)]
-  if (h?.unhealthy) return refuse(`provider health: ${healthKey(spec)} failed ${h.consecutiveErrors} times in a row; no substitute model is chosen automatically`)
+  const now = input.now ?? Date.now()
+  // an open breaker delays work on this model; it never moves the work to another model
+  if (h?.unhealthy && (h.until === undefined || h.until > now)) return refuse(`provider health: ${healthKey(spec)} failed ${h.consecutiveErrors} times in a row; cooling down${h.until !== undefined ? ` for ${Math.ceil((h.until - now) / 1000)}s` : ''}; no substitute model is chosen automatically`)
   const plan = planReasoning(spec.reasoning, res.reasoningValues, res.reasoningToggle)
   if (!plan.ok) return refuse(plan.reason)
   const price = pricingFor(config, spec.model, res.info)
@@ -110,25 +119,57 @@ export const routeTask = (input: RouteInput): RouteDecision => {
 
 // ---------------------------------------------------------------------------
 // Bounded escalation and retry. Unlimited retries are impossible by construction.
+/**
+ * Failure classes, by what may safely follow:
+ *   transient       provider_error, rate_limited, timeout, unknown_outcome, resource_error -> same model, backoff
+ *   implementation  gate_failed, misreported_completion, no_changes -> correction, then escalation
+ *   final           auth_error, budget_exceeded, policy_abort, wire_mismatch, model_mismatch, unmetered,
+ *                   sandbox_error -> stop with the reason (a safety refusal stays a refusal)
+ */
 export type FailureClass =
-  | 'gate_failed' | 'misreported_completion' | 'no_changes' | 'provider_error' | 'timeout'
-  | 'budget_exceeded' | 'policy_abort' | 'wire_mismatch' | 'model_mismatch' | 'unmetered' | 'sandbox_error' | 'unknown_outcome'
-export type NextStep = { action: 'retry_same' | 'escalate' | 'stop'; to?: Role; reason: string }
+  | 'gate_failed' | 'misreported_completion' | 'no_changes' | 'provider_error' | 'rate_limited' | 'timeout' | 'resource_error'
+  | 'auth_error' | 'budget_exceeded' | 'policy_abort' | 'wire_mismatch' | 'model_mismatch' | 'unmetered' | 'sandbox_error' | 'unknown_outcome'
+export type NextStep = { action: 'retry_same' | 'correct' | 'escalate' | 'stop'; to?: Role; reason: string; delayMs?: number }
+export const TRANSIENT: readonly FailureClass[] = ['provider_error', 'rate_limited', 'timeout', 'unknown_outcome', 'resource_error']
+export const IMPLEMENTATION: readonly FailureClass[] = ['gate_failed', 'misreported_completion', 'no_changes']
 
-export const nextStep = (cls: FailureClass, role: Role, history: FailureHistory & { transientRetries: number; escalations: number }, config: Config, evidence: string[]): NextStep => {
+/** Sorts a failed run's own error text (result text, stderr) into a class; null when it says nothing classifiable. */
+export const classifyFailureText = (text: string): 'auth_error' | 'rate_limited' | 'resource_error' | 'provider_error' | null => {
+  if (/\b(?:401|403)\b|unauthori[sz]ed|forbidden|invalid (?:api[ _-]?)?key|authenticat|not (?:signed|logged) in|(?:token|session) (?:has )?expired|insufficient (?:credits|balance|funds)|payment required|\b402\b/i.test(text)) return 'auth_error'
+  if (/\b429\b|rate.?limit|too many requests|quota exceeded|slow down/i.test(text)) return 'rate_limited'
+  if (/ENOSPC|ENOMEM|EMFILE|ENFILE|too many open files|out of memory|cannot allocate/i.test(text)) return 'resource_error'
+  if (/\b5\d\d\b|overloaded|unavailable|bad gateway|gateway timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|network|fetch failed|upstream/i.test(text)) return 'provider_error'
+  return null
+}
+
+/** Exponential backoff with full jitter: uniform in [cap/2, cap] where cap = min(max, base * 2^retry). */
+export const backoffMs = (retry: number, base: number, max: number, rand: () => number = Math.random): number => {
+  const cap = Math.min(max, base * 2 ** Math.max(0, retry))
+  return Math.round(cap / 2 + rand() * (cap / 2))
+}
+
+/** Whom an implementation failure escalates to: debugging goes to the specialist (MiMo); otherwise the configured target (Kimi). */
+export const escalationTarget = (role: Role, kind: Kind, config: Config): Role | null => {
+  if ((kind === 'debug' || kind === 'test') && role !== 'specialist' && role !== 'commander') return 'specialist'
+  return config.escalation[role]
+}
+
+export const nextStep = (cls: FailureClass, role: Role, history: FailureHistory & { transientRetries: number; escalations: number; corrections?: number; kind?: Kind }, config: Config, evidence: string[]): NextStep => {
   const l = config.limits
   if (history.attempts >= l.maxAttemptsPerTask) return { action: 'stop', reason: `attempt limit ${l.maxAttemptsPerTask} reached` }
-  switch (cls) {
-    case 'provider_error': case 'timeout': case 'unknown_outcome':
-      return history.transientRetries < l.maxTransientRetries ? { action: 'retry_same', reason: `${cls}: one retry on the same model (${history.transientRetries + 1}/${l.maxTransientRetries})` } : { action: 'stop', reason: `${cls}: transient retry budget used; no model substitution` }
-    case 'gate_failed': case 'misreported_completion': case 'no_changes': {
-      const to = config.escalation[role]
-      if (!to) return { action: 'stop', reason: `${cls} on ${role}: no escalation target configured` }
-      if (history.escalations >= l.maxEscalationsPerTask) return { action: 'stop', reason: `escalation limit ${l.maxEscalationsPerTask} reached` }
-      if (evidence.length === 0) return { action: 'stop', reason: `${cls} without recorded evidence: escalation refused` }
-      return { action: 'escalate', to, reason: `${cls} with evidence (${evidence.length} item(s)): ${role} -> ${to}` }
-    }
-    default:
-      return { action: 'stop', reason: `${cls}: not retried (safety, budget or configuration failure)` }
+  if (TRANSIENT.includes(cls)) {
+    if (history.transientRetries >= l.maxTransientRetries) return { action: 'stop', reason: `${cls}: ${l.maxTransientRetries} transient retr${l.maxTransientRetries === 1 ? 'y' : 'ies'} used; no model substitution` }
+    const delayMs = backoffMs(history.transientRetries + (cls === 'rate_limited' ? 1 : 0), l.retryBaseMs, l.retryMaxMs)
+    return { action: 'retry_same', delayMs, reason: `${cls}: retry ${history.transientRetries + 1}/${l.maxTransientRetries} on the same model in ${(delayMs / 1000).toFixed(1)}s` }
   }
+  if (IMPLEMENTATION.includes(cls)) {
+    if (evidence.length === 0) return { action: 'stop', reason: `${cls} without recorded evidence: no correction or escalation` }
+    if ((history.corrections ?? 0) < l.maxCorrectionsPerTask && history.escalations === 0) return { action: 'correct', reason: `${cls}: one correction attempt on ${role} with its diff and the gate evidence` }
+    const to = escalationTarget(role, history.kind ?? 'implement', config)
+    if (!to) return { action: 'stop', reason: `${cls} on ${role}: no escalation target configured` }
+    if (history.escalations >= l.maxEscalationsPerTask) return { action: 'stop', reason: `escalation limit ${l.maxEscalationsPerTask} reached` }
+    return { action: 'escalate', to, reason: `${cls} after correction: ${role} -> ${to}, which diagnoses the failure before fixing it` }
+  }
+  if (cls === 'auth_error') return { action: 'stop', reason: 'authentication or billing refused the request: sign in or top up with `cline auth`, then run `cockpit-cline recover`; not retried automatically' }
+  return { action: 'stop', reason: `${cls}: not retried (safety, budget or configuration failure)` }
 }

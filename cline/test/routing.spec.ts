@@ -109,8 +109,9 @@ describe('fail-closed refusals', () => {
     const r = await route({}, {}, c)
     assert.equal(r.ok, false); assert.match(r.refusal ?? '', /not supported.*refusing rather than downgrading/)
   })
-  test('attempt limit refuses further attempts', async () => {
-    const r = await route({}, { history: { attempts: 3, gateFailures: 0, escalated: false, lastFailure: null } })
+  test('attempt limit refuses further attempts (4 by default: try, correction, escalation, one spare)', async () => {
+    assert.equal((await route({}, { history: { attempts: 3, gateFailures: 0, escalated: false, lastFailure: null } })).ok, true)
+    const r = await route({}, { history: { attempts: 4, gateFailures: 0, escalated: false, lastFailure: null } })
     assert.equal(r.ok, false); assert.match(r.refusal ?? '', /attempt limit/)
   })
 })
@@ -118,19 +119,22 @@ describe('fail-closed refusals', () => {
 describe('bounded escalation and retry', () => {
   const c = config()
   const h = (o = {}) => ({ attempts: 1, gateFailures: 0, escalated: false, lastFailure: null, transientRetries: 0, escalations: 0, ...o })
-  test('gate failure with evidence escalates DeepSeek -> Kimi once', () => {
-    const s = nextStep('gate_failed', 'coder', h(), c, ['test failed: expected 2'])
+  test('gate failure with evidence: one correction on DeepSeek, then DeepSeek -> Kimi once', () => {
+    assert.equal(nextStep('gate_failed', 'coder', h(), c, ['test failed: expected 2']).action, 'correct')
+    const s = nextStep('gate_failed', 'coder', h({ attempts: 2, corrections: 1 }), c, ['test failed: expected 2'])
     assert.equal(s.action, 'escalate'); assert.equal(s.to, 'commander')
   })
-  test('without evidence there is no escalation', () => assert.equal(nextStep('gate_failed', 'coder', h(), c, []).action, 'stop'))
-  test('a second escalation is refused', () => assert.equal(nextStep('gate_failed', 'coder', h({ escalations: 1, attempts: 2 }), c, ['x']).action, 'stop'))
-  test('the commander has no escalation target', () => assert.equal(nextStep('gate_failed', 'commander', h(), c, ['x']).action, 'stop'))
-  test('provider error retries the same model once, then stops', () => {
-    assert.equal(nextStep('provider_error', 'coder', h(), c, []).action, 'retry_same')
-    assert.equal(nextStep('provider_error', 'coder', h({ transientRetries: 1, attempts: 2 }), c, []).action, 'stop')
+  test('without evidence there is no correction or escalation', () => assert.equal(nextStep('gate_failed', 'coder', h(), c, []).action, 'stop'))
+  test('a second escalation is refused', () => assert.equal(nextStep('gate_failed', 'coder', h({ escalations: 1, corrections: 1, attempts: 3 }), c, ['x']).action, 'stop'))
+  test('the commander has no escalation target once its correction is used', () => assert.equal(nextStep('gate_failed', 'commander', h({ corrections: 1, attempts: 2 }), c, ['x']).action, 'stop'))
+  test('provider error retries the same model twice with backoff, then stops', () => {
+    const first = nextStep('provider_error', 'coder', h(), c, [])
+    assert.equal(first.action, 'retry_same'); assert.ok((first.delayMs ?? 0) > 0)
+    assert.equal(nextStep('provider_error', 'coder', h({ transientRetries: 1, attempts: 2 }), c, []).action, 'retry_same')
+    assert.equal(nextStep('provider_error', 'coder', h({ transientRetries: 2, attempts: 3 }), c, []).action, 'stop')
   })
   for (const cls of ['budget_exceeded', 'policy_abort', 'wire_mismatch', 'model_mismatch', 'sandbox_error'] as const) test(`${cls} is never retried or escalated`, () => assert.equal(nextStep(cls, 'coder', h(), c, ['x']).action, 'stop'))
-  test('the attempt limit stops everything', () => assert.equal(nextStep('provider_error', 'coder', h({ attempts: 3 }), c, []).action, 'stop'))
+  test('the attempt limit stops everything', () => assert.equal(nextStep('provider_error', 'coder', h({ attempts: 4 }), c, []).action, 'stop'))
 })
 
 describe('capability-checked reasoning', () => {

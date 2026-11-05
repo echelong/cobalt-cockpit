@@ -61,19 +61,19 @@ describe('failure handling', () => {
     const as = attempts(m, 'a'); assert.equal(as.length, 2)
     assert.ok(as.every(a => a.model === 'deepseek/deepseek-v4.1-flash-1017' && a.failure === 'provider_error'))
   })
-  test('misreported completion (says done, changes nothing) escalates once to Kimi with evidence, which fixes it', T, async () => {
+  test('misreported completion (says done, changes nothing): one DeepSeek correction, then Kimi with the evidence, which fixes it', T, async () => {
     const e = env()
     const m = await mission(e, { tasks: [task('a', { prompt: '[[write-if:moonshotai/kimi-k3.1-pro|src/a/out.txt=fixed]] [[say:Done, all tests pass.]]' })], gates: [{ name: 'exists', command: 'test -f src/a/out.txt', required: true }] })
     const v = await m.run()
     assert.equal(v.state, 'DONE', v.reasons.join('; '))
     const as = attempts(m, 'a')
-    assert.deepEqual(as.map(a => [a.role, a.model, a.failure]), [['coder', 'deepseek/deepseek-v4.1-flash-1017', 'misreported_completion'], ['commander', 'moonshotai/kimi-k3.1-pro', null]])
+    assert.deepEqual(as.map(a => [a.role, a.model, a.failure]), [['coder', 'deepseek/deepseek-v4.1-flash-1017', 'misreported_completion'], ['coder', 'deepseek/deepseek-v4.1-flash-1017', 'misreported_completion'], ['commander', 'moonshotai/kimi-k3.1-pro', null]])
   })
-  test('a gate that keeps failing: DeepSeek, one Kimi escalation, then FAILED (no third attempt)', T, async () => {
+  test('a gate that keeps failing: DeepSeek, its correction, one Kimi escalation, then FAILED (bounded)', T, async () => {
     const e = env(); const m = await mission(e, { tasks: [task('a', { prompt: '[[write:src/a/out.txt=x]] [[say:Changed the file as asked.]]' })], gates: [{ name: 'test', command: 'echo "expected 2 got 3" >&2; exit 1', required: true }] })
     const v = await m.run()
     assert.equal(v.state, 'FAILED')
-    assert.deepEqual(attempts(m, 'a').map(a => [a.role, a.failure]), [['coder', 'gate_failed'], ['commander', 'gate_failed']])
+    assert.deepEqual(attempts(m, 'a').map(a => [a.role, a.failure]), [['coder', 'gate_failed'], ['coder', 'gate_failed'], ['commander', 'gate_failed']])
   })
   test('wrong model version reported: model_mismatch, not retried, not escalated', T, async () => {
     const e = env(); const m = await mission(e, { tasks: [task('a', { prompt: '[[model:deepseek/deepseek-v4.1-flash-0909]] [[write:src/a/out.txt=x]]' })] })

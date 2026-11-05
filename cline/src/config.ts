@@ -24,6 +24,8 @@ export type Config = {
     concurrency: { total: number } & Record<Role, number>; perProvider: Record<string, number>; spawnsPerMinute: number
     minFreeMemoryMB: number; maxLoadPerCpu: number
     maxAttemptsPerTask: number; maxEscalationsPerTask: number; maxTransientRetries: number; providerUnhealthyAfter: number
+    /** Correction attempts by the same model, given its diff and the gate evidence, before escalating. */ maxCorrectionsPerTask: number
+    /** Exponential backoff with full jitter for transient failures: base * 2^n, capped. */ retryBaseMs: number; retryMaxMs: number
     workerTimeoutSeconds: number; gateTimeoutSeconds: number; clineRetries: number; pageSize: number; maxStoreBytes: number
   }
   /** "provider/model" ids that may run although they carry no required version (an explicit opt-in). */
@@ -68,6 +70,10 @@ export const validateConfig = (raw: unknown): Config => {
   num(c.limits.concurrency.total, 'limits.concurrency.total', 1)
   if (c.limits.maxTasksPerMission !== null) num(c.limits.maxTasksPerMission, 'limits.maxTasksPerMission', 1)
   for (const k of ['maxAttemptsPerTask', 'maxQueue', 'pageSize', 'maxStoreBytes', 'spawnsPerMinute'] as const) num(c.limits[k], `limits.${k}`, 1)
+  for (const k of ['maxCorrectionsPerTask', 'retryBaseMs', 'retryMaxMs'] as const) num(c.limits[k], `limits.${k}`)
+  if (c.limits.maxCorrectionsPerTask > 2) throw new Error('config limits.maxCorrectionsPerTask: at most 2')
+  if (c.limits.maxTransientRetries > 5) throw new Error('config limits.maxTransientRetries: at most 5')
+  if (c.limits.maxAttemptsPerTask > 8) throw new Error('config limits.maxAttemptsPerTask: at most 8')
   for (const k of ['maxDelegationDepth', 'maxChildrenPerTask', 'maxEscalationsPerTask', 'maxTransientRetries', 'providerUnhealthyAfter', 'workerTimeoutSeconds', 'gateTimeoutSeconds', 'clineRetries', 'minFreeMemoryMB', 'maxLoadPerCpu'] as const) num(c.limits[k], `limits.${k}`)
   if (c.limits.maxEscalationsPerTask > 2) throw new Error('config limits.maxEscalationsPerTask: at most 2')
   if (c.limits.maxDelegationDepth > 4) throw new Error('config limits.maxDelegationDepth: at most 4')

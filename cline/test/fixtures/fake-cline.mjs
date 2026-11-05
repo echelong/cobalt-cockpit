@@ -61,6 +61,22 @@ const abort = (why) => {
 }
 
 out({ type: 'hook_event', hookEventName: 'agent_start', agentId: 'agent_fake', taskId: 'conv_fake' })
+// [[fail-times:N:KIND]]: the first N runs of this prompt fail (KIND 503 | 429 | 401). The counter
+// lives in the Cline data dir, the one place a sandboxed worker may write besides its worktree.
+const failTimes = argOf('fail-times')
+if (failTimes) {
+  const [n, kind] = failTimes.split(':'); const dataDir = opt('--data-dir') ?? '/tmp'
+  const key = join(dataDir, `fake-count-${Buffer.from(failTimes + (argOf('key') ?? '')).toString('hex').slice(0, 32)}`)
+  let count = 0; try { count = Number((await import('node:fs')).readFileSync(key, 'utf8')) } catch { /* first run */ }
+  writeFileSync(key, String(count + 1))
+  if (count < Number(n)) {
+    const msg = kind === '429' ? 'Provider error: 429 Too Many Requests (rate limited)' : kind === '401' ? 'Provider error: 401 Unauthorized: invalid API key' : 'Provider error: 503 upstream overloaded'
+    out({ type: 'hook_event', hookEventName: 'agent_error', agentId: 'agent_fake' })
+    out({ type: 'run_result', finishReason: 'error', iterations: 0, usage: {}, aggregateUsage: {}, text: msg, model: { id: reportedModel, provider } })
+    process.exit(1)
+  }
+}
+const correction = /did not pass Cockpit's verification/.test(prompt)
 if (has('crash-early')) process.exit(137)
 const usage = argOf('usage') ? argOf('usage').split(',').map(Number) : undefined
 const repeat = Number(argOf('repeat') ?? 1)
@@ -78,6 +94,13 @@ for (const s of steps) {
     out({ type: 'agent_event', event: { type: 'content_start', contentType: 'tool', toolName: 'editor', input: { path, new_text: rest.join('=') } } })
     if (hook('editor', { path, new_text: rest.join('=') }).cancel) abort(`hook refused editor ${rel}`)
     try { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, rest.join('=')) } catch (e) { out({ type: 'agent_event', event: { type: 'content_end', contentType: 'tool', toolName: 'editor', output: { error: e.message } } }) }
+  } else if (s.op === 'write-on-retry') {
+    // writes only when the prompt is a correction or diagnosis (carries Cockpit's verification evidence)
+    if (correction) {
+      const [rel, ...rest] = s.arg.split('='); const path = join(cwd, rel)
+      if (hook('editor', { path, new_text: rest.join('=') }).cancel) abort(`hook refused editor ${rel}`)
+      mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, rest.join('='))
+    }
   } else if (s.op === 'write-if') {
     const bar = s.arg.indexOf('|'); const want = s.arg.slice(0, bar); const [rel, ...rest] = s.arg.slice(bar + 1).split('=')
     if (want === model) {
@@ -106,5 +129,7 @@ if (has('error')) {
 }
 const planB64 = argOf('plan-b64'); const reqB64 = argOf('request-b64')
 const text = argOf('say') ?? (planB64 !== undefined ? `Plan:\n\`\`\`json\n${Buffer.from(planB64, 'base64').toString()}\n\`\`\`` : reqB64 !== undefined ? `Done.\nCOCKPIT_REQUEST\n\`\`\`json\n${Buffer.from(reqB64, 'base64').toString()}\n\`\`\`` : argOf('plan') !== undefined ? `Plan:\n\`\`\`json\n${argOf('plan')}\n\`\`\`` : argOf('request') !== undefined ? `Done.\nCOCKPIT_REQUEST\n\`\`\`json\n${argOf('request')}\n\`\`\`` : 'Done. All changes made and tests pass.')
+// like Cline: the answer streams as text deltas (content_start contentType text) before done
+if (!has('nostream')) { let acc = ''; for (const chunk of text.match(/.{1,24}/gs) ?? []) { acc += chunk; out({ type: 'agent_event', event: { type: 'content_start', contentType: 'text', text: chunk, accumulated: acc } }); if (argOf('stream-delay')) await sleep(Number(argOf('stream-delay'))) } }
 out({ type: 'agent_event', event: { type: 'done', reason: 'completed', text, iterations: req, usage: totals } })
 out({ type: 'run_result', finishReason: 'completed', iterations: req, usage: finalUsage(), aggregateUsage: finalUsage(), durationMs: 10, text, model: { id: reportedModel, provider, info: { id: reportedModel } } })

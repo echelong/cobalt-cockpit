@@ -24,6 +24,7 @@ import { census } from './proc.ts'
 import { render } from './hud.ts'
 import { repoInfo } from './git.ts'
 import { validateTasks } from './planner.ts'
+import { statusOf } from './status.ts'
 
 type Args = { _: string[]; flags: Record<string, string | boolean>; multi: Record<string, string[]> }
 const parseArgs = (argv: string[]): Args => {
@@ -202,7 +203,7 @@ const replay = (a: Args): number => {
 const list = (a: Args): number => {
   const r = root(a)
   let ids: string[] = []; try { ids = readdirSync(join(r, 'missions')).sort() } catch { /* none */ }
-  for (const id of ids) { try { const h = readJson<Header>(join(missionDir(r, id), 'mission.json')); const l = readJson<Live>(join(missionDir(r, id), 'live.json')); print(`${id}  ${l.state.padEnd(9)} ${(l.verdict?.state ?? '—').padEnd(10)} ${usd(l.session.unmetered ? null : l.session.spentUsd).padEnd(10)} ${h.repoRoot}  ${h.goal.split('\n')[0].slice(0, 60)}`) } catch { print(`${id}  unreadable`) } }
+  for (const id of ids) { try { const h = readJson<Header>(join(missionDir(r, id), 'mission.json')); const l = readJson<Live>(join(missionDir(r, id), 'live.json')); print(`${id}  ${statusOf(l).label.padEnd(22)} ${usd(l.session.unmetered ? null : l.session.spentUsd).padEnd(10)} ${h.repoRoot}  ${h.goal.split('\n')[0].slice(0, 60)}`) } catch { print(`${id}  unreadable`) } }
   return 0
 }
 

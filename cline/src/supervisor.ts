@@ -11,7 +11,7 @@ import {
 import type { Role, Swarm } from './core/engine.ts'
 import type { Config } from './config.ts'
 import type { Resolution } from './catalog.ts'
-import { routeTask, nextStep, healthKey } from './router.ts'
+import { routeTask, nextStep, healthKey, classifyFailureText, IMPLEMENTATION, backoffMs } from './router.ts'
 import type { FailureClass, Health, RouteDecision, TaskSpec } from './router.ts'
 import { chargeOf, checkBudget, pricingFor } from './cost.ts'
 import type { Usage } from './cost.ts'
@@ -24,7 +24,7 @@ import type { WireVerdict } from './reasoning.ts'
 import { gateTaint, gitGate, packageScripts, runCommandGate, securityGate } from './gates.ts'
 import type { GateResult, GateSpec } from './gates.ts'
 import { git } from './git.ts'
-import { addTaskWorktree, changesOf, commitTask, createIntegration, headOf, integrate, integratedCommitFor, missionBranch, repoInfo } from './git.ts'
+import { addTaskWorktree, changesOf, commitTask, createIntegration, diffText, headOf, integrate, integratedCommitFor, missionBranch, repoInfo } from './git.ts'
 import type { RepoInfo } from './git.ts'
 import { isPlanTask, needsCommander, parsePlan, parseRequest, planPrefix, plannerPrompt, repoSummaryText, workerPrompt } from './planner.ts'
 import { ownedCovers } from './hook/policy.ts'
@@ -54,6 +54,8 @@ export type TaskRecord = {
   spec: TaskSpec; state: TaskState; attempts: AttemptRecord[]; transientRetries: number; escalations: number
   escalateTo: Role | null; evidence: string[]; createdAt: number; updatedAt: number; reason: string | null
   verification: 'PROVISIONAL_CHECKED' | 'SELF_REPORTED_UNCHECKED' | null; integratedHead: string | null; children: string[]; requestsRefused: string[]
+  /** Correction attempts made on the same model after an implementation failure. */ corrections?: number
+  /** A transient failure's backoff: the task is not admitted before this time (epoch ms). */ retryAt?: number | null
 }
 export type Verdict = { state: 'DONE' | 'PARTIAL' | 'BLOCKED' | 'FAILED' | 'STOPPED' | 'UNVERIFIED'; reasons: string[]; at: string }
 export type Live = {
@@ -280,7 +282,8 @@ export class Mission {
   private readyQueue(): TaskRecord[] {
     const now = this.deps.now()
     const eff = (t: TaskRecord): number => Math.min(12, (t.spec.priority ?? 5) + Math.floor((now - t.updatedAt) / 60_000))
-    return Object.values(this.live.tasks).filter(t => t.state === 'queued').sort((a, b) => eff(b) - eff(a) || a.createdAt - b.createdAt)
+    // a task backing off after a transient failure waits for its retry time
+    return Object.values(this.live.tasks).filter(t => t.state === 'queued' && !((t.retryAt ?? 0) > now)).sort((a, b) => eff(b) - eff(a) || a.createdAt - b.createdAt)
   }
 
   // ----- the loop ----------------------------------------------------------------
@@ -390,6 +393,8 @@ export class Mission {
       if (!d.ready) continue
       const route = this.route(t)
       if (!route.ok) {
+        // an open provider breaker clears with time: the task waits on the same model, it is not refused
+        if (route.refusal?.startsWith('provider health')) { if (!t.reason?.startsWith('waiting: provider health')) this.ledger.append('route_waiting', t.spec.id, { refusal: route.refusal }); t.reason = `waiting: ${route.refusal}`; continue }
         t.reason = `route refused: ${route.refusal}`; t.updatedAt = this.deps.now()
         this.ledger.append('route_refused', t.spec.id, route)
         if (!route.refusal?.startsWith('budget') && !route.refusal?.startsWith('session cost')) { this.endTask(t, 'refused', t.reason); continue }
@@ -437,6 +442,9 @@ export class Mission {
       history: { attempts: t.attempts.length, gateFailures: t.attempts.filter(a => a.failure === 'gate_failed' || a.failure === 'misreported_completion').length, escalated: t.escalations > 0, lastFailure: (last?.failure ?? null) as FailureClass | null },
       spentSessionUsd: this.live.session.unmetered ? null : this.committedUsd(),
       ...(t.escalateTo ? { escalateTo: t.escalateTo } : {}),
+      // a correction (no escalation yet) stays on the role of the attempt it corrects
+      ...(!t.escalateTo && (t.corrections ?? 0) > 0 && last ? { pinRole: last.role } : {}),
+      now: this.deps.now(),
     })
   }
 
@@ -604,14 +612,18 @@ export class Mission {
     if (out.stoppedBy === 'budget') return { cls: 'budget_exceeded', detail: out.stopDetail ?? 'budget', evidence: [] }
     if (out.stoppedBy === 'unmetered') return { cls: 'unmetered', detail: out.stopDetail ?? 'cost cannot be measured', evidence: [] }
     if (out.stoppedBy === 'timeout') return { cls: 'timeout', detail: out.stopDetail ?? 'timeout', evidence: [] }
-    if (out.stoppedBy === 'spawn_error') return { cls: 'sandbox_error', detail: out.stopDetail ?? 'sandbox failed to start', evidence: [] }
+    // the run's own error text decides between authentication, rate limits, resources and provider faults
+    const errText = `${f.resultText ?? ''}\n${f.aborted ?? ''}\n${out.stderrHead ?? ''}\n${out.stopDetail ?? ''}`
+    const textClass = classifyFailureText(errText)
+    const errLine = (errText.split('\n').map(s => s.trim()).find(s => s && classifyFailureText(s)) ?? errText.trim().split('\n')[0] ?? '').slice(0, 300)
+    if (out.stoppedBy === 'spawn_error') return textClass === 'resource_error' ? { cls: 'resource_error', detail: `sandbox could not start: ${errLine}`, evidence: [] } : { cls: 'sandbox_error', detail: out.stopDetail ?? 'sandbox failed to start', evidence: [] }
     if (out.hookRefusals.length) return { cls: 'policy_abort', detail: `Cockpit policy refused ${out.hookRefusals.map(r => `${r.tool}: ${r.reason}`).join('; ').slice(0, 600)}`, evidence: [] }
     if (f.reportedModel !== null && f.reportedModel !== a.model) return { cls: 'model_mismatch', detail: `Cline reported model ${f.reportedModel}, routed ${a.model}`, evidence: [] }
     if (f.reportedProvider !== null && f.reportedProvider !== a.provider) return { cls: 'model_mismatch', detail: `Cline reported provider ${f.reportedProvider}, routed ${a.provider}`, evidence: [] }
     if (out.wire.state === 'mismatch') return { cls: 'wire_mismatch', detail: out.wire.detail, evidence: [] }
     if (out.wire.state === 'unconfirmed' && this.header.strict && (f.finishReason === 'completed')) return { cls: 'wire_mismatch', detail: `strict: ${out.wire.detail}`, evidence: [] }
-    if (f.finishReason === 'error') return { cls: 'provider_error', detail: (f.resultText ?? 'provider error').slice(0, 300), evidence: [] }
-    if (f.finishReason !== 'completed') return { cls: 'unknown_outcome', detail: `finish ${f.finishReason ?? 'none'}${f.aborted ? ` (${f.aborted})` : ''}, exit ${out.exitCode}`, evidence: [] }
+    if (f.finishReason === 'error') return { cls: textClass ?? 'provider_error', detail: errLine || 'provider error', evidence: [] }
+    if (f.finishReason !== 'completed') return { cls: textClass ?? 'unknown_outcome', detail: `${textClass ? `${errLine} · ` : ''}finish ${f.finishReason ?? 'none'}${f.aborted ? ` (${f.aborted})` : ''}, exit ${out.exitCode}`, evidence: [] }
     return null
   }
 
@@ -619,12 +631,14 @@ export class Mission {
     const key = `${a.provider}/${a.model}`
     const h = this.live.health[key] ?? { consecutiveErrors: 0, unhealthy: false }
     const l = this.config.limits
-    if (cls?.cls === 'provider_error') {
+    if (cls?.cls === 'provider_error' || cls?.cls === 'rate_limited') {
       h.consecutiveErrors++; h.unhealthy = h.consecutiveErrors >= l.providerUnhealthyAfter
+      // open breaker: work on this model waits a backed-off cool-down, then one half-open try
+      if (h.unhealthy) h.until = this.deps.now() + backoffMs(h.consecutiveErrors - l.providerUnhealthyAfter + 1, l.retryBaseMs, l.retryMaxMs)
       this.live.aimd[a.provider] = Math.max(1, Math.floor((this.live.aimd[a.provider] ?? l.concurrency.total) / 2))
       this.ledger.append('provider_health', null, { key, ...h, concurrency: this.live.aimd[a.provider] })
     } else if (!cls || cls.cls !== 'cancelled') {
-      h.consecutiveErrors = 0
+      h.consecutiveErrors = 0; h.unhealthy = false; delete h.until
       this.live.aimd[a.provider] = Math.min(l.perProvider[a.provider] ?? l.concurrency.total, (this.live.aimd[a.provider] ?? l.concurrency.total) + 1)
     }
     this.live.health[key] = h
@@ -766,13 +780,23 @@ export class Mission {
     this.endAttempt(t, a, cls === 'cancelled' ? 'cancelled' : 'failed')
     if (cls === 'cancelled') { this.endTask(t, 'cancelled', detail); return }
     if (cls === 'budget_exceeded') this.live.alerts.push(`${t.spec.id}: budget exceeded on ${a.model}: ${detail}`)
+    if (cls === 'auth_error') this.live.alerts.push(`${t.spec.id}: provider refused authentication or billing (${detail.slice(0, 160)})`)
+    const l = this.config.limits
     const step = cls === 'integration_conflict'
-      ? (t.transientRetries < this.config.limits.maxTransientRetries + 1 && t.attempts.length < this.config.limits.maxAttemptsPerTask ? { action: 'retry_same' as const, reason: 'integration conflict: retry on the current mission head' } : { action: 'stop' as const, reason: 'integration conflict persists' })
-      : nextStep(cls, a.role, { attempts: t.attempts.length, gateFailures: 0, escalated: t.escalations > 0, lastFailure: cls, transientRetries: t.transientRetries, escalations: t.escalations }, this.config, evidence)
+      ? (t.transientRetries < l.maxTransientRetries && t.attempts.length < l.maxAttemptsPerTask ? { action: 'retry_same' as const, reason: 'integration conflict: retry on the current mission head', delayMs: 0 } : { action: 'stop' as const, reason: 'integration conflict persists' })
+      : nextStep(cls, a.role, { attempts: t.attempts.length, gateFailures: 0, escalated: t.escalations > 0, lastFailure: cls, transientRetries: t.transientRetries, escalations: t.escalations, corrections: t.corrections ?? 0, kind: t.spec.kind }, this.config, evidence)
     this.ledger.append('next_step', t.spec.id, { attempt: a.id, ...step })
     if (step.action === 'stop' || this.live.stopRequested || this.live.session.capReached) { this.endTask(t, 'failed', `${cls}: ${detail.slice(0, 300)} · ${step.reason}`); return }
-    t.evidence = evidence.slice(0, 8)
-    if (step.action === 'retry_same') t.transientRetries++
+    // Implementation failures carry what the attempt actually did: its diff (bounded) and the gate output.
+    let diff = ''
+    if (IMPLEMENTATION.includes(cls as FailureClass) && a.worktree && t.spec.mode === 'write') { try { diff = (await diffText(a.worktree, a.adminDir ?? null)).slice(0, 5000) } catch { /* no diff available */ } }
+    const lead = step.action === 'escalate'
+      ? ['Earlier attempts did not pass Cockpit\'s verification. First diagnose the root cause from the evidence below, then fix it; keep what was correct.']
+      : step.action === 'correct' ? ['Your previous attempt did not pass Cockpit\'s verification. Correct it using the evidence below (the checkout starts from the mission head again).'] : []
+    t.evidence = [...lead, ...evidence.slice(0, 6), ...(diff ? [`Diff of the previous attempt:\n${diff}`] : [])]
+    if (step.action === 'retry_same') { t.transientRetries++; t.retryAt = this.deps.now() + (step.delayMs ?? backoffMs(t.transientRetries, l.retryBaseMs, l.retryMaxMs)) }
+    else t.retryAt = null
+    if (step.action === 'correct') t.corrections = (t.corrections ?? 0) + 1
     if (step.action === 'escalate') { t.escalations++; t.escalateTo = step.to ?? null }
     t.state = 'queued'; t.reason = step.reason; t.updatedAt = this.deps.now()
     this.persist(true)
