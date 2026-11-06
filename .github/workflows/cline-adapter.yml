@@ -140,6 +140,19 @@ jobs:
           git config --global user.email "cockpit-ci@example.invalid"
           git config --global init.defaultBranch main
 
+      - name: Synthetic host secrets for the isolation tests
+        run: |
+          set -euo pipefail
+          # The isolation tests check that a sandbox cannot see the person's real secrets and other projects, and
+          # require enough of them to exist for that to mean something. A fresh runner HOME has none, so plant
+          # clearly synthetic ones where a developer's would be. Nothing here is a real credential.
+          umask 077
+          mkdir -p "$HOME/.ssh" "$HOME/.cline/data/settings" "$HOME/.claude-main" "$HOME/Projects/other-project"
+          echo "SYNTHETIC-CI-CANARY not a key" > "$HOME/.ssh/id_ci_canary"
+          [ -e "$HOME/.cline/data/settings/providers.json" ] || echo '{"providers":{}}' > "$HOME/.cline/data/settings/providers.json"
+          echo "SYNTHETIC-CI-CANARY" > "$HOME/.claude-main/canary"
+          echo "SYNTHETIC-CI-CANARY" > "$HOME/Projects/other-project/README.md"
+
       - name: Typecheck
         timeout-minutes: 5
         run: cline/scripts/typecheck.sh
