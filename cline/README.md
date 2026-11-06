@@ -225,8 +225,11 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
    fields Cline uses, the routed model and, for effort-level routes, exactly the routed reasoning effort; the body
    it checked is the body it sends) and the three `GET` paths Cline makes at start, and refuses everything else
    (other paths, models, efforts or fields such as fallback model lists, other hosts, the authentication
-   endpoints). It also enforces the attempt's cost and token budget from the usage the API itself returns, caps
-   the number of requests and concurrent requests, and records every request (`broker.jsonl`). Host localhost services, abstract and filesystem unix sockets, DNS and the internet
+   endpoints). A toggle model must send its routed effort with thinking on, a route without reasoning none.
+   It also enforces the attempt's cost and token budget from the usage the API itself returns (it always asks
+   the API for usage, and a turn the API answers without usage leaves the attempt unmeasured and stops it), caps
+   requests and concurrent requests (so at most a few turns can be in flight past a budget), and records every
+   request (`broker.jsonl`). Worker output (stream, stderr, gate logs) is bounded on the host. Host localhost services, abstract and filesystem unix sockets, DNS and the internet
    are unreachable; gates have no network at all. A worker therefore cannot `npm install`, `pip install` or
    `git fetch`: install dependencies in your checkout and pass `--share node_modules`. What a worker sends to the
    model (prompts, the code it read) does reach the provider: that is the model's job.
@@ -239,7 +242,9 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
    previous file kept as `providers.json.cockpit-backup`, mode 0600). The server's answer is saved first
    (`providers.json.cockpit-refresh`, 0600, removed after a successful save) and the file is re-read just before
    the write, so neither a failed save nor a concurrent change by Cline itself loses your sign-in or your
-   settings. That is the only write Cockpit makes to your Cline data. Only the `cline` and `cline-pass` providers can be brokered; a role configured for any other
+   settings. If you sign in again while a refresh is running, your sign-in wins. After a failed save the broker
+   never retries with the same refresh token, and the kept answer is applied on the next start. That is the only
+   write Cockpit makes to your Cline data. Only the `cline` and `cline-pass` providers can be brokered; a role configured for any other
    provider is refused, not run with exposed credentials.
 4. **Evidence from inside a sandbox can be forged by an adversarial model**: the JSONL stream, wire captures and
    reported cost are written by processes in that sandbox. Gates, the GIT scope check and the census are done by
@@ -308,15 +313,18 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
       200 ms in case it starts a key sequence or paste marker split across reads, so Esc followed by a key
       within that time reads as Alt+key.
 21. **What a worker can still read**, all read-only: `/usr`, an allowlist of `/etc` (users and groups, name
-    service, dynamic linker, certificates, time zone, alternatives, `gitconfig`; not `/etc` as a whole), the node
+    service, dynamic linker, the certificate stores, time zone, alternatives; not `/etc` as a whole, and not
+    `/etc/gitconfig`), the node
     installation that runs Cline (its global `npmrc` covered), Cockpit's own hook code (`cline/src`,
     `cline/loader`, `hooks`, `types`), and the repository's git directory (objects and refs; its `config` is
-    replaced by a stripped copy without remotes, credential helpers, hooks or commands, and Cockpit's claim store
-    and any fsmonitor socket are covered). Every host path mounted is checked on its real path first:
+    replaced by a stripped copy without remotes, credential helpers, hooks or commands; submodule and per-worktree
+    configs, Cockpit's claim store and fsmonitor sockets are covered; the history itself is readable). Every host path mounted is checked on its real path first:
     `sandbox.allowRead`, `--share` (repository-relative only), the node prefix and the git directory are refused
-    when they are `/`, a home directory, an ancestor of it, or overlap `~/.cline`, `~/.ssh`, `~/.gnupg`,
-    `~/.config`, `~/.cache`, `~/.local/share`, `~/.local/state` or another credential store, and the launch fails
-    rather than run with a wider view. Toolchains elsewhere (`~/.cargo`, a virtualenv) must be added to
+    when they are `/`, a system tree (`/proc`, `/sys`, `/dev`, `/run`), a home directory (`$HOME` or the
+    account's), an ancestor of it, or overlap `~/.cline`, `~/.ssh`, `~/.gnupg`, `~/.config`, `~/.cache`,
+    `~/.local/share`, `~/.local/state`, shell histories and rc files or another credential store, and the
+    launch fails rather than run with a wider view. `--share` takes a dependency directory only (never `.git`
+    or `.env`). Toolchains elsewhere (`~/.cargo`, a virtualenv) must be added to
     `sandbox.allowRead`.
 22. **Not isolated by the sandbox** (the kernel interfaces bubblewrap leaves open): there is no seccomp filter, so
     system calls such as `keyctl` (the user's kernel keyring), `io_uring`, `perf_event_open` and `bpf` are

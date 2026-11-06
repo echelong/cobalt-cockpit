@@ -347,3 +347,111 @@ describe('isolation: a worker process cannot outlive its attempt', () => {
     assert.ok(!ps.split('\n').some(l => l.trim() === 'sleep 300'), 'the detached sleep survived')
   })
 })
+
+describe('isolation (review 10): the broker as a hard bound', () => {
+  const slowUp = async (o: { delayMs?: number; usage?: Record<string, number> | null } = {}): Promise<{ url: string; seen: Seen[] }> => {
+    const seen: Seen[] = []
+    const server = createServer((req, res) => { let body = ''; req.on('data', c => { body += c }); req.on('end', () => { seen.push({ method: req.method ?? '', url: req.url ?? '', headers: req.headers, body }); setTimeout(() => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: true, ...(o.usage === null ? {} : { usage: o.usage ?? { prompt_tokens: 1, completion_tokens: 1, cost: 0.004 } }) })) }, o.delayMs ?? 0) }) })
+    servers.push(server); await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r()))
+    return { url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, seen }
+  }
+  const call = (b: Broker, body: Record<string, unknown> = { model: 'deepseek/deepseek-v4.1-flash-1017', reasoning_effort: 'max' }, path = '/api/v1/chat/completions', method = 'POST'): Promise<number> => new Promise(res => { const r = request({ socketPath: b.socketPath, path, method, headers: { authorization: `Bearer workos:${b.fakeToken}`, 'content-type': 'application/json' } }, s => { s.resume(); s.on('end', () => res(s.statusCode ?? 0)) }); r.on('error', () => res(-1)); r.end(method === 'POST' ? JSON.stringify(body) : undefined) })
+  const broker = (up: string, o: Partial<Parameters<typeof startBroker>[0]> = {}): Promise<Broker> => startBroker({ dataDir: clineData(), provider: 'cline', upstream: up, model: 'deepseek/deepseek-v4.1-flash-1017', reasoning: { effort: 'max' }, ...o })
+  test('many concurrent model turns cannot all pass the same budget check: at most maxInflight reach the API', T, async () => {
+    const up = await slowUp({ delayMs: 300 })
+    const b = await broker(up.url, { budgetUsd: 0.001, maxInflight: 4 })
+    const codes = await Promise.all(Array.from({ length: 24 }, () => call(b)))
+    await b.close()
+    assert.ok(up.seen.length <= 4, `${up.seen.length} turns reached the API`)
+    assert.equal(codes.filter(c => c === 200).length, up.seen.length); assert.ok(codes.every(c => c === 200 || c === 429 || c === 402), codes.join(','))
+    assert.equal(b.spent.carried, up.seen.length)
+  })
+  test('the API is always asked for usage; a carried turn with no usage leaves the spend unmeasured and stops further turns', T, async () => {
+    const up = await slowUp({ usage: null })
+    const b = await broker(up.url)
+    assert.equal(await call(b, { model: 'deepseek/deepseek-v4.1-flash-1017', reasoning_effort: 'max', stream: true, stream_options: { include_usage: false } }), 200)
+    assert.deepEqual(JSON.parse(up.seen[0].body).stream_options, { include_usage: true }, 'include_usage is forced on')
+    assert.equal(b.spent.unmeasured, 1); assert.equal(b.spent.usdKnown, false)
+    assert.equal(await call(b), 402, 'no further turn once spend is unmeasured')
+    await b.close()
+    const allowed = await broker(up.url, { allowUnmetered: true }); assert.equal(await call(allowed), 200); assert.equal(await call(allowed), 200); await allowed.close()
+  })
+  test('a flood of refused requests cannot push a real model turn out of the record or the carried count', T, async () => {
+    const up = await slowUp()
+    const b = await broker(up.url)
+    for (let i = 0; i < 1500; i++) await call(b, {}, '/api/v1/users/me', 'GET')
+    assert.equal(await call(b), 200)
+    await b.close()
+    assert.equal(b.spent.carried, 1)
+    assert.equal(b.records.filter(r => !r.refused && r.path === '/api/v1/chat/completions').length, 1)
+    assert.equal(attestWire({ state: 'unconfirmed', requests: 0, effective: null, models: [], detail: '' }, b.records, 'deepseek/deepseek-v4.1-flash-1017', 'max').state, 'confirmed')
+  })
+  test('toggle and no-reasoning routes are enforced too: a worker cannot raise or switch the reasoning it was routed', T, async () => {
+    const up = await slowUp()
+    const toggle = await broker(up.url, { model: 'xiaomi/mimo-v2.6-pro', reasoning: { toggle: 'on', effort: 'high' } })
+    assert.deepEqual([await call(toggle, { model: 'xiaomi/mimo-v2.6-pro', reasoning_effort: 'high' }), await call(toggle, { model: 'xiaomi/mimo-v2.6-pro', reasoning_effort: 'max' }), await call(toggle, { model: 'xiaomi/mimo-v2.6-pro', reasoning_effort: 'high', reasoning: { enabled: false } }), await call(toggle, { model: 'xiaomi/mimo-v2.6-pro', reasoning_effort: { x: 1 } })], [200, 403, 403, 403])
+    await toggle.close()
+    const none = await broker(up.url, { model: 'zai/glm-5.3-flash', reasoning: { none: true } })
+    assert.deepEqual([await call(none, { model: 'zai/glm-5.3-flash' }), await call(none, { model: 'zai/glm-5.3-flash', reasoning_effort: 'max' }), await call(none, { model: 'zai/glm-5.3-flash', reasoning: { enabled: true } })], [200, 403, 403])
+    await none.close()
+    const effort = await broker(up.url)
+    assert.equal(await call(effort, { model: 'deepseek/deepseek-v4.1-flash-1017', reasoning_effort: 'max', reasoning: { enabled: false } }), 403, 'max with thinking switched off is not the routed max')
+    await effort.close()
+    const rec = (o: Record<string, unknown>) => ({ at: '', method: 'POST', path: '/api/v1/chat/completions', status: 200, model: 'm', effort: 'high', bytesIn: 1, reasoningEnabled: null, ...o }) as never
+    const w = { state: 'unconfirmed' as const, requests: 0, effective: null, models: [], detail: '' }
+    assert.equal(attestWire(w, [rec({})], 'm', 'on').state, 'confirmed', 'toggle on is confirmed from the broker, not the captures')
+    assert.equal(attestWire(w, [rec({ effort: null })], 'm', 'on').state, 'mismatch')
+    assert.equal(attestWire(w, [rec({ reasoningEnabled: false })], 'm', 'on').state, 'mismatch')
+    assert.equal(attestWire(w, [rec({ effort: null })], 'm', 'none').state, 'confirmed')
+    assert.equal(attestWire(w, [rec({ effort: 'max' })], 'm', 'none').state, 'mismatch')
+  })
+  test('a failed save latches: the old (possibly spent) refresh token is never tried again, and the kept answer is applied next time', T, async () => {
+    const data = clineData(); const f = join(data, 'settings', 'providers.json'); const d = JSON.parse(readFileSync(f, 'utf8')); d.providers.cline.settings.auth.expiresAt = Date.now() - 60_000; writeFileSync(f, JSON.stringify(d))
+    const block = `${f}.cockpit-${process.pid}.tmp`; mkdirSync(block)
+    let refreshes = 0
+    const up = await upstream({ refresh: () => { refreshes++; return { success: true, data: { accessToken: 'A5', refreshToken: 'R5', expiresAt: new Date(Date.now() + 3600_000).toISOString(), userInfo: { clineUserId: 'acct-test' } } } } })
+    await assert.rejects(realToken(data, 'cline', up.url), /cockpit-refresh/)
+    await assert.rejects(realToken(data, 'cline', up.url), /cockpit-refresh/)
+    assert.equal(refreshes, 1, 'no second refresh with the same token')
+    rmSync(block, { recursive: true })
+    // a later supervisor (a new process: simulated by another data-dir key would not share the latch, so apply directly)
+    const fresh = await import(`../src/broker.ts?fresh=${Date.now()}`) as typeof import('../src/broker.ts')
+    assert.equal(await fresh.realToken(data, 'cline', up.url), 'A5')
+    assert.equal(refreshes, 1, 'the kept answer was applied, not a new refresh')
+    assert.equal(JSON.parse(readFileSync(f, 'utf8')).providers.cline.settings.auth.refreshToken, 'R5'); assert.ok(!existsSync(`${f}.cockpit-refresh`))
+  })
+  test('if the person signs in again during a refresh, their sign-in wins and is not overwritten', T, async () => {
+    const data = clineData(); const f = join(data, 'settings', 'providers.json'); const d = JSON.parse(readFileSync(f, 'utf8')); d.providers.cline.settings.auth.expiresAt = Date.now() - 60_000; writeFileSync(f, JSON.stringify(d))
+    const up = await upstream({ refresh: () => { const x = JSON.parse(readFileSync(f, 'utf8')); x.providers.cline.settings.auth = { accessToken: 'OWNER-NEW', refreshToken: 'OWNER-R', expiresAt: Date.now() + 3600_000 }; writeFileSync(f, JSON.stringify(x)); return { success: true, data: { accessToken: 'BROKER-A', refreshToken: 'BROKER-R', expiresAt: new Date(Date.now() + 3600_000).toISOString() } } } })
+    assert.equal(await realToken(data, 'cline', up.url), 'OWNER-NEW')
+    const a = JSON.parse(readFileSync(f, 'utf8')).providers.cline.settings.auth
+    assert.equal(a.accessToken, 'OWNER-NEW'); assert.equal(a.refreshToken, 'OWNER-R')
+  })
+  test('a worker that replaces its hook log (to hide refusals) is itself refused', T, async () => {
+    const e = env()
+    const m = await mission(e, { tasks: [task('a', { owned: ['*'], prompt: '[[cmd:ln -sf /dev/null "$COCKPIT_HOOK_LOG"]] [[write:src/a/x=1]]' })] })
+    const v = await m.run()
+    assert.notEqual(v.state, 'DONE')
+    const a = allTasks(m)[0].attempts[0]
+    assert.equal(a.failure, 'policy_abort', JSON.stringify(a.failureDetail)); assert.match(a.failureDetail ?? '', /hook log was replaced/)
+  })
+})
+
+describe('isolation (review 10): git internals, /etc and what may be mounted', () => {
+  test('submodule configs and a linked worktree\'s fsmonitor socket are covered; /etc/gitconfig is not shown', T, async () => {
+    const repo = join(CANARY, 'subrepo'); mkdirSync(repo); execFileSync('git', ['init', '-q', '-b', 'main', repo]); writeFileSync(join(repo, 'a.txt'), 'a')
+    git(repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.'); git(repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'a')
+    plant('subrepo/.git/modules/lib/config', `[remote "origin"]\n\turl = https://u:${SECRET}@example.invalid/lib.git\n`)
+    const wt = join(CANARY, 'subrepo-wt'); git(repo, 'worktree', 'add', '-q', '--detach', wt, 'HEAD')
+    const admin = join(repo, '.git', 'worktrees', 'subrepo-wt'); assert.ok(existsSync(admin))
+    const ipc = join(admin, 'fsmonitor--daemon.ipc'); const fsm = netServer(s => { s.on('error', () => {}); s.end('FSMON') }); await new Promise<void>(r => fsm.listen(ipc, () => r()))
+    const r = await attack([allow('git_status', 'git -C . status --porcelain'), deny('submodule_config', `grep -q ${SECRET} ${repo}/.git/modules/lib/config`), deny('worktree_fsmonitor', conn(`{path:'${ipc}'}`)), deny('etc_gitconfig', 'test -s /etc/gitconfig')].join('\n'), { workdir: wt, gitCommonDir: join(repo, '.git') })
+    fsm.close()
+    ok(r.out, ['git_status', 'submodule_config', 'worktree_fsmonitor', 'etc_gitconfig']); assert.ok(!r.out.includes(SECRET))
+  })
+  test('system trees, $HOME and the account home, shell histories and dotfiles are never mountable; --share refuses .git, .env and files', () => {
+    for (const p of ['/proc', '/proc/1', '/sys', '/dev', '/run', '/run/user/1000', '/var/run', '/boot', '~/.bash_history', '~/.gitconfig', '~/.cargo/credentials.toml', '~/.npm', `${userInfo().homedir}/.ssh`]) assert.ok(mountProblem(p), `${p} must be refused`)
+    const repo = tmp('share-repo2'); mkdirSync(join(repo, '.git')); writeFileSync(join(repo, '.env'), 'X'); writeFileSync(join(repo, 'file.txt'), 'x'); mkdirSync(join(repo, '.env.d'))
+    for (const s of ['.git', '.env', '.env.d', 'file.txt']) assert.throws(() => shareDir(repo, s), UsageError, s)
+  })
+})

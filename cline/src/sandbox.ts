@@ -11,8 +11,8 @@
 //   - the repository's git common dir is read-only (its Cockpit claim store hidden)
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
-import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readdirSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs'
+import { homedir, userInfo } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { pidNamespaceOf, processIdentity, startTimeOf } from './proc.ts'
 import type { ProcessIdentity } from './proc.ts'
@@ -39,8 +39,11 @@ export type SandboxSpec = {
 }
 
 /** Home-relative places that hold credentials or private state: never mounted, and never an ancestor of a mount. */
-export const SECRET_HOME_PATHS: readonly string[] = ['.cline', '.ssh', '.gnupg', '.aws', '.azure', '.config', '.local/share', '.local/state', '.cache', '.claude', '.claude-main', '.netrc', '.git-credentials', '.docker', '.kube', '.password-store', '.npmrc', '.pypirc', '.mozilla', '.pki', '.terraform.d', '.vault-token']
+export const SECRET_HOME_PATHS: readonly string[] = ['.cline', '.ssh', '.gnupg', '.aws', '.azure', '.config', '.local/share', '.local/state', '.cache', '.claude', '.claude-main', '.netrc', '.git-credentials', '.gitconfig', '.docker', '.kube', '.password-store', '.npmrc', '.npm', '.yarnrc', '.pypirc', '.mozilla', '.pki', '.terraform.d', '.vault-token', '.oci', '.s3cfg', '.boto', '.m2', '.gradle', '.gem', '.cargo/credentials', '.cargo/credentials.toml', '.var', '.Xauthority', '.bash_history', '.zsh_history', '.python_history', '.psql_history', '.mysql_history', '.bashrc', '.zshrc', '.profile', '.bash_profile']
+/** System trees that are never mounted from the host (each sandbox gets its own /proc, /dev and empty /run). */
+const SYSTEM_TREES: readonly string[] = ['/proc', '/sys', '/dev', '/run', '/var/run', '/boot', '/root']
 const real = (p: string): string => { try { return realpathSync(p) } catch { return p } }
+const accountHome = (): string => { try { return userInfo().homedir } catch { return homedir() } }
 /**
  * Why mounting `raw` (read-only) would undo the boundary, or null. Judged on the real path (symlinks resolved,
  * `.`, `..` and `//` normalised): the root, a home directory as a whole or an ancestor of it, and anything that
@@ -51,11 +54,15 @@ export const mountProblem = (raw: string): string | null => {
   const ex = expandHome(raw.trim())
   if (!ex.startsWith('/')) return 'an absolute path (or ~/...) is required'
   const p = real(resolve(ex))
-  const home = real(homedir())
-  if (p === '/' || p === '/home' || p === '/root' || /^\/home\/[^/]+$/.test(p) || p === home || home.startsWith(`${p}/`)) return 'the root or a whole home directory would expose everything in it'
-  for (const rel of SECRET_HOME_PATHS) {
-    const s = real(join(home, rel))
-    if (p === s || p.startsWith(`${s}/`) || s.startsWith(`${p}/`)) return `it overlaps ${s.replace(home, '~')}, which holds credentials or private state`
+  for (const t of SYSTEM_TREES) { const r = real(t); if (p === t || p.startsWith(`${t}/`) || p === r || p.startsWith(`${r}/`)) return `${t} is never mounted from the host` }
+  // $HOME and the account's home directory (they can differ): both, and everything sensitive in them
+  const homes = [...new Set([real(homedir()), real(accountHome())])]
+  for (const home of homes) {
+    if (p === '/' || p === '/home' || /^\/home\/[^/]+$/.test(p) || p === home || home.startsWith(`${p}/`)) return 'the root or a whole home directory would expose everything in it'
+    for (const rel of SECRET_HOME_PATHS) {
+      const s = real(join(home, rel))
+      if (p === s || p.startsWith(`${s}/`) || s.startsWith(`${p}/`)) return `it overlaps ${s.replace(home, '~')}, which holds credentials or private state`
+    }
   }
   return null
 }
@@ -78,8 +85,28 @@ export const strippedGitConfig = (text: string): string => {
   return `${out.join('\n')}\n`
 }
 
+/**
+ * Files inside a git directory that are covered with an empty file: per-worktree configs, submodule configs
+ * (remote URLs can embed tokens) and fsmonitor daemon sockets (a path socket is reachable whatever the network
+ * namespace), in the common dir, its linked worktrees and its submodules (three levels deep).
+ */
+export const gitCovers = (commonDir: string): string[] => {
+  const out: string[] = []
+  const at = (dir: string, depth: number): void => {
+    for (const f of ['config.worktree', 'fsmonitor--daemon.ipc']) if (existsSync(join(dir, f))) out.push(join(dir, f))
+    if (depth > 0 && existsSync(join(dir, 'config'))) out.push(join(dir, 'config'))
+    for (const sub of ['worktrees', 'modules']) {
+      let names: string[] = []
+      try { names = readdirSync(join(dir, sub)) } catch { continue }
+      for (const n of names.slice(0, 256)) if (depth < 3) at(join(dir, sub, n), depth + 1)
+    }
+  }
+  at(commonDir, 0)
+  return out
+}
+
 /** The /etc files ordinary tools read (users, name service, dynamic linker, certificates, time zone, alternatives); not /etc as a whole. */
-export const ETC_ALLOW: readonly string[] = ['passwd', 'group', 'nsswitch.conf', 'host.conf', 'hosts', 'ld.so.cache', 'ld.so.conf', 'ld.so.conf.d', 'ssl', 'pki', 'ca-certificates', 'crypto-policies', 'localtime', 'alternatives', 'os-release', 'gitconfig', 'protocols', 'services', 'mime.types', 'terminfo', 'inputrc', 'locale.conf', 'shells']
+export const ETC_ALLOW: readonly string[] = ['passwd', 'group', 'nsswitch.conf', 'host.conf', 'hosts', 'ld.so.cache', 'ld.so.conf', 'ld.so.conf.d', 'ssl/certs', 'ssl/openssl.cnf', 'ssl/cert.pem', 'pki/tls/certs', 'pki/tls/openssl.cnf', 'pki/tls/cert.pem', 'pki/ca-trust', 'ca-certificates', 'crypto-policies', 'localtime', 'alternatives', 'os-release', 'protocols', 'services', 'mime.types', 'terminfo', 'inputrc', 'locale.conf', 'shells']
 export const expandHome = (p: string): string => p === '~' ? homedir() : p.startsWith('~/') ? `${homedir()}/${p.slice(2)}` : p
 export const MARKER_VAR = 'COCKPIT_CLINE_ATTEMPT'
 
@@ -153,7 +180,7 @@ export const bwrapArgs = (s: SandboxSpec): string[] => {
     if (existsSync(join(s.gitCommonDir, 'cobalt-cockpit-cline'))) a.push('--tmpfs', join(s.gitCommonDir, 'cobalt-cockpit-cline'))
     // remotes (a URL can embed a token), credential helpers, hooks and commands are not shown: a stripped config is
     if (existsSync(join(s.gitCommonDir, 'config'))) { if (!s.gitConfig) throw new Error('sandbox: the git directory needs a stripped config copy'); a.push('--ro-bind', s.gitConfig, join(s.gitCommonDir, 'config')) }
-    for (const f of ['config.worktree', 'fsmonitor--daemon.ipc']) if (existsSync(join(s.gitCommonDir, f))) a.push('--ro-bind', '/dev/null', join(s.gitCommonDir, f))
+    for (const f of gitCovers(s.gitCommonDir)) a.push('--ro-bind', '/dev/null', f)
   }
   for (const p of s.readOnly) ro(p)
   a.push(s.writable ? '--bind' : '--ro-bind', s.workdir, s.workdir); sources.push(s.workdir)

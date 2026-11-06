@@ -647,8 +647,9 @@ export class Mission {
     // A provider error before any turn, or a cancel or timeout before the first turn ended, spent
     // nothing observable and must not stop the retry (or the rest of the mission).
     // the broker shows whether any model turn reached the API: when none did, nothing was spent (a refused turn costs nothing)
-    const carried = out.broker ? carriedTurns(out.broker) : null
-    const spentUnmeasured = carried !== 0 && (out.stoppedBy === 'unmetered' || (f.usageEvents === 0 && f.iterations > 0) || (f.finishReason === 'completed' && (f.usageEvents === 0 || a.charge.basis === 'unmetered')))
+    const carried = out.brokerSpent ? out.brokerSpent.carried : out.broker ? carriedTurns(out.broker) : null
+    // a carried turn whose usage the API did not report is unmeasured spend, whatever the worker's stream says
+    const spentUnmeasured = (out.brokerSpent?.unmeasured ?? 0) > 0 || carried !== 0 && (out.stoppedBy === 'unmetered' || (f.usageEvents === 0 && f.iterations > 0) || (f.finishReason === 'completed' && (f.usageEvents === 0 || a.charge.basis === 'unmetered')))
     if (spentUnmeasured && !this.live.session.unmeteredTasks.includes(a.id)) {
       this.live.session.unmetered = true; this.live.session.unmeteredTasks.push(a.id)
       this.ledger.append('unmetered', t.spec.id, { attempt: a.id, detail: 'run reported no usable cost; session admissions stop' })

@@ -31,7 +31,10 @@ export const runCommandGate = async (g: GateSpec, workdir: string, outDir: strin
   if (gitConfig && env.gitCommonDir) writeFileSync(gitConfig, strippedGitConfig(readFileSync(join(env.gitCommonDir, 'config'), 'utf8')), { mode: 0o400 })
   const { child, identity } = launch({ workdir, writable: true, gitCommonDir: env.gitCommonDir, gitAdminDir: null, home, readOnly: [], readWrite: [], allowRead: env.allowRead ?? [], hide: env.hide, network: 'none', marker, env: {}, binds: env.shareDirs, gitConfig }, ['bash', '-c', g.command])
   const out = createWriteStream(file, { mode: 0o600 })
-  child.stdout?.pipe(out); child.stderr?.pipe(out)
+  // bounded: worker-authored gate code cannot fill the host's disk through its output
+  let outBytes = 0
+  const sink = (c: Uint8Array): void => { if (outBytes < 64 << 20) { out.write(c); outBytes += c.length } }
+  child.stdout?.on('data', sink); child.stderr?.on('data', sink)
   let timedOut = false
   const timer = setTimeout(() => { timedOut = true; void identity.then(i => terminate({ initPid: i.initPid, initStart: i.initStart, pidNs: i.pidNs, marker: i.marker, since: i.since })) }, env.timeoutSeconds * 1000)
   const code = await new Promise<number | null>(res => { child.on('exit', c => res(c)); child.on('error', () => res(null)) })
@@ -41,7 +44,7 @@ export const runCommandGate = async (g: GateSpec, workdir: string, outDir: strin
   const target: Target = { initPid: id2.initPid, initStart: id2.initStart, pidNs: id2.pidNs, marker: id2.marker, since: id2.since }
   const census = await terminate(target, true, 3000)
   await new Promise(r => out.end(r))
-  const text = existsSync(file) ? readFileSync(file, 'utf8') : ''
+  const text = existsSync(file) ? readFileSync(file, 'utf8').slice(-(1 << 20)) : ''
   const tail = text.split('\n').slice(-25).join('\n').slice(-2000)
   const sha = createHash('sha256').update(text).digest('hex')
   if (census.state !== 'gone') return { name: g.name, kind: 'command', command: g.command, exitCode: code, durationMs: Date.now() - t0, state: 'error', evidence: `gate processes not accounted for (${census.state}: ${census.detail})`, outputSha256: sha, unaccounted: census.detail, target }

@@ -1,7 +1,7 @@
 // cockpit-cline: Cobalt Cockpit for Cline. Commands: doctor, models, route, run, status,
 // watch, cancel, recover, replay, list, smoke.
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { ROLES } from './core/engine.ts'
 import type { Role } from './core/engine.ts'
@@ -83,11 +83,13 @@ const deps = (a: Args, repoRoot: string): Deps => ({
 })
 /** A --share directory: repository-relative, inside the repository on its real path (it is mounted read-only into sandboxes). */
 export const shareDir = (repoRoot: string, s: string): { from: string; to: string } => {
-  if (!s || s.startsWith('/') || s.split('/').includes('..') || s.includes('\\')) throw new UsageError(`--share ${s}: a repository-relative directory such as node_modules is required`)
+  if (!s || s.startsWith('/') || s.split('/').includes('..') || s.includes('\\') || s.split('/').some(seg => seg === '.git' || seg.startsWith('.env'))) throw new UsageError(`--share ${s}: a repository-relative dependency directory such as node_modules is required (never .git or .env)`)
   const rootReal = realpathSync(repoRoot)
   let from: string
   try { from = realpathSync(resolve(repoRoot, s)) } catch { throw new UsageError(`--share ${s}: no such directory in ${repoRoot}`) }
   if (!from.startsWith(`${rootReal}/`)) throw new UsageError(`--share ${s}: resolves outside the repository (${from})`)
+  if (!statSync(from).isDirectory()) throw new UsageError(`--share ${s}: not a directory`)
+  if (from.split('/').some(seg => seg === '.git' || seg.startsWith('.env'))) throw new UsageError(`--share ${s}: resolves into .git or an .env path`)
   return { from, to: s.replace(/\/+$/, '') }
 }
 const root = (a: Args): string => str(a, 'state') ?? stateRoot()

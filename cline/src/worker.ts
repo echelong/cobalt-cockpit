@@ -1,14 +1,13 @@
 // One worker attempt: a `cline --json` process inside its own sandbox.
 // The supervisor learns everything from Cline's JSONL stream and wire capture, and
 // declares the attempt ended only after a clean process census of its namespace.
-import { appendFileSync, chmodSync, createWriteStream, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { createInterface } from 'node:readline'
 import { PACKAGE_DIR } from './config.ts'
 import { cockpitRoots, launch, MARKER_VAR, mountProblem, readUntrusted, strippedGitConfig } from './sandbox.ts'
 import { BROKER_PORT, prepareClineData, startBroker } from './broker.ts'
-import type { Broker, BrokerRecord } from './broker.ts'
+import type { Broker, BrokerRecord, BrokerSpent, ReasoningRule } from './broker.ts'
 import type { Identity, SandboxSpec } from './sandbox.ts'
 import { census, terminate } from './proc.ts'
 import type { Census, Target } from './proc.ts'
@@ -55,6 +54,8 @@ export type WorkerOutcome = {
   stderrHead?: string
   /** What the host-side broker saw: every request the worker made, with model and reasoning effort (host-attested). */
   broker?: BrokerRecord[]
+  /** The broker's counters: model turns carried to the API, turns whose usage was not reported, measured tokens and cost. */
+  brokerSpent?: BrokerSpent
 }
 
 /**
@@ -167,7 +168,7 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   const home = join(rw, 'home'), data = join(rw, 'cline-data')
   mkdirSync(home, { recursive: true, mode: 0o700 })
   let broker: Broker
-  try { broker = await startBroker({ dataDir: w.clineDataDir, provider: w.provider, model: w.model, effort: effortLevel(w.expectedWire) ? w.expectedWire : null, budgetUsd: w.budgetUsd, budgetTokens: w.budgetTokens, log: r => { try { appendFileSync(join(w.runDir, 'broker.jsonl'), `${JSON.stringify(r)}\n`, { mode: 0o600 }) } catch { /* evidence only */ } } }) }
+  try { broker = await startBroker({ dataDir: w.clineDataDir, provider: w.provider, model: w.model, reasoning: reasoningRule(w.expectedWire, w.cliThinking), budgetUsd: w.budgetUsd, budgetTokens: w.budgetTokens, allowUnmetered: w.allowUnmetered, log: r => { try { appendFileSync(join(w.runDir, 'broker.jsonl'), `${JSON.stringify(r)}\n`, { mode: 0o600 }) } catch { /* evidence only */ } } }) }
   catch (e) { return { identity: null, exitCode: null, signal: null, facts: emptyFacts(), wire: judgeWire([], w.model, w.expectedWire), census: census({ initPid: null, initStart: null, pidNs: null, marker: `${MARKER_VAR}=${w.attemptId}`, since: Date.now() - 60_000 }), stoppedBy: 'spawn_error', stopDetail: `provider broker: ${(e as Error).message}`, hookRefusals: [], observerError: null } }
   prepareClineData(data, w.provider, w.model, broker.fakeToken)
   const sandbox = workerSandbox(w, { ro, rw, home }, broker.socketDir)
@@ -213,16 +214,17 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   // can never swap them for a link that a later host-side read would follow
   const streamFile = createWriteStream(join(w.runDir, 'stream.jsonl'), { mode: 0o600 })
   const errFile = createWriteStream(join(w.runDir, 'stderr.txt'), { mode: 0o600 })
-  child.stderr?.pipe(errFile)
+  // bounded: a worker cannot fill the host's disk or memory with output
+  let errBytes = 0
+  child.stderr?.on('data', (c: Uint8Array) => { if (errBytes < MAX_STDERR) { errFile.write(c); errBytes += c.length } })
   const timer = setTimeout(() => stopNow('timeout', `no completion within ${w.timeoutSeconds + 30}s`), (w.timeoutSeconds + 30) * 1000)
-  const rl = child.stdout ? createInterface({ input: child.stdout }) : null
-  const lines = rl ? (async () => {
-    for await (const line of rl) {
+  const lines = child.stdout ? (async () => {
+    for await (const line of boundedLines(child.stdout as NodeJS.ReadableStream, () => stopNow('budget', `the worker's output exceeded ${MAX_STREAM >> 20} MB`))) {
       streamFile.write(`${line}\n`)
       foldLine(facts, line)
       // display passthrough only: what a worker prints is never trusted for decisions here
       if (on.event) { try { const o = JSON.parse(line) as unknown; if (o && typeof o === 'object') on.event(o as Record<string, unknown>) } catch { /* not JSON, or a failing viewer */ } }
-      const b = budgetVerdict(facts, w, carriedTurns(broker.records))
+      const b = budgetVerdict(facts, w, broker.spent.carried)
       if (b) stopNow(b.stop, b.detail)
       // A failing observer (for example a full disk while persisting) must not stop the
       // stream being read: budget enforcement and the run result depend on it.
@@ -242,21 +244,43 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   const final = await terminate(targetOf(identity, marker, started), true, 5000)
   await broker.close()
   let stderrHead = ''
-  try { stderrHead = readFileSync(join(w.runDir, 'stderr.txt'), 'utf8').slice(0, 600) } catch { /* none */ }
+  try { stderrHead = readUntrusted(join(w.runDir, 'stderr.txt'), 600) } catch { /* none */ }
   if (facts.lines === 0 && stoppedBy === 'exit' && /^bwrap: /m.test(stderrHead)) { stoppedBy = 'spawn_error'; stopDetail = `sandbox did not start: ${stderrHead.split('\n')[0]}` }
   const wire = judgeWire(readWireCaptures(cap), w.model, w.expectedWire)
   let hookRefusals: { tool: string; reason: string }[] = []
   // per line, bounded: one malformed line does not hide the refusals around it
-  try { for (const l of readUntrusted(join(rw, 'hook.jsonl'), 1 << 20).split('\n')) { if (!l.trim()) continue; try { const e = JSON.parse(l) as { tool?: unknown; allow?: unknown; reason?: unknown }; if (e.allow === false) hookRefusals.push({ tool: String(e.tool ?? '?'), reason: String(e.reason ?? '') }) } catch { /* one bad line */ } } } catch { /* no hook log */ }
+  // the hook log is worker-writable: a log that was replaced, is not a regular file or is too large is itself a refusal
+  const hookLog = join(rw, 'hook.jsonl')
+  let hookStat: ReturnType<typeof lstatSync> | null = null
+  try { hookStat = lstatSync(hookLog) } catch { /* no tool call reached the hook */ }
+  if (hookStat && (!hookStat.isFile() || hookStat.isSymbolicLink())) hookRefusals.push({ tool: 'hook-log', reason: 'the hook log was replaced by something that is not a regular file' })
+  else if (hookStat && hookStat.size > MAX_HOOK_LOG) hookRefusals.push({ tool: 'hook-log', reason: `the hook log exceeds ${MAX_HOOK_LOG >> 20} MB` })
+  else if (hookStat) { try { for (const l of readUntrusted(hookLog, MAX_HOOK_LOG).split('\n')) { if (!l.trim()) continue; try { const e = JSON.parse(l) as { tool?: unknown; allow?: unknown; reason?: unknown }; if (e.allow === false) hookRefusals.push({ tool: String(e.tool ?? '?'), reason: String(e.reason ?? '') }) } catch { /* one bad line */ } } } catch { hookRefusals.push({ tool: 'hook-log', reason: 'the hook log could not be read' }) } }
   let stderrText = ''
-  try { stderrText = readFileSync(join(w.runDir, 'stderr.txt'), 'utf8').slice(0, 2000) } catch { /* none */ }
+  try { stderrText = readUntrusted(join(w.runDir, 'stderr.txt'), 2000) } catch { /* none */ }
   const attested = attestWire(wire, broker.records, w.model, w.expectedWire, facts.iterations)
   // the broker's figures come from the API's own answers: the cost the worker's stream reports can only be raised by them
   if (broker.spent.requests > 0 && broker.spent.usdKnown && broker.spent.usd > (facts.usage.reportedUsd ?? 0) + 1e-9) { facts.usage = { ...facts.usage, reportedUsd: broker.spent.usd }; observerError ??= `the worker's stream reported less cost than the API returned to the broker ($${broker.spent.usd.toFixed(5)}); the broker's figure is used` }
   if (broker.spent.tokens > facts.usage.inputTokens + facts.usage.outputTokens) facts.usage = { ...facts.usage, inputTokens: Math.max(facts.usage.inputTokens, broker.spent.tokens - facts.usage.outputTokens) }
-  return { identity, exitCode: ex.code, signal: ex.signal, facts, wire: attested, census: final, stoppedBy, stopDetail, hookRefusals, observerError, stderrHead: stderrText, broker: broker.records }
+  return { identity, exitCode: ex.code, signal: ex.signal, facts, wire: attested, census: final, stoppedBy, stopDetail, hookRefusals, observerError, stderrHead: stderrText, broker: broker.records, brokerSpent: { ...broker.spent } }
 }
 
+const MAX_STREAM = 256 << 20, MAX_LINE = 4 << 20, MAX_STDERR = 8 << 20, MAX_HOOK_LOG = 16 << 20
+/** Lines of a stream, each at most MAX_LINE (a longer one is cut), the whole at most MAX_STREAM (then `over` is called and reading stops). */
+async function* boundedLines(input: NodeJS.ReadableStream, over: () => void): AsyncGenerator<string> {
+  const dec = new TextDecoder(); let buf = ''; let total = 0
+  for await (const chunk of input as AsyncIterable<Uint8Array>) {
+    total += chunk.length
+    if (total > MAX_STREAM) { over(); return }
+    buf += dec.decode(chunk, { stream: true })
+    let i: number
+    while ((i = buf.indexOf('\n')) >= 0) { yield buf.slice(0, i).replace(/\r$/, ''); buf = buf.slice(i + 1) }
+    if (buf.length > MAX_LINE) { yield buf.slice(0, MAX_LINE); buf = '' }
+  }
+  buf += dec.decode(); if (buf) yield buf
+}
+/** What the broker lets a route send as reasoning: the exact effort level; a toggle model's sent effort; or none. */
+export const reasoningRule = (expectedWire: string, cliThinking: string): ReasoningRule => effortLevel(expectedWire) ? { effort: expectedWire } : expectedWire === 'on' ? { toggle: 'on', ...(cliThinking !== 'none' ? { effort: cliThinking } : {}) } : { none: true }
 /** Model turns the broker passed on to the API (refused ones never reached it). */
 export const carriedTurns = (records: readonly BrokerRecord[]): number => records.filter(r => r.path === '/api/v1/chat/completions' && !r.refused).length
 /** Whether a route's expected wire value is a reasoning effort level the broker can enforce (not none or a toggle). */
@@ -276,12 +300,20 @@ export const attestWire = (wire: WireVerdict, records: readonly BrokerRecord[], 
   if (carried.length === 0) return iterations > 0 ? { ...wire, state: 'unconfirmed', detail: 'the broker carried no model turn, so the request the provider received cannot be confirmed' } : wire
   const wrongModel = carried.find(r => r.model !== model)
   if (wrongModel) return { ...wire, state: 'mismatch', detail: `broker carried a request for model ${wrongModel.model}, routed ${model}` }
+  const n = carried.length
   if (effortLevel(expectedWire)) {
-    const wrong = carried.find(r => r.effort !== expectedWire)
-    if (wrong) return { ...wire, state: 'mismatch', detail: `broker carried reasoning effort ${wrong.effort ?? 'none'}, expected ${expectedWire}` }
-    return { ...wire, state: 'confirmed', requests: carried.length, effective: expectedWire, models: [model], detail: `broker carried ${carried.length} request(s) for ${model} at reasoning ${expectedWire}` }
+    const wrong = carried.find(r => r.effort !== expectedWire || r.reasoningEnabled === false)
+    if (wrong) return { ...wire, state: 'mismatch', detail: `broker carried reasoning effort ${wrong.effort ?? 'none'}${wrong.reasoningEnabled === false ? ' with thinking off' : ''}, expected ${expectedWire}` }
+    return { ...wire, state: 'confirmed', requests: n, effective: expectedWire, models: [model], detail: `broker carried ${n} request(s) for ${model} at reasoning ${expectedWire}` }
   }
-  return wire.state === 'confirmed' ? { ...wire, detail: `broker carried ${carried.length} request(s) for ${model}; ${wire.detail}` } : wire
+  if (expectedWire === 'on') {
+    const wrong = carried.find(r => r.effort === null || r.reasoningEnabled === false)
+    if (wrong) return { ...wire, state: 'mismatch', detail: `broker carried a request for ${model} ${wrong.reasoningEnabled === false ? 'with thinking off' : 'without a reasoning effort'}, expected thinking on` }
+    return { ...wire, state: 'confirmed', requests: n, effective: 'on', models: [model], detail: `broker carried ${n} request(s) for ${model} with thinking on (sent reasoning_effort=${carried[0].effort}; whether a toggle-only provider honours the level is not observable)` }
+  }
+  const wrong = carried.find(r => (r.effort !== null && r.effort !== 'none') || r.reasoningEnabled === true)
+  if (wrong) return { ...wire, state: 'mismatch', detail: `broker carried a request for ${model} with reasoning ${wrong.effort ?? 'on'}, expected ${expectedWire}` }
+  return { ...wire, state: 'confirmed', requests: n, effective: expectedWire, models: [model], detail: `broker carried ${n} request(s) for ${model} without reasoning` }
 }
 
 export const targetOf = (id: Identity | null, marker: string, since: number): Target => ({ initPid: id?.initPid ?? null, initStart: id?.initStart ?? null, pidNs: id?.pidNs ?? null, marker, since: id?.since ?? since })

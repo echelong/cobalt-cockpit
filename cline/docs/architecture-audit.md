@@ -287,6 +287,20 @@ merge-ready. Fixed, with tests in `test/isolation.spec.ts`:
 - **Host-side reads.** Capture files are capped in number and size, the hook log is parsed per line, and no
   artifact is removed while a gate's processes are not accounted for.
 
+A second fresh review, of the corrected diff (`1e65cbc..d3b5672`), accepted the isolation (no BLOCKER; the
+filesystem, network, credential and descendant boundaries hold) and listed what still weakened the broker as a
+hard bound. Fixed in the next commit, each with a test (`isolation (review 10)` in `test/isolation.spec.ts`):
+the broker's counters now move before its first await (concurrent turns cannot all pass one budget check; at
+most `maxInflight` can be in flight), it always asks the API for usage and treats a carried turn without usage as
+unmeasured (no further turns), counts carried turns separately from its bounded record list (a flood of refused
+requests cannot hide a real turn), records a turn before sending it, and cancels upstream when the client goes
+away; a failed save latches (no second refresh with the same token) and the kept answer is applied next time;
+if the person signs in again during a refresh their sign-in wins; toggle and no-reasoning routes are enforced
+and attested from the broker; a replaced or oversized hook log is a refusal; stream, stderr and gate output are
+bounded; submodule and per-worktree git configs and worktree fsmonitor sockets are covered; `/etc` exposes only
+the certificate stores (no `/etc/gitconfig`); system trees and both home directories are never mountable;
+`--share` refuses `.git`, `.env` and files; broker errors no longer reveal host paths to the worker.
+
 Accepted and documented (README limitations 22 and 23): no seccomp filter (keyring, io_uring, perf and bpf
 follow host settings), no resource limits, and the routed-model rule would refuse a different auxiliary model.
 
