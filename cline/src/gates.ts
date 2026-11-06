@@ -17,13 +17,17 @@ export type GateResult = { name: string; kind: 'command' | 'git' | 'security'; s
   /** A command gate whose sandbox processes could not be confirmed gone: worker-authored code may still run, so the attempt keeps its ownership. */ unaccounted?: string
   /** How to find those processes again (after a restart too): the gate sandbox's init and marker. */ target?: Target }
 
-export type GateEnv = { hide: string[]; shareDirs: { from: string; to: string }[]; timeoutSeconds: number; gitCommonDir: string | null }
+export type GateEnv = { hide: string[]; shareDirs: { from: string; to: string }[]; timeoutSeconds: number; gitCommonDir: string | null
+  /** Extra read-only paths the owner approved (toolchains); nothing else of the host is visible. */ allowRead?: string[] }
 
 export const runCommandGate = async (g: GateSpec, workdir: string, outDir: string, env: GateEnv, id: string): Promise<GateResult> => {
   mkdirSync(outDir, { recursive: true, mode: 0o700 })
   const t0 = Date.now(); const file = join(outDir, `${g.name}.log`)
   const marker = `gate-${id}-${g.name}`
-  const { child, identity } = launch({ workdir, writable: true, gitCommonDir: env.gitCommonDir, gitAdminDir: null, readOnly: [], readWrite: [], hide: env.hide, network: false, marker, env: {}, binds: env.shareDirs }, ['bash', '-c', g.command])
+  // a fresh home per gate run, beside its log (outside the tree): no host home, no network at all
+  const home = join(outDir, `home-${g.name.replace(/[^A-Za-z0-9._-]/g, '_')}-${Date.now()}`)
+  mkdirSync(home, { recursive: true, mode: 0o700 })
+  const { child, identity } = launch({ workdir, writable: true, gitCommonDir: env.gitCommonDir, gitAdminDir: null, home, readOnly: [], readWrite: [], allowRead: env.allowRead ?? [], hide: env.hide, network: 'none', marker, env: {}, binds: env.shareDirs }, ['bash', '-c', g.command])
   const out = createWriteStream(file, { mode: 0o600 })
   child.stdout?.pipe(out); child.stderr?.pipe(out)
   let timedOut = false

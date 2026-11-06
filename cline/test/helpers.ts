@@ -68,7 +68,16 @@ export const resolutions = async (c: Config): Promise<Record<Role, Resolution>> 
 }
 
 export type Env = { root: string; repo: string; data: string }
-export const env = (): Env => { const root = tmp('state'); const data = join(root, 'cline-data'); mkdirSync(data, { recursive: true }); return { root, repo: mkRepo(), data } }
+/** A real secret-shaped token planted in the test sign-in: tests assert it never reaches a sandbox. */
+export const TEST_REAL_TOKEN = 'REAL-TEST-TOKEN-must-never-enter-a-sandbox-7f3a9c'
+/** A Cline data directory with a (test) sign-in for both brokered providers, as `cline auth` leaves it. */
+export const clineData = (dir: string = tmp('cline-data')): string => {
+  mkdirSync(join(dir, 'settings'), { recursive: true })
+  const auth = { accessToken: TEST_REAL_TOKEN, refreshToken: 'test-refresh', expiresAt: Date.now() + 86400_000, accountId: 'acct-test', metadata: { provider: 'cline', tokenType: 'Bearer' } }
+  writeFileSync(join(dir, 'settings', 'providers.json'), JSON.stringify({ version: 1, lastUsedProvider: 'cline', modes: {}, providers: { cline: { settings: { provider: 'cline', auth }, tokenSource: 'oauth' }, 'cline-pass': { settings: { provider: 'cline-pass', auth }, tokenSource: 'manual' }, anthropic: { settings: { provider: 'anthropic', apiKey: 'sk-ant-OTHER-PROVIDER-KEY-must-never-enter' }, tokenSource: 'manual' } } }, null, 2))
+  return dir
+}
+export const env = (): Env => { const root = tmp('state'); const data = clineData(join(root, 'cline-data')); return { root, repo: mkRepo(), data } }
 
 export const deps = (e: Env, over: Partial<Deps> = {}): Deps => ({ clineBin: FAKE, clineDataDir: e.data, now: Date.now, runWorker, shareDirs: [], log: () => undefined, ...over })
 

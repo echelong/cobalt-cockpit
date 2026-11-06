@@ -1,12 +1,14 @@
 // One worker attempt: a `cline --json` process inside its own sandbox.
 // The supervisor learns everything from Cline's JSONL stream and wire capture, and
 // declares the attempt ended only after a clean process census of its namespace.
-import { chmodSync, createWriteStream, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, createWriteStream, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { PACKAGE_DIR } from './config.ts'
-import { launch, MARKER_VAR } from './sandbox.ts'
+import { cockpitRoots, launch, MARKER_VAR, readUntrusted } from './sandbox.ts'
+import { BROKER_PORT, prepareClineData, startBroker } from './broker.ts'
+import type { Broker, BrokerRecord } from './broker.ts'
 import type { Identity, SandboxSpec } from './sandbox.ts'
 import { census, terminate } from './proc.ts'
 import type { Census, Target } from './proc.ts'
@@ -22,7 +24,13 @@ export type WorkerSpec = {
   gitCommonDir: string | null; gitAdminDir: string | null
   provider: string; model: string; cliThinking: string; expectedWire: string
   prompt: string; policy: Policy; timeoutSeconds: number; clineRetries: number
-  hide: string[]; network: boolean; clineBin: string; clineDataDir: string
+  hide: string[]; clineBin: string
+  /** The person's Cline data directory on the HOST: the broker reads the sign-in from it. It is never mounted into the sandbox. */
+  clineDataDir: string
+  /** Extra read-only paths the owner approved; nothing else of the host is visible to the worker. */
+  allowRead?: string[]
+  /** Read-only dependency directories (e.g. the checkout's node_modules) bound into the worker's tree. */
+  binds?: { from: string; to: string }[]
   /** Live limits: crossing either ends the attempt at once. */
   budgetUsd: number | null; budgetTokens: number
   /** Pricing for the estimate that enforces budgetUsd when Cline reports no cost; null when unknown. */
@@ -45,6 +53,8 @@ export type WorkerOutcome = {
   observerError: string | null
   /** The first 2000 characters of the worker's stderr, for failure classification (never trusted for success). */
   stderrHead?: string
+  /** What the host-side broker saw: every request the worker made, with model and reasoning effort (host-attested). */
+  broker?: BrokerRecord[]
 }
 
 /**
@@ -113,6 +123,26 @@ export const foldLine = (f: StreamFacts, line: string): StreamFacts => {
   return f
 }
 
+/** The forwarder that maps the sandbox's 127.0.0.1:BROKER_PORT to the broker socket, then runs Cline. */
+export const FORWARDER = join(PACKAGE_DIR, 'src', 'forward.mjs')
+
+/**
+ * A worker's sandbox: the worktree, the attempt's read-only and writable directories, the Cockpit code its
+ * hook runs, approved read-only paths, the broker's socket and nothing else of the host (see sandbox.ts).
+ */
+export const workerSandbox = (w: Pick<WorkerSpec, 'workdir' | 'writable' | 'gitCommonDir' | 'gitAdminDir' | 'clineBin' | 'allowRead' | 'hide' | 'attemptId' | 'binds'>, d: { ro: string; rw: string; home: string }, brokerDir: string): SandboxSpec => {
+  // a Cline given as a path (a test double) is mounted read-only from where it lives
+  const binDir = w.clineBin.includes('/') ? [dirname(realpathSync(w.clineBin))] : []
+  return {
+    workdir: w.workdir, writable: w.writable, gitCommonDir: w.gitCommonDir, gitAdminDir: w.gitAdminDir,
+    home: d.home, readOnly: [d.ro, ...cockpitRoots(PACKAGE_DIR), ...binDir], readWrite: [d.rw], allowRead: w.allowRead ?? [],
+    hide: w.hide, network: 'provider', brokerDir, marker: w.attemptId, binds: w.binds,
+    env: { CLINE_API_BASE_URL: `http://127.0.0.1:${BROKER_PORT}`, CLINE_CAPTURE_PROVIDER_REQUEST: 'full', CLINE_CAPTURE_WIRE: 'true', CLINE_CAPTURE_DIR: join(d.rw, 'capture'), COCKPIT_POLICY: join(d.ro, 'policy.json'), COCKPIT_HOOK_LOG: join(d.rw, 'hook.jsonl') },
+  }
+}
+/** The argv prefix that starts the forwarder (127.0.0.1:BROKER_PORT -> broker socket) in front of a command. */
+export const viaBroker = (socketPath: string): string[] => [process.execPath, FORWARDER, String(BROKER_PORT), socketPath, '--']
+
 const hookScript = (): string => `#!/usr/bin/env bash
 # Cobalt Cockpit PreToolUse hook (generated). Any failure here cancels the run.
 exec "${process.execPath}" --experimental-transform-types --no-warnings --import "${join(PACKAGE_DIR, 'loader', 'register.mjs')}" "${join(PACKAGE_DIR, 'src', 'hook', 'pretool.ts')}" || { echo '{"cancel": true, "errorMessage": "COCKPIT: hook did not run"}'; exit 0; }
@@ -127,14 +157,16 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   writeFileSync(join(ro, 'hooks', 'PreToolUse.sh'), hookScript(), { mode: 0o500 })
   chmodSync(join(ro, 'hooks', 'PreToolUse.sh'), 0o500)
   writeFileSync(join(ro, 'prompt.txt'), w.prompt, { mode: 0o400 })
-  const sandbox: SandboxSpec = {
-    workdir: w.workdir, writable: w.writable, gitCommonDir: w.gitCommonDir, gitAdminDir: w.gitAdminDir,
-    readOnly: [ro, PACKAGE_DIR, join(PACKAGE_DIR, '..', 'hooks'), join(PACKAGE_DIR, '..', 'types')],
-    readWrite: [rw, w.clineDataDir],
-    hide: w.hide, network: w.network, marker: w.attemptId,
-    env: { CLINE_CAPTURE_PROVIDER_REQUEST: 'full', CLINE_CAPTURE_WIRE: 'true', CLINE_CAPTURE_DIR: cap, COCKPIT_POLICY: join(ro, 'policy.json'), COCKPIT_HOOK_LOG: join(rw, 'hook.jsonl') },
-  }
-  const argv = [w.clineBin, '--json', '-P', w.provider, '-m', w.model, '--thinking', w.cliThinking, '-c', w.workdir, '--config', cfg, '--data-dir', w.clineDataDir, '--hooks-dir', join(ro, 'hooks'), '-t', String(w.timeoutSeconds), '--retries', String(w.clineRetries), w.prompt]
+  // a disposable home and Cline data directory, inside the attempt's own writable directory; the
+  // broker holds the real sign-in on the host and is the sandbox's only way out
+  const home = join(rw, 'home'), data = join(rw, 'cline-data')
+  mkdirSync(home, { recursive: true, mode: 0o700 })
+  let broker: Broker
+  try { broker = await startBroker({ dataDir: w.clineDataDir, provider: w.provider, model: w.model, log: r => { try { appendFileSync(join(w.runDir, 'broker.jsonl'), `${JSON.stringify(r)}\n`, { mode: 0o600 }) } catch { /* evidence only */ } } }) }
+  catch (e) { return { identity: null, exitCode: null, signal: null, facts: emptyFacts(), wire: judgeWire([], w.model, w.expectedWire), census: census({ initPid: null, initStart: null, pidNs: null, marker: `${MARKER_VAR}=${w.attemptId}`, since: Date.now() - 60_000 }), stoppedBy: 'spawn_error', stopDetail: `provider broker: ${(e as Error).message}`, hookRefusals: [], observerError: null } }
+  prepareClineData(data, w.provider, w.model, broker.fakeToken)
+  const sandbox = workerSandbox(w, { ro, rw, home }, broker.socketDir)
+  const argv = [...viaBroker(broker.socketPath), w.clineBin, '--json', '-P', w.provider, '-m', w.model, '--thinking', w.cliThinking, '-c', w.workdir, '--config', cfg, '--data-dir', data, '--hooks-dir', join(ro, 'hooks'), '-t', String(w.timeoutSeconds), '--retries', String(w.clineRetries), w.prompt]
   writeFileSync(join(rw, 'argv.json'), JSON.stringify({ bwrap: sandbox, argv: argv.slice(0, -1).concat(['<prompt.txt>']) }, null, 1), { mode: 0o600 })
   const marker = `${MARKER_VAR}=${w.attemptId}`
   const facts = emptyFacts()
@@ -144,6 +176,7 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
 
   const start = io.launch ?? launch
   const launched = (() => { try { return start(sandbox, argv) } catch (e) { stopDetail = (e as Error).message; return null } })()
+  if (!launched) await broker.close()
   if (!launched) return { identity: null, exitCode: null, signal: null, facts, wire: judgeWire([], w.model, w.expectedWire), census: census({ initPid: null, initStart: null, pidNs: null, marker, since: Date.now() - 60_000 }), stoppedBy: 'spawn_error', stopDetail, hookRefusals: [], observerError: null }
   const { child } = launched
   const started = Date.now()
@@ -171,8 +204,10 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
     // the callback writes claims and the ledger; its failure must not crash the supervisor unseen
     try { on.identity?.(id) } catch (e) { observerError ??= `identity observer: ${(e as Error).message}` }
   })
-  const streamFile = createWriteStream(join(rw, 'stream.jsonl'), { mode: 0o600 })
-  const errFile = createWriteStream(join(rw, 'stderr.txt'), { mode: 0o600 })
+  // the stream and stderr are written by the supervisor OUTSIDE the worker's writable directory, so a worker
+  // can never swap them for a link that a later host-side read would follow
+  const streamFile = createWriteStream(join(w.runDir, 'stream.jsonl'), { mode: 0o600 })
+  const errFile = createWriteStream(join(w.runDir, 'stderr.txt'), { mode: 0o600 })
   child.stderr?.pipe(errFile)
   const timer = setTimeout(() => stopNow('timeout', `no completion within ${w.timeoutSeconds + 30}s`), (w.timeoutSeconds + 30) * 1000)
   const rl = child.stdout ? createInterface({ input: child.stdout }) : null
@@ -196,19 +231,35 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   const id = identity ?? await Promise.race([launched.identity, new Promise<null>(r => setTimeout(() => r(null), 1000))])
   if (id) identity = id
   returned = true
-  if (observerError) writeFileSync(join(rw, 'observer-error.txt'), observerError, { mode: 0o600 })
+  if (observerError) writeFileSync(join(w.runDir, 'observer-error.txt'), observerError, { mode: 0o600 })
   // The outer bwrap has exited. Nothing is declared ended until the census is clean.
   // A clean exit is not proof: the census reads the sandbox init and the marker.
   const final = await terminate(targetOf(identity, marker, started), true, 5000)
+  await broker.close()
   let stderrHead = ''
-  try { stderrHead = readFileSync(join(rw, 'stderr.txt'), 'utf8').slice(0, 600) } catch { /* none */ }
+  try { stderrHead = readFileSync(join(w.runDir, 'stderr.txt'), 'utf8').slice(0, 600) } catch { /* none */ }
   if (facts.lines === 0 && stoppedBy === 'exit' && /^bwrap: /m.test(stderrHead)) { stoppedBy = 'spawn_error'; stopDetail = `sandbox did not start: ${stderrHead.split('\n')[0]}` }
   const wire = judgeWire(readWireCaptures(cap), w.model, w.expectedWire)
   let hookRefusals: { tool: string; reason: string }[] = []
-  try { hookRefusals = readFileSync(join(rw, 'hook.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l) as { tool: string; allow: boolean; reason: string }).filter(e => !e.allow).map(e => ({ tool: e.tool, reason: e.reason })) } catch { /* no refusals */ }
+  try { hookRefusals = readUntrusted(join(rw, 'hook.jsonl')).split('\n').filter(Boolean).map(l => JSON.parse(l) as { tool: string; allow: boolean; reason: string }).filter(e => !e.allow).map(e => ({ tool: e.tool, reason: e.reason })) } catch { /* no refusals */ }
   let stderrText = ''
-  try { stderrText = readFileSync(join(rw, 'stderr.txt'), 'utf8').slice(0, 2000) } catch { /* none */ }
-  return { identity, exitCode: ex.code, signal: ex.signal, facts, wire, census: final, stoppedBy, stopDetail, hookRefusals, observerError, stderrHead: stderrText }
+  try { stderrText = readFileSync(join(w.runDir, 'stderr.txt'), 'utf8').slice(0, 2000) } catch { /* none */ }
+  const attested = attestWire(wire, broker.records, w.model, w.expectedWire)
+  return { identity, exitCode: ex.code, signal: ex.signal, facts, wire: attested, census: final, stoppedBy, stopDetail, hookRefusals, observerError, stderrHead: stderrText, broker: broker.records }
+}
+
+/**
+ * Host-attested wire check: a request the broker carried for a different model, or (for an effort-level
+ * route) with a different reasoning effort, is a mismatch whatever the sandbox-written captures say. A
+ * toggle model's "thinking on/off" is judged from the captures alone.
+ */
+export const attestWire = (wire: WireVerdict, records: readonly BrokerRecord[], model: string, expectedWire: string): WireVerdict => {
+  const seen = records.filter(r => r.model !== null && !r.refused)
+  const wrongModel = seen.find(r => r.model !== model)
+  if (wrongModel) return { ...wire, state: 'mismatch', detail: `broker carried a request for model ${wrongModel.model}, routed ${model}` }
+  const wrongEffort = !['none', 'on', 'off'].includes(expectedWire) ? seen.find(r => r.effort !== null && r.effort !== expectedWire) : undefined
+  if (wrongEffort) return { ...wire, state: 'mismatch', detail: `broker carried reasoning effort ${wrongEffort.effort}, expected ${expectedWire}` }
+  return wire
 }
 
 export const targetOf = (id: Identity | null, marker: string, since: number): Target => ({ initPid: id?.initPid ?? null, initStart: id?.initStart ?? null, pidNs: id?.pidNs ?? null, marker, since: id?.since ?? since })

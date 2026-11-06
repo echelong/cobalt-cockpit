@@ -6,8 +6,9 @@
 // deepseek/deepseek-v4.1-flash-1017 (catalog values none|low|high|max) sent
 // "reasoning_effort":"max" on the wire. That translation (xhigh -> max when the
 // model lists max but not xhigh) is the only non-identity mapping accepted here.
-import { readdirSync, readFileSync } from 'node:fs'
+import { readdirSync } from 'node:fs'
 import { join } from 'node:path'
+import { readUntrusted, realDir } from './sandbox.ts'
 import type { Thinking } from './config.ts'
 
 export type ReasoningPlan =
@@ -78,11 +79,13 @@ export const headFields = (head: string): Record<string, unknown> => {
 /** Reads every wire request Cline captured into `dir` (CLINE_CAPTURE_WIRE=true). Only model and effort are kept. */
 export const readWireCaptures = (dir: string): WireRequest[] => {
   let names: string[] = []
+  // the capture directory is worker-writable: a symlink in place of it, or of a file in it, is never followed
+  if (!realDir(dir)) return []
   try { names = readdirSync(dir).filter(n => n.includes('.wire_request.') && n.endsWith('.json')).sort() } catch { return [] }
   const out: WireRequest[] = []
   for (const name of names) {
     try {
-      const doc = JSON.parse(readFileSync(join(dir, name), 'utf8')) as { timestamp?: string; payload?: { body?: unknown; truncated?: unknown; preview?: unknown; bytes?: unknown; sha256?: unknown } }
+      const doc = JSON.parse(readUntrusted(join(dir, name))) as { timestamp?: string; payload?: { body?: unknown; truncated?: unknown; preview?: unknown; bytes?: unknown; sha256?: unknown } }
       const p = doc.payload ?? {}
       let b: Record<string, unknown> | null = null
       let source: WireRequest['source'] = 'unreadable'

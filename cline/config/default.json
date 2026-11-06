@@ -68,7 +68,7 @@
   "unpinnedAllowed": [],
   "sandbox": {
     "hide": ["~/.ssh", "~/.gnupg", "~/.aws", "~/.config/gcloud", "~/.claude", "~/.claude-main", "~/.local/share/cobalt-cockpit-evidence", "~/.local/share/cobalt-cockpit-backup-key", "~/.local/state/cobalt-cockpit-cline"],
-    "allowNetwork": true
+    "allowRead": []
   },
   "tools": {
     "allowed": ["read_files", "search_codebase", "run_commands", "editor"],

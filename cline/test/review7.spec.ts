@@ -12,7 +12,7 @@ import { render, taskCost } from '../src/hud.ts'
 import { costMeasured } from '../src/supervisor.ts'
 import type { AttemptRecord } from '../src/supervisor.ts'
 import { Ledger, listClaims } from '../src/store.ts'
-import { alwaysHidden, bwrapArgs } from '../src/sandbox.ts'
+import { bwrapArgs } from '../src/sandbox.ts'
 import { runCommandGate } from '../src/gates.ts'
 import { sanitize } from '../src/ui/term.ts'
 import { startTimeOf } from '../src/proc.ts'
@@ -122,11 +122,9 @@ describe('review 7: the legacy status screen is terminal-safe and never shows un
 })
 
 describe('review 7: sandboxes, gates and the ledger', () => {
-  test('every sandbox hides the user service manager, the buses and container sockets, whatever the config', () => {
-    const uid = process.getuid?.() ?? 1000
-    assert.ok(alwaysHidden(uid).includes(`/run/user/${uid}`))
-    const args = bwrapArgs({ workdir: '/tmp', writable: false, gitCommonDir: null, gitAdminDir: null, readOnly: [], readWrite: [], hide: [], network: false, marker: 'm', env: {} })
-    if (readdirSync('/run/user').includes(String(uid))) assert.ok(args.join(' ').includes(`--tmpfs /run/user/${uid}`), args.join(' '))
+  test('no sandbox mounts the host root, /run or the user service manager', () => {
+    const args = bwrapArgs({ workdir: '/tmp', writable: false, gitCommonDir: null, gitAdminDir: null, home: '/tmp', readOnly: [], readWrite: [], allowRead: [], hide: [], network: 'none', marker: 'm', env: {} }).join(' ')
+    assert.doesNotMatch(args, /--ro-bind \/ \//); assert.match(args, /--tmpfs \/run /); assert.match(args, /--unshare-net/); assert.match(args, /--disable-userns/)
   })
   test('a gate (worker-authored code) cannot reach the user service manager socket', T, async t => {
     const uid = process.getuid?.() ?? 1000

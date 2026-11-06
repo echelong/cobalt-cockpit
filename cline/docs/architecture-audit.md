@@ -219,6 +219,44 @@ the author's conclusions.
   normalisation, DeepSeek-never-substituted routing, bounded `nextStep`, wire judging, and that no stop or cancel
   path releases ownership without a clean census.
 
+## 6a. Default-deny isolation (2026-11-06)
+
+The owner did not accept the open-read sandbox or the writable `~/.cline/data`. Both were replaced:
+
+- **Filesystem.** bubblewrap no longer binds the host root. Each worker and gate gets an empty root (remounted
+  read-only) holding `/usr` and `/etc` read-only, the node installation that runs Cline read-only, Cockpit's hook
+  code read-only (`cline/src`, `cline/loader`, `hooks`, `types`), the repository's git directory read-only (its
+  claim store covered), the task's worktree, the attempt's own run directory, a disposable `HOME`, and paths the
+  owner adds to `sandbox.allowRead` (validated against `/`, home directories and credential stores). `/tmp`,
+  `/var/tmp` and `/run` are private and empty. `sandbox.hide` remains as a second layer inside mounted trees.
+- **Namespaces and privilege.** `--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try
+  --unshare-net --disable-userns --assert-userns-disabled`, environment cleared and rebuilt. No capabilities,
+  `no_new_privs`, no nested user namespaces, a private procfs.
+- **Credentials and network.** Investigated in the installed Cline 3.0.74: the API base comes from
+  `CLINE_API_BASE_URL` (provider `cline`) or the provider's `baseUrl` setting (`cline-pass`); a model turn is
+  `POST /api/v1/chat/completions` signed `Bearer workos:<access token>`; a refresh is
+  `POST /api/v1/auth/refresh {refreshToken, grantType}` under an SQLite lock file
+  `providers.json.oauth-<sha256(provider)>.lock` (`BEGIN EXCLUSIVE`). The real `providers.json` also held an
+  Anthropic and an OpenAI-compatible key, which every earlier worker could read. Now each worker's Cline gets a
+  disposable data directory with only its provider, a random fake token and the base URL
+  `http://127.0.0.1:8899`. Inside the sandbox (loopback only) `src/forward.mjs` connects that port to a unix
+  socket of a host-side broker (`src/broker.ts`), which accepts exactly four requests (the model turn for the
+  routed model, and three GET paths Cline makes at start), sends them only to `https://api.cline.bot`, replaces the
+  fake token with the real one and records model and effort per request. It refreshes an expiring token on the
+  host under Cline's own lock, writing the new token where Cline keeps it (backup beside it). Rejected: a CONNECT
+  proxy (the real token would still be in the sandbox) and a per-attempt copy of the real settings with write-back
+  (real credentials in the writable sandbox, and a worker could plant tokens into the host store).
+- **Host-side reads.** The stream and stderr are written outside the worker-writable directory; captures and the
+  hook log are read with `O_NOFOLLOW` and only as regular files, from a capture directory that is not a symlink.
+- **Evidence.** `test/isolation.spec.ts` runs each attack as a shell command in the real worker sandbox (the
+  spec `runWorker` builds, with a live broker) or in a real gate, with no hook in the way: unrelated repositories
+  and `.env` files outside `/tmp`, the real home, keys and Cline data, host TCP services, abstract and filesystem
+  unix sockets, the user and system bus, DNS and the internet, broker paths, hosts and models outside the
+  allowlist, symlinks, `/proc`, mounts, nested namespaces and bwrap, writes outside the worktree, `sudo`, `su`,
+  `pkexec`, capabilities, and a detached descendant after the attempt ends. Live, through the broker, on the
+  owner's machine: all five roles PASS (DeepSeek 1017 xhigh→max, Kimi high, MiMo toggle on, Qwen xhigh, GLM low)
+  for $0.0325, and the expired sign-in was refreshed host-side with every other provider entry unchanged.
+
 ## 7. Test baseline
 
 Before any change, on `main` at `4e3b90a` with the isolated gate runner (Claude Code 2.1.296, TypeScript 5.9.3,

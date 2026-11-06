@@ -65,15 +65,15 @@ const abort = (why) => {
 }
 
 out({ type: 'hook_event', hookEventName: 'agent_start', agentId: 'agent_fake', taskId: 'conv_fake' })
-// [[fail-times:N:KIND]]: the first N runs of this prompt fail (KIND 503 | 429 | 401). The counter
-// lives in the Cline data dir, the one place a sandboxed worker may write besides its worktree.
+// The attempt number, from the attempt's own run directory (…/runs/<task>/<n>/rw/cline-data): a sandboxed
+// worker keeps nothing between attempts (its home and Cline data are disposable), so a test double that
+// must behave differently on a retry reads which attempt it is instead of counting in a file.
+const attemptNo = (() => { const m = /\/runs\/[^/]+\/(\d+)\/rw\//.exec(opt('--data-dir') ?? ''); return m ? Number(m[1]) : 1 })()
+// [[fail-times:N:KIND]]: the first N attempts of this task fail (KIND 503 | 429 | 401).
 const failTimes = argOf('fail-times')
 if (failTimes) {
-  const [n, kind] = failTimes.split(':'); const dataDir = opt('--data-dir') ?? '/tmp'
-  const key = join(dataDir, `fake-count-${Buffer.from(failTimes + (argOf('key') ?? '')).toString('hex').slice(0, 32)}`)
-  let count = 0; try { count = Number((await import('node:fs')).readFileSync(key, 'utf8')) } catch { /* first run */ }
-  writeFileSync(key, String(count + 1))
-  if (count < Number(n)) {
+  const [n, kind] = failTimes.split(':')
+  if (attemptNo <= Number(n)) {
     const msg = kind === '429' ? 'Provider error: 429 Too Many Requests (rate limited)' : kind === '401' ? 'Provider error: 401 Unauthorized: invalid API key' : 'Provider error: 503 upstream overloaded'
     out({ type: 'hook_event', hookEventName: 'agent_error', agentId: 'agent_fake' })
     out({ type: 'run_result', finishReason: 'error', iterations: 0, usage: {}, aggregateUsage: {}, text: msg, model: { id: reportedModel, provider } })
@@ -83,11 +83,9 @@ if (failTimes) {
 const correction = /did not pass Cockpit's verification/.test(prompt)
 // [[fail-on-correction:N]]: the first N correction/escalation runs hit a transient provider error
 const failCorr = argOf('fail-on-correction')
+// (the first correction is the second attempt: corrections so far = attempt number - 2)
 if (failCorr && correction) {
-  const key = join(opt('--data-dir') ?? '/tmp', `fake-corr-${Buffer.from(prompt.slice(0, 200)).toString('hex').slice(0, 24)}`)
-  let count = 0; try { count = Number((await import('node:fs')).readFileSync(key, 'utf8')) } catch { /* first */ }
-  writeFileSync(key, String(count + 1))
-  if (count < Number(failCorr)) {
+  if (attemptNo - 2 < Number(failCorr)) {
     out({ type: 'run_result', finishReason: 'error', iterations: 0, usage: {}, aggregateUsage: {}, text: 'Provider error: 503 upstream overloaded', model: { id: reportedModel, provider } })
     process.exit(1)
   }

@@ -1,24 +1,37 @@
-// OS enforcement for workers: bubblewrap. The hook is a second layer; this is the boundary.
-//   - read-only root, private /tmp, own /dev and /proc
-//   - pid, ipc and uts namespaces: when the sandbox ends, the kernel kills every process
-//     in it, detached or not; --die-with-parent ends it when the supervisor dies
-//   - only the task's worktree (or nothing, for read-only work), the attempt's own output
-//     directory and Cline's data directory are writable
-//   - the repository's git common dir is read-only except the worktree's own admin dir
-//   - configured secret directories, and a fixed list of sockets and credential stores (alwaysHidden),
-//     are hidden behind empty tmpfs mounts
+// OS enforcement for workers and gates: bubblewrap, default-deny. The hook is a second layer; this is the boundary.
+//   - no host root: an empty root (remounted read-only) with only an allowlist mounted into it:
+//     /usr and /etc read-only, the node runtime that runs Cline read-only, the task's worktree, the
+//     attempt's own directories and paths the owner approved (read-only). Everything else on the
+//     host (other repositories, the home directory, .env files, keys, the real ~/.cline) is absent.
+//   - a disposable HOME (and XDG directories under it) per run; the environment is cleared and rebuilt
+//   - user, pid, ipc, uts, cgroup and network namespaces; nested user namespaces are disabled, so a
+//     worker cannot gain capabilities to mount or unshare anything; no_new_privs blocks setuid gain
+//   - network: none (gates), provider (workers: loopback only, plus the host broker's socket), or
+//     host (an explicit, unsafe opt-in). When the sandbox ends, the kernel kills every process in it.
+//   - the repository's git common dir is read-only (its Cockpit claim store hidden)
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
-import { existsSync, statSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { pidNamespaceOf, processIdentity, startTimeOf } from './proc.ts'
 import type { ProcessIdentity } from './proc.ts'
 
+export type NetworkMode = 'none' | 'provider' | 'host'
 export type SandboxSpec = {
   workdir: string; writable: boolean
   gitCommonDir: string | null; gitAdminDir: string | null
-  readOnly: string[]; readWrite: string[]; hide: string[]
-  network: boolean; marker: string; env: Record<string, string>
+  /** The run's disposable home directory (writable); HOME and the XDG directories point into it. */
+  home: string
+  readOnly: string[]; readWrite: string[]
+  /** Extra read-only paths the owner approved (toolchains, dependency caches); nothing else of the host is visible. */
+  allowRead: string[]
+  /** Paths hidden even inside mounted trees (a second layer; the allowlist is the boundary). */
+  hide: string[]
+  network: NetworkMode
+  /** provider mode: the directory holding the broker's unix socket, mounted read-only. */
+  brokerDir?: string | null
+  marker: string; env: Record<string, string>
   /** Extra read-only binds placed after the workdir (e.g. the main checkout's node_modules for gates). */
   binds?: { from: string; to: string }[]
 }
@@ -26,48 +39,87 @@ export const expandHome = (p: string): string => p === '~' ? homedir() : p.start
 export const MARKER_VAR = 'COCKPIT_CLINE_ATTEMPT'
 
 /**
- * Hidden from EVERY sandbox (workers and the gates that run their code), whatever the config says:
- * the user's service manager and session bus (a process started through them runs outside the
- * sandbox, with network, and never carries the attempt marker, so no census could see it), the
- * system bus, container engine sockets, and well-known credential stores outside the configured list.
+ * Reads a file a sandboxed process could have written (captures, hook log) without following a
+ * symlink it may have planted there: only a regular file is read, up to `max` bytes. The host never
+ * becomes a deputy that reads its own secrets through a worker's link.
  */
-export const alwaysHidden = (uid: number = process.getuid?.() ?? 1000): string[] => [
-  `/run/user/${uid}`, '/run/dbus', '/run/docker.sock', '/run/podman', '/run/containerd',
-  '~/.config/gh', '~/.config/hub', '~/.netrc', '~/.npmrc', '~/.pypirc', '~/.git-credentials', '~/.docker', '~/.kube',
-  '~/.password-store', '~/.local/share/keyrings', '~/.cargo/credentials', '~/.cargo/credentials.toml',
-  '~/.mozilla', '~/.config/google-chrome', '~/.config/chromium', '~/.config/BraveSoftware',
-]
+export const readUntrusted = (path: string, max = 64 << 20): string => {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const st = fstatSync(fd)
+    if (!st.isFile()) throw new Error(`${path}: not a regular file`)
+    const n = Math.min(st.size, max); const buf = new Uint8Array(n); let off = 0
+    while (off < n) { const r = readSync(fd, buf, off, n - off, off); if (r <= 0) break; off += r }
+    return Buffer.from(buf.buffer, 0, off).toString('utf8')
+  } finally { closeSync(fd) }
+}
+/** A directory a sandboxed process could have replaced: true only when it is still a real directory (not a symlink). */
+export const realDir = (path: string): boolean => { try { const st = lstatSync(path); return st.isDirectory() && !st.isSymbolicLink() } catch { return false } }
+
+/** The node installation that runs Cline and the hook (its prefix holds `cline` and global packages), when outside /usr. */
+export const runtimeRoots = (): string[] => {
+  const prefix = dirname(dirname(realpathSync(process.execPath)))
+  return prefix === '/usr' || prefix.startsWith('/usr/') ? [] : [prefix]
+}
+/** The Cockpit code a worker's hook runs (read-only): the adapter's sources and loader, and the engine it imports. */
+export const cockpitRoots = (packageDir: string): string[] => [join(packageDir, 'src'), join(packageDir, 'loader'), join(packageDir, '..', 'hooks'), join(packageDir, '..', 'types')]
+
+/** The operating system, read-only; /bin, /lib... follow the host's layout (symlinks into /usr on merged-/usr systems). */
+const osMounts = (): string[] => {
+  const a = ['--ro-bind', '/usr', '/usr']
+  for (const p of ['/bin', '/sbin', '/lib', '/lib64']) {
+    try { const st = lstatSync(p); if (st.isSymbolicLink()) a.push('--symlink', readlinkSync(p), p); else if (st.isDirectory()) a.push('--ro-bind', p, p) } catch { /* absent */ }
+  }
+  a.push('--ro-bind', '/etc', '/etc', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp', '--tmpfs', '/var/tmp', '--tmpfs', '/run')
+  return a
+}
+const under = (p: string, root: string): boolean => p === root || p.startsWith(`${root}/`)
+const ENV_KEEP = /^(?:USER|LOGNAME|LANG|LANGUAGE|LC_[A-Z]+|TERM|COLORTERM|TZ)$/
+/** The environment a sandboxed process starts with: cleared, then only these. Nothing of the host's secrets or paths. */
+export const sandboxEnv = (s: SandboxSpec, host: NodeJS.ProcessEnv = process.env): Record<string, string> => {
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(host)) if (v !== undefined && ENV_KEEP.test(k)) out[k] = v
+  const bins = [...runtimeRoots().map(r => join(r, 'bin')), ...s.allowRead.map(expandHome).filter(p => /\/bin$/.test(p)), '/usr/local/bin', '/usr/bin', '/bin']
+  Object.assign(out, {
+    HOME: s.home, XDG_CONFIG_HOME: join(s.home, '.config'), XDG_CACHE_HOME: join(s.home, '.cache'), XDG_DATA_HOME: join(s.home, '.local', 'share'), XDG_STATE_HOME: join(s.home, '.local', 'state'),
+    TMPDIR: '/tmp', PATH: [...new Set(bins)].join(':'), [MARKER_VAR]: s.marker,
+  }, s.env)
+  return out
+}
 
 export const bwrapArgs = (s: SandboxSpec): string[] => {
-  const a = ['--die-with-parent', '--new-session', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--unshare-cgroup-try']
-  if (!s.network) a.push('--unshare-net')
-  a.push('--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp')
-  for (const raw of [...new Set([...s.hide, ...alwaysHidden()])]) {
-    const p = expandHome(raw)
-    if (!existsSync(p)) continue
-    if (statSync(p).isDirectory()) a.push('--tmpfs', p); else a.push('--ro-bind', '/dev/null', p)
+  const a = ['--die-with-parent', '--new-session', '--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--unshare-cgroup-try', '--disable-userns', '--assert-userns-disabled']
+  if (s.network !== 'host') a.push('--unshare-net')
+  a.push(...osMounts())
+  const sources: string[] = ['/usr', '/etc']
+  const ro = (p: string): void => { if (existsSync(p)) { a.push('--ro-bind', p, p); sources.push(p) } }
+  for (const p of runtimeRoots()) ro(p)
+  for (const p of s.allowRead) ro(expandHome(p))
+  if (s.gitCommonDir) {
+    ro(s.gitCommonDir)
+    // other missions' claims and markers are not the worker's business
+    if (existsSync(join(s.gitCommonDir, 'cobalt-cockpit-cline'))) a.push('--tmpfs', join(s.gitCommonDir, 'cobalt-cockpit-cline'))
   }
-  if (s.gitCommonDir) a.push('--ro-bind', s.gitCommonDir, s.gitCommonDir)
-  for (const p of s.readOnly) a.push('--ro-bind', p, p)
-  a.push(s.writable ? '--bind' : '--ro-bind', s.workdir, s.workdir)
+  for (const p of s.readOnly) ro(p)
+  a.push(s.writable ? '--bind' : '--ro-bind', s.workdir, s.workdir); sources.push(s.workdir)
   // The worktree's .git link stays read-only (and, being a mount point, cannot be replaced),
   // and its admin dir stays inside the read-only git common dir: host git later trusts both.
   if (s.writable && existsSync(`${s.workdir}/.git`)) a.push('--ro-bind', `${s.workdir}/.git`, `${s.workdir}/.git`)
-  for (const b of s.binds ?? []) if (existsSync(b.from)) a.push('--ro-bind', b.from, b.to)
-  for (const p of s.readWrite) a.push('--bind', p, p)
-  a.push('--setenv', MARKER_VAR, s.marker)
-  for (const [k, v] of Object.entries(s.env)) a.push('--setenv', k, v)
+  for (const b of s.binds ?? []) if (existsSync(b.from)) { a.push('--ro-bind', b.from, b.to); sources.push(b.from) }
+  for (const p of s.readWrite) { a.push('--bind', p, p); sources.push(p) }
+  a.push('--bind', s.home, s.home)
+  if (s.network === 'provider') { if (!s.brokerDir) throw new Error('sandbox: provider network needs the broker socket directory'); a.push('--ro-bind', s.brokerDir, s.brokerDir) }
+  // a second layer inside what is mounted: configured secret paths are covered over
+  for (const raw of [...new Set(s.hide)]) {
+    const p = expandHome(raw)
+    if (!existsSync(p) || !sources.some(src => under(p, src))) continue
+    if (statSync(p).isDirectory()) a.push('--tmpfs', p); else a.push('--ro-bind', '/dev/null', p)
+  }
+  // the root itself (only directories bwrap made for the mounts above) becomes read-only
+  a.push('--remount-ro', '/', '--clearenv')
+  for (const [k, v] of Object.entries(sandboxEnv(s))) a.push('--setenv', k, v)
   a.push('--chdir', s.workdir, '--info-fd', '3')
   return a
-}
-
-/** Environment a worker inherits: an allowlist, so credentials in the supervisor's environment do not leak in. */
-const ENV_KEEP = /^(?:PATH|HOME|USER|LOGNAME|SHELL|LANG|LANGUAGE|LC_[A-Z]+|TERM|COLORTERM|TZ|NVM_DIR|NVM_BIN|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|HTTPS?_PROXY|https?_proxy|NO_PROXY|no_proxy|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_CACHE_HOME|XDG_STATE_HOME|CLINE_[A-Z_]+)$/
-const ENV_SECRET = /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i
-export const workerEnv = (env: NodeJS.ProcessEnv): Record<string, string> => {
-  const out: Record<string, string> = {}
-  for (const [k, v] of Object.entries(env)) if (v !== undefined && ENV_KEEP.test(k) && !ENV_SECRET.test(k)) out[k] = v
-  return out
 }
 
 export type Identity = { supervisor: ProcessIdentity; outer: ProcessIdentity; initPid: number | null; initStart: string | null; pidNs: string | null; marker: string; startedAt: string; since: number }
@@ -78,7 +130,8 @@ export type Launched = { child: ChildProcess; identity: Promise<Identity> }
 export const launch = (s: SandboxSpec, argv: string[], bwrap = process.env.COCKPIT_CLINE_BWRAP ?? 'bwrap'): Launched => {
   const child = spawn(bwrap, [...bwrapArgs(s), '--', ...argv], {
     stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
-    env: { ...workerEnv(process.env), [MARKER_VAR]: s.marker },
+    // bwrap itself needs only PATH; the sandboxed process gets the cleared environment built above
+    env: { PATH: process.env.PATH ?? '/usr/bin:/bin', [MARKER_VAR]: s.marker },
     detached: false,
   })
   const supervisor = processIdentity(process.pid)
@@ -99,10 +152,11 @@ export const launch = (s: SandboxSpec, argv: string[], bwrap = process.env.COCKP
   return { child, identity }
 }
 
+/** Whether the full isolation this module asks for can be established here (doctor, readiness). */
 export const bwrapAvailable = (bwrap = process.env.COCKPIT_CLINE_BWRAP ?? 'bwrap'): Promise<{ ok: boolean; detail: string }> => new Promise(resolve => {
-  const c = spawn(bwrap, ['--unshare-pid', '--ro-bind', '/', '/', '--proc', '/proc', '--dev', '/dev', '--', 'true'], { stdio: ['ignore', 'ignore', 'pipe'] })
+  const c = spawn(bwrap, ['--unshare-user', '--unshare-pid', '--unshare-net', '--disable-userns', '--assert-userns-disabled', ...osMounts(), '--remount-ro', '/', '--', '/usr/bin/true'], { stdio: ['ignore', 'ignore', 'pipe'] })
   let err = ''
   c.stderr?.on('data', d => { err += d })
   c.on('error', e => resolve({ ok: false, detail: e.message }))
-  c.on('exit', code => resolve(code === 0 ? { ok: true, detail: 'bubblewrap with unprivileged pid namespaces works' } : { ok: false, detail: `bwrap exit ${code}: ${err.trim().slice(0, 200)}` }))
+  c.on('exit', code => resolve(code === 0 ? { ok: true, detail: 'bubblewrap: allowlisted root, user/pid/net namespaces, nested user namespaces disabled' } : { ok: false, detail: `bwrap exit ${code}: ${err.trim().slice(0, 200)}` }))
 })

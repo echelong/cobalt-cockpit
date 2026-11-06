@@ -86,7 +86,7 @@ export const providerAuth = (provider: string, dataDir = join(homedir(), '.cline
     const refresh = typeof s.auth?.refreshToken === 'string' && s.auth.refreshToken.length > 0
     const key = typeof s.apiKey === 'string' && s.apiKey.length > 0
     const expiresAt = typeof s.auth?.expiresAt === 'number' ? s.auth.expiresAt : null
-    if (token || refresh) return { provider, configured: true, kind: 'oauth', expiresAt, note: expiresAt !== null && expiresAt < Date.now() ? (refresh ? 'access token expired; Cline refreshes it on use' : 'access token expired and no refresh token') : 'signed in' }
+    if (token || refresh) return { provider, configured: true, kind: 'oauth', expiresAt, note: expiresAt !== null && expiresAt < Date.now() ? (refresh ? 'access token expired; the Cockpit broker refreshes it on the host before a worker uses it' : 'access token expired and no refresh token') : 'signed in' }
     if (key) return { provider, configured: true, kind: 'api-key', expiresAt: null, note: 'api key present' }
     return { provider, configured: false, kind: 'none', expiresAt: null, note: 'entry has no credentials' }
   } catch (e) {

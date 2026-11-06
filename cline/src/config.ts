@@ -30,7 +30,12 @@ export type Config = {
   }
   /** "provider/model" ids that may run although they carry no required version (an explicit opt-in). */
   unpinnedAllowed: string[]
-  sandbox: { hide: string[]; allowNetwork: boolean }
+  /**
+   * Workers and gates see only an allowlist of the host (see sandbox.ts). allowRead adds read-only paths the
+   * owner approves (a toolchain, a dependency cache); hide covers paths inside what is mounted. Workers reach
+   * only the Cline API, through the host-side broker; gates have no network.
+   */
+  sandbox: { hide: string[]; allowRead: string[] }
   tools: { allowed: string[]; readOnlyAllowed: string[] }
 }
 
@@ -91,7 +96,28 @@ export const validateConfig = (raw: unknown): Config => {
   if (c.budgets.onSessionCap !== 'cancel' && c.budgets.onSessionCap !== 'drain') throw new Error('config budgets.onSessionCap: cancel|drain')
   if (!Array.isArray(c.unpinnedAllowed)) throw new Error('config unpinnedAllowed: array required')
   if (!Array.isArray(c.tools.allowed) || !Array.isArray(c.tools.readOnlyAllowed)) throw new Error('config tools: allowed lists required')
+  if (!isObj(c.sandbox) || !Array.isArray(c.sandbox.hide)) throw new Error('config sandbox.hide: array required')
+  if ('allowNetwork' in c.sandbox) throw new Error('config sandbox.allowNetwork was removed: workers reach only the Cline API through the host-side broker, gates have no network')
+  if (!Array.isArray(c.sandbox.allowRead)) throw new Error('config sandbox.allowRead: array of read-only paths required')
+  for (const p of c.sandbox.allowRead) { const why = allowReadProblem(p); if (why) throw new Error(`config sandbox.allowRead ${JSON.stringify(p)}: ${why}`) }
   return c
+}
+
+/**
+ * Why an approved read-only path would undo the boundary, or null. The root, a home directory as a whole,
+ * anything holding the person's Cline data, keys or Cockpit state, and relative paths are refused.
+ */
+export const allowReadProblem = (raw: unknown): string | null => {
+  if (typeof raw !== 'string' || !raw.trim()) return 'a path is required'
+  const home = homedir()
+  const p = raw === '~' ? home : raw.startsWith('~/') ? join(home, raw.slice(2)) : raw
+  if (!p.startsWith('/')) return 'an absolute path (or ~/...) is required'
+  const n = p.replace(/\/+$/, '') || '/'
+  if (n.split('/').includes('..')) return 'no ".." segments'
+  if (['/', '/home', '/root', home].includes(n) || /^\/home\/[^/]+$/.test(n)) return 'the root or a whole home directory would expose everything in it'
+  const secret = ['.cline', '.ssh', '.gnupg', '.aws', '.config', '.local/state', '.local/share', '.claude', '.claude-main', '.netrc', '.git-credentials', '.docker', '.kube', '.password-store'].map(d => join(home, d))
+  for (const s of secret) if (n === s || n.startsWith(`${s}/`) || s.startsWith(`${n}/`)) return `it overlaps ${s.replace(home, '~')}, which holds credentials or private state`
+  return null
 }
 
 export type LoadOptions = { file?: string; profile?: string; strict?: boolean; overrides?: unknown }

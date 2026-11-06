@@ -14,6 +14,7 @@ import { routeTask, KINDS, RISKS } from './router.ts'
 import type { TaskSpec } from './router.ts'
 import { pricingFor, usd } from './cost.ts'
 import { bwrapAvailable } from './sandbox.ts'
+import { ALLOWED, BROKERED_PROVIDERS, CLINE_API_ORIGIN } from './broker.ts'
 import { DEFAULT_CLINE_DATA, runWorker } from './worker.ts'
 import { detectGates } from './gates.ts'
 import type { GateSpec } from './gates.ts'
@@ -89,6 +90,8 @@ const doctor = async (a: Args): Promise<number> => {
   const { config, catalog, resolutions } = await setup(a)
   print(`Cline ${catalog.clineVersion} · @cline/llms ${catalog.sdkVersion} · catalog ${catalog.source}`)
   const bw = await bwrapAvailable(); print(`sandbox: ${bw.ok ? 'OK' : 'FAIL'} ${bw.detail}`); if (!bw.ok) bad++
+  print(`network: workers reach only ${CLINE_API_ORIGIN} (${ALLOWED.map(x => `${x.method} ${x.path}`).join(', ')}) through the host-side broker; gates have none`)
+  for (const r of ROLES) { const p = rolesOf(config)[r].provider; if (!BROKERED_PROVIDERS.includes(p)) { print(`  ${r.padEnd(10)} FAIL provider ${p} cannot be brokered (only ${BROKERED_PROVIDERS.join(', ')}): its workers would be refused`); bad++ } }
   print(`profile: ${config.profile} (${config.profiles[config.profile].description}) · strict ${config.strict}`)
   for (const p of [...new Set(ROLES.map(r => rolesOf(config)[r].provider))]) { const s = providerAuth(p, process.env.COCKPIT_CLINE_DATA ?? DEFAULT_CLINE_DATA); print(`auth ${p}: ${s.configured ? 'configured' : 'MISSING'} (${s.kind}; ${s.note})`); if (!s.configured) bad++ }
   for (const r of ROLES) {
@@ -98,7 +101,7 @@ const doctor = async (a: Args): Promise<number> => {
     print(`  ${r.padEnd(10)} ${plan.ok ? 'OK  ' : 'FAIL'} ${res.provider}/${res.model} "${res.info.name}" · reasoning ${spec.reasoning}${plan.ok ? ` → cli --thinking ${plan.cliFlag}, expected wire ${plan.expectedWire} (${plan.mapping})` : `: ${plan.reason}`} · catalog levels ${res.reasoningValues.join('|') || (res.reasoningToggle ? 'toggle' : 'none')} · $${price.pricing.input}/$${price.pricing.output} per 1M (${price.source})${res.notes.length ? ` · ${res.notes.join('; ')}` : ''}`)
     if (!plan.ok) bad++
   }
-  try { const hub = execFileSync('bash', ['-c', 'pgrep -af -- "[-]-cline-hub-daemon" || true'], { encoding: 'utf8' }).trim(); if (hub) print(`warning: a Cline hub daemon is running (${hub.split('\n').length}); sandboxed workers can reach loopback services, see cline/README.md, Limitations`) } catch { /* pgrep missing */ }
+  try { const hub = execFileSync('bash', ['-c', 'pgrep -af -- "[-]-cline-hub-daemon" || true'], { encoding: 'utf8' }).trim(); if (hub) print(`note: a Cline hub daemon is running (${hub.split('\n').length}); workers cannot reach it (each has its own network namespace)`) } catch { /* pgrep missing */ }
   const repo = str(a, 'repo')
   if (repo) { try { const info = await repoInfo(repo); const lost = lostMissions(info.commonDir); print(`repo ${info.root}: ${lost.length ? `LOST STATE for ${lost.map(l => l.marker.missionId).join(', ')}` : 'no lost mission state'} · claims ${listClaims(info.commonDir).claims.length}`); if (lost.length) bad++ } catch (e) { print(`repo: ${(e as Error).message}`); bad++ } }
   print(`state: ${root(a)}`)
@@ -251,11 +254,11 @@ const smoke = async (a: Args): Promise<number> => {
     const spec = rolesOf(config)[role]; const plan = planReasoning(spec.reasoning, res.reasoningValues, res.reasoningToggle)
     if (!plan.ok) { results.push({ role, ok: false, reason: plan.reason }); print(`${role}: ${plan.reason}`); failures++; continue }
     if (spent >= maxUsd) { print(`${role}: skipped, smoke budget $${maxUsd} used`); results.push({ role, ok: false, reason: 'smoke budget used' }); failures++; continue }
-    const out = await runWorker({ attemptId: `smoke-${role}-${Date.now()}`, runDir: join(dir, role), workdir: join(dir, 'repo'), writable: false, gitCommonDir: null, gitAdminDir: null, provider: res.provider, model: res.model, cliThinking: plan.cliFlag, expectedWire: plan.expectedWire, prompt: 'Reply with exactly the word OK and finish. Do not call any tool.', policy: { workdir: join(dir, 'repo'), owned: [], mode: 'read', allowedTools: config.tools.readOnlyAllowed }, timeoutSeconds: 120, clineRetries: 1, hide: config.sandbox.hide, network: true, clineBin: process.env.COCKPIT_CLINE_BIN ?? 'cline', clineDataDir: process.env.COCKPIT_CLINE_DATA ?? DEFAULT_CLINE_DATA, budgetUsd: Math.min(0.1, maxUsd - spent), budgetTokens: 120_000, pricing: (() => { const p = pricingFor(config, res.model, res.info); return p.source === 'none' ? null : p.pricing })(), allowUnmetered: false })
+    const out = await runWorker({ attemptId: `smoke-${role}-${Date.now()}`, runDir: join(dir, role), workdir: join(dir, 'repo'), writable: false, gitCommonDir: null, gitAdminDir: null, provider: res.provider, model: res.model, cliThinking: plan.cliFlag, expectedWire: plan.expectedWire, prompt: 'Reply with exactly the word OK and finish. Do not call any tool.', policy: { workdir: join(dir, 'repo'), owned: [], mode: 'read', allowedTools: config.tools.readOnlyAllowed }, timeoutSeconds: 120, clineRetries: 1, hide: config.sandbox.hide, allowRead: config.sandbox.allowRead, clineBin: process.env.COCKPIT_CLINE_BIN ?? 'cline', clineDataDir: process.env.COCKPIT_CLINE_DATA ?? DEFAULT_CLINE_DATA, budgetUsd: Math.min(0.1, maxUsd - spent), budgetTokens: 120_000, pricing: (() => { const p = pricingFor(config, res.model, res.info); return p.source === 'none' ? null : p.pricing })(), allowUnmetered: false })
     spent += out.facts.usage.reportedUsd ?? 0
     const ok = out.facts.finishReason === 'completed' && out.facts.reportedModel === res.model && out.wire.state === 'confirmed' && out.census.state === 'gone' && out.facts.usage.reportedUsd !== null
     if (!ok) failures++
-    const row = { role, ok, provider: res.provider, model: res.model, name: res.info.name, reasoning: { requested: spec.reasoning, cli: plan.cliFlag, expectedWire: plan.expectedWire, mapping: plan.mapping, wire: out.wire }, reportedModel: out.facts.reportedModel, reportedProvider: out.facts.reportedProvider, finish: out.facts.finishReason, usage: out.facts.usage, census: out.census.state, text: (out.facts.resultText ?? '').slice(0, 80) }
+    const row = { role, ok, provider: res.provider, model: res.model, name: res.info.name, reasoning: { requested: spec.reasoning, cli: plan.cliFlag, expectedWire: plan.expectedWire, mapping: plan.mapping, wire: out.wire }, reportedModel: out.facts.reportedModel, reportedProvider: out.facts.reportedProvider, finish: out.facts.finishReason, usage: out.facts.usage, census: out.census.state, text: (out.facts.resultText ?? '').slice(0, 80), broker: (out.broker ?? []).map(r => ({ method: r.method, path: r.path, status: r.status, model: r.model, effort: r.effort, refused: r.refused ?? null })) }
     results.push(row)
     // written after every paid role, so an interrupted smoke still leaves its evidence
     writeFileSync(join(dir, 'smoke.json'), JSON.stringify({ at: new Date().toISOString(), profile: config.profile, spentUsd: spent, complete: false, results }, null, 1))

@@ -576,7 +576,7 @@ export class Mission {
       prompt: workerPrompt(t.spec, { evidence: t.evidence, readOnly, allowedTools, dependencyResults: this.dependencyResults(t) }),
       policy: { workdir, owned: t.spec.owned, mode: t.spec.mode, allowedTools },
       timeoutSeconds: this.config.limits.workerTimeoutSeconds, clineRetries: this.config.limits.clineRetries,
-      hide: this.config.sandbox.hide, network: this.config.sandbox.allowNetwork, clineBin: this.deps.clineBin, clineDataDir: this.deps.clineDataDir,
+      hide: this.config.sandbox.hide, allowRead: this.config.sandbox.allowRead, binds: this.deps.shareDirs.map(sd => ({ from: sd.from, to: join(workdir, sd.to) })), clineBin: this.deps.clineBin, clineDataDir: this.deps.clineDataDir,
       budgetUsd: this.config.budgets.taskUsd[a.role], budgetTokens: this.config.budgets.taskTokens[a.role],
       pricing: (() => { const p = pricingFor(this.config, a.model, (this.resolutions[a.role] as { info?: never }).info); return p.source === 'none' ? null : p.pricing })(),
       allowUnmetered: this.config.budgets.allowUnmetered,
@@ -709,7 +709,7 @@ export class Mission {
     if (t.spec.mode === 'write') {
       gates.push(await securityGate(wt, admin))
       if (g.changes.length && g.result.state === 'pass') {
-        for (const spec of this.header.gates) gates.push(await runCommandGate(spec, wt, join(this.dir, 'runs', t.spec.id, String(a.n), 'gates'), { hide: this.config.sandbox.hide, shareDirs: this.deps.shareDirs.map(s => ({ from: s.from, to: join(wt, s.to) })), timeoutSeconds: this.config.limits.gateTimeoutSeconds, gitCommonDir: this.header.commonDir }, a.id))
+        for (const spec of this.header.gates) gates.push(await runCommandGate(spec, wt, join(this.dir, 'runs', t.spec.id, String(a.n), 'gates'), { hide: this.config.sandbox.hide, allowRead: this.config.sandbox.allowRead, shareDirs: this.deps.shareDirs.map(s => ({ from: s.from, to: join(wt, s.to) })), timeoutSeconds: this.config.limits.gateTimeoutSeconds, gitCommonDir: this.header.commonDir }, a.id))
         let finalChanges = g.changes
         // Command gates run worker-authored code with a writable tree: whatever they changed is
         // re-checked for scope, hooks, links and credentials before anything is committed.
@@ -886,7 +886,7 @@ export class Mission {
         this.ledger.append('reconciled', t.spec.id, { attempt: a.id, census: c })
         if (c.state !== 'gone') { this.hold(t, a, `after restart: ${c.detail}; ownership retained`); continue }
         a.phase = 'ended'; a.endedAt = new Date(this.deps.now()).toISOString()
-        const stream = join(this.dir, 'runs', t.spec.id, String(a.n), 'rw', 'stream.jsonl')
+        const stream = join(this.dir, 'runs', t.spec.id, String(a.n), 'stream.jsonl')
         const text = existsSync(stream) ? readFileSync(stream, 'utf8') : ''
         const sawResult = text.includes('"type":"run_result"')
         // usage the stream recorded after the last persist is folded in; a request still in flight when the
@@ -943,7 +943,7 @@ export class Mission {
       // without a reliable picture of the tree before the gates, nothing is removed afterwards
       const pre = await changesOf(this.live.integration.dir, null).catch(() => null)
       const before = new Set((pre ?? []).map(c => c.path))
-      for (const g of this.header.gates) this.live.finalGates.push(await runCommandGate(g, this.live.integration.dir, join(this.dir, 'final-gates'), { hide: this.config.sandbox.hide, shareDirs: this.deps.shareDirs.map(s => ({ from: s.from, to: join(this.live.integration.dir, s.to) })), timeoutSeconds: this.config.limits.gateTimeoutSeconds, gitCommonDir: this.header.commonDir }, `${this.header.id}-final`))
+      for (const g of this.header.gates) this.live.finalGates.push(await runCommandGate(g, this.live.integration.dir, join(this.dir, 'final-gates'), { hide: this.config.sandbox.hide, allowRead: this.config.sandbox.allowRead, shareDirs: this.deps.shareDirs.map(s => ({ from: s.from, to: join(this.live.integration.dir, s.to) })), timeoutSeconds: this.config.limits.gateTimeoutSeconds, gitCommonDir: this.header.commonDir }, `${this.header.id}-final`))
       this.live.finalGatesHead = head
       // The final gates ran worker-authored code in the integration worktree, which later turns read and pick
       // onto: new untracked paths are their artifacts and are removed; anything else they changed is reported.

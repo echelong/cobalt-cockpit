@@ -11,7 +11,8 @@ It is not a Cline plugin and does not claim Cline feature parity; see [Limitatio
 
 ## Requirements
 
-- Linux with unprivileged user namespaces and `bwrap` (bubblewrap). `cockpit-cline doctor` checks both.
+- Linux with unprivileged user namespaces and `bwrap` (bubblewrap) 0.8 or later (for `--disable-userns`).
+  `cockpit-cline doctor` checks that the full isolation can be established; without it nothing runs.
 - Node 24 (the one that runs `cline`), `git`, and the `cline` CLI on `PATH`, signed in (`cline auth`).
 - No npm install: the adapter has no dependencies. Type checking uses TypeScript 5.9.3 (`scripts/typecheck.sh`).
 
@@ -173,7 +174,7 @@ cockpit-cline smoke --yes [--roles coder,utility] [--max-usd 0.25]           # L
   Review the branch and merge it yourself.
 - `--gate name=command` adds a required gate (repeatable). Without `--gate`, `package.json` scripts named
   typecheck, lint, test and build are used; with none at all the verdict is `UNVERIFIED`, never `DONE`.
-- `--share node_modules` read-only-binds your checkout's dependency directory into gate sandboxes (gates run
+- `--share node_modules` read-only-binds your checkout's dependency directory into worker and gate sandboxes (neither can download dependencies; gates run
   without network, in fresh worktrees that have no `node_modules` of their own).
 - `--budget-usd N` sets the session cap; per-task caps are in the config.
 - Options are strict: an unknown or misspelt option, a missing value or a bad amount is an error (exit 2) and
@@ -185,7 +186,8 @@ cockpit-cline smoke --yes [--roles coder,utility] [--max-usd 0.25]           # L
 |---|---|---|
 | Correct model per worker | deterministic rules (`src/router.ts`), every decision lists fired rules and rejected roles; Cline's reported model and the wire request are both compared with the route | `routing.spec.ts`, `integration.spec.ts` (wrong model version) |
 | Reasoning never silently downgraded | capability check against the catalog; every wire request's effort is read from Cline's capture; strict mode fails a run whose effort cannot be confirmed | downgrade, no-capture tests; live smoke |
-| Workers cannot write outside their task | bubblewrap: read-only root, writable worktree only, git dir read-only, configured secret dirs hidden; in every sandbox (workers and the gates that run their code) the user service manager and session bus (`/run/user/<uid>`), the system bus, container sockets and a fixed list of credential stores are always hidden (`alwaysHidden` in `src/sandbox.ts`); PreToolUse hook refuses out-of-scope edits and dangerous commands; GIT gate re-checks the diff | adversarial tests |
+| Workers see only their task | bubblewrap with no host root: an empty read-only root holding `/usr`, `/etc`, the node runtime, Cockpit's hook code and the repository's git directory (all read-only), the task's worktree and the attempt's own directory; a disposable `HOME` and Cline data directory per attempt; user, pid, ipc, uts and network namespaces with nested user namespaces disabled; PreToolUse hook as a second layer; GIT gate re-checks the diff | `isolation.spec.ts` (attacks run as shell commands in the real sandbox, no hook in the way) |
+| Credentials stay on the host | a host-side broker is the worker's only way out: it accepts only the Cline API paths Cline uses, only for the routed model, sends them to the one fixed Cline origin and swaps the fake token for the real one; it refreshes the sign-in host-side under Cline's own lock | `isolation.spec.ts` (broker, refresh) |
 | No uncontrolled spawning | native `spawn_agent`/`team_*` and agent launchers are refused; workers can only *request* work (`COCKPIT_REQUEST`), which goes through central admission with depth, child and queue limits | delegation tests |
 | Cancellation is real | each worker is a pid namespace; ending it kills every process in it, detached ones included; ownership is released only after a process census of the namespace init and the attempt marker is clean | detached-children, cancel tests |
 | Crash safety | `--die-with-parent`; claims live in the repository's git dir, so a restarted supervisor (or another mission) sees them; `recover` reconciles by identity; unknown status keeps the claim and blocks overlapping work | crash `kill -9` test |
@@ -208,26 +210,38 @@ bin/cockpit-cline smoke --yes --max-usd 0.25   # live, opt-in, budget bounded
 ```
 
 `COCKPIT_SCALE_N` sets the sequential-task scale test (default 2000).
+`test/isolation.spec.ts` attacks the sandbox from inside it (no hook in the way): other repositories, `.env`
+files, the real home and Cline data, local services and sockets, the internet, the broker's limits, symlinks,
+`/proc`, mounts, nested namespaces, privilege tools, persistence outside the worktree and surviving descendants.
 
 ## Limitations
 
 Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
 
 1. **Linux only**, and it needs unprivileged user namespaces for bubblewrap.
-2. **Network and loopback are shared.** Workers need the provider API, so they can reach the network and
-   localhost services, including a running Cline hub daemon (`doctor` warns). The hook refuses `cline` and other
-   agent launchers, but a determined model could talk to a local service directly. Abstract-namespace unix
-   sockets (some X11 and D-Bus setups) are reachable the same way; socket paths under `/run/user/<uid>` and the
-   system bus are hidden. Gates run without network and reach none of these. Stop local services you do
-   not trust a worker with, or run missions on a machine without them.
-3. **Cline's data directory (`~/.cline/data`) is writable inside the sandbox**: Cline needs it for its sessions
-   and to refresh OAuth tokens. A worker can therefore read the Cline credentials it is already using, and it can
-   also write there: a worker could leave settings or state that your ordinary, unsandboxed `cline` reads later.
-   A per-attempt copy holding only the credentials is not built (token refresh rotates them). Review that
-   directory if a mission ran untrusted code, or point `COCKPIT_CLINE_DATA` at a separate Cline data directory.
+2. **Workers reach only the Cline API.** Each worker has its own network namespace with loopback only; its one
+   way out is the host-side broker (through `src/forward.mjs`, which maps the sandbox's `127.0.0.1:8899` to the
+   broker's unix socket). The broker accepts `POST /api/v1/chat/completions` for the routed model and the few
+   `GET` paths Cline itself uses, and refuses everything else (other paths, other models, other hosts, the
+   authentication endpoints). Host localhost services, abstract and filesystem unix sockets, DNS and the internet
+   are unreachable; gates have no network at all. A worker therefore cannot `npm install`, `pip install` or
+   `git fetch`: install dependencies in your checkout and pass `--share node_modules`. What a worker sends to the
+   model (prompts, the code it read) does reach the provider: that is the model's job.
+3. **Cline credentials and settings stay on the host.** Each attempt gets a disposable `HOME` and Cline data
+   directory inside its own run directory, holding only the routed provider with a fake, far-future token; no
+   other provider's key, session, plugin or setting of yours enters a sandbox, and no worker can read or write the
+   real `~/.cline`. The broker reads your sign-in on the host and, when the access token is within 5 minutes of
+   expiry, refreshes it the way Cline does (`POST /api/v1/auth/refresh`, under Cline's own SQLite lock file) and
+   writes the new token back to `~/.cline/data/settings/providers.json` (other entries untouched, a backup of the
+   previous file kept as `providers.json.cockpit-backup`, mode 0600). That is the only write Cockpit makes to your
+   Cline data. Only the `cline` and `cline-pass` providers can be brokered; a role configured for any other
+   provider is refused, not run with exposed credentials.
 4. **Evidence from inside a sandbox can be forged by an adversarial model**: the JSONL stream, wire captures and
    reported cost are written by processes in that sandbox. Gates, the GIT scope check and the census are done by
-   the supervisor outside it; treat stream-derived figures as Cline-reported, not independently attested.
+   the supervisor outside it; treat stream-derived figures as Cline-reported, not independently attested. The
+   model and reasoning effort of every request, however, are recorded by the host-side broker (`broker.jsonl` in
+   the attempt's run directory): a request for another model is refused there, and one with another effort fails
+   the attempt as a wire mismatch. The host never follows a link a worker planted where it reads worker output.
 5. **The spending cap is not exact.** A worker is stopped as soon as a usage event crosses its budget, so one
    in-flight request can exceed it; the session cap stops admissions and, by default, cancels running workers.
    Admission reserves each running worker's remaining pre-spawn estimate. When Cline reports tokens but no cost
@@ -288,10 +302,11 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
     - an Alt+key chord (Esc and a printable key in one read) is ignored rather than typed; a lone Esc waits
       200 ms in case it starts a key sequence or paste marker split across reads, so Esc followed by a key
       within that time reads as Alt+key.
-21. **Sandbox reads are default-allow.** The root is mounted read-only but readable: everything not hidden is
-    visible to a worker, including other repositories, untracked files in your checkout (such as `.env`) and
-    any credential file outside the hidden lists, and with the network shared a model could send it out. Every
-    sandbox hides the configured `sandbox.hide` list plus a fixed list (`alwaysHidden` in `src/sandbox.ts`: the
-    user service manager and buses, container sockets, `gh`, `npm`, `pip`, `cargo`, `docker`, `kube`, netrc,
-    git credentials, password stores and browser profiles). Add your own secret locations to `sandbox.hide`, or
-    run missions as a user whose home holds nothing a worker should read. An allowlist root is not built.
+21. **What a worker can still read**, all read-only: `/usr` and `/etc` (the operating system's world-readable
+    files), the node installation that runs Cline (including globally installed npm packages), Cockpit's own hook
+    code (`cline/src`, `cline/loader`, `hooks`, `types`), and the repository's git directory (objects, refs and
+    `.git/config`: a remote URL with an embedded token there would be visible; Cockpit's claim store is hidden).
+    Toolchains elsewhere (`~/.cargo`, a Python virtualenv, `~/.local/bin`) are not visible until you add them to
+    `sandbox.allowRead`, which refuses `/`, a whole home directory and anything overlapping `~/.cline`, `~/.ssh`,
+    `~/.gnupg`, `~/.config`, `~/.local/share`, `~/.local/state` and other credential stores. The isolation is
+    bubblewrap's: a kernel vulnerability, or a bug in bubblewrap, is outside what Cockpit can defend against.

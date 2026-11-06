@@ -9,13 +9,13 @@ import { budgetVerdict, runWorker } from '../src/worker.ts'
 import type { WorkerSpec } from '../src/worker.ts'
 import type { Identity, Launched } from '../src/sandbox.ts'
 import { ZERO_USAGE } from '../src/cost.ts'
-import { allTasks, config, env, FAKE, mission, task, tmp } from './helpers.ts'
+import { allTasks, clineData, config, env, FAKE, mission, task, tmp } from './helpers.ts'
 
 const PRICE = { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 }
 const spec = (over: Partial<WorkerSpec> = {}): WorkerSpec => {
   const wt = tmp('wk'); mkdirSync(join(wt, 'src'), { recursive: true })
-  const data = tmp('wkdata')
-  return { attemptId: `wk-${Math.random().toString(16).slice(2)}`, runDir: tmp('wkrun'), workdir: wt, writable: true, gitCommonDir: null, gitAdminDir: null, provider: 'cline', model: 'deepseek/deepseek-v4.1-flash-1017', cliThinking: 'xhigh', expectedWire: 'max', prompt: '[[write:src/a.txt=x]]', policy: { workdir: wt, owned: ['/src'], mode: 'write', allowedTools: ['editor', 'run_commands', 'read_files', 'search_codebase'] }, timeoutSeconds: 30, clineRetries: 1, hide: [], network: true, clineBin: FAKE, clineDataDir: data, budgetUsd: 1, budgetTokens: 1e7, pricing: PRICE, allowUnmetered: false, ...over }
+  const data = clineData()
+  return { attemptId: `wk-${Math.random().toString(16).slice(2)}`, runDir: tmp('wkrun'), workdir: wt, writable: true, gitCommonDir: null, gitAdminDir: null, provider: 'cline', model: 'deepseek/deepseek-v4.1-flash-1017', cliThinking: 'xhigh', expectedWire: 'max', prompt: '[[write:src/a.txt=x]]', policy: { workdir: wt, owned: ['/src'], mode: 'write', allowedTools: ['editor', 'run_commands', 'read_files', 'search_codebase'] }, timeoutSeconds: 30, clineRetries: 1, hide: [], clineBin: FAKE, clineDataDir: data, budgetUsd: 1, budgetTokens: 1e7, pricing: PRICE, allowUnmetered: false, ...over }
 }
 const usage = (o: Partial<typeof ZERO_USAGE>) => ({ ...ZERO_USAGE, ...o })
 
