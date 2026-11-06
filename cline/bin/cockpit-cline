@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Cobalt Cockpit for Cline: launcher. Runs the supervisor CLI with the Node that runs Cline.
+set -euo pipefail
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+NODE=${COCKPIT_CLINE_NODE:-node}
+exec "$NODE" --experimental-transform-types --no-warnings --import "$HERE/loader/register.mjs" "$HERE/src/cli.ts" "$@"

@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "profile": "cline",
+  "strict": true,
+  "profiles": {
+    "cline": {
+      "description": "Cline billing (Cline credits). Default.",
+      "roles": {
+        "commander": { "provider": "cline", "model": "moonshotai/kimi-k3.1-pro", "reasoning": "high" },
+        "coder": { "provider": "cline", "model": "deepseek/deepseek-v4.1-flash-1017", "reasoning": "xhigh", "requireName": "1017" },
+        "specialist": { "provider": "cline", "model": "xiaomi/mimo-v2.6-pro", "reasoning": "high" },
+        "frontend": { "provider": "cline", "model": "qwen/qwen3.8-max-0902", "reasoning": "xhigh", "requireName": "0902" },
+        "utility": { "provider": "cline", "model": "zai/glm-5.3-flash", "reasoning": "low" }
+      }
+    },
+    "cline-pass": {
+      "description": "ClinePass subscription models. Switch with --profile cline-pass or COCKPIT_CLINE_PROFILE=cline-pass. ClinePass lists no version-pinned Qwen3.8 Max 0902, so the frontend role is refused in strict mode until you opt in with allowUnpinned.",
+      "roles": {
+        "commander": { "provider": "cline-pass", "model": "cline-pass/kimi-k3.1-pro", "reasoning": "high" },
+        "coder": { "provider": "cline-pass", "model": "cline-pass/deepseek-v4.1-flash-1017", "reasoning": "xhigh", "requireName": "1017" },
+        "specialist": { "provider": "cline-pass", "model": "cline-pass/mimo-v2.6-pro", "reasoning": "high" },
+        "frontend": { "provider": "cline-pass", "model": "cline-pass/qwen3.8-max", "reasoning": "xhigh", "requireName": "0902" },
+        "utility": { "provider": "cline-pass", "model": "cline-pass/glm-5.3-flash", "reasoning": "low" }
+      }
+    }
+  },
+  "escalation": { "coder": "commander", "specialist": "commander", "frontend": "commander", "utility": "coder", "commander": null },
+  "pricingOverrides": {},
+  "budgets": {
+    "sessionUsd": 3.0,
+    "sessionTokens": 40000000,
+    "taskUsd": { "commander": 1.5, "coder": 0.75, "specialist": 0.75, "frontend": 1.0, "utility": 0.2 },
+    "taskTokens": { "commander": 3000000, "coder": 4000000, "specialist": 3000000, "frontend": 3000000, "utility": 1000000 },
+    "alertAt": [0.5, 0.8, 1.0],
+    "allowUnmetered": false,
+    "onSessionCap": "cancel"
+  },
+  "estimates": {
+    "commander": { "input": 300000, "output": 30000, "cacheRatio": 0.5 },
+    "coder": { "input": 400000, "output": 20000, "cacheRatio": 0.6 },
+    "specialist": { "input": 300000, "output": 20000, "cacheRatio": 0.5 },
+    "frontend": { "input": 300000, "output": 20000, "cacheRatio": 0.5 },
+    "utility": { "input": 100000, "output": 5000, "cacheRatio": 0.5 }
+  },
+  "limits": {
+    "maxTasksPerMission": null,
+    "maxQueue": 64,
+    "maxDelegationDepth": 2,
+    "maxChildrenPerTask": 3,
+    "concurrency": { "total": 6, "commander": 1, "coder": 6, "specialist": 2, "frontend": 2, "utility": 4 },
+    "perProvider": { "cline": 6, "cline-pass": 6 },
+    "spawnsPerMinute": 12,
+    "minFreeMemoryMB": 700,
+    "maxLoadPerCpu": 2.0,
+    "maxAttemptsPerTask": 4,
+    "maxCorrectionsPerTask": 1,
+    "retryBaseMs": 2000,
+    "retryMaxMs": 30000,
+    "maxEscalationsPerTask": 1,
+    "maxTransientRetries": 2,
+    "providerUnhealthyAfter": 2,
+    "workerTimeoutSeconds": 1800,
+    "gateTimeoutSeconds": 900,
+    "clineRetries": 3,
+    "pageSize": 256,
+    "maxStoreBytes": 268435456
+  },
+  "unpinnedAllowed": [],
+  "sandbox": {
+    "hide": ["~/.ssh", "~/.gnupg", "~/.aws", "~/.config/gcloud", "~/.claude", "~/.claude-main", "~/.local/share/cobalt-cockpit-evidence", "~/.local/share/cobalt-cockpit-backup-key", "~/.local/state/cobalt-cockpit-cline"],
+    "allowRead": []
+  },
+  "tools": {
+    "allowed": ["read_files", "search_codebase", "run_commands", "editor"],
+    "readOnlyAllowed": ["read_files", "search_codebase", "run_commands"]
+  }
+}

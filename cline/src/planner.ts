@@ -1,0 +1,153 @@
+// Commander planning and worker delegation requests. Both are untrusted model output:
+// they are parsed strictly, any violation rejects the whole document, and the router
+// (not the model) still picks every task's model.
+import { lexicalFeatures, normalizeOwned } from './core/engine.ts'
+import { KINDS, RISKS } from './router.ts'
+import type { Kind, Risk, TaskSpec } from './router.ts'
+
+export const MAX_PLAN_TASKS = 12
+const ID = /^[a-z0-9][a-z0-9-]{0,39}$/
+/** Ids the supervisor itself uses; model output may not claim them (a task named final-review would capture the review slot). */
+export const RESERVED_IDS: ReadonlySet<string> = new Set(['plan', 'task', 'final-review'])
+/** Anything that can answer whether an id is taken: live tasks and the paginated archive. */
+export type IdSet = { has(id: string): boolean }
+
+export type Parsed = { ok: true; tasks: TaskSpec[]; design?: string } | { ok: false; reason: string }
+export const MAX_DESIGN_CHARS = 6000
+
+/** The last ```json fenced block after `marker` (or anywhere when marker is null). */
+export const lastJsonBlock = (text: string, marker: string | null = null): string | null => {
+  const from = marker === null ? text : text.slice(Math.max(0, text.lastIndexOf(marker)))
+  if (marker !== null && !text.includes(marker)) return null
+  const blocks = [...from.matchAll(/```json\s*\n([\s\S]*?)\n```/g)]
+  return blocks.length ? blocks[blocks.length - 1][1] : null
+}
+
+/** Control, escape and bidirectional characters: an owned path or title is shown in the HUD and must not drive the terminal. */
+// eslint-disable-next-line no-control-regex
+const UNPRINTABLE = /[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩]/
+const relOwned = (p: unknown): string | null => {
+  if (typeof p !== 'string' || !p.trim()) return null
+  if (p.trim() === '*' ) return '*'
+  if (UNPRINTABLE.test(p)) return null
+  if (p.startsWith('/') || p.includes('\\') || p.split('/').includes('..')) return null
+  const n = normalizeOwned(p)
+  return n === '*' && p.trim() !== '*' ? null : n
+}
+
+export const validateTasks = (raw: unknown, opts: { max: number; depth: number; parent: string | null; existing: IdSet; idPrefix?: string }): Parsed => {
+  const list = (raw && typeof raw === 'object' && Array.isArray((raw as { tasks?: unknown }).tasks)) ? (raw as { tasks: unknown[] }).tasks : null
+  if (!list) return { ok: false, reason: 'document has no "tasks" array' }
+  if (list.length === 0) return { ok: false, reason: 'no tasks' }
+  if (list.length > opts.max) return { ok: false, reason: `${list.length} tasks exceed the limit of ${opts.max}` }
+  const out: TaskSpec[] = []; const ids = new Set<string>()
+  for (const [i, t] of list.entries()) {
+    const o = (t ?? {}) as Record<string, unknown>
+    const where = `task ${i + 1}`
+    if (typeof o.id !== 'string' || !ID.test(o.id)) return { ok: false, reason: `${where}: id must match ${ID}` }
+    const id = `${opts.idPrefix ?? ''}${o.id}`
+    // checked before and after prefixing: a requested child "plan" would become "<parent>.plan",
+    // which the supervisor reads as a planning task (whose answer is parsed as a whole new plan)
+    if (RESERVED_IDS.has(o.id) || RESERVED_IDS.has(id) || isPlanTask(id)) return { ok: false, reason: `${where}: id "${id}" is reserved by the supervisor` }
+    if (ids.has(id) || opts.existing.has(id)) return { ok: false, reason: `${where}: duplicate id ${id}` }
+    if (typeof o.title !== 'string' || !o.title.trim() || o.title.length > 200 || UNPRINTABLE.test(o.title)) return { ok: false, reason: `${where}: title required (max 200, printable text)` }
+    if (!(KINDS as readonly string[]).includes(o.kind as string)) return { ok: false, reason: `${where}: kind must be one of ${KINDS.join('|')}` }
+    if (!(RISKS as readonly string[]).includes(o.risk as string)) return { ok: false, reason: `${where}: risk must be one of ${RISKS.join('|')}` }
+    if (typeof o.complexity !== 'number' || !Number.isInteger(o.complexity) || o.complexity < 1 || o.complexity > 5) return { ok: false, reason: `${where}: complexity 1-5` }
+    if (o.mode !== 'read' && o.mode !== 'write') return { ok: false, reason: `${where}: mode read|write` }
+    if (!Array.isArray(o.owned) || o.owned.length === 0 || o.owned.length > 20) return { ok: false, reason: `${where}: owned must list 1-20 repository-relative paths` }
+    const owned: string[] = []
+    for (const p of o.owned) { const n = relOwned(p); if (n === null) return { ok: false, reason: `${where}: owned path ${JSON.stringify(p)} is not a safe repository-relative path` }; owned.push(n) }
+    const deps = Array.isArray(o.dependencies) ? o.dependencies : []
+    if (!deps.every(d => typeof d === 'string')) return { ok: false, reason: `${where}: dependencies must be ids` }
+    if (typeof o.prompt !== 'string' || !o.prompt.trim() || o.prompt.length > 8000) return { ok: false, reason: `${where}: prompt required (max 8000 chars)` }
+    const priority = o.priority === undefined ? 5 : o.priority
+    if (typeof priority !== 'number' || !Number.isInteger(priority) || priority < 0 || priority > 9) return { ok: false, reason: `${where}: priority 0-9` }
+    ids.add(id)
+    out.push({ id, title: o.title.trim(), kind: o.kind as Kind, risk: o.risk as Risk, complexity: o.complexity, mode: o.mode, owned, dependencies: (deps as string[]).map(d => opts.existing.has(d) ? d : `${opts.idPrefix ?? ''}${d}`), prompt: o.prompt, priority, depth: opts.depth, parent: opts.parent, ...(typeof o.contextTokens === 'number' ? { contextTokens: o.contextTokens } : {}) })
+  }
+  for (const t of out) for (const d of t.dependencies) if (!ids.has(d) && !opts.existing.has(d)) return { ok: false, reason: `task ${t.id}: unknown dependency ${d}` }
+  const visiting = new Set<string>(), done = new Set<string>()
+  const byId = new Map(out.map(t => [t.id, t]))
+  const cyc = (id: string): boolean => { if (done.has(id)) return false; if (visiting.has(id)) return true; visiting.add(id); const r = (byId.get(id)?.dependencies ?? []).some(cyc); visiting.delete(id); done.add(id); return r }
+  if (out.some(t => cyc(t.id))) return { ok: false, reason: 'dependency cycle' }
+  const design = (raw as { design?: unknown }).design
+  if (design !== undefined && (typeof design !== 'string' || design.length > MAX_DESIGN_CHARS)) return { ok: false, reason: `"design" must be text of at most ${MAX_DESIGN_CHARS} characters` }
+  return { ok: true, tasks: out, ...(typeof design === 'string' && design.trim() ? { design: design.trim() } : {}) }
+}
+
+export const parsePlan = (text: string, existing: IdSet = new Set<string>(), idPrefix = ''): Parsed => {
+  const block = lastJsonBlock(text)
+  if (!block) return { ok: false, reason: 'no ```json plan block in the commander output' }
+  let doc: unknown
+  try { doc = JSON.parse(block) } catch (e) { return { ok: false, reason: `plan JSON invalid: ${(e as Error).message}` } }
+  return validateTasks(doc, { max: MAX_PLAN_TASKS, depth: 1, parent: null, existing, idPrefix })
+}
+
+/** A planning task: the mission's own `plan`, or a conversation turn's `<turn>.plan`. */
+export const isPlanTask = (id: string): boolean => id === 'plan' || id.endsWith('.plan')
+/** Task ids a plan produces are prefixed by the turn that asked for it, so turns never collide. */
+export const planPrefix = (id: string): string => id === 'plan' ? '' : `${id.slice(0, -'plan'.length)}`
+
+export const REQUEST_MARKER = 'COCKPIT_REQUEST'
+/** A worker's request for more work; validated like a plan, one level deeper, prefixed by its parent id. */
+export const parseRequest = (text: string, parent: TaskSpec, maxChildren: number, existing: IdSet): Parsed | null => {
+  const block = lastJsonBlock(text, REQUEST_MARKER)
+  if (block === null) return null
+  let doc: unknown
+  try { doc = JSON.parse(block) } catch (e) { return { ok: false, reason: `request JSON invalid: ${(e as Error).message}` } }
+  // an empty list ([] or {"tasks": []}) asks for nothing: it is not a request, so nothing is refused
+  if ((Array.isArray(doc) && doc.length === 0) || (doc && typeof doc === 'object' && Array.isArray((doc as { tasks?: unknown }).tasks) && (doc as { tasks: unknown[] }).tasks.length === 0)) return null
+  const r = validateTasks(doc, { max: maxChildren, depth: (parent.depth ?? 0) + 1, parent: parent.id, existing, idPrefix: `${parent.id}.` })
+  if (!r.ok) return r
+  // The fields that choose a role are the worker's own words about its children: a child may not
+  // claim architecture work (the commander's), more risk or complexity than its parent, or a long
+  // context. The router then decides from what the parent was already trusted with.
+  const arch = r.tasks.find(t => t.kind === 'architecture')
+  if (arch) return { ok: false, reason: `${arch.id}: a worker may not request architecture work; that is the commander's` }
+  const cap = RISKS.indexOf(parent.risk)
+  return { ok: true, ...(r.design ? { design: r.design } : {}), tasks: r.tasks.map(({ contextTokens: _ctx, ...t }) => ({ ...t, risk: RISKS.indexOf(t.risk) > cap ? parent.risk : t.risk, complexity: Math.min(t.complexity, parent.complexity) })) }
+}
+
+/** Small tasks go straight to the coder; the commander plans only substantial ones. */
+export const needsCommander = (goal: string, flags: { swarm?: boolean; single?: boolean }): { commander: boolean; reason: string } => {
+  if (flags.single) return { commander: false, reason: '--single: one coder task' }
+  if (flags.swarm) return { commander: true, reason: '--swarm: commander decomposes the goal' }
+  const f = lexicalFeatures({ prompt: goal, files: [], milestones: 0, errorStreak: 0 })
+  const items = goal.split('\n').filter(l => /^\s*(?:[-*]|\d+[.)])\s+\S/.test(l)).length
+  if (f.architecture) return { commander: true, reason: 'architecture wording: commander plans' }
+  if (f.parallel && items >= 2) return { commander: true, reason: `independent parts (${items} items): commander plans` }
+  if (items >= 3) return { commander: true, reason: `${items} listed parts: commander plans` }
+  if (goal.length > 1500) return { commander: true, reason: 'long goal: commander plans' }
+  return { commander: false, reason: 'bounded goal: one coder task, no commander call' }
+}
+
+export const plannerPrompt = (goal: string, repoSummary: string): string => `You are the commander of a Cobalt Cockpit mission. Decompose the GOAL into bounded tasks for separate workers.
+Do not edit files. The repository summary below lists its tracked files; read files only where the summary is not enough. Answer with ONE fenced \`\`\`json block:
+{"design":"the architecture: modules, interfaces, data flow, error handling and test strategy every worker must follow","tasks":[{"id":"short-kebab-id","title":"...","kind":"${KINDS.join('|')}","risk":"${RISKS.join('|')}","complexity":1-5,"mode":"read|write","owned":["repo/relative/path"],"dependencies":["other-id"],"priority":0-9,"prompt":"complete self-contained instructions"}]}
+Rules: at most ${MAX_PLAN_TASKS} tasks; prefer few; tasks that write must own disjoint paths unless one depends on the other;
+owned paths are repository-relative (no leading slash, no ..); use "*" only when a task truly needs the whole tree;
+put the architecture in "design" (Cockpit gives it to every task); do NOT add a separate read-only design or architecture task,
+only an architecture task that must WRITE a design document the repository needs;
+each prompt must be self-contained. Cockpit, not you, chooses each worker's model.
+Repository: ${repoSummary}
+GOAL:
+${goal}`
+
+/** A bounded, factual repository summary for the planner, so the commander need not explore with tool calls. */
+export const repoSummaryText = (root: string, head: string, files: readonly string[], scripts: Record<string, string>): string => {
+  const shown = files.slice(0, 150)
+  const scriptLine = Object.keys(scripts).length ? `\npackage.json scripts: ${Object.entries(scripts).slice(0, 12).map(([k, v]) => `${k}=${v.slice(0, 80)}`).join('; ')}` : ''
+  return `${root} at ${head.slice(0, 12)}, ${files.length} tracked file(s)${files.length > shown.length ? ` (first ${shown.length} shown)` : ''}:\n${shown.join('\n') || '(empty)'}${scriptLine}`
+}
+
+export const workerPrompt = (t: TaskSpec, ctx: { evidence?: string[]; readOnly: boolean; allowedTools: string[]; dependencyResults?: { id: string; text: string }[] }): string => `${t.context ? `${t.context.slice(0, 12_000)}\n\n` : ''}${t.prompt}
+${ctx.dependencyResults?.length ? `\nResults of the tasks this one depends on (their code changes are already in this checkout):\n${ctx.dependencyResults.map(d => `[${d.id}]\n${d.text}`).join('\n\n')}\n` : ''}
+
+-- Cobalt Cockpit worker contract --
+Task: ${t.id}${t.prompt.includes(t.title) ? '' : ` · ${t.title}`}
+${ctx.readOnly ? 'This task is READ-ONLY: do not modify files.' : `You may modify only: ${t.owned.join(', ')} (repository-relative; "*" means the whole tree).`}
+Allowed tools: ${ctx.allowedTools.join(', ')}. Any other tool, launching agents, or Git commits/branches aborts the run.
+Cockpit runs the tests, type checks and Git checks itself after you finish; your own claims are not accepted as verification.
+Only if more independent work is needed that no other task already covers, do not start it: end your reply with a line ${REQUEST_MARKER} followed by a \`\`\`json block {"tasks":[...]} in the commander's task format. When nothing more is needed, do not write ${REQUEST_MARKER} at all.
+${ctx.evidence?.length ? `\nEvidence from the previous attempt (fix these):\n${ctx.evidence.map(e => `- ${e}`).join('\n')}` : ''}`
