@@ -674,3 +674,24 @@ describe('isolation (review 14): every failure after the server answered latches
     await assert.rejects(realToken(data, 'cline', 'http://127.0.0.1:9'), (e: Error) => e instanceof SignInError)
   })
 })
+
+describe('isolation (merge check): a corrupt providers.json never puts credential text into an error or a log', () => {
+  test('an unquoted token in a corrupt providers.json does not appear in the sign-in error, the broker log or the worker\'s failure', T, async () => {
+    const secret = `TOKEN-${Math.random().toString(16).slice(2)}-must-not-be-logged`
+    // V8 quotes about ten characters around a parse error ("Unexpected token 'T', ...\"Token\":TOKEN-..."), positive control:
+    let parserMessage = ''
+    try { JSON.parse(`{"accessToken":${secret}}`) } catch (e) { parserMessage = (e as Error).message }
+    assert.match(parserMessage, /TOKEN-/, 'the parser itself does echo the input')
+    const data = clineData(); writeFileSync(join(data, 'settings', 'providers.json'), `{"providers":{"cline":{"settings":{"auth":{"accessToken":${secret}}}}}}`)
+    const e1 = await startBroker({ dataDir: data, provider: 'cline' }).then(() => null, (e: Error) => e)
+    assert.ok(e1 instanceof SignInError); assert.ok(!e1.message.includes('TOKEN-'), e1.message)
+    const e2 = await realToken(data, 'cline', 'http://127.0.0.1:9').then(() => null, (e: Error) => e)
+    assert.ok(e2 instanceof SignInError); assert.ok(!e2.message.includes('TOKEN-'), e2.message)
+    // through a real worker attempt: nothing it records (stream, stderr, broker log, outcome) holds the token text
+    const run = tmp('leak-run'); const wt = tmp('leak-wt'); mkdirSync(join(wt, 'src'), { recursive: true })
+    const out = await runWorker({ attemptId: `leak-${Date.now()}`, runDir: run, workdir: wt, writable: true, gitCommonDir: null, gitAdminDir: null, provider: 'cline', model: 'deepseek/deepseek-v4.1-flash-1017', cliThinking: 'xhigh', expectedWire: 'max', prompt: '[[write:src/a.txt=x]]', policy: { workdir: wt, owned: ['*'], mode: 'write', allowedTools: ['editor'] }, timeoutSeconds: 30, clineRetries: 1, hide: [], clineBin: FAKE, clineDataDir: data, budgetUsd: 1, budgetTokens: 1e7, pricing: null, allowUnmetered: false })
+    assert.equal(out.stoppedBy, 'spawn_error'); assert.match(out.stopDetail ?? '', /^Cline authentication unavailable on the host/)
+    assert.ok(!JSON.stringify(out).includes('TOKEN-'), 'the outcome holds no token text')
+    for (const f of execFileSync('find', [run, '-type', 'f'], { encoding: 'utf8' }).split('\n').filter(Boolean)) assert.ok(!readFileSync(f, 'utf8').includes('TOKEN-'), `${f} holds token text`)
+  })
+})

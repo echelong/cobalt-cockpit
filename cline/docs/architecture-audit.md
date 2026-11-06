@@ -349,6 +349,13 @@ or unreadable is a sign-in problem. Also: a lock that cannot be opened is a sign
 settings directory is not writable, and after a confirmed save the kept answer is moved aside rather than
 deleted.
 
+Pre-merge check (`902181b`): a corrupt providers.json made the sign-in error carry the JSON parser's own message,
+and V8 quotes about ten characters of the input around a syntax error, which can be the start of a token (seen:
+`Unexpected token 'R', ..."essToken":REALTOKEN-"...`). That message reached the broker log and the attempt's
+failure detail. The parser's message is no longer used: the error says only "not valid JSON", and a test plants an
+unquoted token and checks that no error, outcome or file of the attempt holds any of it. The merge was held until
+this was fixed.
+
 Accepted and documented (README limitations 22 and 23): no seccomp filter (keyring, io_uring, perf and bpf
 follow host settings), no resource limits, and the routed-model rule would refuse a different auxiliary model.
 

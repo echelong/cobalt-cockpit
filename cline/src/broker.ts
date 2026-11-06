@@ -103,7 +103,8 @@ const readJson = async (f: string, patienceMs = 1500): Promise<ProvidersDoc> => 
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code
       if (code === 'EACCES' || code === 'EPERM' || code === 'EISDIR') throw new SignInError(`no usable Cline settings (${code}): run \`cline auth\` on the host`)
-      last = code === 'ENOENT' ? 'missing' : (e as Error).message
+      // never the parser's own message: V8 quotes the input around the error, which can be part of a token
+      last = code === 'ENOENT' ? 'missing' : code ? `unreadable (${code})` : 'not valid JSON'
     }
     if (Date.now() >= until) throw new SignInError(`Cline's providers.json is ${last}: run \`cline auth\` on the host`)
     await new Promise(r => setTimeout(r, 50))
