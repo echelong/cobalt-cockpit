@@ -81,11 +81,12 @@ export const readWireCaptures = (dir: string): WireRequest[] => {
   let names: string[] = []
   // the capture directory is worker-writable: a symlink in place of it, or of a file in it, is never followed
   if (!realDir(dir)) return []
-  try { names = readdirSync(dir).filter(n => n.includes('.wire_request.') && n.endsWith('.json')).sort() } catch { return [] }
+  // bounded: a worker cannot stall the supervisor with thousands of files or huge ones
+  try { names = readdirSync(dir).filter(n => n.includes('.wire_request.') && n.endsWith('.json')).sort().slice(0, 2000) } catch { return [] }
   const out: WireRequest[] = []
   for (const name of names) {
     try {
-      const doc = JSON.parse(readUntrusted(join(dir, name))) as { timestamp?: string; payload?: { body?: unknown; truncated?: unknown; preview?: unknown; bytes?: unknown; sha256?: unknown } }
+      const doc = JSON.parse(readUntrusted(join(dir, name), 2 << 20)) as { timestamp?: string; payload?: { body?: unknown; truncated?: unknown; preview?: unknown; bytes?: unknown; sha256?: unknown } }
       const p = doc.payload ?? {}
       let b: Record<string, unknown> | null = null
       let source: WireRequest['source'] = 'unreadable'

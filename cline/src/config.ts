@@ -6,6 +6,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ROLES, isRole } from './core/engine.ts'
+import { mountProblem } from './sandbox.ts'
 import type { Role } from './core/engine.ts'
 
 export const CLI_THINKING = ['none', 'low', 'medium', 'high', 'xhigh'] as const
@@ -107,18 +108,7 @@ export const validateConfig = (raw: unknown): Config => {
  * Why an approved read-only path would undo the boundary, or null. The root, a home directory as a whole,
  * anything holding the person's Cline data, keys or Cockpit state, and relative paths are refused.
  */
-export const allowReadProblem = (raw: unknown): string | null => {
-  if (typeof raw !== 'string' || !raw.trim()) return 'a path is required'
-  const home = homedir()
-  const p = raw === '~' ? home : raw.startsWith('~/') ? join(home, raw.slice(2)) : raw
-  if (!p.startsWith('/')) return 'an absolute path (or ~/...) is required'
-  const n = p.replace(/\/+$/, '') || '/'
-  if (n.split('/').includes('..')) return 'no ".." segments'
-  if (['/', '/home', '/root', home].includes(n) || /^\/home\/[^/]+$/.test(n)) return 'the root or a whole home directory would expose everything in it'
-  const secret = ['.cline', '.ssh', '.gnupg', '.aws', '.config', '.local/state', '.local/share', '.claude', '.claude-main', '.netrc', '.git-credentials', '.docker', '.kube', '.password-store'].map(d => join(home, d))
-  for (const s of secret) if (n === s || n.startsWith(`${s}/`) || s.startsWith(`${n}/`)) return `it overlaps ${s.replace(home, '~')}, which holds credentials or private state`
-  return null
-}
+export const allowReadProblem = (raw: unknown): string | null => typeof raw === 'string' ? mountProblem(raw) : 'a path is required'
 
 export type LoadOptions = { file?: string; profile?: string; strict?: boolean; overrides?: unknown }
 

@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { pidNamespaceOf, processIdentity, startTimeOf } from './proc.ts'
 import type { ProcessIdentity } from './proc.ts'
 
@@ -34,7 +34,52 @@ export type SandboxSpec = {
   marker: string; env: Record<string, string>
   /** Extra read-only binds placed after the workdir (e.g. the main checkout's node_modules for gates). */
   binds?: { from: string; to: string }[]
+  /** A stripped copy of the repository's git config (no remotes, credentials, hooks or commands) shown in place of the real one. */
+  gitConfig?: string | null
 }
+
+/** Home-relative places that hold credentials or private state: never mounted, and never an ancestor of a mount. */
+export const SECRET_HOME_PATHS: readonly string[] = ['.cline', '.ssh', '.gnupg', '.aws', '.azure', '.config', '.local/share', '.local/state', '.cache', '.claude', '.claude-main', '.netrc', '.git-credentials', '.docker', '.kube', '.password-store', '.npmrc', '.pypirc', '.mozilla', '.pki', '.terraform.d', '.vault-token']
+const real = (p: string): string => { try { return realpathSync(p) } catch { return p } }
+/**
+ * Why mounting `raw` (read-only) would undo the boundary, or null. Judged on the real path (symlinks resolved,
+ * `.`, `..` and `//` normalised): the root, a home directory as a whole or an ancestor of it, and anything that
+ * is, contains or lies inside a credential store are refused.
+ */
+export const mountProblem = (raw: string): string | null => {
+  if (typeof raw !== 'string' || !raw.trim()) return 'a path is required'
+  const ex = expandHome(raw.trim())
+  if (!ex.startsWith('/')) return 'an absolute path (or ~/...) is required'
+  const p = real(resolve(ex))
+  const home = real(homedir())
+  if (p === '/' || p === '/home' || p === '/root' || /^\/home\/[^/]+$/.test(p) || p === home || home.startsWith(`${p}/`)) return 'the root or a whole home directory would expose everything in it'
+  for (const rel of SECRET_HOME_PATHS) {
+    const s = real(join(home, rel))
+    if (p === s || p.startsWith(`${s}/`) || s.startsWith(`${p}/`)) return `it overlaps ${s.replace(home, '~')}, which holds credentials or private state`
+  }
+  return null
+}
+const mustMount = (p: string, what: string): void => { const why = mountProblem(p); if (why) throw new Error(`sandbox: refusing to mount ${what} ${p}: ${why}`) }
+
+/** The repository's git config reduced to what reading a worktree needs ([core] format keys and [extensions]); remotes, credentials, hooks and commands are left out. */
+const SAFE_CORE = new Set(['repositoryformatversion', 'filemode', 'bare', 'logallrefupdates', 'ignorecase', 'precomposeunicode', 'symlinks', 'autocrlf', 'eol', 'safecrlf', 'quotepath', 'checkstat', 'trustctime', 'splitindex', 'sparsecheckout', 'commitgraph', 'multipackindex', 'compression', 'loosecompression', 'abbrev', 'longpaths'])
+export const strippedGitConfig = (text: string): string => {
+  const out: string[] = []; let section = ''
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    const h = /^\[\s*([A-Za-z0-9.-]+)(?:\s+"[^"]*")?\s*\]/.exec(line)
+    if (h) { section = h[1].toLowerCase(); if ((section === 'core' || section === 'extensions') && !/"/.test(line)) out.push(`[${section}]`); else section = `skip:${section}`; continue }
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue
+    const kv = /^([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?$/.exec(line)
+    if (!kv) continue
+    const key = kv[1].toLowerCase()
+    if (section === 'extensions' || (section === 'core' && SAFE_CORE.has(key))) out.push(`\t${key} = ${(kv[2] ?? 'true').replace(/[\r\n]/g, '')}`)
+  }
+  return `${out.join('\n')}\n`
+}
+
+/** The /etc files ordinary tools read (users, name service, dynamic linker, certificates, time zone, alternatives); not /etc as a whole. */
+export const ETC_ALLOW: readonly string[] = ['passwd', 'group', 'nsswitch.conf', 'host.conf', 'hosts', 'ld.so.cache', 'ld.so.conf', 'ld.so.conf.d', 'ssl', 'pki', 'ca-certificates', 'crypto-policies', 'localtime', 'alternatives', 'os-release', 'gitconfig', 'protocols', 'services', 'mime.types', 'terminfo', 'inputrc', 'locale.conf', 'shells']
 export const expandHome = (p: string): string => p === '~' ? homedir() : p.startsWith('~/') ? `${homedir()}/${p.slice(2)}` : p
 export const MARKER_VAR = 'COCKPIT_CLINE_ATTEMPT'
 
@@ -70,7 +115,9 @@ const osMounts = (): string[] => {
   for (const p of ['/bin', '/sbin', '/lib', '/lib64']) {
     try { const st = lstatSync(p); if (st.isSymbolicLink()) a.push('--symlink', readlinkSync(p), p); else if (st.isDirectory()) a.push('--ro-bind', p, p) } catch { /* absent */ }
   }
-  a.push('--ro-bind', '/etc', '/etc', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp', '--tmpfs', '/var/tmp', '--tmpfs', '/run')
+  a.push('--dir', '/etc')
+  for (const f of ETC_ALLOW) a.push('--ro-bind-try', `/etc/${f}`, `/etc/${f}`)
+  a.push('--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp', '--tmpfs', '/var/tmp', '--tmpfs', '/run')
   return a
 }
 const under = (p: string, root: string): boolean => p === root || p.startsWith(`${root}/`)
@@ -93,19 +140,27 @@ export const bwrapArgs = (s: SandboxSpec): string[] => {
   a.push(...osMounts())
   const sources: string[] = ['/usr', '/etc']
   const ro = (p: string): void => { if (existsSync(p)) { a.push('--ro-bind', p, p); sources.push(p) } }
-  for (const p of runtimeRoots()) ro(p)
-  for (const p of s.allowRead) ro(expandHome(p))
+  // every host path mounted below is checked on its real path first; a refusal stops the launch (fail closed)
+  for (const p of runtimeRoots()) {
+    mustMount(p, 'the node runtime'); ro(p)
+    // a global npmrc can hold a registry token
+    if (existsSync(join(p, 'etc', 'npmrc'))) a.push('--ro-bind', '/dev/null', join(p, 'etc', 'npmrc'))
+  }
+  for (const p of s.allowRead) { mustMount(p, 'approved path'); ro(real(resolve(expandHome(p)))) }
   if (s.gitCommonDir) {
-    ro(s.gitCommonDir)
+    mustMount(s.gitCommonDir, 'the git directory'); ro(s.gitCommonDir)
     // other missions' claims and markers are not the worker's business
     if (existsSync(join(s.gitCommonDir, 'cobalt-cockpit-cline'))) a.push('--tmpfs', join(s.gitCommonDir, 'cobalt-cockpit-cline'))
+    // remotes (a URL can embed a token), credential helpers, hooks and commands are not shown: a stripped config is
+    if (existsSync(join(s.gitCommonDir, 'config'))) { if (!s.gitConfig) throw new Error('sandbox: the git directory needs a stripped config copy'); a.push('--ro-bind', s.gitConfig, join(s.gitCommonDir, 'config')) }
+    for (const f of ['config.worktree', 'fsmonitor--daemon.ipc']) if (existsSync(join(s.gitCommonDir, f))) a.push('--ro-bind', '/dev/null', join(s.gitCommonDir, f))
   }
   for (const p of s.readOnly) ro(p)
   a.push(s.writable ? '--bind' : '--ro-bind', s.workdir, s.workdir); sources.push(s.workdir)
   // The worktree's .git link stays read-only (and, being a mount point, cannot be replaced),
   // and its admin dir stays inside the read-only git common dir: host git later trusts both.
   if (s.writable && existsSync(`${s.workdir}/.git`)) a.push('--ro-bind', `${s.workdir}/.git`, `${s.workdir}/.git`)
-  for (const b of s.binds ?? []) if (existsSync(b.from)) { a.push('--ro-bind', b.from, b.to); sources.push(b.from) }
+  for (const b of s.binds ?? []) if (existsSync(b.from)) { mustMount(b.from, 'shared dependency directory'); a.push('--ro-bind', b.from, b.to); sources.push(b.from) }
   for (const p of s.readWrite) { a.push('--bind', p, p); sources.push(p) }
   a.push('--bind', s.home, s.home)
   if (s.network === 'provider') { if (!s.brokerDir) throw new Error('sandbox: provider network needs the broker socket directory'); a.push('--ro-bind', s.brokerDir, s.brokerDir) }

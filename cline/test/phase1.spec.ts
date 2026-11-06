@@ -52,7 +52,8 @@ describe('truncated wire captures (root cause of the failed mission)', () => {
     const v = await m.run()
     assert.equal(v.state, 'DONE', v.reasons.join('; '))
     const a = byId(m, 'a').attempts[0]
-    assert.equal(a.wire?.state, 'confirmed'); assert.match(a.wire?.detail ?? '', /truncated capture previews/)
+    // the verdict now comes from the broker, which saw the full requests (the truncated previews are judged in the unit tests above)
+    assert.equal(a.wire?.state, 'confirmed'); assert.match(a.wire?.detail ?? '', /broker carried 3 request\(s\) for deepseek\/deepseek-v4\.1-flash-1017 at reasoning max/)
     assert.ok(a.gates.some(g => g.name === 'sanity' && g.state === 'pass'), 'verification gates ran')
   })
 })

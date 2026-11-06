@@ -80,13 +80,18 @@ describe('failure handling', () => {
     assert.equal((await m.run()).state, 'FAILED')
     const as = attempts(m, 'a'); assert.equal(as.length, 1); assert.equal(as[0].failure, 'model_mismatch')
   })
-  test('reasoning downgrade on the wire (max requested, high sent): wire_mismatch, strict FAILED', T, async () => {
+  test('a missing wire capture no longer matters: the broker attests the reasoning it carried', T, async () => {
+    const e = env(); const m = await mission(e, { tasks: [task('a', { prompt: '[[nocapture]] [[write:src/a/out.txt=x]]' })] })
+    assert.equal((await m.run()).state, 'DONE'); assert.match(attempts(m, 'a')[0].wire?.detail ?? '', /broker carried \d+ request\(s\) .* at reasoning max/)
+  })
+  test('reasoning downgrade on the wire (max requested, high sent): refused by the broker, wire_mismatch, strict FAILED, and the session stays metered', T, async () => {
     const e = env(); const m = await mission(e, { tasks: [task('a', { prompt: '[[downgrade]] [[write:src/a/out.txt=x]]' })] })
     assert.equal((await m.run()).state, 'FAILED')
     const a = attempts(m, 'a')[0]; assert.equal(a.failure, 'wire_mismatch'); assert.equal(a.wire?.state, 'mismatch')
+    assert.equal(m.live.session.unmetered, false, 'a refused turn reached no provider: nothing was spent')
   })
-  test('no wire capture in strict mode: reasoning unconfirmed, fails closed', T, async () => {
-    const e = env(); const m = await mission(e, { tasks: [task('a', { prompt: '[[nocapture]] [[write:src/a/out.txt=x]]' })] })
+  test('a run whose model turns the broker never carried: reasoning unconfirmed, strict mode fails closed', T, async () => {
+    const e = env(); const m = await mission(e, { tasks: [task('a', { prompt: '[[nobroker]] [[write:src/a/out.txt=x]]' })] })
     assert.equal((await m.run()).state, 'FAILED'); assert.equal(attempts(m, 'a')[0].failure, 'wire_mismatch')
   })
   test('token overrun: the worker is stopped at the task token budget, classed budget_exceeded, not retried', T, async () => {

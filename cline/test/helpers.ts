@@ -1,6 +1,7 @@
 // Shared offline test fixtures: temporary repos, a catalog that mirrors the installed
 // Cline 3.0.74 entries for the five roles, and a mission factory using the fake Cline.
 import { execFileSync } from 'node:child_process'
+import { createServer } from 'node:http'
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -18,6 +19,17 @@ import type { GateSpec } from '../src/gates.ts'
 import type { TaskSpec } from '../src/router.ts'
 
 export const HERE = dirname(fileURLToPath(import.meta.url))
+
+/**
+ * A stand-in for the Cline API on loopback, used by every broker in this test process (and by shells it
+ * starts): model turns get a small JSON answer with token usage and no cost, so the stream's own figures stay
+ * the ones under test. Requests are kept for assertions.
+ */
+export const API_SEEN: { method: string; url: string; authorization: string | undefined; body: string }[] = []
+const api = createServer((req, res) => { let body = ''; req.on('data', c => { body += c }); req.on('end', () => { if (API_SEEN.length < 5000) API_SEEN.push({ method: req.method ?? '', url: req.url ?? '', authorization: req.headers.authorization, body: body.slice(0, 2000) }); res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ id: 'standin', choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } })) }) })
+api.listen(0, '127.0.0.1'); api.unref()
+await new Promise<void>(r => api.once('listening', () => r()))
+process.env.COCKPIT_BROKER_UPSTREAM = `http://127.0.0.1:${(api.address() as { port: number }).port}`
 export const FAKE = join(HERE, 'fixtures', 'fake-cline.mjs')
 
 export const tmp = (name: string): string => mkdtempSync(join(process.env.COCKPIT_TEST_TMP ?? tmpdir(), `ccl-${name}-`))

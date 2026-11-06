@@ -221,9 +221,12 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
 1. **Linux only**, and it needs unprivileged user namespaces for bubblewrap.
 2. **Workers reach only the Cline API.** Each worker has its own network namespace with loopback only; its one
    way out is the host-side broker (through `src/forward.mjs`, which maps the sandbox's `127.0.0.1:8899` to the
-   broker's unix socket). The broker accepts `POST /api/v1/chat/completions` for the routed model and the few
-   `GET` paths Cline itself uses, and refuses everything else (other paths, other models, other hosts, the
-   authentication endpoints). Host localhost services, abstract and filesystem unix sockets, DNS and the internet
+   broker's unix socket). The broker accepts `POST /api/v1/chat/completions` only as Cline sends it (JSON, the
+   fields Cline uses, the routed model and, for effort-level routes, exactly the routed reasoning effort; the body
+   it checked is the body it sends) and the three `GET` paths Cline makes at start, and refuses everything else
+   (other paths, models, efforts or fields such as fallback model lists, other hosts, the authentication
+   endpoints). It also enforces the attempt's cost and token budget from the usage the API itself returns, caps
+   the number of requests and concurrent requests, and records every request (`broker.jsonl`). Host localhost services, abstract and filesystem unix sockets, DNS and the internet
    are unreachable; gates have no network at all. A worker therefore cannot `npm install`, `pip install` or
    `git fetch`: install dependencies in your checkout and pass `--share node_modules`. What a worker sends to the
    model (prompts, the code it read) does reach the provider: that is the model's job.
@@ -233,8 +236,10 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
    real `~/.cline`. The broker reads your sign-in on the host and, when the access token is within 5 minutes of
    expiry, refreshes it the way Cline does (`POST /api/v1/auth/refresh`, under Cline's own SQLite lock file) and
    writes the new token back to `~/.cline/data/settings/providers.json` (other entries untouched, a backup of the
-   previous file kept as `providers.json.cockpit-backup`, mode 0600). That is the only write Cockpit makes to your
-   Cline data. Only the `cline` and `cline-pass` providers can be brokered; a role configured for any other
+   previous file kept as `providers.json.cockpit-backup`, mode 0600). The server's answer is saved first
+   (`providers.json.cockpit-refresh`, 0600, removed after a successful save) and the file is re-read just before
+   the write, so neither a failed save nor a concurrent change by Cline itself loses your sign-in or your
+   settings. That is the only write Cockpit makes to your Cline data. Only the `cline` and `cline-pass` providers can be brokered; a role configured for any other
    provider is refused, not run with exposed credentials.
 4. **Evidence from inside a sandbox can be forged by an adversarial model**: the JSONL stream, wire captures and
    reported cost are written by processes in that sandbox. Gates, the GIT scope check and the census are done by
@@ -302,11 +307,22 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
     - an Alt+key chord (Esc and a printable key in one read) is ignored rather than typed; a lone Esc waits
       200 ms in case it starts a key sequence or paste marker split across reads, so Esc followed by a key
       within that time reads as Alt+key.
-21. **What a worker can still read**, all read-only: `/usr` and `/etc` (the operating system's world-readable
-    files), the node installation that runs Cline (including globally installed npm packages), Cockpit's own hook
-    code (`cline/src`, `cline/loader`, `hooks`, `types`), and the repository's git directory (objects, refs and
-    `.git/config`: a remote URL with an embedded token there would be visible; Cockpit's claim store is hidden).
-    Toolchains elsewhere (`~/.cargo`, a Python virtualenv, `~/.local/bin`) are not visible until you add them to
-    `sandbox.allowRead`, which refuses `/`, a whole home directory and anything overlapping `~/.cline`, `~/.ssh`,
-    `~/.gnupg`, `~/.config`, `~/.local/share`, `~/.local/state` and other credential stores. The isolation is
-    bubblewrap's: a kernel vulnerability, or a bug in bubblewrap, is outside what Cockpit can defend against.
+21. **What a worker can still read**, all read-only: `/usr`, an allowlist of `/etc` (users and groups, name
+    service, dynamic linker, certificates, time zone, alternatives, `gitconfig`; not `/etc` as a whole), the node
+    installation that runs Cline (its global `npmrc` covered), Cockpit's own hook code (`cline/src`,
+    `cline/loader`, `hooks`, `types`), and the repository's git directory (objects and refs; its `config` is
+    replaced by a stripped copy without remotes, credential helpers, hooks or commands, and Cockpit's claim store
+    and any fsmonitor socket are covered). Every host path mounted is checked on its real path first:
+    `sandbox.allowRead`, `--share` (repository-relative only), the node prefix and the git directory are refused
+    when they are `/`, a home directory, an ancestor of it, or overlap `~/.cline`, `~/.ssh`, `~/.gnupg`,
+    `~/.config`, `~/.cache`, `~/.local/share`, `~/.local/state` or another credential store, and the launch fails
+    rather than run with a wider view. Toolchains elsewhere (`~/.cargo`, a virtualenv) must be added to
+    `sandbox.allowRead`.
+22. **Not isolated by the sandbox** (the kernel interfaces bubblewrap leaves open): there is no seccomp filter, so
+    system calls such as `keyctl` (the user's kernel keyring), `io_uring`, `perf_event_open` and `bpf` are
+    available subject to the host's own settings; there are no memory, CPU or process-count limits; a worker can
+    fill its tmpfs or the disk. `/proc` is the sandbox's own but still shows kernel information (`/proc/sys`,
+    `/proc/cmdline`). A kernel or bubblewrap vulnerability is outside what Cockpit can defend against.
+23. **Long Cline sessions**: the broker refuses a model turn for any model other than the routed one. If a future
+    Cline version uses a different model for auxiliary work (for example context compaction), those turns are
+    refused (the run fails as a wire mismatch) rather than allowed.

@@ -3,7 +3,7 @@
 // Cline 3.0.74, a deterministic script read from [[...]] tokens in the prompt, and the
 // REAL Cockpit PreToolUse hook called before every tool action.
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { mkdirSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join, dirname, isAbsolute } from 'node:path'
 
 const args = process.argv.slice(2)
@@ -24,8 +24,27 @@ const effortFor = (t) => has('downgrade') ? 'high' : t === 'xhigh' && !/qwen3\.8
 let totals = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, totalCost: 0 }
 let req = 0
 
+// Like Cline, each model turn goes to the provider API, here the Cockpit broker at CLINE_API_BASE_URL (the
+// sandbox's only way out), signed with the token from the worker's own Cline data. [[nobroker]] skips it
+// (a turn the provider never saw); a refusal by the broker ends the run with a provider error, as in Cline.
+const viaBroker = (body) => {
+  const base = process.env.CLINE_API_BASE_URL
+  if (!base || has('nobroker')) return
+  let token = ''
+  try { token = JSON.parse(readFileSync(join(opt('--data-dir') ?? '', 'settings', 'providers.json'), 'utf8')).providers[provider].settings.auth.accessToken } catch { /* none */ }
+  const r = spawnSync('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', '-H', 'content-type: application/json', '-H', `authorization: Bearer workos:${token}`, '--data-binary', '@-', `${base}/api/v1/chat/completions`], { input: JSON.stringify(body), encoding: 'utf8' })
+  // no broker listening at all (a test that replaces the sandbox launcher): nothing was sent
+  if (r.status === 7) return
+  if (r.stdout !== '200') {
+    out({ type: 'hook_event', hookEventName: 'agent_error', agentId: 'agent_fake' })
+    out({ type: 'run_result', finishReason: 'error', iterations: req, usage: totals, aggregateUsage: totals, text: `Provider error: ${r.stdout || 'no answer'} from the API (Cockpit broker)`, model: { id: reportedModel, provider } })
+    process.exit(1)
+  }
+}
 const request = (u = [9000, 100, 0.001]) => {
   req++
+  const turn = { model: reportedModel, ...(effortFor(thinking) ? { reasoning_effort: effortFor(thinking) } : {}), stream: true, ...(has('toggle-off') ? { reasoning: { enabled: false } } : {}), messages: [{ role: 'user', content: 'hello' }] }
+  viaBroker(turn)
   const cap = process.env.CLINE_CAPTURE_DIR
   if (cap && !has('nocapture')) {
     mkdirSync(cap, { recursive: true })

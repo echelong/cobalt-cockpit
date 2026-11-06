@@ -15,7 +15,7 @@ import { routeTask, nextStep, healthKey, classifyFailureText, IMPLEMENTATION, ba
 import type { FailureClass, Health, RouteDecision, TaskSpec } from './router.ts'
 import { chargeOf, checkBudget, pricingFor } from './cost.ts'
 import type { Usage } from './cost.ts'
-import { emptyFacts, foldLine, runWorker, targetOf } from './worker.ts'
+import { carriedTurns, emptyFacts, foldLine, runWorker, targetOf } from './worker.ts'
 import type { StreamFacts, WorkerOutcome, WorkerSpec, Control } from './worker.ts'
 import type { Identity } from './sandbox.ts'
 import { census, processIdentity, sameProcess, terminate } from './proc.ts'
@@ -646,7 +646,9 @@ export class Mission {
     // stop, a model turn that ended without a usage event, or a completed run without usable cost.
     // A provider error before any turn, or a cancel or timeout before the first turn ended, spent
     // nothing observable and must not stop the retry (or the rest of the mission).
-    const spentUnmeasured = out.stoppedBy === 'unmetered' || (f.usageEvents === 0 && f.iterations > 0) || (f.finishReason === 'completed' && (f.usageEvents === 0 || a.charge.basis === 'unmetered'))
+    // the broker shows whether any model turn reached the API: when none did, nothing was spent (a refused turn costs nothing)
+    const carried = out.broker ? carriedTurns(out.broker) : null
+    const spentUnmeasured = carried !== 0 && (out.stoppedBy === 'unmetered' || (f.usageEvents === 0 && f.iterations > 0) || (f.finishReason === 'completed' && (f.usageEvents === 0 || a.charge.basis === 'unmetered')))
     if (spentUnmeasured && !this.live.session.unmeteredTasks.includes(a.id)) {
       this.live.session.unmetered = true; this.live.session.unmeteredTasks.push(a.id)
       this.ledger.append('unmetered', t.spec.id, { attempt: a.id, detail: 'run reported no usable cost; session admissions stop' })
@@ -713,7 +715,8 @@ export class Mission {
         let finalChanges = g.changes
         // Command gates run worker-authored code with a writable tree: whatever they changed is
         // re-checked for scope, hooks, links and credentials before anything is committed.
-        if (this.header.gates.length) {
+        // gate processes not confirmed gone could still change the tree: nothing is removed, the attempt is held below
+        if (this.header.gates.length && !gates.some(x => x.unaccounted)) {
           // New untracked paths that appeared only during the gates are their artifacts (coverage/,
           // dist/, caches), not the worker's change: they are removed from this attempt's own
           // temporary worktree. Tracked or pre-existing paths the gates modified still fail below.
@@ -948,7 +951,8 @@ export class Mission {
       // The final gates ran worker-authored code in the integration worktree, which later turns read and pick
       // onto: new untracked paths are their artifacts and are removed; anything else they changed is reported.
       const after = await changesOf(this.live.integration.dir, null).catch(() => null)
-      if (after === null || pre === null) this.problem(`final gates: the integration worktree could not be inspected ${pre === null ? 'before' : 'after'} they ran; nothing was removed`)
+      if (this.live.finalGates.some(g => g.unaccounted)) { /* reported below; nothing is removed while gate processes may run */ }
+      else if (after === null || pre === null) this.problem(`final gates: the integration worktree could not be inspected ${pre === null ? 'before' : 'after'} they ran; nothing was removed`)
       else {
         const dir = this.live.integration.dir; const removed: string[] = []
         for (const c of after) if (c.status === '??' && !before.has(c.path)) { const abs = resolve(dir, c.path); if (abs.startsWith(`${dir}/`) && !c.path.split('/').includes('.git')) { rmSync(abs, { force: true, recursive: true }); removed.push(c.path) } }

@@ -257,6 +257,39 @@ The owner did not accept the open-read sandbox or the writable `~/.cline/data`. 
   owner's machine: all five roles PASS (DeepSeek 1017 xhigh→max, Kimi high, MiMo toggle on, Qwen xhigh, GLM low)
   for $0.0325, and the expired sign-in was refreshed host-side with every other provider entry unchanged.
 
+### Security review of the isolation (round 9)
+
+A fresh security review of `ff606fd` found no escape through the bubblewrap boundary but did not accept it as
+merge-ready. Fixed, with tests in `test/isolation.spec.ts`:
+
+- **Refresh could lose the owner's login.** The broker wrote back a copy of providers.json read before a
+  30-second refresh (overwriting a concurrent change by Cline), and an unexpected expiry form threw after the
+  server had answered (losing a rotated refresh token). Now the answer is saved first to a 0600 recovery file,
+  the file is re-read just before the write and only that provider's `auth` changes, expiries in seconds,
+  milliseconds or ISO form are read, and a failed save keeps the recovery file. Live, the refresh of the
+  owner's expired sign-in succeeded (new access token, refresh token unchanged, every other entry identical).
+- **Vacuous attack tests.** The canaries sat in `/var/tmp`, which every sandbox also replaces with an empty
+  tmpfs, so those tests would have passed with the old open root; several commands failed for unrelated reasons
+  (a missing `/mnt`, `ip`, `sudo` without a tty). Canaries now live under the host's `$HOME`, each is checked on
+  the host first, and every denial has a positive control; a probe confirmed the same canary is readable by an
+  open-root sandbox and absent in the new one.
+- **Forgeable wire attestation.** A turn without a reasoning effort, or no broker record at all, could stay
+  "confirmed" from sandbox-written captures. Now an effort-level route is confirmed only from broker records
+  that all carry exactly the routed effort; the broker itself refuses other efforts; a run whose turns the broker
+  never carried is unconfirmed (strict mode fails it).
+- **Broker body differential and spend.** The broker forwards the JSON it validated (not the raw bytes), refuses
+  fields Cline does not send (fallback model lists, routing, plugins), enforces the attempt's cost and token
+  budget from the API's own usage figures, and caps requests and concurrency. A broker refusal no longer marks the
+  session unmetered (nothing reached the provider).
+- **Unvalidated mounts.** Every host mount source (node prefix, approved paths, `--share`, the git directory, a
+  Cline binary given as a path) is checked on its real path; `/etc` is an allowlist; `.git/config` is replaced by
+  a stripped copy; the node prefix's global `npmrc`, the claim store and an fsmonitor socket are covered.
+- **Host-side reads.** Capture files are capped in number and size, the hook log is parsed per line, and no
+  artifact is removed while a gate's processes are not accounted for.
+
+Accepted and documented (README limitations 22 and 23): no seccomp filter (keyring, io_uring, perf and bpf
+follow host settings), no resource limits, and the routed-model rule would refuse a different auxiliary model.
+
 ## 7. Test baseline
 
 Before any change, on `main` at `4e3b90a` with the isolated gate runner (Claude Code 2.1.296, TypeScript 5.9.3,

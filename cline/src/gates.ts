@@ -3,10 +3,10 @@
 // scope structurally; the SECURITY gate scans the added lines for credentials. A worker's
 // claim of success is never a gate result.
 import { createHash } from 'node:crypto'
-import { createWriteStream, existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { secretText } from './core/engine.ts'
-import { launch } from './sandbox.ts'
+import { launch, strippedGitConfig } from './sandbox.ts'
 import { terminate } from './proc.ts'
 import type { Target } from './proc.ts'
 import { changesOf, diffText, gitLinkProblem, scopeProblems } from './git.ts'
@@ -27,7 +27,9 @@ export const runCommandGate = async (g: GateSpec, workdir: string, outDir: strin
   // a fresh home per gate run, beside its log (outside the tree): no host home, no network at all
   const home = join(outDir, `home-${g.name.replace(/[^A-Za-z0-9._-]/g, '_')}-${Date.now()}`)
   mkdirSync(home, { recursive: true, mode: 0o700 })
-  const { child, identity } = launch({ workdir, writable: true, gitCommonDir: env.gitCommonDir, gitAdminDir: null, home, readOnly: [], readWrite: [], allowRead: env.allowRead ?? [], hide: env.hide, network: 'none', marker, env: {}, binds: env.shareDirs }, ['bash', '-c', g.command])
+  const gitConfig = env.gitCommonDir && existsSync(join(env.gitCommonDir, 'config')) ? join(outDir, `git-config-${Date.now()}`) : null
+  if (gitConfig && env.gitCommonDir) writeFileSync(gitConfig, strippedGitConfig(readFileSync(join(env.gitCommonDir, 'config'), 'utf8')), { mode: 0o400 })
+  const { child, identity } = launch({ workdir, writable: true, gitCommonDir: env.gitCommonDir, gitAdminDir: null, home, readOnly: [], readWrite: [], allowRead: env.allowRead ?? [], hide: env.hide, network: 'none', marker, env: {}, binds: env.shareDirs, gitConfig }, ['bash', '-c', g.command])
   const out = createWriteStream(file, { mode: 0o600 })
   child.stdout?.pipe(out); child.stderr?.pipe(out)
   let timedOut = false

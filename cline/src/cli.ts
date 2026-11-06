@@ -1,7 +1,7 @@
 // cockpit-cline: Cobalt Cockpit for Cline. Commands: doctor, models, route, run, status,
 // watch, cancel, recover, replay, list, smoke.
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { ROLES } from './core/engine.ts'
 import type { Role } from './core/engine.ts'
@@ -78,9 +78,18 @@ const setup = async (a: Args): Promise<{ config: Config; catalog: Catalog; resol
 }
 const deps = (a: Args, repoRoot: string): Deps => ({
   clineBin: process.env.COCKPIT_CLINE_BIN ?? 'cline', clineDataDir: process.env.COCKPIT_CLINE_DATA ?? DEFAULT_CLINE_DATA, now: Date.now, runWorker,
-  shareDirs: (a.multi.share ?? []).map(s => ({ from: resolve(repoRoot, s), to: s })),
+  shareDirs: (a.multi.share ?? []).map(s => shareDir(repoRoot, s)),
   log: l => process.stderr.write(`${l}\n`),
 })
+/** A --share directory: repository-relative, inside the repository on its real path (it is mounted read-only into sandboxes). */
+export const shareDir = (repoRoot: string, s: string): { from: string; to: string } => {
+  if (!s || s.startsWith('/') || s.split('/').includes('..') || s.includes('\\')) throw new UsageError(`--share ${s}: a repository-relative directory such as node_modules is required`)
+  const rootReal = realpathSync(repoRoot)
+  let from: string
+  try { from = realpathSync(resolve(repoRoot, s)) } catch { throw new UsageError(`--share ${s}: no such directory in ${repoRoot}`) }
+  if (!from.startsWith(`${rootReal}/`)) throw new UsageError(`--share ${s}: resolves outside the repository (${from})`)
+  return { from, to: s.replace(/\/+$/, '') }
+}
 const root = (a: Args): string => str(a, 'state') ?? stateRoot()
 const latestMission = (r: string): string | null => { try { return readdirSync(join(r, 'missions')).sort().at(-1) ?? null } catch { return null } }
 

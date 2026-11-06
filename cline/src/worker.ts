@@ -1,12 +1,12 @@
 // One worker attempt: a `cline --json` process inside its own sandbox.
 // The supervisor learns everything from Cline's JSONL stream and wire capture, and
 // declares the attempt ended only after a clean process census of its namespace.
-import { appendFileSync, chmodSync, createWriteStream, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, createWriteStream, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { PACKAGE_DIR } from './config.ts'
-import { cockpitRoots, launch, MARKER_VAR, readUntrusted } from './sandbox.ts'
+import { cockpitRoots, launch, MARKER_VAR, mountProblem, readUntrusted, strippedGitConfig } from './sandbox.ts'
 import { BROKER_PORT, prepareClineData, startBroker } from './broker.ts'
 import type { Broker, BrokerRecord } from './broker.ts'
 import type { Identity, SandboxSpec } from './sandbox.ts'
@@ -63,10 +63,11 @@ export type WorkerOutcome = {
  * else the run is unmeasurable and is stopped unless unmetered runs are allowed. A model
  * turn that ended without any usage event is unmeasurable too.
  */
-export const budgetVerdict = (f: Pick<StreamFacts, 'usage' | 'usageEvents' | 'iterations'>, w: Pick<WorkerSpec, 'budgetUsd' | 'budgetTokens' | 'pricing' | 'allowUnmetered'>): { stop: 'budget' | 'unmetered'; detail: string } | null => {
+export const budgetVerdict = (f: Pick<StreamFacts, 'usage' | 'usageEvents' | 'iterations'>, w: Pick<WorkerSpec, 'budgetUsd' | 'budgetTokens' | 'pricing' | 'allowUnmetered'>, carried: number | null = null): { stop: 'budget' | 'unmetered'; detail: string } | null => {
   const tokens = f.usage.inputTokens + f.usage.outputTokens
   if (tokens > w.budgetTokens) return { stop: 'budget', detail: `${tokens} tokens exceeded the task token budget ${w.budgetTokens}` }
-  if (f.usageEvents === 0 && f.iterations > 0 && !w.allowUnmetered) return { stop: 'unmetered', detail: `${f.iterations} model turn(s) ended without a usage event: cost cannot be measured` }
+  // carried: model turns the broker passed to the API; none at all means nothing could have been spent
+  if (f.usageEvents === 0 && f.iterations > 0 && !w.allowUnmetered && carried !== 0) return { stop: 'unmetered', detail: `${f.iterations} model turn(s) ended without a usage event: cost cannot be measured` }
   if (w.budgetUsd === null || f.usageEvents === 0) return null
   const estimate = w.pricing ? estimateUsd(f.usage, w.pricing) : null
   // a reported $0 for real tokens of a priced model is not a cost figure: hold the budget against the estimate
@@ -131,21 +132,25 @@ export const FORWARDER = join(PACKAGE_DIR, 'src', 'forward.mjs')
  * hook runs, approved read-only paths, the broker's socket and nothing else of the host (see sandbox.ts).
  */
 export const workerSandbox = (w: Pick<WorkerSpec, 'workdir' | 'writable' | 'gitCommonDir' | 'gitAdminDir' | 'clineBin' | 'allowRead' | 'hide' | 'attemptId' | 'binds'>, d: { ro: string; rw: string; home: string }, brokerDir: string): SandboxSpec => {
-  // a Cline given as a path (a test double) is mounted read-only from where it lives
+  // a Cline given as a path (a test double) is mounted read-only from where it lives, if that place is safe to show
   const binDir = w.clineBin.includes('/') ? [dirname(realpathSync(w.clineBin))] : []
+  for (const b of binDir) { const why = mountProblem(b); if (why) throw new Error(`sandbox: refusing to mount the Cline binary's directory ${b}: ${why}`) }
+  // the repository's git config, stripped of remotes, credential helpers, hooks and commands
+  const gitConfig = w.gitCommonDir && existsSync(join(w.gitCommonDir, 'config')) ? join(d.ro, 'git-config') : null
+  if (gitConfig && w.gitCommonDir) writeFileSync(gitConfig, strippedGitConfig(readFileSync(join(w.gitCommonDir, 'config'), 'utf8')), { mode: 0o400 })
   return {
     workdir: w.workdir, writable: w.writable, gitCommonDir: w.gitCommonDir, gitAdminDir: w.gitAdminDir,
     home: d.home, readOnly: [d.ro, ...cockpitRoots(PACKAGE_DIR), ...binDir], readWrite: [d.rw], allowRead: w.allowRead ?? [],
-    hide: w.hide, network: 'provider', brokerDir, marker: w.attemptId, binds: w.binds,
+    hide: w.hide, network: 'provider', brokerDir, marker: w.attemptId, binds: w.binds, gitConfig,
     env: { CLINE_API_BASE_URL: `http://127.0.0.1:${BROKER_PORT}`, CLINE_CAPTURE_PROVIDER_REQUEST: 'full', CLINE_CAPTURE_WIRE: 'true', CLINE_CAPTURE_DIR: join(d.rw, 'capture'), COCKPIT_POLICY: join(d.ro, 'policy.json'), COCKPIT_HOOK_LOG: join(d.rw, 'hook.jsonl') },
   }
 }
 /** The argv prefix that starts the forwarder (127.0.0.1:BROKER_PORT -> broker socket) in front of a command. */
-export const viaBroker = (socketPath: string): string[] => [process.execPath, FORWARDER, String(BROKER_PORT), socketPath, '--']
+export const viaBroker = (socketPath: string): string[] => [realpathSync(process.execPath), FORWARDER, String(BROKER_PORT), socketPath, '--']
 
 const hookScript = (): string => `#!/usr/bin/env bash
 # Cobalt Cockpit PreToolUse hook (generated). Any failure here cancels the run.
-exec "${process.execPath}" --experimental-transform-types --no-warnings --import "${join(PACKAGE_DIR, 'loader', 'register.mjs')}" "${join(PACKAGE_DIR, 'src', 'hook', 'pretool.ts')}" || { echo '{"cancel": true, "errorMessage": "COCKPIT: hook did not run"}'; exit 0; }
+exec "${realpathSync(process.execPath)}" --experimental-transform-types --no-warnings --import "${join(PACKAGE_DIR, 'loader', 'register.mjs')}" "${join(PACKAGE_DIR, 'src', 'hook', 'pretool.ts')}" || { echo '{"cancel": true, "errorMessage": "COCKPIT: hook did not run"}'; exit 0; }
 `
 
 export type Control = { cancel: (why: string) => void }
@@ -162,7 +167,7 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   const home = join(rw, 'home'), data = join(rw, 'cline-data')
   mkdirSync(home, { recursive: true, mode: 0o700 })
   let broker: Broker
-  try { broker = await startBroker({ dataDir: w.clineDataDir, provider: w.provider, model: w.model, log: r => { try { appendFileSync(join(w.runDir, 'broker.jsonl'), `${JSON.stringify(r)}\n`, { mode: 0o600 }) } catch { /* evidence only */ } } }) }
+  try { broker = await startBroker({ dataDir: w.clineDataDir, provider: w.provider, model: w.model, effort: effortLevel(w.expectedWire) ? w.expectedWire : null, budgetUsd: w.budgetUsd, budgetTokens: w.budgetTokens, log: r => { try { appendFileSync(join(w.runDir, 'broker.jsonl'), `${JSON.stringify(r)}\n`, { mode: 0o600 }) } catch { /* evidence only */ } } }) }
   catch (e) { return { identity: null, exitCode: null, signal: null, facts: emptyFacts(), wire: judgeWire([], w.model, w.expectedWire), census: census({ initPid: null, initStart: null, pidNs: null, marker: `${MARKER_VAR}=${w.attemptId}`, since: Date.now() - 60_000 }), stoppedBy: 'spawn_error', stopDetail: `provider broker: ${(e as Error).message}`, hookRefusals: [], observerError: null } }
   prepareClineData(data, w.provider, w.model, broker.fakeToken)
   const sandbox = workerSandbox(w, { ro, rw, home }, broker.socketDir)
@@ -217,7 +222,7 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
       foldLine(facts, line)
       // display passthrough only: what a worker prints is never trusted for decisions here
       if (on.event) { try { const o = JSON.parse(line) as unknown; if (o && typeof o === 'object') on.event(o as Record<string, unknown>) } catch { /* not JSON, or a failing viewer */ } }
-      const b = budgetVerdict(facts, w)
+      const b = budgetVerdict(facts, w, carriedTurns(broker.records))
       if (b) stopNow(b.stop, b.detail)
       // A failing observer (for example a full disk while persisting) must not stop the
       // stream being read: budget enforcement and the run result depend on it.
@@ -241,25 +246,42 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   if (facts.lines === 0 && stoppedBy === 'exit' && /^bwrap: /m.test(stderrHead)) { stoppedBy = 'spawn_error'; stopDetail = `sandbox did not start: ${stderrHead.split('\n')[0]}` }
   const wire = judgeWire(readWireCaptures(cap), w.model, w.expectedWire)
   let hookRefusals: { tool: string; reason: string }[] = []
-  try { hookRefusals = readUntrusted(join(rw, 'hook.jsonl')).split('\n').filter(Boolean).map(l => JSON.parse(l) as { tool: string; allow: boolean; reason: string }).filter(e => !e.allow).map(e => ({ tool: e.tool, reason: e.reason })) } catch { /* no refusals */ }
+  // per line, bounded: one malformed line does not hide the refusals around it
+  try { for (const l of readUntrusted(join(rw, 'hook.jsonl'), 1 << 20).split('\n')) { if (!l.trim()) continue; try { const e = JSON.parse(l) as { tool?: unknown; allow?: unknown; reason?: unknown }; if (e.allow === false) hookRefusals.push({ tool: String(e.tool ?? '?'), reason: String(e.reason ?? '') }) } catch { /* one bad line */ } } } catch { /* no hook log */ }
   let stderrText = ''
   try { stderrText = readFileSync(join(w.runDir, 'stderr.txt'), 'utf8').slice(0, 2000) } catch { /* none */ }
-  const attested = attestWire(wire, broker.records, w.model, w.expectedWire)
+  const attested = attestWire(wire, broker.records, w.model, w.expectedWire, facts.iterations)
+  // the broker's figures come from the API's own answers: the cost the worker's stream reports can only be raised by them
+  if (broker.spent.requests > 0 && broker.spent.usdKnown && broker.spent.usd > (facts.usage.reportedUsd ?? 0) + 1e-9) { facts.usage = { ...facts.usage, reportedUsd: broker.spent.usd }; observerError ??= `the worker's stream reported less cost than the API returned to the broker ($${broker.spent.usd.toFixed(5)}); the broker's figure is used` }
+  if (broker.spent.tokens > facts.usage.inputTokens + facts.usage.outputTokens) facts.usage = { ...facts.usage, inputTokens: Math.max(facts.usage.inputTokens, broker.spent.tokens - facts.usage.outputTokens) }
   return { identity, exitCode: ex.code, signal: ex.signal, facts, wire: attested, census: final, stoppedBy, stopDetail, hookRefusals, observerError, stderrHead: stderrText, broker: broker.records }
 }
 
+/** Model turns the broker passed on to the API (refused ones never reached it). */
+export const carriedTurns = (records: readonly BrokerRecord[]): number => records.filter(r => r.path === '/api/v1/chat/completions' && !r.refused).length
+/** Whether a route's expected wire value is a reasoning effort level the broker can enforce (not none or a toggle). */
+export const effortLevel = (expectedWire: string): boolean => !['none', 'on', 'off'].includes(expectedWire)
 /**
- * Host-attested wire check: a request the broker carried for a different model, or (for an effort-level
- * route) with a different reasoning effort, is a mismatch whatever the sandbox-written captures say. A
- * toggle model's "thinking on/off" is judged from the captures alone.
+ * The wire verdict, host-attested. The broker saw every model turn the worker made; the captures are written
+ * inside the sandbox. So: a request the broker refused for its model or effort is a mismatch; a run that took
+ * model turns without the broker carrying any is unconfirmed (strict mode fails it); for an effort-level route
+ * every carried turn must have had exactly the routed effort (a turn with none is a mismatch), and the verdict
+ * is confirmed from the broker's records alone. A toggle model's thinking on/off still comes from the captures.
  */
-export const attestWire = (wire: WireVerdict, records: readonly BrokerRecord[], model: string, expectedWire: string): WireVerdict => {
-  const seen = records.filter(r => r.model !== null && !r.refused)
-  const wrongModel = seen.find(r => r.model !== model)
+export const attestWire = (wire: WireVerdict, records: readonly BrokerRecord[], model: string, expectedWire: string, iterations = 1): WireVerdict => {
+  const turns = records.filter(r => r.path === '/api/v1/chat/completions')
+  const refused = turns.find(r => r.refused && /routed/.test(r.refused))
+  if (refused) return { ...wire, state: 'mismatch', detail: `broker refused a model turn: ${refused.refused}` }
+  const carried = turns.filter(r => !r.refused)
+  if (carried.length === 0) return iterations > 0 ? { ...wire, state: 'unconfirmed', detail: 'the broker carried no model turn, so the request the provider received cannot be confirmed' } : wire
+  const wrongModel = carried.find(r => r.model !== model)
   if (wrongModel) return { ...wire, state: 'mismatch', detail: `broker carried a request for model ${wrongModel.model}, routed ${model}` }
-  const wrongEffort = !['none', 'on', 'off'].includes(expectedWire) ? seen.find(r => r.effort !== null && r.effort !== expectedWire) : undefined
-  if (wrongEffort) return { ...wire, state: 'mismatch', detail: `broker carried reasoning effort ${wrongEffort.effort}, expected ${expectedWire}` }
-  return wire
+  if (effortLevel(expectedWire)) {
+    const wrong = carried.find(r => r.effort !== expectedWire)
+    if (wrong) return { ...wire, state: 'mismatch', detail: `broker carried reasoning effort ${wrong.effort ?? 'none'}, expected ${expectedWire}` }
+    return { ...wire, state: 'confirmed', requests: carried.length, effective: expectedWire, models: [model], detail: `broker carried ${carried.length} request(s) for ${model} at reasoning ${expectedWire}` }
+  }
+  return wire.state === 'confirmed' ? { ...wire, detail: `broker carried ${carried.length} request(s) for ${model}; ${wire.detail}` } : wire
 }
 
 export const targetOf = (id: Identity | null, marker: string, since: number): Target => ({ initPid: id?.initPid ?? null, initStart: id?.initStart ?? null, pidNs: id?.pidNs ?? null, marker, since: id?.since ?? since })
