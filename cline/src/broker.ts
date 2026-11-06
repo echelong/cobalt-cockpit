@@ -163,7 +163,9 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
   const spent = { usd: 0, tokens: 0, requests: 0, inflight: 0, usdKnown: true }
   const socketDir = mkdtempSync(join(tmpdir(), 'ccl-b-'))
   const socketPath = join(socketDir, 's')
-  const note = (r: BrokerRecord): void => { if (records.length < 10_000) records.push(r); try { o.log?.(r) } catch { /* the log is evidence, not control */ } }
+  const log = (r: BrokerRecord): void => { try { o.log?.(r) } catch { /* the log is evidence, not control */ } }
+  // a carried request is logged when its response has ended (with the usage the API reported); a refusal at once
+  const note = (r: BrokerRecord, final = true): void => { if (records.length < 10_000) records.push(r); if (final) log(r) }
   const refuse = (res: ServerResponse, req: IncomingMessage, status: number, why: string, model: string | null = null, effort: string | null = null): void => {
     note({ at: new Date().toISOString(), method: req.method ?? '?', path: (req.url ?? '').slice(0, 200), status, model, effort, bytesIn: 0, refused: why })
     res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: `Cockpit broker: ${why}` } }))
@@ -216,11 +218,11 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
       const ac = new AbortController(); req.on('close', () => { if (!res.writableEnded) ac.abort() })
       const up = await fetch(`${upstream}${path}${query ? `?${query}` : ''}`, { method: req.method, headers, body, redirect: 'manual', signal: ac.signal })
       const rec: BrokerRecord = { at: new Date().toISOString(), method: req.method, path, status: up.status, model, effort, bytesIn: body?.length ?? 0 }
-      note(rec)
+      note(rec, false)
       const out: Record<string, string> = {}
       up.headers.forEach((v, k) => { if (!HOP_OUT.has(k)) out[k] = v })
       res.writeHead(up.status, out)
-      if (!up.body) { res.end(); return }
+      if (!up.body) { res.end(); log(rec); return }
       // pass every byte through, and read the usage the API reports (SSE `data:` lines, or one JSON body)
       const dec = new TextDecoder(); let tail = ''; let whole = ''
       const count = (o2: unknown): void => { const u = usageOf(o2); if (!u) return; spent.tokens += u.tokens; rec.tokens = (rec.tokens ?? 0) + u.tokens; if (u.usd === null) { spent.usdKnown = false; rec.usd ??= null } else { spent.usd += u.usd; rec.usd = (rec.usd ?? 0) + u.usd } }
@@ -233,8 +235,8 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
           tail += t; const lines = tail.split('\n'); tail = lines.pop() ?? ''
           for (const l of lines) if (l.startsWith('data:') && l.includes('"usage"')) { try { count(JSON.parse(l.slice(5).trim())) } catch { /* not JSON */ } }
         })
-        s.on('end', () => { if (!/^\s*data:/m.test(whole)) { try { count(JSON.parse(whole)) } catch { /* not JSON */ } } res.end(); resolve() })
-        s.on('error', () => { res.destroy(); resolve() })
+        s.on('end', () => { if (!/^\s*data:/m.test(whole)) { try { count(JSON.parse(whole)) } catch { /* not JSON */ } } res.end(); log(rec); resolve() })
+        s.on('error', () => { res.destroy(); log(rec); resolve() })
       })
     } finally { spent.inflight-- }
   }
