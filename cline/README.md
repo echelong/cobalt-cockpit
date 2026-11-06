@@ -303,13 +303,16 @@ are never swept, so remove them yourself. Tests run one file at a time
 (`--test-concurrency=1`) and need the same prerequisites as the adapter, including a working bubblewrap: without
 one, the sandbox tests fail rather than skip. `COCKPIT_SCALE_N` sets the sequential-task scale test (default 2000).
 `scripts/typecheck.sh` looks for TypeScript 5.9.3 and `@types/node` in the npm `npx` cache; set `TSC` and
-`NODE_TYPES` to use other installs. The `Cline adapter` GitHub Actions workflow (`.github/workflows/cline-adapter.yml`) runs the typecheck and the
-whole suite on Ubuntu 24.04 when `cline/`, `hooks/`, `types/` or the workflow change. It installs pinned Node,
-Cline, TypeScript and bubblewrap (each download checked against a pinned hash), checks with the adapter's own code
-that real isolation can be established (`test/ci-preflight.ts`), and fails on any failed, skipped, cancelled or todo
-test, on fewer tests than expected, or on a test fixture left behind. If Ubuntu's AppArmor restriction blocks
-bubblewrap, it allows user namespaces for `/usr/bin/bwrap` only, never for the whole runner. On failure it keeps
-the test output for 7 days, never the fixtures or captured requests.
+`NODE_TYPES` to use other installs. The `Cline adapter` GitHub Actions workflow (`.github/workflows/cline-adapter.yml`) is written to run the
+typecheck and the whole suite on Ubuntu 24.04 when `cline/`, `hooks/`, `types/` or the workflow change; it has not
+yet run on GitHub-hosted runners. It installs Node 24.20.0 from the official tarball and the `cline`, `typescript`
+and `@types/node` npm tarballs, each checked against a pinned hash (their own npm dependencies are not pinned), and
+bubblewrap from Ubuntu's package (not version-pinned; 0.8 or later is required and the version is recorded). It
+checks with the adapter's own code that real isolation can be established (`test/ci-preflight.ts`), and fails on
+any failed, skipped, cancelled or todo test, on fewer tests than expected, on a test fixture left behind or on a
+bubblewrap process still running. If Ubuntu's AppArmor restriction blocks bubblewrap, it allows user namespaces for
+`/usr/bin/bwrap` only, never for the whole runner. On failure or cancellation it keeps the test output (as printed
+in the job log) for 7 days, never fixture directories.
 `test/isolation.spec.ts` attacks the sandbox from inside it (no hook in the way): other repositories, `.env`
 files, the real home and Cline data, local services and sockets, the internet, the broker's limits, symlinks,
 `/proc`, mounts, nested namespaces, privilege tools, persistence outside the worktree and surviving descendants.

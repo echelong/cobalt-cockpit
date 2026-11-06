@@ -17,7 +17,8 @@ permissions:
 
 concurrency:
   group: cline-adapter-${{ github.ref }}
-  cancel-in-progress: true
+  # superseded pull-request runs are cancelled; runs on main always finish
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   adapter:
@@ -97,21 +98,21 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
+          # not version-pinned (the runner image's Ubuntu archive decides); recorded here and checked for 0.8 or later
+          dpkg-query -W bubblewrap | tee "$RUNNER_TEMP/versions.txt"
           ls -l /usr/bin/bwrap
           v=$(/usr/bin/bwrap --version | awk '{print $2}')
           if [ "$(printf '%s\n0.8.0\n' "$v" | sort -V | head -1)" != "0.8.0" ]; then echo "::error::bubblewrap $v is older than 0.8" >&2; exit 1; fi
 
       - name: User namespaces for bwrap only (when the runner restricts them)
         timeout-minutes: 3
+        working-directory: cline
         run: |
           set -euo pipefail
-          probe() {
-            /usr/bin/bwrap --unshare-user --unshare-pid --unshare-net --disable-userns --assert-userns-disabled \
-              --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
-              --remount-ro / -- /usr/bin/true
-          }
+          # the adapter's own probe (sandbox.ts bwrapAvailable, through the trusted bubblewrap), not a copy of it
+          probe() { node --experimental-transform-types --no-warnings --import ./loader/register.mjs test/ci-preflight.ts --probe; }
           echo "user.max_user_namespaces=$(cat /proc/sys/user/max_user_namespaces)"
           restrict=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)
           echo "kernel.apparmor_restrict_unprivileged_userns=$restrict"
@@ -132,6 +133,9 @@ jobs:
         working-directory: cline
         run: |
           set -euo pipefail
+          # the same settings scripts/test.sh clears before the suite (the broker refuses to run with any of them)
+          unset NODE_OPTIONS NODE_PATH NODE_COMPILE_CACHE LD_PRELOAD LD_AUDIT NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS NODE_USE_ENV_PROXY SSL_CERT_FILE SSL_CERT_DIR SSLKEYLOGFILE OPENSSL_CONF
+          npm ls -g --all >> "$RUNNER_TEMP/versions.txt" 2>&1 || true
           node --experimental-transform-types --no-warnings --import ./loader/register.mjs test/ci-preflight.ts "$CLINE_VERSION" 2>&1 | tee "$RUNNER_TEMP/preflight.log"
 
       - name: Git identity for test fixtures
@@ -163,6 +167,10 @@ jobs:
           set -euo pipefail
           # no core dumps (they could hold test data) and no single file above 8 GiB; the job and every step have timeouts
           ulimit -c 0; ulimit -f 8388608
+          # what is in the temporary directory before any test runs, to find anything the tests leave behind
+          tmpd=${TMPDIR:-/tmp}
+          find "$tmpd" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "$RUNNER_TEMP/tmp-entries-before.txt"
+          df -i "$tmpd" | tee "$RUNNER_TEMP/tmp-before.txt"
           cline/scripts/test.sh test/isolation.spec.ts test/hardening.spec.ts test/scratch.spec.ts 2>&1 | tee "$RUNNER_TEMP/isolation.log"
 
       - name: Full adapter suite
@@ -171,7 +179,6 @@ jobs:
           set -euo pipefail
           # no core dumps (they could hold test data) and no single file above 8 GiB; the job and every step have timeouts
           ulimit -c 0; ulimit -f 8388608
-          df -i /tmp | tee "$RUNNER_TEMP/tmp-before.txt"
           cline/scripts/test.sh 2>&1 | tee "$RUNNER_TEMP/suite.log"
 
       - name: No skipped tests, and the expected number ran
@@ -180,7 +187,7 @@ jobs:
           check() {
             local log=$1 min=$2 v k bad=0
             for k in tests pass fail cancelled skipped todo; do
-              v=$(grep -E "^ℹ $k [0-9]+$" "$log" | tail -1 | awk '{print $3}')
+              v=$(grep -E "^ℹ $k [0-9]+$" "$log" | tail -1 | awk '{print $3}' || true)
               [ -n "$v" ] || { echo "::error::$log has no '$k' count" >&2; bad=1; continue; }
               eval "$k=$v"
             done
@@ -194,13 +201,18 @@ jobs:
           check "$RUNNER_TEMP/isolation.log" "$MIN_ISOLATION_TESTS"
           check "$RUNNER_TEMP/suite.log" "$MIN_TESTS"
 
-      - name: Test fixtures cleaned up
+      - name: Test fixtures cleaned up, no sandbox left running
         run: |
           set -euo pipefail
-          df -i /tmp | tee "$RUNNER_TEMP/tmp-after.txt"
-          left=$(find /tmp "$HOME" -maxdepth 1 \( -name 'ccl-*' -o -name '.ccl-*' \) -user "$(id -un)" | tee "$RUNNER_TEMP/fixtures-left.txt" | wc -l)
+          tmpd=${TMPDIR:-/tmp}
+          df -i "$tmpd" | tee "$RUNNER_TEMP/tmp-after.txt"
+          find "$tmpd" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "$RUNNER_TEMP/tmp-entries-after.txt"
+          comm -13 "$RUNNER_TEMP/tmp-entries-before.txt" "$RUNNER_TEMP/tmp-entries-after.txt" > "$RUNNER_TEMP/tmp-entries-new.txt"
+          if [ -s "$RUNNER_TEMP/tmp-entries-new.txt" ]; then echo "new entries in $tmpd since the tests started:"; cat "$RUNNER_TEMP/tmp-entries-new.txt"; fi
+          left=$(find "$tmpd" /tmp "$HOME" -maxdepth 1 \( -name 'ccl-*' -o -name '.ccl-*' \) -user "$(id -un)" | sort -u | tee "$RUNNER_TEMP/fixtures-left.txt" | wc -l)
           if [ "$left" != 0 ]; then echo "::error::$left test fixture director(ies) were left behind" >&2; exit 1; fi
-          echo "no test fixtures left in /tmp or HOME"
+          if pgrep -u "$(id -u)" -x bwrap > "$RUNNER_TEMP/bwrap-left.txt"; then echo "::error::bubblewrap processes are still running after the tests" >&2; exit 1; fi
+          echo "no test fixtures left in $tmpd, /tmp or HOME; no bubblewrap process running"
 
       - name: Summary
         if: always()
@@ -217,17 +229,19 @@ jobs:
             done
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Diagnostics on failure (test output only; no fixtures or captured requests)
-        if: failure()
+      - name: Diagnostics on failure (test output only, no fixture directories)
+        if: failure() || cancelled()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cline-adapter-logs
           path: |
+            ${{ runner.temp }}/versions.txt
             ${{ runner.temp }}/preflight.log
             ${{ runner.temp }}/isolation.log
             ${{ runner.temp }}/suite.log
             ${{ runner.temp }}/tmp-before.txt
             ${{ runner.temp }}/tmp-after.txt
             ${{ runner.temp }}/fixtures-left.txt
+            ${{ runner.temp }}/tmp-entries-new.txt
           if-no-files-found: ignore
           retention-days: 7
