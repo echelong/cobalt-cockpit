@@ -134,8 +134,9 @@ jobs:
         run: |
           set -euo pipefail
           # the same settings scripts/test.sh clears before the suite (the broker refuses to run with any of them)
-          unset NODE_OPTIONS NODE_PATH NODE_COMPILE_CACHE LD_PRELOAD LD_AUDIT NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS NODE_USE_ENV_PROXY SSL_CERT_FILE SSL_CERT_DIR SSLKEYLOGFILE OPENSSL_CONF
-          npm ls -g --all >> "$RUNNER_TEMP/versions.txt" 2>&1 || true
+          unset NODE_OPTIONS NODE_PATH NODE_COMPILE_CACHE LD_PRELOAD LD_AUDIT NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS NODE_USE_ENV_PROXY SSL_CERT_FILE SSL_CERT_DIR SSLKEYLOGFILE OPENSSL_CONF \
+            COCKPIT_BROKER_UPSTREAM COCKPIT_CLINE_BIN COCKPIT_CLINE_BWRAP COCKPIT_CLINE_CATALOG_BIN COCKPIT_CLINE_NODE
+          { npm ls -g --all; npm ls --prefix "$RUNNER_TEMP/ts" --all; } >> "$RUNNER_TEMP/versions.txt" 2>&1 || true
           node --experimental-transform-types --no-warnings --import ./loader/register.mjs test/ci-preflight.ts "$CLINE_VERSION" 2>&1 | tee "$RUNNER_TEMP/preflight.log"
 
       - name: Git identity for test fixtures
