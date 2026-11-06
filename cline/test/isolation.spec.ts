@@ -618,12 +618,14 @@ describe('isolation (review 13): the sign-in survives write failures and concurr
     const lock = writeLockFile(data)
     const up = await upstream({ refresh: () => ans('X-A', 'X-R') })
     const holder = spawn(process.execPath, ['-e', `const {DatabaseSync}=require('node:sqlite');const d=new DatabaseSync(${JSON.stringify(lock)});d.exec('BEGIN EXCLUSIVE');process.stdout.write('held\\n');setTimeout(()=>{d.exec('COMMIT');d.close();process.exit(0)},2500)`], { stdio: ['ignore', 'pipe', 'inherit'] })
+    // registered at once: the holder can exit before the save returns, and a later listener would wait forever
+    const holderExited = new Promise(r => holder.on('exit', r))
     await new Promise<void>(r => holder.stdout?.once('data', () => r()))
     const t0 = Date.now()
     assert.equal(await realToken(data, 'cline', up.url), 'X-A')
     assert.ok(Date.now() - t0 >= 1000, `the save waited for the other process's lock (${Date.now() - t0} ms)`)
     assert.equal(JSON.parse(readFileSync(f, 'utf8')).providers.cline.settings.auth.accessToken, 'X-A')
-    await new Promise(r => holder.on('exit', r))
+    await holderExited
   })
   test('a missing or corrupt providers.json is a sign-in problem, and a refused refresh is not retried', T, async () => {
     const missing = tmp('nodata')
