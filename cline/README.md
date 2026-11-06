@@ -17,19 +17,19 @@ that plugin does not install or enable this adapter, and this adapter needs no C
 | Requirement | Why | Check |
 |---|---|---|
 | Linux | bubblewrap and Linux namespaces are the isolation boundary; macOS and Windows are not supported | `uname -s` |
-| `bwrap` (bubblewrap) **0.8 or later** on `PATH` | every worker and gate runs in it; 0.8 added `--disable-userns`, which Cockpit requires | `bwrap --version` |
+| `bwrap` (bubblewrap) **0.8 or later**, from the system's package manager | every worker and gate runs in it; 0.8 added `--disable-userns`, which Cockpit requires. Only a root-owned `/usr/bin/bwrap`, `/bin/bwrap` or `/usr/local/bin/bwrap` is used, never one found on `PATH` (NixOS, which keeps it elsewhere, is not supported: Cockpit refuses to start workers there) | `bwrap --version` |
 | Unprivileged user namespaces allowed for `bwrap` | the sandbox is set up without root or setuid | `cockpit-cline doctor` (the `sandbox:` line) |
 | Node **24** (the same Node that runs `cline`) | the adapter is TypeScript run by Node's type stripping; tested on 24.20.0 | `node --version` |
 | `git` | missions run in Git worktrees | `git --version` |
-| The `cline` CLI on `PATH`, signed in | workers are stock `cline` processes; Cockpit resolves models from the installed catalog | `cline --version`, then `cline auth` |
+| The `cline` CLI, installed under that Node, signed in | workers are stock `cline` processes; Cockpit resolves models from the installed catalog. It must be owned by you or root and not writable by others | `cline --version`, then `cline auth` |
 
 There is no npm install: the adapter has no dependencies. Install bubblewrap with your distribution's package
 manager, for example `sudo dnf install bubblewrap` (Fedora), `sudo apt install bubblewrap` (Debian, Ubuntu) or
 `sudo pacman -S bubblewrap` (Arch), and check that the version is at least 0.8. Install Cline with the npm of
-the same Node (`npm install -g cline`), so that it lands in that Node installation's `bin` directory: inside the
-sandbox `cline` is looked up only there, in `/usr/local/bin`, `/usr/bin` and `/bin`, and in any `sandbox.allowRead`
-path ending in `/bin`. A `cline` elsewhere on your `PATH` (for example a link in `~/.local/bin`) is not found by
-workers. Sign in once with `cline auth`. Only the `cline` (Cline credits) and `cline-pass`
+the same Node (`npm install -g cline`), so that it lands in that Node installation's `bin` directory: Cockpit
+uses the `cline` there, otherwise `/usr/local/bin/cline` or `/usr/bin/cline`, for both the model catalog and the
+workers, and never one chosen by `PATH` or an environment variable. A `cline` elsewhere on your `PATH` (for
+example a link in `~/.local/bin`) is not used. Sign in once with `cline auth`. Only the `cline` (Cline credits) and `cline-pass`
 (ClinePass) providers are supported, because only they can be served by Cockpit's credential broker.
 Type checking the adapter itself uses TypeScript 5.9.3 (`scripts/typecheck.sh`); running it does not.
 
@@ -44,7 +44,7 @@ git clone https://github.com/echelong/cobalt-cockpit.git ~/src/cobalt-cockpit
 ```
 
 `doctor` must print `doctor: OK`. It resolves every role against the **installed** Cline model catalog, checks that
-the configured reasoning level exists for that model, checks that the full sandbox can be established, and reports
+the configured reasoning level exists for that model, checks that bubblewrap can set up its namespaces (user, pid and network, nested user namespaces disabled), and reports
 whether each provider has credentials (it never prints them). Nothing runs without the sandbox. To update, pull
 `main` in your clone and run `doctor` again; after a Cline upgrade, also run the live check
 `cockpit-cline smoke --yes` (it spends a few cents of real credits, capped by `--max-usd`).
@@ -80,8 +80,8 @@ fi
 Outside a repository, with `CLINE_COCKPIT_REPO` unset, this wrapper refuses every command, `doctor` included;
 run `bin/cockpit-cline doctor` (or the `cockpit-cline` link) directly there.
 
-Do not name a wrapper or alias `cline`: Cockpit starts `cline` from `PATH` for its workers, so a wrapper with that
-name would intercept them, and it would change a command you already rely on (see
+Do not name a wrapper or alias `cline`: Cockpit ignores it (workers run the installed Cline by its real path), but
+it would change a command you already rely on (see
 [below](#the-interactive-cockpit-one-command)). If your shell startup file defines both an alias and a function
 with the same name, define the alias after the function: Bash expands an alias that already exists while it reads
 the function's definition, and the function then gets the alias's target as its name.
@@ -98,7 +98,7 @@ that needs them.
 | `setting up uid map: Permission denied`, `loopback: Failed RTM_NEWADDR` or `Creating new namespace failed` on Ubuntu 23.10 or later | AppArmor restricts unprivileged user namespaces to programs whose profile allows them (`kernel.apparmor_restrict_unprivileged_userns = 1`) | give the `bwrap` binary an AppArmor profile that allows `userns`, as Ubuntu documents for applications that need namespaces; do not set `kernel.apparmor_restrict_unprivileged_userns=0`, which lifts the restriction for every program. Not tested by this project |
 | `Creating new namespace failed` (for example with `No space left on device`; older versions: `No permissions to creating new namespace`) elsewhere | user namespaces are off: `user.max_user_namespaces` is 0, or, on older Debian kernels, `kernel.unprivileged_userns_clone` is 0 | ask whoever administers the machine; these are system-wide security settings and a policy may require them off |
 | `bwrap: setting up uid map` inside a container or CI runner | the container does not allow nested namespaces | run on the host or a VM; do not run the container privileged for this |
-| `spawn bwrap ENOENT` | bubblewrap is not installed or not on `PATH` | install it, or point `COCKPIT_CLINE_BWRAP` at the binary |
+| `no trusted bubblewrap: …` (from Cockpit) | bubblewrap is not installed in a system location, or the one there is not owned by root or is writable by others | install it with the system package manager; a copy in your home directory or on `PATH` is never used |
 
 A `bwrap` that is installed setuid root is not what Cockpit is designed around (it expects unprivileged user
 namespaces); check with `ls -l "$(command -v bwrap)"`.
@@ -185,9 +185,8 @@ supervised `cline` runs. The stock `cline` command and installation are left exa
 
 **Optional integration with the normal `cline` command: investigated, not built.** The only reversible hooks
 into `cline` itself are a plugin command (text replies only, see above) or a shell alias/wrapper named `cline`.
-A wrapper would also intercept every other tool that runs `cline`, including Cockpit itself (it finds `cline`
-on `PATH`, so its sandboxed workers would start the wrapper instead of Cline), and it would change a command you
-already rely on. So the interactive Cockpit stays a separate command, `cockpit-cline`. If you want one anyway, a personal
+A wrapper would intercept every other tool that runs `cline` from `PATH` (Cockpit itself does not: its workers
+run the installed Cline by its real path), and it would change a command you already rely on. So the interactive Cockpit stays a separate command, `cockpit-cline`. If you want one anyway, a personal
 alias such as `alias clc=cockpit-cline` is reversible and touches nothing else.
 
 `/new` opens the new conversation first and closes the old one only when none of its tasks holds ownership;
@@ -291,8 +290,16 @@ scripts/typecheck.sh       # TypeScript 5.9.3, strict
 bin/cockpit-cline smoke --yes --max-usd 0.25   # live, opt-in, budget bounded
 ```
 
-The offline suite is 337 tests in 73 suites; on the development machine it takes about 5 minutes (298 s measured
-on 2026-11-06) and the isolation tests alone (53) under a minute. Tests run one file at a time
+The offline suite is 369 tests in 81 suites; on the development machine it takes about 5 minutes (310 s measured
+on 2026-11-06 with `/tmp` on tmpfs; a disk-backed temporary directory is much slower, and the archive test's
+30-second bound can fail there), the isolation tests alone (53) under a minute and the hardening tests
+(`hardening.spec.ts`, 24: what chooses the broker's upstream, bubblewrap and Cline) a few seconds.
+Each test process keeps all its fixtures in one directory, `ccl-run-*` in the temporary directory (and
+`~/.ccl-run-*` for canaries that must be on persistent storage), removed when the process exits or is
+interrupted (SIGINT, SIGTERM, SIGHUP); one left by a killed process is removed by the next test run, which
+checks that it is a test root and that its owner has provably ended; when that cannot be established, it is kept
+(`test/scratch.ts`, tested in `scratch.spec.ts`). `COCKPIT_TEST_KEEP=1` keeps a run's fixtures for debugging; they
+are never swept, so remove them yourself. Tests run one file at a time
 (`--test-concurrency=1`) and need the same prerequisites as the adapter, including a working bubblewrap: without
 one, the sandbox tests fail rather than skip. `COCKPIT_SCALE_N` sets the sequential-task scale test (default 2000).
 `scripts/typecheck.sh` looks for TypeScript 5.9.3 and `@types/node` in the npm `npx` cache; set `TSC` and

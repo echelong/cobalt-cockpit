@@ -5,9 +5,16 @@ import { spawn, execFileSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { FAKE, HERE, tmp } from '../helpers.ts'
+import { FAKE, HERE, STANDIN, tmp } from '../helpers.ts'
 
+/** The shipped launcher (bin/cockpit-cline): tests that need the production entry run it directly. */
 export const BIN = join(HERE, '..', 'bin', 'cockpit-cline')
+/**
+ * The CLI as the shell tests run it: the production main() through fixtures/cli-under-test.ts, which points the
+ * broker at this process's loopback stand-in and workers at the fake Cline through the test seams (arguments, not
+ * environment variables).
+ */
+export const TEST_CLI = [process.execPath, '--experimental-transform-types', '--no-warnings', '--import', join(HERE, '..', 'loader', 'register.mjs'), join(HERE, 'fixtures', 'cli-under-test.ts'), '--seam-upstream', STANDIN, '--seam-cline-bin', FAKE, '--']
 
 export type Pty = { child: ChildProcess; frame: () => string; raw: () => string; send: (s: string) => void; waitFor: (re: RegExp, ms?: number) => Promise<string>; exited: Promise<number | null>; pid: () => number | null; stateDir: string; resize: (cols: number, rows: number) => void }
 
@@ -23,8 +30,8 @@ export const testConfigFile = (over: Record<string, unknown> = {}): string => {
 export const openShell = (o: { repo: string; root: string; data: string; cols?: number; rows?: number; args?: string[]; config?: string; env?: Record<string, string> }): Pty => {
   const frameFile = join(tmp('frame'), 'frame.txt')
   const args = ['shell', '--repo', o.repo, '--state', o.root, '--config', o.config ?? testConfigFile(), ...(o.args ?? [])]
-  const cmd = `stty cols ${o.cols ?? 160} rows ${o.rows ?? 46}; exec ${[BIN, ...args].map(a => `'${a.replace(/'/g, `'\\''`)}'`).join(' ')}`
-  const child = spawn('script', ['-qfec', cmd, '/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, COCKPIT_SHELL_FRAME: frameFile, COCKPIT_CLINE_BIN: FAKE, COCKPIT_CLINE_DATA: o.data, NO_COLOR: '', COCKPIT_COLOR: '', COCKPIT_REDUCED_MOTION: '', ...(o.env ?? {}) } })
+  const cmd = `stty cols ${o.cols ?? 160} rows ${o.rows ?? 46}; exec ${[...TEST_CLI, ...args].map(a => `'${a.replace(/'/g, `'\\''`)}'`).join(' ')}`
+  const child = spawn('script', ['-qfec', cmd, '/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, COCKPIT_SHELL_FRAME: frameFile, COCKPIT_CLINE_DATA: o.data, NO_COLOR: '', COCKPIT_COLOR: '', COCKPIT_REDUCED_MOTION: '', ...(o.env ?? {}) } })
   let raw = ''
   child.stdout?.on('data', d => { raw += d.toString() }); child.stderr?.on('data', d => { raw += d.toString() })
   const exited = new Promise<number | null>(r => child.on('exit', c => r(c)))
@@ -44,7 +51,7 @@ export const openShell = (o: { repo: string; root: string; data: string; cols?: 
   /** The node process running this shell (not `script` or the shell wrapper). */
   const pid = (): number | null => {
     const out = execFileSync('ps', ['-eo', 'pid=,args='], { encoding: 'utf8' })
-    for (const line of out.split('\n')) { const m = /^\s*(\d+)\s+(\S+)\s(.*)$/.exec(line); if (m && /(?:^|\/)node$/.test(m[2]) && m[3].includes('src/cli.ts shell') && m[3].includes(o.root)) return Number(m[1]) }
+    for (const line of out.split('\n')) { const m = /^\s*(\d+)\s+(\S+)\s(.*)$/.exec(line); if (m && /(?:^|\/)node$/.test(m[2]) && m[3].includes('cli-under-test.ts') && / -- shell /.test(m[3]) && m[3].includes(o.root)) return Number(m[1]) }
     return null
   }
   /** A real window resize: sets the terminal size on the shell's pty, so the kernel sends it SIGWINCH. */

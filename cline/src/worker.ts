@@ -133,7 +133,8 @@ export const FORWARDER = join(PACKAGE_DIR, 'src', 'forward.mjs')
  * hook runs, approved read-only paths, the broker's socket and nothing else of the host (see sandbox.ts).
  */
 export const workerSandbox = (w: Pick<WorkerSpec, 'workdir' | 'writable' | 'gitCommonDir' | 'gitAdminDir' | 'clineBin' | 'allowRead' | 'hide' | 'attemptId' | 'binds'>, d: { ro: string; rw: string; home: string }, brokerDir: string): SandboxSpec => {
-  // a Cline given as a path (a test double) is mounted read-only from where it lives, if that place is safe to show
+  // the Cline to run (the trusted installed one by its real path, or a test's stand-in) is mounted read-only from
+  // where it lives, if that place is safe to show
   const binDir = w.clineBin.includes('/') ? [dirname(realpathSync(w.clineBin))] : []
   for (const b of binDir) { const why = mountProblem(b); if (why) throw new Error(`sandbox: refusing to mount the Cline binary's directory ${b}: ${why}`) }
   // the repository's git config, stripped of remotes, credential helpers, hooks and commands

@@ -209,8 +209,14 @@ use it, and the sandbox still decides what that tool can reach.
 | `COCKPIT_CLINE_PROFILE` | The profile, unless `--profile` is given. |
 | `COCKPIT_CLINE_STATE` | The state directory (default `$XDG_STATE_HOME/cobalt-cockpit-cline`, `~/.local/state/cobalt-cockpit-cline`); the `--state DIR` option overrides it for one command. |
 | `COCKPIT_CLINE_DATA` | Cline's data directory, whose sign-in the broker reads and refreshes (default `~/.cline/data`). |
-| `COCKPIT_CLINE_BWRAP` | The bubblewrap binary (default `bwrap` on `PATH`). |
-| `COCKPIT_CLINE_NODE` | The Node binary `bin/cockpit-cline` runs (default `node` on `PATH`). |
-| `COCKPIT_CLINE_BIN` | The `cline` binary workers run (default `cline` on `PATH`). The model catalog is always read from the installed `cline` (or `COCKPIT_CLINE_CATALOG_BIN`). |
 | `NO_COLOR`, `COCKPIT_COLOR`, `COCKPIT_REDUCED_MOTION` | HUD colour and motion (README, HUD 2.0). |
-| `COCKPIT_BROKER_UPSTREAM` | **Tests only; never set it.** Redirects the credential broker, and with it your real Cline token, from `https://api.cline.bot` to another `https` origin or a loopback `http` one. Workers cannot set it. |
+| `COCKPIT_WATCH_MS` | How long `watch` runs when its input is not a terminal (default 1500 ms). |
+
+No variable chooses where the broker sends your token, or which bubblewrap or Cline Cockpit runs. `COCKPIT_BROKER_UPSTREAM`,
+`COCKPIT_CLINE_BWRAP`, `COCKPIT_CLINE_BIN`, `COCKPIT_CLINE_CATALOG_BIN` and `COCKPIT_CLINE_NODE` were removed:
+the broker always uses `https://api.cline.bot`; bubblewrap is the root-owned system binary; Cline is the one in the
+Node installation that runs Cockpit (else `/usr/local/bin` or `/usr/bin`), owned by you or root and writable by
+nobody else; Node is the `node` on `PATH` (see [SECURITY.md](../../SECURITY.md#what-cockpit-runs-and-what-chooses-it)).
+`bin/cockpit-cline` also clears `NODE_OPTIONS`, `NODE_PATH`, `NODE_COMPILE_CACHE`, `LD_PRELOAD`, `LD_AUDIT` and Node's TLS and proxy settings (`NODE_TLS_REJECT_UNAUTHORIZED`,
+`NODE_EXTRA_CA_CERTS`, `NODE_USE_ENV_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `SSLKEYLOGFILE`, `OPENSSL_CONF`)
+before Node starts; started any other way with one of them set (or any `NODE_OPTIONS`), the broker refuses to run.
