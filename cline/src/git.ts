@@ -124,9 +124,10 @@ export const commitTask = async (dir: string, message: string, admin: string | n
 
 /** Serial integration onto the mission branch. A conflict aborts the pick and reports it. */
 export const integrate = async (integrationDir: string, commit: string): Promise<{ ok: true; head: string } | { ok: false; conflict: string }> => {
-  const r = await git(['-c', 'commit.gpgsign=false', 'cherry-pick', '--allow-empty', '-x', commit], { cwd: integrationDir, allowFail: true })
+  // the picked tree is worker-authored: host git runs no hooks or fsmonitor it could name
+  const r = await git([...pinned(integrationDir, null), '-c', 'commit.gpgsign=false', 'cherry-pick', '--allow-empty', '-x', commit], { cwd: integrationDir, allowFail: true })
   if (r.code === 0) return { ok: true, head: await headOf(integrationDir) }
-  await git(['cherry-pick', '--abort'], { cwd: integrationDir, allowFail: true })
+  await git([...pinned(integrationDir, null), 'cherry-pick', '--abort'], { cwd: integrationDir, allowFail: true })
   return { ok: false, conflict: (r.stderr || r.stdout).trim().slice(0, 600) }
 }
 

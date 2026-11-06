@@ -62,8 +62,15 @@ export const validateConfig = (raw: unknown): Config => {
       const r = p.roles[role]
       if (!isObj(r) || typeof r.provider !== 'string' || !r.provider || typeof r.model !== 'string' || !r.model) throw new Error(`config profiles.${name}.roles.${role}: provider and model required`)
       if (!(CLI_THINKING as readonly string[]).includes(r.reasoning)) throw new Error(`config profiles.${name}.roles.${role}.reasoning: one of ${CLI_THINKING.join('|')} (got ${String(r.reasoning)})`)
+      // a null or empty pin would silently unpin the role (bypassing unpinnedAllowed): absent, or a version string
+      if (r.requireName !== undefined && (typeof r.requireName !== 'string' || !r.requireName.trim())) throw new Error(`config profiles.${name}.roles.${role}.requireName: a non-empty version string, or leave it out (got ${JSON.stringify(r.requireName)})`)
     }
   }
+  // pre-spawn estimates enforce the session budget before a worker starts: a typo must not disable that
+  if (!isObj(c.estimates)) throw new Error('config estimates: object required')
+  for (const role of ROLES) { const e = (c.estimates as Record<string, unknown>)[role]; if (!isObj(e)) throw new Error(`config estimates.${role}: object required`); num(e.input, `estimates.${role}.input`); num(e.output, `estimates.${role}.output`); num(e.cacheRatio, `estimates.${role}.cacheRatio`); if ((e.cacheRatio as number) > 1) throw new Error(`config estimates.${role}.cacheRatio: at most 1`) }
+  if (!Array.isArray(c.budgets.alertAt) || !c.budgets.alertAt.every(x => typeof x === 'number' && Number.isFinite(x) && x > 0 && x <= 1)) throw new Error('config budgets.alertAt: fractions in (0, 1]')
+  if (typeof c.budgets.allowUnmetered !== 'boolean') throw new Error('config budgets.allowUnmetered: boolean required')
   for (const [id, p] of Object.entries(c.pricingOverrides ?? {})) for (const k of ['input', 'output', 'cacheRead', 'cacheWrite'] as const) num(p[k], `pricingOverrides.${id}.${k}`)
   num(c.budgets.sessionUsd, 'budgets.sessionUsd'); num(c.budgets.sessionTokens, 'budgets.sessionTokens')
   for (const role of ROLES) { num(c.budgets.taskUsd[role], `budgets.taskUsd.${role}`); num(c.budgets.taskTokens[role], `budgets.taskTokens.${role}`); num(c.limits.concurrency[role], `limits.concurrency.${role}`) }

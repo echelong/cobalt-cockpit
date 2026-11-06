@@ -67,7 +67,7 @@ export const budgetVerdict = (f: Pick<StreamFacts, 'usage' | 'usageEvents' | 'it
   return null
 }
 
-const emptyFacts = (): StreamFacts => ({ usage: { ...ZERO_USAGE }, usageEvents: 0, toolCalls: {}, iterations: 0, finishReason: null, aborted: null, resultText: null, reportedModel: null, reportedProvider: null, agentErrors: 0, lines: 0, badLines: 0, sessionIds: [], firstEventAt: null, lastEventAt: null })
+export const emptyFacts = (): StreamFacts => ({ usage: { ...ZERO_USAGE }, usageEvents: 0, toolCalls: {}, iterations: 0, finishReason: null, aborted: null, resultText: null, reportedModel: null, reportedProvider: null, agentErrors: 0, lines: 0, badLines: 0, sessionIds: [], firstEventAt: null, lastEventAt: null })
 
 /** Folds one JSONL line from `cline --json` into the facts. Unknown lines are counted, not trusted. */
 export const foldLine = (f: StreamFacts, line: string): StreamFacts => {
@@ -127,12 +127,11 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   writeFileSync(join(ro, 'hooks', 'PreToolUse.sh'), hookScript(), { mode: 0o500 })
   chmodSync(join(ro, 'hooks', 'PreToolUse.sh'), 0o500)
   writeFileSync(join(ro, 'prompt.txt'), w.prompt, { mode: 0o400 })
-  const uid = process.getuid?.() ?? 1000
   const sandbox: SandboxSpec = {
     workdir: w.workdir, writable: w.writable, gitCommonDir: w.gitCommonDir, gitAdminDir: w.gitAdminDir,
     readOnly: [ro, PACKAGE_DIR, join(PACKAGE_DIR, '..', 'hooks'), join(PACKAGE_DIR, '..', 'types')],
     readWrite: [rw, w.clineDataDir],
-    hide: [...w.hide, `/run/user/${uid}`], network: w.network, marker: w.attemptId,
+    hide: w.hide, network: w.network, marker: w.attemptId,
     env: { CLINE_CAPTURE_PROVIDER_REQUEST: 'full', CLINE_CAPTURE_WIRE: 'true', CLINE_CAPTURE_DIR: cap, COCKPIT_POLICY: join(ro, 'policy.json'), COCKPIT_HOOK_LOG: join(rw, 'hook.jsonl') },
   }
   const argv = [w.clineBin, '--json', '-P', w.provider, '-m', w.model, '--thinking', w.cliThinking, '-c', w.workdir, '--config', cfg, '--data-dir', w.clineDataDir, '--hooks-dir', join(ro, 'hooks'), '-t', String(w.timeoutSeconds), '--retries', String(w.clineRetries), w.prompt]

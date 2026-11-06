@@ -15,7 +15,7 @@ import { routeTask, nextStep, healthKey, classifyFailureText, IMPLEMENTATION, ba
 import type { FailureClass, Health, RouteDecision, TaskSpec } from './router.ts'
 import { chargeOf, checkBudget, pricingFor } from './cost.ts'
 import type { Usage } from './cost.ts'
-import { runWorker, targetOf } from './worker.ts'
+import { emptyFacts, foldLine, runWorker, targetOf } from './worker.ts'
 import type { StreamFacts, WorkerOutcome, WorkerSpec, Control } from './worker.ts'
 import type { Identity } from './sandbox.ts'
 import { census, processIdentity, sameProcess, terminate } from './proc.ts'
@@ -61,10 +61,11 @@ export type Verdict = { state: 'DONE' | 'PARTIAL' | 'BLOCKED' | 'FAILED' | 'STOP
 export type Live = {
   version: 1; missionId: string; epoch: string; state: 'planning' | 'running' | 'finalizing' | 'done' | 'stopped'
   supervisor: ProcessIdentity | null; tasks: Record<string, TaskRecord>; swarm: Swarm
-  session: { spentUsd: number; tokens: number; archivedUsd: number; archivedTokens: number; unmetered: boolean; alertsFired: number[]; capReached: boolean; unmeteredTasks: string[]; /** attempts whose cost is an estimate from configured pricing, not a reported figure */ estimatedTasks?: string[] }
+  session: { spentUsd: number; tokens: number; archivedUsd: number; archivedTokens: number; unmetered: boolean; alertsFired: number[]; capReached: boolean; unmeteredTasks: string[]; /** attempts whose cost is an estimate from configured pricing, not a reported figure */ estimatedTasks?: string[]; /** attempts a restart interrupted: their cost is what the stream recorded, a lower bound */ lowerBoundTasks?: string[] }
   health: Health; aimd: Record<string, number>; spawnTimes: number[]
   counters: { created: number; completed: number; failed: number; cancelled: number; refused: number; archived: number; attempts: number }
-  recent: { id: string; title: string; state: TaskState; role: Role | null; model: string | null; usd: number | null; at: string }[]
+  /** usd: null when none of the task's cost was measured; partial: some attempts' cost is unknown, so usd is a lower bound. */
+  recent: { id: string; title: string; state: TaskState; role: Role | null; model: string | null; usd: number | null; partial?: boolean; at: string }[]
   integration: { dir: string; branch: string; base: string; head: string }
   finalGates: GateResult[]; review: { text: string | null; attempt: string | null } | null
   verdict: Verdict | null; alerts: string[]; stopRequested: string | null; updatedAt: string
@@ -94,6 +95,9 @@ const CPU_COUNT = Math.max(1, cpus().length) // os.cpus() is slow; the count doe
 const SUCCESS_CLAIM = /\b(?:all\s+tests?\s+pass|tests?\s+(?:pass|passed|passing)|done|completed?|finished|fixed|implemented|works)\b/i
 
 export const missionDir = (root: string, id: string): string => join(root, 'missions', id)
+
+/** Whether an attempt's cost is known: measured (reported or estimated from usage), or it never launched and spent nothing. */
+export const costMeasured = (a: AttemptRecord): boolean => (a.charge.usd !== null && (a.usageEvents > 0 || a.charge.basis !== 'unmetered')) || (a.identity === null && a.usageEvents === 0 && (a.iterations ?? 0) === 0)
 
 /** Stable digest of the effective configuration (keys sorted), fixed at mission creation. */
 export const configDigest = (c: Config): string => {
@@ -211,7 +215,8 @@ export class Mission {
       this.live.session.archivedUsd += usd
       this.live.session.archivedTokens += t.attempts.reduce((x, a) => x + a.usage.inputTokens + a.usage.outputTokens, 0)
       const last = t.attempts.at(-1)
-      this.live.recent = [{ id, title: t.spec.title, state: t.state, role: last?.role ?? null, model: last?.model ?? null, usd: t.attempts.some(a => a.charge.usd === null && a.usageEvents === 0 && a.iterations > 0) ? null : usd, at: new Date().toISOString() }, ...this.live.recent].slice(0, 50)
+      const measured = t.attempts.filter(costMeasured)
+      this.live.recent = [{ id, title: t.spec.title, state: t.state, role: last?.role ?? null, model: last?.model ?? null, usd: t.attempts.length && !measured.length ? null : usd, ...(measured.length < t.attempts.length && measured.length ? { partial: true } : {}), at: new Date().toISOString() }, ...this.live.recent].slice(0, 50)
       delete this.live.tasks[id]
       this.live.counters.archived++
     }
@@ -497,6 +502,7 @@ export class Mission {
     this.live.swarm = adm.swarm
     if (!adm.ok) { t.reason = `waiting: ${adm.reason}`; return false }
     if (t.spec.mode === 'write') {
+      // a claims lock that cannot be taken in time leaves the task waiting, with its reservation released
       const conflict = await withLock(claimsLock(this.header.commonDir), `admit ${attemptId}`, () => {
         const { claims, unreadable } = listClaims(this.header.commonDir)
         if (unreadable.length) return `repository claims unreadable (${unreadable.join(', ')}): writes held`
@@ -505,7 +511,7 @@ export class Mission {
         if (other) return `repository claim held by ${other.missionId}/${other.taskId} (${other.state})${sameProcess(other.supervisor) ? '' : `; orphaned: its supervisor is gone, run cockpit-cline recover ${other.missionId}`}`
         writeClaim(this.header.commonDir, { missionId: this.header.id, taskId: t.spec.id, attempt: n, owned: t.spec.owned, mode: t.spec.mode, state: 'reserved', identity: null, supervisor: processIdentity(process.pid), stateDir: this.dir, at: new Date().toISOString() })
         return null
-      })
+      }).catch((e: Error) => `repository claims lock unavailable (${e.message.slice(0, 160)})`)
       if (conflict) { this.live.swarm = releaseReservation(this.live.swarm, engineId, now, conflict); t.reason = `waiting: ${conflict}`; return false }
     }
     const price = pricingFor(this.config, route.model as string, (this.resolutions[role] as { info?: never }).info)
@@ -725,6 +731,9 @@ export class Mission {
       }
     }
     a.gates = gates
+    // a gate whose sandbox processes are not confirmed gone may still be running worker code: ownership is kept
+    const loose = gates.find(x => x.unaccounted)
+    if (loose) { this.ledger.append('gates', t.spec.id, { attempt: a.id, gates: gates.map(x => ({ name: x.name, state: x.state })) }); this.hold(t, a, `gate ${loose.name}: processes not accounted for (${loose.unaccounted}); ownership retained`); return }
     this.ledger.append('gates', t.spec.id, { attempt: a.id, gates: gates.map(x => ({ name: x.name, state: x.state, exit: x.exitCode ?? null, sha: x.outputSha256 ?? null, evidence: x.evidence.slice(0, 600) })) })
     const bad = gates.filter(x => x.state !== 'pass')
     const structural = bad.find(x => x.kind === 'git' || x.kind === 'security')
@@ -870,7 +879,12 @@ export class Mission {
         if (c.state !== 'gone') { this.hold(t, a, `after restart: ${c.detail}; ownership retained`); continue }
         a.phase = 'ended'; a.endedAt = new Date(this.deps.now()).toISOString()
         const stream = join(this.dir, 'runs', t.spec.id, String(a.n), 'rw', 'stream.jsonl')
-        const sawResult = existsSync(stream) && readFileSync(stream, 'utf8').includes('"type":"run_result"')
+        const text = existsSync(stream) ? readFileSync(stream, 'utf8') : ''
+        const sawResult = text.includes('"type":"run_result"')
+        // usage the stream recorded after the last persist is folded in; a request still in flight when the
+        // supervisor ended may be billed but never reported, so the attempt's cost is a lower bound
+        if (text) { const f = emptyFacts(); for (const line of text.split('\n')) if (line.trim()) foldLine(f, line); if (f.usageEvents >= a.usageEvents) { this.absorb(a, f); this.chargeSession() } }
+        const lb = (this.live.session.lowerBoundTasks ??= []); if (!lb.includes(a.id)) lb.push(a.id)
         await this.failed(t, a, 'unknown_outcome', `supervisor ended while the attempt ran; ${sawResult ? 'a run result was written but was never verified' : 'no run result'}`, [])
       }
       // Processes ended (census gone when the attempt ended) but no outcome was recorded: a crash or
@@ -917,8 +931,21 @@ export class Mission {
     this.live.finalGatesHead = null
     if (this.live.integration.head !== this.live.integration.base) {
       const head = this.live.integration.head
+      const before = new Set((await changesOf(this.live.integration.dir, null).catch(() => [])).map(c => c.path))
       for (const g of this.header.gates) this.live.finalGates.push(await runCommandGate(g, this.live.integration.dir, join(this.dir, 'final-gates'), { hide: this.config.sandbox.hide, shareDirs: this.deps.shareDirs.map(s => ({ from: s.from, to: join(this.live.integration.dir, s.to) })), timeoutSeconds: this.config.limits.gateTimeoutSeconds, gitCommonDir: this.header.commonDir }, `${this.header.id}-final`))
       this.live.finalGatesHead = head
+      // The final gates ran worker-authored code in the integration worktree, which later turns read and pick
+      // onto: new untracked paths are their artifacts and are removed; anything else they changed is reported.
+      const after = await changesOf(this.live.integration.dir, null).catch(() => null)
+      if (after === null) this.problem('final gates: the integration worktree could not be inspected afterwards')
+      else {
+        const dir = this.live.integration.dir; const removed: string[] = []
+        for (const c of after) if (c.status === '??' && !before.has(c.path)) { const abs = resolve(dir, c.path); if (abs.startsWith(`${dir}/`) && !c.path.split('/').includes('.git')) { rmSync(abs, { force: true, recursive: true }); removed.push(c.path) } }
+        if (removed.length) this.ledger.append('gate_artifacts_removed', null, { scope: 'final', count: removed.length, paths: removed.slice(0, 50) })
+        const changed = after.filter(c => !(c.status === '??' && !before.has(c.path)) && !before.has(c.path))
+        if (changed.length) this.problem(`final gates changed ${changed.length} tracked path(s) in the integration worktree (${changed.slice(0, 5).map(c => c.path).join(', ')}); review ${this.live.integration.branch}`)
+      }
+      for (const g of this.live.finalGates) if (g.unaccounted) this.problem(`final gate ${g.name}: processes not accounted for (${g.unaccounted})`)
       this.ledger.append('final_gates', null, { head, gates: this.live.finalGates.map(x => ({ name: x.name, state: x.state, sha: x.outputSha256 })) })
     }
     return false
@@ -957,7 +984,8 @@ export class Mission {
     if (c.completed === 0) return { state: 'FAILED', reasons: reasons.length ? reasons : ['nothing completed'], at }
     if (reasons.length) return { state: reasons.every(weakOnly) ? 'UNVERIFIED' : 'PARTIAL', reasons, at }
     const estimated = this.live.session.estimatedTasks ?? []
-    const cost = estimated.length ? `usage measured; cost of ${estimated.length} attempt(s) estimated from configured pricing (Cline reported no cost): ${estimated.join(', ')}` : 'costs metered (Cline-reported)'
+    const lower = this.live.session.lowerBoundTasks ?? []
+    const cost = [estimated.length ? `usage measured; cost of ${estimated.length} attempt(s) estimated from configured pricing (Cline reported no cost): ${estimated.join(', ')}` : 'costs metered (Cline-reported)', ...(lower.length ? [`cost of ${lower.length} attempt(s) interrupted by a restart is a lower bound: ${lower.join(', ')}`] : [])].join('; ')
     return { state: 'DONE', reasons: [`${c.completed} task(s) verified by supervisor gates and integrated on ${this.live.integration.branch}; final gates pass; ${cost}; ledger intact`], at }
   }
 

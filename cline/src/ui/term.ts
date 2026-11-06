@@ -98,7 +98,9 @@ const OSC_DCS = /\x1b[\]P_^][\s\S]*?(?:\x07|\x1b\\|$)|[\x90\x9d\x9e\x9f][\s\S]*?
 const ANY_ESC = /\x1b\[[0-9;?<=>!]*[ -/]*[@-~]?|\x9b[0-9;?<=>!]*[ -/]*[@-~]?|\x1b[ -/]*[0-~]?|\x1b/g
 // eslint-disable-next-line no-control-regex
 const CONTROLS = /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g
-export const sanitize = (s: string): string => s.replace(OSC_DCS, '').replace(ANY_ESC, '').replace(/\t/g, '  ').replace(CONTROLS, '').replace(/️/g, '')
+/** Bidirectional overrides and isolates: they reorder what follows on screen (a filename or model text could display reversed). */
+const BIDI = /[\u202a-\u202e\u2066-\u2069]/g
+export const sanitize = (s: string): string => s.replace(OSC_DCS, '').replace(ANY_ESC, '').replace(/\t/g, '  ').replace(CONTROLS, '').replace(BIDI, '').replace(/️/g, '')
 /**
  * For streamed text: splits off an escape sequence that the chunk ends in the middle of, so the next
  * chunk can complete it and the whole sequence is removed (not half of it, leaving its payload as text).

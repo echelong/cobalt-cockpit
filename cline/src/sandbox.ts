@@ -5,7 +5,8 @@
 //   - only the task's worktree (or nothing, for read-only work), the attempt's own output
 //     directory and Cline's data directory are writable
 //   - the repository's git common dir is read-only except the worktree's own admin dir
-//   - configured secret directories are hidden behind empty tmpfs mounts
+//   - configured secret directories, and a fixed list of sockets and credential stores (alwaysHidden),
+//     are hidden behind empty tmpfs mounts
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { existsSync, statSync } from 'node:fs'
@@ -24,11 +25,24 @@ export type SandboxSpec = {
 export const expandHome = (p: string): string => p === '~' ? homedir() : p.startsWith('~/') ? `${homedir()}/${p.slice(2)}` : p
 export const MARKER_VAR = 'COCKPIT_CLINE_ATTEMPT'
 
+/**
+ * Hidden from EVERY sandbox (workers and the gates that run their code), whatever the config says:
+ * the user's service manager and session bus (a process started through them runs outside the
+ * sandbox, with network, and never carries the attempt marker, so no census could see it), the
+ * system bus, container engine sockets, and well-known credential stores outside the configured list.
+ */
+export const alwaysHidden = (uid: number = process.getuid?.() ?? 1000): string[] => [
+  `/run/user/${uid}`, '/run/dbus', '/run/docker.sock', '/run/podman', '/run/containerd',
+  '~/.config/gh', '~/.config/hub', '~/.netrc', '~/.npmrc', '~/.pypirc', '~/.git-credentials', '~/.docker', '~/.kube',
+  '~/.password-store', '~/.local/share/keyrings', '~/.cargo/credentials', '~/.cargo/credentials.toml',
+  '~/.mozilla', '~/.config/google-chrome', '~/.config/chromium', '~/.config/BraveSoftware',
+]
+
 export const bwrapArgs = (s: SandboxSpec): string[] => {
   const a = ['--die-with-parent', '--new-session', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--unshare-cgroup-try']
   if (!s.network) a.push('--unshare-net')
   a.push('--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp')
-  for (const raw of s.hide) {
+  for (const raw of [...new Set([...s.hide, ...alwaysHidden()])]) {
     const p = expandHome(raw)
     if (!existsSync(p)) continue
     if (statSync(p).isDirectory()) a.push('--tmpfs', p); else a.push('--ro-bind', '/dev/null', p)

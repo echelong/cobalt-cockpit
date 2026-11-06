@@ -39,8 +39,10 @@ const startedAtMs = (start: string): number | null => {
  *    namespace has exited (kernel zap_pid_ns_processes), so "init gone" proves the
  *    namespace is empty, detached children included.
  * 2. The marker: any readable process of this user, inside or outside the namespace,
- *    whose environment carries the attempt marker (catches escapes such as a process
- *    started through a service manager).
+ *    whose environment carries the attempt marker (catches escapes that keep their
+ *    environment). A process started through a service manager inherits the manager's
+ *    environment, not the marker: that route is closed instead, by hiding the user
+ *    manager's and the buses' sockets from every sandbox (sandbox.ts alwaysHidden).
  * 3. Without a known init, a process of this user that cannot be inspected and started
  *    after the attempt began makes the answer 'unknown', never 'gone'.
  * The pid namespace inode is NOT used to find processes: the kernel reuses namespace

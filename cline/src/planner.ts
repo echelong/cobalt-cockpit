@@ -23,9 +23,13 @@ export const lastJsonBlock = (text: string, marker: string | null = null): strin
   return blocks.length ? blocks[blocks.length - 1][1] : null
 }
 
+/** Control, escape and bidirectional characters: an owned path or title is shown in the HUD and must not drive the terminal. */
+// eslint-disable-next-line no-control-regex
+const UNPRINTABLE = /[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩]/
 const relOwned = (p: unknown): string | null => {
   if (typeof p !== 'string' || !p.trim()) return null
   if (p.trim() === '*' ) return '*'
+  if (UNPRINTABLE.test(p)) return null
   if (p.startsWith('/') || p.includes('\\') || p.split('/').includes('..')) return null
   const n = normalizeOwned(p)
   return n === '*' && p.trim() !== '*' ? null : n
@@ -42,9 +46,11 @@ export const validateTasks = (raw: unknown, opts: { max: number; depth: number; 
     const where = `task ${i + 1}`
     if (typeof o.id !== 'string' || !ID.test(o.id)) return { ok: false, reason: `${where}: id must match ${ID}` }
     const id = `${opts.idPrefix ?? ''}${o.id}`
-    if (RESERVED_IDS.has(id)) return { ok: false, reason: `${where}: id "${id}" is reserved by the supervisor` }
+    // checked before and after prefixing: a requested child "plan" would become "<parent>.plan",
+    // which the supervisor reads as a planning task (whose answer is parsed as a whole new plan)
+    if (RESERVED_IDS.has(o.id) || RESERVED_IDS.has(id) || isPlanTask(id)) return { ok: false, reason: `${where}: id "${id}" is reserved by the supervisor` }
     if (ids.has(id) || opts.existing.has(id)) return { ok: false, reason: `${where}: duplicate id ${id}` }
-    if (typeof o.title !== 'string' || !o.title.trim() || o.title.length > 200) return { ok: false, reason: `${where}: title required (max 200)` }
+    if (typeof o.title !== 'string' || !o.title.trim() || o.title.length > 200 || UNPRINTABLE.test(o.title)) return { ok: false, reason: `${where}: title required (max 200, printable text)` }
     if (!(KINDS as readonly string[]).includes(o.kind as string)) return { ok: false, reason: `${where}: kind must be one of ${KINDS.join('|')}` }
     if (!(RISKS as readonly string[]).includes(o.risk as string)) return { ok: false, reason: `${where}: risk must be one of ${RISKS.join('|')}` }
     if (typeof o.complexity !== 'number' || !Number.isInteger(o.complexity) || o.complexity < 1 || o.complexity > 5) return { ok: false, reason: `${where}: complexity 1-5` }
@@ -92,7 +98,15 @@ export const parseRequest = (text: string, parent: TaskSpec, maxChildren: number
   try { doc = JSON.parse(block) } catch (e) { return { ok: false, reason: `request JSON invalid: ${(e as Error).message}` } }
   // an empty list ([] or {"tasks": []}) asks for nothing: it is not a request, so nothing is refused
   if ((Array.isArray(doc) && doc.length === 0) || (doc && typeof doc === 'object' && Array.isArray((doc as { tasks?: unknown }).tasks) && (doc as { tasks: unknown[] }).tasks.length === 0)) return null
-  return validateTasks(doc, { max: maxChildren, depth: (parent.depth ?? 0) + 1, parent: parent.id, existing, idPrefix: `${parent.id}.` })
+  const r = validateTasks(doc, { max: maxChildren, depth: (parent.depth ?? 0) + 1, parent: parent.id, existing, idPrefix: `${parent.id}.` })
+  if (!r.ok) return r
+  // The fields that choose a role are the worker's own words about its children: a child may not
+  // claim architecture work (the commander's), more risk or complexity than its parent, or a long
+  // context. The router then decides from what the parent was already trusted with.
+  const arch = r.tasks.find(t => t.kind === 'architecture')
+  if (arch) return { ok: false, reason: `${arch.id}: a worker may not request architecture work; that is the commander's` }
+  const cap = RISKS.indexOf(parent.risk)
+  return { ok: true, ...(r.design ? { design: r.design } : {}), tasks: r.tasks.map(({ contextTokens: _ctx, ...t }) => ({ ...t, risk: RISKS.indexOf(t.risk) > cap ? parent.risk : t.risk, complexity: Math.min(t.complexity, parent.complexity) })) }
 }
 
 /** Small tasks go straight to the coder; the commander plans only substantial ones. */

@@ -170,6 +170,41 @@ the author's conclusions.
 
   The remaining NITs are recorded under limitations: bidi controls are not stripped, and ZWJ and flag emoji are
   counted too narrow. A ledger seek that lands exactly on a line start skips one entry.
+- **Round 7, release candidate** (whole branch at `e1bdb5a`, three parallel fresh reviews: terminal and HUD,
+  supervisor and sandbox, routing and compatibility). All three said not merge-ready. Fixed, each with a test in
+  `test/review7.spec.ts`:
+  - a worker could request a child named `plan`; it became `<parent>.plan`, which the supervisor reads as a
+    planning task, so its answer was parsed as a whole new plan outside the child cap, the depth limit and the
+    parent's ownership. Reserved ids are now checked before prefixing;
+  - a worker request could steer its children's role (`architecture`, higher risk or complexity, a huge
+    `contextTokens`); architecture is refused and the rest is capped at the parent's;
+  - unknown or misspelt CLI options were ignored (`--budget 0.5` ran under the default $3); options are now
+    strict, smoke validates roles and amounts before any paid call and writes its evidence after every role;
+  - a null or empty `requireName` silently unpinned a role, and unvalidated `estimates` could disable the
+    pre-spawn budget check; both are now validation errors;
+  - the legacy `status`/`watch`/`run` screen printed alerts, reasons and paths unsanitized and showed unknown
+    task cost as `$0.00000`; it now sanitizes every value and shows `unknown` or `≥`;
+  - gate sandboxes (which run worker-authored code) did not hide `/run/user/<uid>`, so a gate could reach the
+    user service manager and start a process outside the sandbox and outside any census. Every sandbox now hides
+    the user manager, the buses, container sockets and well-known credential stores, and a gate whose processes
+    are not confirmed gone holds the attempt;
+  - integration cherry-picks ran host git without the hook and fsmonitor pinning; final gates could leave
+    artifacts in the integration worktree; an interrupted attempt's usage after the last persist was lost (now
+    folded from its stream and labelled a lower bound); a crash between a ledger write and its head update made
+    the ledger permanently invalid (the head is now rolled forward to a verified entry, and the repair is logged);
+  - terminal input: a Ctrl+C or Ctrl+D byte inside pasted text ended the paste and the rest was typed (its
+    newlines submitted turns); a lone Esc split from a paste marker or key sequence was a key; a multi-byte
+    character split across reads was corrupted; an event-loop stall could end a paste early; SIGINT and SIGQUIT
+    left the terminal in the alternate screen; a crash hid its message behind the alternate screen; bidi
+    overrides reached the screen; the unmetered spend panel showed precise figures.
+
+  Disclosed instead of fixed (owner decisions, README limitations 3, 5 and 21): sandbox reads are default-allow
+  (an allowlist root is not built); `~/.cline/data` is writable, so a worker could leave state for the user's
+  ordinary `cline`; per-task caps apply per attempt. Residual NITs: `COCKPIT_CLINE_BWRAP` is honoured outside
+  tests; proxy variables pass into workers unscanned; an empty or torn lock file is never treated as stale; a
+  catalog price without `cacheWrite` counts it as $0; a stale `reportedUsd` with growing tokens keeps the
+  `reported` label; the DONE wording counts read-only tasks as gate-verified; a crash between archiving a task and
+  writing `live.json` can list it twice in the report; the streamed answer can continue on a system line.
 - The reviews found sound: the census logic after the inode fix, the ledger hash chain, claim overlap
   normalisation, DeepSeek-never-substituted routing, bounded `nextStep`, wire judging, and that no stop or cancel
   path releases ownership without a clean census.

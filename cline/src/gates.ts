@@ -12,7 +12,8 @@ import { changesOf, diffText, gitLinkProblem, scopeProblems } from './git.ts'
 import type { Change } from './git.ts'
 
 export type GateSpec = { name: string; command: string; required: boolean }
-export type GateResult = { name: string; kind: 'command' | 'git' | 'security'; state: 'pass' | 'fail' | 'error'; command?: string; exitCode?: number | null; durationMs: number; evidence: string; outputSha256?: string }
+export type GateResult = { name: string; kind: 'command' | 'git' | 'security'; state: 'pass' | 'fail' | 'error'; command?: string; exitCode?: number | null; durationMs: number; evidence: string; outputSha256?: string
+  /** A command gate whose sandbox processes could not be confirmed gone: worker-authored code may still run, so the attempt keeps its ownership. */ unaccounted?: string }
 
 export type GateEnv = { hide: string[]; shareDirs: { from: string; to: string }[]; timeoutSeconds: number; gitCommonDir: string | null }
 
@@ -28,11 +29,14 @@ export const runCommandGate = async (g: GateSpec, workdir: string, outDir: strin
   const code = await new Promise<number | null>(res => { child.on('exit', c => res(c)); child.on('error', () => res(null)) })
   clearTimeout(timer)
   const id2 = await identity
-  await terminate({ initPid: id2.initPid, initStart: id2.initStart, pidNs: id2.pidNs, marker: id2.marker, since: id2.since }, true, 3000)
+  // the gate ran worker-authored code: its processes must be confirmed gone like a worker's
+  const census = await terminate({ initPid: id2.initPid, initStart: id2.initStart, pidNs: id2.pidNs, marker: id2.marker, since: id2.since }, true, 3000)
   await new Promise(r => out.end(r))
   const text = existsSync(file) ? readFileSync(file, 'utf8') : ''
   const tail = text.split('\n').slice(-25).join('\n').slice(-2000)
-  return { name: g.name, kind: 'command', command: g.command, exitCode: code, durationMs: Date.now() - t0, state: timedOut ? 'error' : code === 0 ? 'pass' : 'fail', evidence: timedOut ? `timed out after ${env.timeoutSeconds}s` : `exit ${code}${tail ? `\n${tail}` : ''}`, outputSha256: createHash('sha256').update(text).digest('hex') }
+  const sha = createHash('sha256').update(text).digest('hex')
+  if (census.state !== 'gone') return { name: g.name, kind: 'command', command: g.command, exitCode: code, durationMs: Date.now() - t0, state: 'error', evidence: `gate processes not accounted for (${census.state}: ${census.detail})`, outputSha256: sha, unaccounted: census.detail }
+  return { name: g.name, kind: 'command', command: g.command, exitCode: code, durationMs: Date.now() - t0, state: timedOut ? 'error' : code === 0 ? 'pass' : 'fail', evidence: timedOut ? `timed out after ${env.timeoutSeconds}s` : `exit ${code}${tail ? `\n${tail}` : ''}`, outputSha256: sha }
 }
 
 export const gitGate = async (workdir: string, covers: (rel: string) => boolean, mode: 'read' | 'write', admin: string | null = null, label = 'GIT'): Promise<{ result: GateResult; changes: Change[] }> => {

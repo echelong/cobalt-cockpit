@@ -27,27 +27,49 @@ import { validateTasks } from './planner.ts'
 import { statusOf } from './status.ts'
 
 type Args = { _: string[]; flags: Record<string, string | boolean>; multi: Record<string, string[]> }
-const parseArgs = (argv: string[]): Args => {
+/** A command-line mistake: printed with the usage, exit 2, and nothing has run. */
+export class UsageError extends Error {}
+const VALUE_FLAGS: readonly string[] = ['repo', 'plan', 'profile', 'gate', 'budget-usd', 'config', 'roles', 'max-usd', 'kind', 'risk', 'complexity', 'mode', 'title', 'prompt', 'owned', 'lost', 'share', 'state']
+const SWITCHES: readonly string[] = ['no-strict', 'json', 'watch', 'single', 'swarm', 'no-review', 'allow-dirty', 'no-detect-gates', 'accept-config-change', 'new', 'yes', 'help']
+/**
+ * Strict: an unknown or misspelt flag, a missing or empty value, or a value given to a switch is
+ * an error. A typo such as `--budget 0.5` must not quietly run under the default budget.
+ */
+export const parseArgs = (argv: string[]): Args => {
   const a: Args = { _: [], flags: {}, multi: {} }
   for (let i = 0; i < argv.length; i++) {
     const v = argv[i]
     if (v === '--') { a._.push(...argv.slice(i + 1)); break }
     if (v.startsWith('--')) {
       const [k, inline] = v.slice(2).split(/=(.*)/s)
-      const takes = ['repo', 'plan', 'profile', 'gate', 'budget-usd', 'config', 'roles', 'max-usd', 'kind', 'risk', 'complexity', 'mode', 'title', 'prompt', 'owned', 'lost', 'share', 'state'].includes(k)
-      const val = inline !== undefined ? inline : takes ? argv[++i] : true
+      let val: string | boolean
+      if (VALUE_FLAGS.includes(k)) {
+        const given = inline !== undefined ? inline : argv[++i]
+        if (given === undefined || !given.trim() || (inline === undefined && given.startsWith('--'))) throw new UsageError(`--${k} needs a value`)
+        val = given
+      } else if (SWITCHES.includes(k)) {
+        if (inline !== undefined) throw new UsageError(`--${k} takes no value (got --${k}=${inline})`)
+        val = true
+      } else throw new UsageError(`unknown option --${k}`)
       if (k === 'gate' || k === 'share') (a.multi[k] ??= []).push(String(val))
       else a.flags[k] = val
     } else a._.push(v)
   }
   return a
 }
+/** A positive, finite dollar amount from a flag, or a usage error. */
+const dollars = (a: Args, k: string): number | undefined => {
+  const s = str(a, k); if (s === undefined) return undefined
+  const n = Number(s)
+  if (!Number.isFinite(n) || n < 0 || !/^\s*\d*\.?\d+\s*$/.test(s)) throw new UsageError(`--${k} must be a dollar amount such as 0.25 (got ${s})`)
+  return n
+}
 const str = (a: Args, k: string): string | undefined => typeof a.flags[k] === 'string' ? a.flags[k] as string : undefined
 const print = (s: string): void => { process.stdout.write(`${s}\n`) }
 
 const setup = async (a: Args): Promise<{ config: Config; catalog: Catalog; resolutions: Record<Role, Resolution> }> => {
-  const budget = str(a, 'budget-usd')
-  const config = loadConfig({ file: str(a, 'config'), profile: str(a, 'profile'), ...(a.flags['no-strict'] ? { strict: false } : {}), ...(budget ? { overrides: { budgets: { sessionUsd: Number(budget) } } } : {}) })
+  const budget = dollars(a, 'budget-usd')
+  const config = loadConfig({ file: str(a, 'config'), profile: str(a, 'profile'), ...(a.flags['no-strict'] ? { strict: false } : {}), ...(budget !== undefined ? { overrides: { budgets: { sessionUsd: budget } } } : {}) })
   const catalog = await loadCatalog()
   const roles = rolesOf(config)
   const resolutions = Object.fromEntries(await Promise.all(ROLES.map(async r => [r, await resolveRole(catalog, r, roles[r], config.unpinnedAllowed)] as const))) as Record<Role, Resolution>
@@ -93,9 +115,10 @@ const models = async (a: Args): Promise<number> => {
 const route = async (a: Args): Promise<number> => {
   const { config, resolutions } = await setup(a)
   const task: TaskSpec = { id: 'probe', title: str(a, 'title') ?? 'probe', kind: (str(a, 'kind') ?? 'implement') as TaskSpec['kind'], risk: (str(a, 'risk') ?? 'medium') as TaskSpec['risk'], complexity: Number(str(a, 'complexity') ?? 3), mode: (str(a, 'mode') ?? 'write') as 'read' | 'write', owned: (str(a, 'owned') ?? '*').split(','), dependencies: [], prompt: str(a, 'prompt') ?? a._.slice(1).join(' ') }
-  if (!(KINDS as readonly string[]).includes(task.kind) || !(RISKS as readonly string[]).includes(task.risk)) { print(`kind ${KINDS.join('|')}, risk ${RISKS.join('|')}`); return 2 }
-  print(JSON.stringify(routeTask({ task, history: { attempts: 0, gateFailures: 0, escalated: false, lastFailure: null }, config, resolutions, health: {}, spentSessionUsd: 0 }), null, 1))
-  return 0
+  if (!(KINDS as readonly string[]).includes(task.kind) || !(RISKS as readonly string[]).includes(task.risk) || !Number.isInteger(task.complexity) || task.complexity < 1 || task.complexity > 5 || (task.mode !== 'read' && task.mode !== 'write')) { print(`kind ${KINDS.join('|')}, risk ${RISKS.join('|')}, complexity 1-5, mode read|write`); return 2 }
+  const d = routeTask({ task, history: { attempts: 0, gateFailures: 0, escalated: false, lastFailure: null }, config, resolutions, health: {}, spentSessionUsd: 0 })
+  print(JSON.stringify(d, null, 1))
+  return d.ok ? 0 : 1
 }
 
 const gatesOf = (a: Args, repoRoot: string): GateSpec[] => {
@@ -209,10 +232,14 @@ const list = (a: Args): number => {
 
 /** Live, opt-in, budget-bounded check of each role's real model id, reasoning on the wire and reported cost. */
 const smoke = async (a: Args): Promise<number> => {
-  if (!a.flags.yes) { print('smoke spends real Cline credits (a few cents). Re-run with --yes to confirm. Options: --roles coder,utility --max-usd 0.25'); return 2 }
+  if (a.flags.yes !== true) { print('smoke spends real Cline credits (a few cents). Re-run with --yes to confirm. Options: --roles coder,utility --max-usd 0.25'); return 2 }
+  // every argument is checked before the first paid call
+  const roles = (str(a, 'roles') ?? 'coder,commander,specialist,frontend,utility').split(',').map(r => r.trim()) as Role[]
+  const badRole = roles.find(r => !(ROLES as readonly string[]).includes(r))
+  if (badRole !== undefined) throw new UsageError(`--roles: unknown role "${badRole}" (roles: ${ROLES.join(', ')})`)
+  const maxUsd = dollars(a, 'max-usd') ?? 0.25
+  if (maxUsd <= 0) throw new UsageError('--max-usd must be above 0')
   const { config, resolutions } = await setup(a)
-  const roles = (str(a, 'roles') ?? 'coder,commander,specialist,frontend,utility').split(',') as Role[]
-  const maxUsd = Number(str(a, 'max-usd') ?? '0.25')
   const dir = join(root(a), 'smoke', new Date().toISOString().replace(/[:.]/g, '-'))
   mkdirSync(join(dir, 'repo'), { recursive: true, mode: 0o700 })
   execFileSync('git', ['init', '-q', join(dir, 'repo')]); execFileSync('git', ['-C', join(dir, 'repo'), '-c', 'user.name=cockpit', '-c', 'user.email=cockpit@localhost', 'commit', '-q', '--allow-empty', '-m', 'smoke'])
@@ -229,9 +256,11 @@ const smoke = async (a: Args): Promise<number> => {
     if (!ok) failures++
     const row = { role, ok, provider: res.provider, model: res.model, name: res.info.name, reasoning: { requested: spec.reasoning, cli: plan.cliFlag, expectedWire: plan.expectedWire, mapping: plan.mapping, wire: out.wire }, reportedModel: out.facts.reportedModel, reportedProvider: out.facts.reportedProvider, finish: out.facts.finishReason, usage: out.facts.usage, census: out.census.state, text: (out.facts.resultText ?? '').slice(0, 80) }
     results.push(row)
+    // written after every paid role, so an interrupted smoke still leaves its evidence
+    writeFileSync(join(dir, 'smoke.json'), JSON.stringify({ at: new Date().toISOString(), profile: config.profile, spentUsd: spent, complete: false, results }, null, 1))
     print(`${role.padEnd(10)} ${ok ? 'PASS' : 'FAIL'} ${res.provider}/${res.model} · reported ${out.facts.reportedModel ?? '—'} · reasoning ${spec.reasoning} → wire ${out.wire.effective ?? '—'} (${out.wire.state}: ${out.wire.detail}) · ${out.facts.usage.inputTokens}/${out.facts.usage.outputTokens} tok, cache ${out.facts.usage.cacheReadTokens} · ${usd(out.facts.usage.reportedUsd)} reported · census ${out.census.state}`)
   }
-  writeFileSync(join(dir, 'smoke.json'), JSON.stringify({ at: new Date().toISOString(), profile: config.profile, spentUsd: spent, results }, null, 1))
+  writeFileSync(join(dir, 'smoke.json'), JSON.stringify({ at: new Date().toISOString(), profile: config.profile, spentUsd: spent, complete: true, results }, null, 1))
   print(`smoke: ${failures ? `${failures} failure(s)` : 'all PASS'} · spent ${usd(spent)} (reported by Cline) · evidence ${join(dir, 'smoke.json')}`)
   return failures ? 1 : 0
 }
@@ -260,9 +289,9 @@ const HELP = `cockpit-cline — Cobalt Cockpit for Cline
 Global: --profile cline|cline-pass · --config FILE · --no-strict · --budget-usd N · --state DIR`
 
 export const main = async (argv: string[]): Promise<number> => {
-  const a = parseArgs(argv)
-  const cmd = a._[0]
   try {
+    const a = parseArgs(argv)
+    const cmd = a.flags.help ? 'help' : a._[0]
     switch (cmd) {
       case 'doctor': return await doctor(a)
       case 'models': return await models(a)
@@ -280,7 +309,10 @@ export const main = async (argv: string[]): Promise<number> => {
       case 'help': case '--help': print(HELP); return 0
       default: print(HELP); return 2
     }
-  } catch (e) { process.stderr.write(`cockpit-cline: ${(e as Error).message}\n`); return 1 }
+  } catch (e) {
+    if (e instanceof UsageError) { process.stderr.write(`cockpit-cline: ${e.message}\n${HELP}\n`); return 2 }
+    process.stderr.write(`cockpit-cline: ${(e as Error).message}\n`); return 1
+  }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)) main(process.argv.slice(2)).then(code => process.exit(code))

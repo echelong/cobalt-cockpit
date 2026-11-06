@@ -103,7 +103,38 @@ export class Ledger {
   private head(): { seg: number; seq: number; hash: string } {
     try { return readJson(join(this.dir, 'head.json')) } catch { return { seg: 1, seq: 0, hash: 'genesis' } }
   }
+  private repaired = false
+  /**
+   * A crash between writing an entry and moving head.json leaves the head one entry behind. On the
+   * first append the head is rolled forward only to an entry that verifies against it (same chain,
+   * next sequence, correct hash), and the repair is itself recorded. Anything else (a torn or altered
+   * line) is left as it is: the ledger then fails verification, and the mission cannot end DONE.
+   */
+  private repair(): void {
+    this.repaired = true
+    const h = this.head()
+    const file = join(this.dir, `seg-${String(h.seg).padStart(6, '0')}.jsonl`)
+    const next = join(this.dir, `seg-${String(h.seg + 1).padStart(6, '0')}.jsonl`)
+    for (const [f, seg] of [[next, h.seg + 1], [file, h.seg]] as const) {
+      if (!existsSync(f)) continue
+      const text = readFileSync(f, 'utf8')
+      // a torn final line without its newline would swallow the next entry: the next entry starts on its own line
+      if (text.length && !text.endsWith('\n')) appendFileSync(f, '\n', { mode: 0o600 })
+      const lines = text.split('\n').filter(Boolean)
+      let e: LedgerEntry | null = null
+      try { e = JSON.parse(lines.at(-1) ?? 'null') as LedgerEntry | null } catch { return }
+      if (!e) continue
+      if (e.seq === h.seq) return
+      const { hash, ...body } = e
+      if (e.seq === h.seq + 1 && e.prev === h.hash && createHash('sha256').update(JSON.stringify(body)).digest('hex') === hash) {
+        writeAtomic(join(this.dir, 'head.json'), JSON.stringify({ seg, seq: e.seq, hash }))
+        this.append('ledger_head_repaired', null, { from: h.seq, to: e.seq, why: 'the last entry was written but the head was not moved (interrupted write)' })
+      }
+      return
+    }
+  }
   append(kind: string, task: string | null, data: unknown): LedgerEntry {
+    if (!this.repaired) this.repair()
     const h = this.head()
     const body = { seq: h.seq + 1, at: new Date().toISOString(), kind, task, data: redactDeep(data ?? null), prev: h.hash }
     const hash = createHash('sha256').update(JSON.stringify(body)).digest('hex')

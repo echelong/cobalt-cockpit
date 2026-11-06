@@ -121,7 +121,7 @@ conversation and accepts new turns.
 | provider 5xx/network, rate limit, resource exhaustion, a lost run | retry on the same model, bounded (2), exponential backoff with jitter; a provider circuit breaker delays further work on that model, never reroutes it; the retry waits out the breaker's cool-down and is its half-open try, so an open breaker never turns into a refusal |
 | a correction attempt that hits a transient error | the retry keeps the correction's evidence (diff and gate output) |
 | cancel while the gates run | the task ends cancelled before anything is committed or integrated |
-| implementation (gates fail, claimed success without changes) | one correction on the same model with its diff and the gate output; then one escalation (MiMo for debugging, Kimi otherwise) told to diagnose first; then stop |
+| implementation (gates fail, claimed success without changes) | one correction on the same model with its diff and the gate output; then one escalation (MiMo for debugging and test work, Kimi otherwise) told to diagnose first; then stop |
 | authentication or billing refused | stop at once: sign in with `cline auth`, then `cockpit-cline recover` |
 | budget, policy/sandbox/ownership refusal, model or reasoning mismatch | stop: a safety refusal stays a refusal |
 | a pinned model missing from the catalog | the task is refused with the permitted routes; no checkpoint is switched |
@@ -176,6 +176,8 @@ cockpit-cline smoke --yes [--roles coder,utility] [--max-usd 0.25]           # L
 - `--share node_modules` read-only-binds your checkout's dependency directory into gate sandboxes (gates run
   without network, in fresh worktrees that have no `node_modules` of their own).
 - `--budget-usd N` sets the session cap; per-task caps are in the config.
+- Options are strict: an unknown or misspelt option, a missing value or a bad amount is an error (exit 2) and
+  nothing runs, so a typo such as `--budget 0.5` can never fall back to the default budget.
 
 ## What a mission guarantees, and how
 
@@ -183,7 +185,7 @@ cockpit-cline smoke --yes [--roles coder,utility] [--max-usd 0.25]           # L
 |---|---|---|
 | Correct model per worker | deterministic rules (`src/router.ts`), every decision lists fired rules and rejected roles; Cline's reported model and the wire request are both compared with the route | `routing.spec.ts`, `integration.spec.ts` (wrong model version) |
 | Reasoning never silently downgraded | capability check against the catalog; every wire request's effort is read from Cline's capture; strict mode fails a run whose effort cannot be confirmed | downgrade, no-capture tests; live smoke |
-| Workers cannot write outside their task | bubblewrap: read-only root, writable worktree only, git dir read-only, secret dirs hidden, `/run/user/<uid>` hidden; PreToolUse hook refuses out-of-scope edits and dangerous commands; GIT gate re-checks the diff | adversarial tests |
+| Workers cannot write outside their task | bubblewrap: read-only root, writable worktree only, git dir read-only, configured secret dirs hidden; in every sandbox (workers and the gates that run their code) the user service manager and session bus (`/run/user/<uid>`), the system bus, container sockets and a fixed list of credential stores are always hidden (`alwaysHidden` in `src/sandbox.ts`); PreToolUse hook refuses out-of-scope edits and dangerous commands; GIT gate re-checks the diff | adversarial tests |
 | No uncontrolled spawning | native `spawn_agent`/`team_*` and agent launchers are refused; workers can only *request* work (`COCKPIT_REQUEST`), which goes through central admission with depth, child and queue limits | delegation tests |
 | Cancellation is real | each worker is a pid namespace; ending it kills every process in it, detached ones included; ownership is released only after a process census of the namespace init and the attempt marker is clean | detached-children, cancel tests |
 | Crash safety | `--die-with-parent`; claims live in the repository's git dir, so a restarted supervisor (or another mission) sees them; `recover` reconciles by identity; unknown status keeps the claim and blocks overlapping work | crash `kill -9` test |
@@ -217,7 +219,10 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
    agent launchers, but a determined model could talk to a local service directly. Stop local services you do
    not trust a worker with, or run missions on a machine without them.
 3. **Cline's data directory (`~/.cline/data`) is writable inside the sandbox**: Cline needs it for its sessions
-   and to refresh OAuth tokens. A worker can therefore read the Cline credentials it is already using.
+   and to refresh OAuth tokens. A worker can therefore read the Cline credentials it is already using, and it can
+   also write there: a worker could leave settings or state that your ordinary, unsandboxed `cline` reads later.
+   A per-attempt copy holding only the credentials is not built (token refresh rotates them). Review that
+   directory if a mission ran untrusted code, or point `COCKPIT_CLINE_DATA` at a separate Cline data directory.
 4. **Evidence from inside a sandbox can be forged by an adversarial model**: the JSONL stream, wire captures and
    reported cost are written by processes in that sandbox. Gates, the GIT scope check and the census are done by
    the supervisor outside it; treat stream-derived figures as Cline-reported, not independently attested.
@@ -230,6 +235,10 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
    default figures a Kimi plan reserves about $0.63 while real plans have cost about $0.05, so a session cap
    below $0.63 refuses `/swarm` before it starts (observed live with `--budget-usd 0.50`). Lower `estimates`
    only if you accept a larger possible overrun of a single request.
+   A cancel, timeout or crash before a request's usage event arrives can leave that request unreported (it may
+   still be billed). After a supervisor restart an interrupted attempt's usage is read back from its stream and
+   the verdict labels its cost a lower bound. The per-task caps (`budgets.taskUsd`) apply to each attempt: a task
+   with a correction and an escalation can spend up to the sum of its attempts' caps; the session cap bounds all.
 6. **Hook semantics**: a `PreToolUse` `cancel` aborts the whole Cline run (observed), so a policy violation ends
    the attempt. Hooks are a second layer; bubblewrap is the boundary.
 7. **MiMo V2.6 Pro** is toggle-only in the catalog; Cline still sends `reasoning_effort`. Whether the provider
@@ -256,7 +265,10 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
 16. **Turn classification is rule-based** (keywords for questions, changes, debugging, UI, scouting, architecture).
     A message can land on a different role than you meant; `/route <text>` shows the decision first, and the
     transcript always names the role, model and rule for every turn. Only the turn's own text is classified and
-    routed; the conversation and a commander's design are context the router never reads.
+    routed; the conversation and a commander's design are context the router never reads. UI wording is matched
+    by keyword, so "do not touch the UI" can still route a write task to the frontend role (the rule is named).
+    A worker's own request for more work cannot choose its children's role: architecture work is refused, and
+    risk and complexity are capped at the requesting task's, with no context-size claim.
 18. **Workers sometimes misuse the delegation marker.** Models have ended answers with `COCKPIT_REQUEST` and an
     empty list (now treated as no request) or with a duplicate request for work a sibling task already owns, in
     the wrong format. A malformed non-empty request is refused and recorded, and it keeps the mission from `DONE`
@@ -267,7 +279,17 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
     pseudo-terminals at 160×46 and 72×24; it is a line-oriented UI, not a full editor (no mouse, no syntax
     highlighting).
 20. **HUD text edge cases**:
-    - bidi control characters in model text are not stripped;
-    - ZWJ emoji sequences and flags are counted narrower than some terminals draw them, which can shift a row's
-      right edge (autowrap stays off, so a row never wraps);
-    - an Alt+key chord (Esc and a printable key in one read) is ignored rather than typed.
+    - bidi overrides and isolates are removed from all displayed text; the plain marks (LRM/RLM) are kept;
+    - ZWJ emoji sequences, flags and skin-tone modifiers are counted wider than terminals that join them draw
+      them, and combining marks outside U+0300 to U+036F count as one cell: a row can then end with blank cells
+      (rows are padded to the computed width and autowrap stays off, so a row never wraps or overflows);
+    - an Alt+key chord (Esc and a printable key in one read) is ignored rather than typed; a lone Esc waits
+      200 ms in case it starts a key sequence or paste marker split across reads, so Esc followed by a key
+      within that time reads as Alt+key.
+21. **Sandbox reads are default-allow.** The root is mounted read-only but readable: everything not hidden is
+    visible to a worker, including other repositories, untracked files in your checkout (such as `.env`) and
+    any credential file outside the hidden lists, and with the network shared a model could send it out. Every
+    sandbox hides the configured `sandbox.hide` list plus a fixed list (`alwaysHidden` in `src/sandbox.ts`: the
+    user service manager and buses, container sockets, `gh`, `npm`, `pip`, `cargo`, `docker`, `kube`, netrc,
+    git credentials, password stores and browser profiles). Add your own secret locations to `sandbox.hide`, or
+    run missions as a user whose home holds nothing a worker should read. An allowlist root is not built.

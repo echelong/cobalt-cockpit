@@ -108,6 +108,8 @@ export const routeTask = (input: RouteInput): RouteDecision => {
     return refuse(`model resolution failed for the ${role} role: ${res && !res.ok ? res.reason : 'not resolved'}. Cockpit does not switch checkpoints by itself. Permitted routes: configure an available, version-pinned model for ${role}; opt in to an unpinned id explicitly through unpinnedAllowed; or restate the task so another configured role handles it${others.length ? ` (available: ${others.join(', ')})` : ''}`)
   }
   if (res.model !== spec.model || res.provider !== spec.provider) return refuse(`resolved ${res.provider}/${res.model} differs from configured ${healthKey(spec)}`)
+  // an opted-in unpinned model is named on every decision that uses it, not only in doctor
+  for (const n of res.notes) signals.push(n)
   const h = input.health[healthKey(spec)]
   const now = input.now ?? Date.now()
   // an open breaker delays work on this model; it never moves the work to another model

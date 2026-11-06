@@ -4,6 +4,7 @@
 // worker, verified by the supervisor's gates and integrated on the mission branch. Nothing in
 // the HUD is synthesised: every figure is read from the mission's live state.
 import { appendFileSync, existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { StringDecoder } from 'node:string_decoder'
 import { join } from 'node:path'
 import { ROLES } from './core/engine.ts'
 import type { Role } from './core/engine.ts'
@@ -30,6 +31,10 @@ export { stripAnsi }
 const ESC = '\x1b['
 /** A bracketed paste with no data for this long is over, even if its end marker was lost. */
 const PASTE_IDLE_MS = 2000
+/** A lone Esc is held this long in case it is the start of a key sequence or paste marker split across reads. */
+const ESC_IDLE_MS = 200
+/** A gap between screen ticks longer than this means the event loop was busy: input may be waiting unread. */
+const LAG_MS = 500
 
 // ---------------------------------------------------------------------------
 // Conversation state
@@ -77,6 +82,10 @@ export class Shell {
   private pasteHold = ''
   /** When the last stdin read arrived: a paste that has been quiet for PASTE_IDLE_MS is over. */
   private pasteAt = 0
+  /** The last screen tick: idle time is counted only while ticks run on time (a blocked loop is not a quiet paste). */
+  private lastPulse = 0
+  /** Bytes to text across reads: a character split between two reads is decoded whole. */
+  private decoder = new StringDecoder('utf8')
   // HUD 2.0: the real-event timeline, the ledger it tails, and the frame writer
   private timeline = new Timeline()
   private tail: LedgerTail | null = null
@@ -393,7 +402,7 @@ export class Shell {
   }
 
   private async quit(): Promise<void> {
-    if (this.quitting) return
+    if (this.quitting) { this.notice = 'still stopping the running turn: ownership is released only once its sandbox is confirmed gone (a forced kill leaves it for cockpit-cline recover)'; this.dirty = true; return }
     this.quitting = true
     // before the conversation has opened there is no mission to stop or summarise; the exit still happens
     const m = this.mission as Mission | undefined
@@ -401,23 +410,26 @@ export class Shell {
       if (this.busy && m) { this.system('stopping the running turn before exit…', 'yellow'); m.requestStop('shell exit'); this.render(); await this.busy }
       unlock(this.shellLock)
       this.teardown()
-      this.out.write(m ? `Cobalt Cockpit: conversation ${m.header.id} · branch ${m.live.integration.branch} · ${m.live.session.unmetered ? 'unmetered' : money(m.live.session.spentUsd)} spent\n` : 'Cobalt Cockpit: closed before the conversation opened\n')
+      this.out.write(m ? `Cobalt Cockpit: conversation ${m.header.id} · branch ${m.live.integration.branch} · ${m.live.session.unmetered ? `≥${money(m.live.session.spentUsd)} (unmetered: the true cost is not known)` : `${money(m.live.session.spentUsd)}${(m.live.session.estimatedTasks ?? []).length ? ' (partly estimated)' : ''}`} spent\n` : 'Cobalt Cockpit: closed before the conversation opened\n')
     } finally { process.exit(0) }
   }
 
   // ----- keyboard ----------------------------------------------------------------------------------
   private onKey(buf: Buffer): void {
-    let s = this.pasteHold + buf.toString('utf8'); this.pasteHold = ''
+    const chunk = this.decoder.write(buf)
+    // a real Ctrl+C or Ctrl+D keypress arrives as a read of its own; the same byte inside pasted text is text
+    const lone = chunk === '\x03' || chunk === '\x04'
+    let s = this.pasteHold + chunk; this.pasteHold = ''
     this.pasteAt = Date.now()
     const START = '\x1b[200~', END = '\x1b[201~'
     while (s.length) {
       // a paste is text for the request until its end marker, however many reads it spans: its newlines never
       // submit and its escape and control bytes are dropped; it returns to the conversation. A paste whose end
-      // marker never comes is ended by Ctrl+C or Ctrl+D (a terminal sends neither inside a bracketed paste) or by
-      // a pause of PASTE_IDLE_MS, so the keyboard can never be lost to it.
+      // marker never comes is ended by a Ctrl+C or Ctrl+D keypress (a read of that byte alone) or by a pause of
+      // PASTE_IDLE_MS, so the keyboard can never be lost to it.
       if (this.pasting) {
         const end = s.indexOf(END)
-        const ctl = s.search(/[\x03\x04]/)
+        const ctl = lone ? 0 : -1
         const stop = ctl >= 0 && (end < 0 || ctl < end) ? ctl : end
         let body = stop < 0 ? s : s.slice(0, stop)
         if (stop < 0) { for (let n = Math.min(END.length - 1, body.length); n > 0; n--) if (END.startsWith(body.slice(-n))) { this.pasteHold = body.slice(-n); body = body.slice(0, -n); break } }
@@ -426,8 +438,9 @@ export class Shell {
         this.pasting = false; s = s.slice(stop === end ? end + END.length : stop); continue
       }
       if (s.startsWith(START)) { this.pasting = true; s = s.slice(START.length); continue }
-      // a read that ends inside a paste's start marker: kept until the next read (or the idle pause) decides
-      if (s.length >= 3 && s.length < START.length && START.startsWith(s)) { this.pasteHold = s; return }
+      // a read that ends inside an escape sequence (a lone Esc, or ESC [ and parameters, which includes a split
+      // paste start marker) is kept until the next read completes it, or a pause decides it was a key
+      if (/^\x1b(?:\[[0-9;]*)?$/.test(s)) { this.pasteHold = s; return }
       s = this.keys(s, true)
     }
   }
@@ -436,7 +449,8 @@ export class Shell {
     while (s.length) {
       // Esc followed by a control key in the same read is two keys (Esc, then e.g. Ctrl-D), never an Alt chord;
       // only Alt+Enter and Alt+printable are chords
-      const seq = /^(\x1b\[[0-9;]*[A-Za-z~]|\x1b\r|\x1b[\x20-\x7e]|.)/su.exec(s)?.[0] ?? s[0]
+      // SS3 keys (F1-F4, some arrows) and Esc+CSI (Alt+arrow on some terminals) are whole sequences, never an Esc key plus text
+      const seq = /^(\x1b\x1b\[[0-9;]*[A-Za-z~]|\x1b\[[0-9;]*[A-Za-z~]|\x1bO[A-Za-z]|\x1b\r|\x1b[\x20-\x7e]|.)/su.exec(s)?.[0] ?? s[0]
       s = s.slice(seq.length)
       this.key(seq)
       if (one) return s
@@ -445,11 +459,18 @@ export class Shell {
   }
   /** A paste (or a held start marker) that has gone quiet: what is held is resolved, and the keyboard returns. */
   private settlePaste(now: number): void {
-    if ((!this.pasting && !this.pasteHold) || now - this.pasteAt < PASTE_IDLE_MS) return
+    // after a stall of the event loop, unread input may be waiting: the quiet period starts again
+    if (this.lastPulse && now - this.lastPulse > LAG_MS) this.pasteAt = now
+    this.lastPulse = now
+    const wait = !this.pasting && this.pasteHold === '\x1b' ? ESC_IDLE_MS : PASTE_IDLE_MS
+    if ((!this.pasting && !this.pasteHold) || now - this.pasteAt < wait) return
     const held = this.pasteHold; this.pasteHold = ''
     if (this.pasting) { this.pasting = false; if (held) this.insert(held) } else this.keys(held)
     this.dirty = true
   }
+  /** UTF-16 units of the character before / after the cursor: an emoji is one character, never half of one. */
+  private unitsBefore(): number { const c = this.input.charCodeAt(this.cursor - 1); return this.cursor >= 2 && c >= 0xdc00 && c <= 0xdfff && (this.input.charCodeAt(this.cursor - 2) & 0xfc00) === 0xd800 ? 2 : 1 }
+  private unitsAfter(): number { const c = this.input.charCodeAt(this.cursor); return (c & 0xfc00) === 0xd800 && (this.input.charCodeAt(this.cursor + 1) & 0xfc00) === 0xdc00 ? 2 : 1 }
   private insert(raw: string): void { const t = sanitize(raw); this.input = this.input.slice(0, this.cursor) + t + this.input.slice(this.cursor); this.cursor += t.length; this.dirty = true }
   /** Mission Control navigation. Returns false for keys it leaves to the conversation (Ctrl+C, Ctrl+D). */
   private overlayKey(k: string): boolean {
@@ -481,10 +502,10 @@ export class Shell {
     switch (k) {
       case '\r': case '\n': { const line = this.input.trim(); this.input = ''; this.cursor = 0; this.hist = -1; if (line) { this.history.push(line); void this.enter(line) } return }
       case '\x1b\r': this.insert('\n'); return
-      case '\x7f': case '\b': if (this.cursor > 0) { this.input = this.input.slice(0, this.cursor - 1) + this.input.slice(this.cursor); this.cursor-- } return
-      case '\x1b[3~': this.input = this.input.slice(0, this.cursor) + this.input.slice(this.cursor + 1); return
-      case '\x1b[D': this.cursor = Math.max(0, this.cursor - 1); return
-      case '\x1b[C': this.cursor = Math.min(this.input.length, this.cursor + 1); return
+      case '\x7f': case '\b': if (this.cursor > 0) { const n = this.unitsBefore(); this.input = this.input.slice(0, this.cursor - n) + this.input.slice(this.cursor); this.cursor -= n } return
+      case '\x1b[3~': this.input = this.input.slice(0, this.cursor) + this.input.slice(this.cursor + this.unitsAfter()); return
+      case '\x1b[D': this.cursor = Math.max(0, this.cursor - this.unitsBefore()); return
+      case '\x1b[C': this.cursor = Math.min(this.input.length, this.cursor + this.unitsAfter()); return
       case '\x1b[H': case '\x1b[1~': case '\x01': this.cursor = 0; return
       case '\x1b[F': case '\x1b[4~': case '\x05': this.cursor = this.input.length; return
       case '\x1b[A': if (this.history.length) { this.hist = this.hist < 0 ? this.history.length - 1 : Math.max(0, this.hist - 1); this.input = this.history[this.hist]; this.cursor = this.input.length } return
@@ -634,12 +655,18 @@ export class Shell {
     if (!this.inp.isTTY || !this.out.isTTY) throw new Error('the interactive shell needs a terminal; use `cockpit-cline run` for scripts')
     // alternate screen, bracketed paste, and no autowrap: a miscounted wide character can never wrap a row
     this.out.write(`${ESC}?1049h${ESC}2J${ESC}?2004h${ESC}?7l`)
-    this.inp.setRawMode?.(true); this.inp.resume()
+    try { this.inp.setRawMode?.(true) } catch (e) { this.teardown(); throw e }
+    this.inp.resume()
     this.inp.on('data', (b: Buffer) => this.onKey(b))
     // a resize repaints the whole screen once (the writer clears on a size change); before the
     // conversation is open render() draws only an "opening" line, and it never throws
     this.out.on('resize', () => { this.screen.invalidate(); this.dirty = true; this.render() })
     process.on('SIGTERM', () => { void this.quit() })
+    process.on('SIGINT', () => { void this.quit() })
+    process.on('SIGQUIT', () => { void this.quit() })
+    // a crash leaves the alternate screen first, so its message is visible; sandboxes die with this process
+    // and any ownership they held stays recorded for cockpit-cline recover
+    process.on('uncaughtException', e => { this.teardown(); try { process.stderr.write(`cockpit-cline: internal error: ${sanitize((e as Error)?.stack ?? String(e))}\n`) } finally { process.exit(1) } })
     // a closed terminal stops the running turn the same way /quit does
     process.on('SIGHUP', () => { void this.quit() })
     process.on('unhandledRejection', e => { this.system(`internal error: ${(e as Error)?.message ?? String(e)}`, 'red') })

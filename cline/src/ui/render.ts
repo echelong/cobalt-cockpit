@@ -138,8 +138,9 @@ export const spendLines = (v: View, w: number, p: Paint): string[] => {
   // a model whose attempts reported nothing reads —, a partly reported one ≥: never an unknown read as $0
   const top = c.byModel.slice(0, 4).map(m => `${family(m.model)} ${m.known > 0 && m.estimated ? '~' : ''}${m.known === 0 && m.unmetered ? 'unmetered' : moneyOf(m.usd, m.known, m.attempts)}`).join(' · ') || 'no spend yet'
   return [
-    field('SESSION', `${c.unmetered ? p.fg('warn', 'UNMETERED ') : ''}${p.fg('head', money(c.spent))} ${p.dim(`of $${c.budget.toFixed(2)}`)} ${p.fg(tk, '█'.repeat(b.filled))}${p.fg('rule', '░'.repeat(b.empty))} ${p.dim(`${Math.round(frac * 100)}%`)}`, w, p, 9),
-    field('LEFT', `${p.fg('head', money(c.remaining))} ${p.dim(inflight > 0 ? `· ${money(inflight)} reserved for running workers` : '· nothing reserved')}`, w, p, 9),
+    // unmetered: what was measured is only a lower bound of the spend, and what is left an upper bound
+    field('SESSION', `${c.unmetered ? p.fg('warn', 'UNMETERED ') : ''}${p.fg('head', `${c.unmetered ? '≥' : ''}${money(c.spent)}`)} ${p.dim(`of $${c.budget.toFixed(2)}`)} ${p.fg(tk, '█'.repeat(b.filled))}${p.fg('rule', '░'.repeat(b.empty))} ${p.dim(c.unmetered ? 'true cost not measured' : `${Math.round(frac * 100)}%`)}`, w, p, 9),
+    field('LEFT', `${p.fg('head', `${c.unmetered ? '≤' : ''}${money(c.remaining)}`)} ${p.dim(inflight > 0 ? `· ${money(inflight)} reserved for running workers` : '· nothing reserved')}`, w, p, 9),
     field('BASIS', `${c.reported === null || c.estimated === null
       ? `${p.dim('session total includes archived tasks ·')} ${c.estimatedAttempts ? p.fg('warn', `${c.estimatedAttempts} attempt(s) estimated`) : p.fg('head', 'all reported')}`
       : `${p.dim('reported')} ${p.fg('head', money(c.reported))} ${p.dim('· estimated')} ${p.fg(c.estimated > 0 ? 'warn' : 'head', money(c.estimated))}`} ${p.dim('· unmetered')} ${c.unmeteredTasks.length ? p.fg('warn', `${c.unmeteredTasks.length} task(s)`) : p.fg('head', 'none')}`, w, p, 9),
@@ -185,7 +186,7 @@ export const hudLines = (v: View, events: readonly TimelineEvent[], f: Frame): s
     const gates = v.gates.map(g => `${p.fg('head', w < 80 ? g.name.slice(0, 4) : g.name)} ${p.fg(GATE_TOKEN[g.state], GATE_GLYPH[g.state])}`).join('  ')
     out.push(fit(` ${p.dim('VERIFY')} ${gates}  ${p.dim('·')} ${(() => { const st = v.mission.status; return p.fg(st.outcome === 'VERIFIED' ? 'ok' : st.lifecycle === 'FINISHED' ? 'warn' : 'label', st.label) })()}`, w))
     const c = v.cost; const b = bar(c.budget ? c.spent / c.budget : 0, 10)
-    out.push(fit(` ${p.dim('SPEND')}  ${c.unmetered ? p.fg('warn', 'UNMETERED') : p.fg('head', money(c.spent))} ${p.dim(`of $${c.budget.toFixed(2)}`)} ${p.fg(c.capReached ? 'fail' : 'ok', '█'.repeat(b.filled))}${p.fg('rule', '░'.repeat(b.empty))} ${p.dim(`left ${money(c.remaining)}`)}${(c.estimated ?? 0) > 0 || c.estimatedAttempts > 0 ? p.fg('warn', ' · part estimated') : ''}${c.capReached ? p.fg('fail', ' · CAP REACHED', true) : ''}`, w))
+    out.push(fit(` ${p.dim('SPEND')}  ${c.unmetered ? p.fg('warn', `UNMETERED ≥${money(c.spent)}`) : p.fg('head', money(c.spent))} ${p.dim(`of $${c.budget.toFixed(2)}`)} ${p.fg(c.capReached ? 'fail' : 'ok', '█'.repeat(b.filled))}${p.fg('rule', '░'.repeat(b.empty))} ${p.dim(`left ${c.unmetered ? '≤' : ''}${money(c.remaining)}`)}${(c.estimated ?? 0) > 0 || c.estimatedAttempts > 0 ? p.fg('warn', ' · part estimated') : ''}${c.capReached ? p.fg('fail', ' · CAP REACHED', true) : ''}`, w))
   }
   // the live activity strip: the latest real events
   const strip = tall ? 4 : mid ? 2 : 1
