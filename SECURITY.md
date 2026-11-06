@@ -98,7 +98,7 @@ The adapter in [`cline/`](cline/README.md) is a supervisor you start yourself (`
 
 ### The sandbox
 
-Every worker and every gate command runs in bubblewrap (`bwrap`, 0.8 or later). There is no weaker fallback: when bubblewrap cannot establish this sandbox, the launch fails and nothing runs (`cockpit-cline doctor` and the interactive Cockpit check it beforehand).
+Every worker and every gate command runs in bubblewrap (`bwrap`, 0.8 or later). There is no weaker fallback: when bubblewrap cannot establish this sandbox, the launch fails and nothing runs. `cockpit-cline doctor`, and `/cockpit ready` in the interactive Cockpit, check the basic isolation on request; that probe does not prove every launch will succeed.
 
 - **No host root.** The sandbox root is an empty tmpfs, remounted read-only once the mounts below are in place. Read-only: `/usr`, an allowlist of `/etc` (users and groups, name service, the dynamic linker, certificate stores, time zone; not `/etc/gitconfig`), the Node installation that runs Cline, Cockpit's own hook code, and the repository's Git directory, whose `config` is replaced by a stripped copy without remotes, credential helpers, hooks or commands. Writable: the task's own worktree for a write task (read-only for a read-only task; its `.git` link stays read-only), the writable part of the attempt's run directory, a disposable `HOME` with a disposable Cline data directory, and empty tmpfs mounts at `/tmp`, `/var/tmp` and `/run`.
 - **Namespaces.** User, pid, ipc, uts, network and, where available, cgroup namespaces; nested user namespaces are disabled (`--disable-userns`, asserted). The environment is cleared and rebuilt. The sandbox dies with its supervisor (`--die-with-parent`) and runs in a new session.
