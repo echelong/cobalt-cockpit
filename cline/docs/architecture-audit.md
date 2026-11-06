@@ -339,6 +339,16 @@ refused, and the launch-time authentication mapping no longer relies on a text m
 itself does not take Cockpit's write lock, so Cline refreshing one provider while Cockpit saves another can still
 race, as Cline's own two-provider refreshes can; the recovery file then still holds Cockpit's answer.
 
+A sixth fresh review, of `ca7b225..d8b0872`, again accepted the isolation and found two gaps, fixed with tests
+(`isolation (review 14)`): a failure to take Cockpit's write lock (or a providers.json that is valid JSON but not an
+object) after the server had answered escaped the latch — every failure after the answer now latches, and the
+recovery-unwritable test now really fails the write (a dangling link) instead of passing vacuously; and the
+previous round had made a briefly missing or half-written providers.json an immediate sign-in failure on the hot
+path — such a file is now waited for (about 1.5 s, without blocking), and only one that stays missing, corrupt
+or unreadable is a sign-in problem. Also: a lock that cannot be opened is a sign-in problem only when the
+settings directory is not writable, and after a confirmed save the kept answer is moved aside rather than
+deleted.
+
 Accepted and documented (README limitations 22 and 23): no seccomp filter (keyring, io_uring, perf and bpf
 follow host settings), no resource limits, and the routed-model rule would refuse a different auxiliary model.
 

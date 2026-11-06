@@ -252,7 +252,10 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
    even the recovery file cannot be written, the new sign-in is still saved. Cockpit's rewrite of providers.json
    takes its own lock (`providers.json.cockpit-write.lock`) besides Cline's per-provider one, so two supervisors
    refreshing different providers cannot overwrite each other; the recovery file is removed only once the saved
-   sign-in is confirmed in the file. A missing or corrupt providers.json is reported as a sign-in problem. A sign-in the server refuses reaches the
+   sign-in is confirmed in the file (then moved aside, the newest three kept). Once the server has answered, any
+   failure latches, so a possibly single-use refresh token is never sent twice. A providers.json that is briefly
+   missing or half-written (Cline replacing it) is waited for; one that stays missing, corrupt or unreadable is
+   reported as a sign-in problem. A sign-in the server refuses reaches the
    worker as an authentication failure, so the run stops with "run `cline auth`"; a refresh that fails for a
    temporary reason (server error, rate limit, network, lock) is retried. That is the only write Cockpit makes to
    your Cline data. Only the `cline` and `cline-pass` providers can be brokered; a role configured for any other
