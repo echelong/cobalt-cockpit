@@ -21,10 +21,10 @@ import { loadCatalog, trustedCline } from '../src/catalog.ts'
 import { loopbackOriginProblem, setTestSeams, testSeams } from '../src/seams.ts'
 import { viaBroker, workerSandbox } from '../src/worker.ts'
 import { PACKAGE_DIR } from '../src/config.ts'
-import { clineData, STANDIN, TEST_REAL_TOKEN, tmp } from './helpers.ts'
+import { clineData, homeTmp, STANDIN, TEST_REAL_TOKEN, tmp } from './helpers.ts'
 
 const T = { timeout: 120_000 }
-const CANARY = mkdtempSync(join(homedir(), '.ccl-hard-'))
+const CANARY = homeTmp('hard')
 const SECRET = `SECRET-${Math.random().toString(16).slice(2)}`
 const servers: Server[] = []
 after(() => { for (const s of servers) { s.closeAllConnections(); s.close() } rmSync(CANARY, { recursive: true, force: true }) })
@@ -113,7 +113,7 @@ describe('broker origin: only the Cline API, or a loopback stand-in through the 
       PATH: `${evil}:${process.env.PATH}`, COCKPIT_BROKER_UPSTREAM: att.url, COCKPIT_CLINE_BWRAP: join(evil, 'bwrap'), COCKPIT_CLINE_BIN: join(evil, 'cline'), COCKPIT_CLINE_CATALOG_BIN: join(evil, 'cline'), COCKPIT_CLINE_NODE: join(evil, 'bwrap'),
     })
     assert.equal(r.code, 0, r.err); assert.ok(r.json, r.out + r.err)
-    const j = r.json as { upstream: string; status: number; calls: { url: string; auth: string | null; body: string }[]; bwrap: string; cline: string; catalogSource: string; sandbox: { ok: boolean; detail: string } }
+    const j = r.json as { upstream: string; status: number; calls: { url: string; auth: string | null; body: string }[]; bwrap: string; cline: string; workerCline: string; catalogSource: string; sandbox: { ok: boolean; detail: string } }
     assert.equal(j.upstream, CLINE_API_ORIGIN)
     assert.equal(j.status, 200, 'positive control: the turn was carried')
     assert.deepEqual(j.calls.map(c => c.url), [`${CLINE_API_ORIGIN}/api/v1/auth/refresh`, `${CLINE_API_ORIGIN}/api/v1/chat/completions`])
@@ -123,6 +123,7 @@ describe('broker origin: only the Cline API, or a loopback stand-in through the 
     assert.ok(BWRAP_CANDIDATES.includes(j.bwrap) || j.bwrap === trustedBwrap(), j.bwrap); assert.ok(!j.bwrap.startsWith(CANARY))
     assert.ok(j.sandbox.ok && j.sandbox.detail.includes(trustedBwrap()), j.sandbox.detail)
     assert.equal(j.cline, trustedCline().bin); assert.ok(!j.cline.startsWith(CANARY))
+    assert.equal(j.workerCline, trustedCline().bin, 'the CLI gives workers the trusted cline, not COCKPIT_CLINE_BIN or PATH')
     assert.ok(!j.catalogSource.startsWith(CANARY), j.catalogSource)
     assert.ok(!existsSync(marker), 'no attacker executable ran and no attacker module was imported')
   })
@@ -176,18 +177,19 @@ describe('broker redirects and request targets: never followed, never relayed, n
 describe('Node TLS and proxy settings: stripped by the launcher, refused by the broker', () => {
   test('transportProblem flags every setting that weakens TLS or routes through a proxy, and nothing else', () => {
     assert.equal(transportProblem({}, []), null)
-    assert.equal(transportProblem({ NODE_TLS_REJECT_UNAUTHORIZED: '1', NODE_OPTIONS: '--max-old-space-size=4096', HTTPS_PROXY: 'http://p:1' }, ['--experimental-transform-types']), null, 'a proxy variable alone is not used by Node')
-    for (const env of [{ NODE_TLS_REJECT_UNAUTHORIZED: '0' }, { NODE_TLS_REJECT_UNAUTHORIZED: '' }, { NODE_EXTRA_CA_CERTS: '/tmp/ca.pem' }, { SSL_CERT_FILE: '/tmp/ca.pem' }, { SSL_CERT_DIR: '/tmp' }, { SSLKEYLOGFILE: '/tmp/k' }, { NODE_USE_ENV_PROXY: '1' }, { OPENSSL_CONF: '/tmp/o.cnf' }, { NODE_OPTIONS: '--use-env-proxy' }, { NODE_OPTIONS: '--max-old-space-size=1 --tls-keylog=/tmp/k' }, { NODE_OPTIONS: '--openssl-config=/tmp/o' }])
+    assert.equal(transportProblem({ NODE_TLS_REJECT_UNAUTHORIZED: '1', NODE_OPTIONS: '', HTTPS_PROXY: 'http://p:1' }, ['--experimental-transform-types', '--no-warnings', '--import', '/x/register.mjs', '--test']), null, 'a proxy variable alone is not used by Node')
+    for (const env of [{ NODE_TLS_REJECT_UNAUTHORIZED: '0' }, { NODE_TLS_REJECT_UNAUTHORIZED: '' }, { NODE_EXTRA_CA_CERTS: '/tmp/ca.pem' }, { SSL_CERT_FILE: '/tmp/ca.pem' }, { SSL_CERT_DIR: '/tmp' }, { SSLKEYLOGFILE: '/tmp/k' }, { NODE_USE_ENV_PROXY: '1' }, { OPENSSL_CONF: '/tmp/o.cnf' }, { NODE_OPTIONS: '--use-env-proxy' }, { NODE_OPTIONS: '--use_env_proxy' }, { NODE_OPTIONS: '--tls_keylog=/tmp/k' }, { NODE_OPTIONS: '--max-old-space-size=4096' }, { NODE_OPTIONS: '--require=/tmp/evil.cjs' }, { NODE_OPTIONS: '--openssl_config=/tmp/o' }])
       assert.notEqual(transportProblem(env, []), null, JSON.stringify(env))
-    assert.notEqual(transportProblem({}, ['--use-env-proxy']), null)
+    for (const flag of ['--use-env-proxy', '--use_env_proxy', '--tls-keylog=/tmp/k', '--tls_keylog=/tmp/k', '--openssl-config=/x', '--openssl_shared_config']) assert.notEqual(transportProblem({}, [flag]), null, flag)
+    assert.equal(transportProblem({}, ['--use-env-proxy-not-a-flag']), null, 'whole option names only')
   })
 
-  for (const [k, v] of [['NODE_TLS_REJECT_UNAUTHORIZED', '0'], ['NODE_EXTRA_CA_CERTS', '/nonexistent-ca.pem'], ['NODE_USE_ENV_PROXY', '1'], ['NODE_OPTIONS', '--tls-keylog=/dev/null']] as const) {
+  for (const [k, v] of [['NODE_TLS_REJECT_UNAUTHORIZED', '0'], ['NODE_EXTRA_CA_CERTS', '/nonexistent-ca.pem'], ['NODE_USE_ENV_PROXY', '1'], ['NODE_OPTIONS', '--tls_keylog=/dev/null']] as const) {
     test(`a process started with ${k} set refuses to start the broker, and says why without the token`, T, async () => {
       const data = clineData(join(CANARY, `data-${k}`))
       const r = await hostile({ mode: 'transport', data }, { [k]: v, ...(k === 'NODE_USE_ENV_PROXY' ? { HTTPS_PROXY: 'http://127.0.0.1:9' } : {}) })
       const j = r.json as { started: boolean; error: string | null; tokenInError: boolean } | null
-      assert.ok(j, r.out + r.err); assert.equal(j.started, false); assert.match(j.error ?? '', new RegExp(`credential broker will not run: .*${k === 'NODE_OPTIONS' ? '--tls-keylog' : k}`)); assert.equal(j.tokenInError, false)
+      assert.ok(j, r.out + r.err); assert.equal(j.started, false); assert.match(j.error ?? '', new RegExp(`credential broker will not run: .*${k}`)); assert.equal(j.tokenInError, false)
     })
   }
   test('positive control: the same child with a clean environment starts the broker', T, async () => {
@@ -205,6 +207,18 @@ describe('Node TLS and proxy settings: stripped by the launcher, refused by the 
     for (const k of cleared) assert.ok(!new RegExp(`^${k}=`, 'm').test(env), `${k} reached node`)
     assert.match(env, /^COCKPIT_CLINE_DATA=\/kept$/m, 'positive control: other variables pass')
     assert.ok(args.includes(join(PACKAGE_DIR, 'src', 'cli.ts')) && args.includes('doctor'), args.join(' '))
+  })
+})
+
+describe('doctor never quotes Cline settings', () => {
+  test('a corrupt providers.json is reported without any of its text', async () => {
+    const { providerAuth } = await import('../src/catalog.ts')
+    const data = clineData(join(CANARY, 'data-corrupt'))
+    writeFileSync(join(data, 'settings', 'providers.json'), `{"providers":{"cline":{"settings":{"auth":{"accessToken":${TEST_REAL_TOKEN}}}}}}`)
+    let parser = ''; try { JSON.parse(readFileSync(join(data, 'settings', 'providers.json'), 'utf8')) } catch (e) { parser = (e as Error).message }
+    assert.match(parser, /REAL-TEST/, 'positive control: the parser itself quotes the input')
+    const s = providerAuth('cline', data)
+    assert.equal(s.configured, false); assert.match(s.note, /not valid JSON/); assert.ok(!s.note.includes('REAL-TEST') && !s.note.includes('TOKEN'), s.note)
   })
 })
 
@@ -259,6 +273,11 @@ describe('cline: the trusted installed one; any cline runs only sandboxed, with 
     chmodSync(join(pkg, 'node_modules', '@cline', 'llms', 'dist', 'models.js'), 0o666)
     await assert.rejects(loadCatalog(pkg), /cannot be trusted: .*writable by group or others/)
     assert.ok(!existsSync(marker), 'the untrusted module was imported')
+    // a writable file beside models.js (something it could load) is refused too
+    chmodSync(join(pkg, 'node_modules', '@cline', 'llms', 'dist', 'models.js'), 0o644)
+    writeFileSync(join(pkg, 'node_modules', '@cline', 'llms', 'dist', 'chunk.js'), ''); chmodSync(join(pkg, 'node_modules', '@cline', 'llms', 'dist', 'chunk.js'), 0o666)
+    await assert.rejects(loadCatalog(pkg), /cannot be trusted: .*chunk\.js is writable by group or others/)
+    assert.ok(!existsSync(marker))
   })
 
   test('OS level: a malicious cline given to a worker reaches only the broker with the fake token; the real token, the host and the network stay out of reach', T, async () => {

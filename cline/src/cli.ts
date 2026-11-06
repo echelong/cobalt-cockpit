@@ -81,7 +81,7 @@ const setup = async (a: Args): Promise<{ config: Config; catalog: Catalog; resol
  * The Cline workers run: the trusted installed one (catalog.ts trustedCline), by its real path. Only a test, through
  * its own entry point, can substitute a stand-in (seams.ts); it still runs only inside the sandbox.
  */
-const workerCline = (): string => testSeams().clineBin ?? trustedCline().bin
+export const workerCline = (): string => testSeams().clineBin ?? trustedCline().bin
 const deps = (a: Args, repoRoot: string): Deps => ({
   clineBin: workerCline(), clineDataDir: process.env.COCKPIT_CLINE_DATA ?? DEFAULT_CLINE_DATA, now: Date.now, runWorker,
   shareDirs: (a.multi.share ?? []).map(s => shareDir(repoRoot, s)),

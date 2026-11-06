@@ -14,6 +14,7 @@ import { ROLES } from '../src/core/engine.ts'
 import type { Role } from '../src/core/engine.ts'
 import { runWorker } from '../src/worker.ts'
 import { setTestSeams } from '../src/seams.ts'
+import { homeTmp, tmp, tmpRootDir } from './scratch.ts'
 import { Mission } from '../src/supervisor.ts'
 import type { Deps, TaskRecord } from '../src/supervisor.ts'
 import type { GateSpec } from '../src/gates.ts'
@@ -36,7 +37,10 @@ export const STANDIN = `http://127.0.0.1:${(api.address() as { port: number }).p
 setTestSeams({ brokerUpstream: STANDIN })
 export const FAKE = join(HERE, 'fixtures', 'fake-cline.mjs')
 
-export const tmp = (name: string): string => mkdtempSync(join(process.env.COCKPIT_TEST_TMP ?? tmpdir(), `ccl-${name}-`))
+// every fixture lives in this process's scratch root, removed when the process ends (see scratch.ts); the root is made
+// now so that os.tmpdir() (the broker's socket directories, child processes) points into it from the first test on
+tmpRootDir()
+export { tmp, homeTmp }
 
 export const mkRepo = (dir = tmp('repo')): string => {
   const g = (...a: string[]): void => { execFileSync('git', a, { cwd: dir, stdio: 'ignore' }) }

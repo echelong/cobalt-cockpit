@@ -238,7 +238,7 @@ export const trustedFileProblem = (p: string, owners: readonly number[], o: { ex
  * PATH and never taken from the environment: a bubblewrap someone else could replace could run workers without
  * any isolation.
  */
-export const BWRAP_CANDIDATES: readonly string[] = ['/usr/bin/bwrap', '/bin/bwrap', '/usr/local/bin/bwrap', '/run/current-system/sw/bin/bwrap']
+export const BWRAP_CANDIDATES: readonly string[] = ['/usr/bin/bwrap', '/bin/bwrap', '/usr/local/bin/bwrap']
 /** The real path of the first trusted bubblewrap (root-owned, see trustedFileProblem); refuses when there is none. */
 export const trustedBwrap = (candidates: readonly string[] = BWRAP_CANDIDATES): string => {
   const problems: string[] = []

@@ -269,8 +269,8 @@ const upstreamUrl = (origin: string, pathAndQuery: string): string => {
 }
 /** Upstream answers the broker never follows or passes on: a redirect could carry the request (and the token) elsewhere. */
 const REDIRECT = new Set([300, 301, 302, 303, 305, 307, 308])
-/** Node options that weaken TLS or route requests through a proxy, given on the command line or in NODE_OPTIONS. */
-const UNSAFE_NODE_FLAG = /(?:^|\s)--(?:use-env-proxy|tls-keylog|openssl-config)\b/
+/** Node command-line options that weaken TLS or route requests through a proxy (Node accepts `_` for `-` in option names). */
+const UNSAFE_NODE_FLAG = /^--(?:use-env-proxy|tls-keylog|openssl-config|openssl-shared-config)(?:=|$)/
 /**
  * Why this process cannot carry the real token safely, or null. Node reads these from the environment, and each lets
  * a third party read requests to the Cline API: certificate checks turned off, extra or replaced certificate
@@ -282,9 +282,12 @@ export const transportProblem = (env: NodeJS.ProcessEnv = process.env, execArgv:
   const set = (k: string): boolean => env[k] !== undefined && env[k] !== ''
   if (env.NODE_TLS_REJECT_UNAUTHORIZED !== undefined && env.NODE_TLS_REJECT_UNAUTHORIZED !== '1') return 'NODE_TLS_REJECT_UNAUTHORIZED is set (it can turn off certificate checks)'
   for (const k of ['NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'SSLKEYLOGFILE', 'NODE_USE_ENV_PROXY', 'OPENSSL_CONF']) if (set(k)) return `${k} is set (it changes which servers Node trusts or where its requests go)`
-  const opts = `${execArgv.join(' ')} ${env.NODE_OPTIONS ?? ''}`
-  const m = UNSAFE_NODE_FLAG.exec(opts)
-  if (m) return `Node runs with ${m[0].trim()} (it changes which servers Node trusts or where its requests go)`
+  // NODE_OPTIONS can load code into this process or change TLS and proxies in many spellings: any value is refused
+  if (set('NODE_OPTIONS')) return 'NODE_OPTIONS is set (it can load code into this process or change which servers Node trusts)'
+  for (const a of execArgv) {
+    const name = a.split('=')[0].replace(/_/g, '-')
+    if (UNSAFE_NODE_FLAG.test(name)) return `Node runs with ${name} (it changes which servers Node trusts or where its requests go)`
+  }
   return null
 }
 

@@ -27,10 +27,10 @@ import { runCommandGate } from '../src/gates.ts'
 import { readWireCaptures } from '../src/reasoning.ts'
 import { PACKAGE_DIR } from '../src/config.ts'
 import { shareDir, UsageError } from '../src/cli.ts'
-import { allTasks, clineData, env, FAKE, git, mission, task, TEST_REAL_TOKEN, tmp } from './helpers.ts'
+import { allTasks, clineData, env, FAKE, git, homeTmp, mission, task, TEST_REAL_TOKEN, tmp } from './helpers.ts'
 
 const T = { timeout: 120_000 }
-const CANARY = mkdtempSync(join(homedir(), '.ccl-iso-'))
+const CANARY = homeTmp('iso')
 const SECRET = `SECRET-${Math.random().toString(16).slice(2)}`
 const servers: Server[] = []
 after(() => { for (const s of servers) s.close(); rmSync(CANARY, { recursive: true, force: true }) })

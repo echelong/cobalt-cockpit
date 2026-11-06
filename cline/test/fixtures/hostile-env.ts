@@ -8,6 +8,7 @@ import { readFileSync } from 'node:fs'
 import { startBroker } from '../../src/broker.ts'
 import { bwrapAvailable, launch, trustedBwrap } from '../../src/sandbox.ts'
 import { loadCatalog, trustedCline } from '../../src/catalog.ts'
+import { workerCline } from '../../src/cli.ts'
 
 const o = JSON.parse(process.argv[2]) as { mode: 'broker' | 'launch' | 'transport'; data?: string; canary?: string; workdir?: string; home?: string }
 const print = (v: unknown): void => { process.stdout.write(`${JSON.stringify(v)}\n`) }
@@ -32,7 +33,7 @@ if (o.mode === 'broker') {
   })
   await b.close()
   const catalog = await loadCatalog()
-  print({ upstream: b.upstream, status, calls, bwrap: trustedBwrap(), cline: trustedCline().bin, catalogSource: catalog.source, sandbox: await bwrapAvailable() })
+  print({ upstream: b.upstream, status, calls, bwrap: trustedBwrap(), cline: trustedCline().bin, workerCline: workerCline(), catalogSource: catalog.source, sandbox: await bwrapAvailable() })
 } else if (o.mode === 'launch') {
   // a real sandbox started the production way: which bubblewrap runs, and does the boundary hold?
   const spec = { workdir: o.workdir as string, writable: true, gitCommonDir: null, gitAdminDir: null, home: o.home as string, readOnly: [], readWrite: [], allowRead: [], hide: [], network: 'none' as const, marker: `hostile-${Date.now()}`, env: {} }

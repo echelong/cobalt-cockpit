@@ -218,4 +218,4 @@ Node installation that runs Cockpit (else `/usr/local/bin` or `/usr/bin`), owned
 nobody else; Node is the `node` on `PATH` (see [SECURITY.md](../../SECURITY.md#what-cockpit-runs-and-what-chooses-it)).
 `bin/cockpit-cline` also clears `NODE_OPTIONS` and Node's TLS and proxy settings (`NODE_TLS_REJECT_UNAUTHORIZED`,
 `NODE_EXTRA_CA_CERTS`, `NODE_USE_ENV_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `SSLKEYLOGFILE`, `OPENSSL_CONF`)
-before Node starts; started any other way with one of them set, the broker refuses to run.
+before Node starts; started any other way with one of them set (or any `NODE_OPTIONS`), the broker refuses to run.

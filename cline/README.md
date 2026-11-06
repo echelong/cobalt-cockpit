@@ -80,8 +80,8 @@ fi
 Outside a repository, with `CLINE_COCKPIT_REPO` unset, this wrapper refuses every command, `doctor` included;
 run `bin/cockpit-cline doctor` (or the `cockpit-cline` link) directly there.
 
-Do not name a wrapper or alias `cline`: Cockpit starts `cline` from `PATH` for its workers, so a wrapper with that
-name would intercept them, and it would change a command you already rely on (see
+Do not name a wrapper or alias `cline`: Cockpit ignores it (workers run the installed Cline by its real path), but
+it would change a command you already rely on (see
 [below](#the-interactive-cockpit-one-command)). If your shell startup file defines both an alias and a function
 with the same name, define the alias after the function: Bash expands an alias that already exists while it reads
 the function's definition, and the function then gets the alias's target as its name.
@@ -291,9 +291,15 @@ scripts/typecheck.sh       # TypeScript 5.9.3, strict
 bin/cockpit-cline smoke --yes --max-usd 0.25   # live, opt-in, budget bounded
 ```
 
-The offline suite is 360 tests in 78 suites; on the development machine it takes about 5 minutes (308 s measured
-on 2026-11-06), the isolation tests alone (53) under a minute and the hardening tests (`hardening.spec.ts`, 23:
-what chooses the broker's upstream, bubblewrap and Cline) a few seconds. Tests run one file at a time
+The offline suite is 368 tests in 81 suites; on the development machine it takes about 5 minutes (310 s measured
+on 2026-11-06 with `/tmp` on tmpfs; a disk-backed temporary directory is much slower, and the archive test's
+30-second bound can fail there), the isolation tests alone (53) under a minute and the hardening tests
+(`hardening.spec.ts`, 24: what chooses the broker's upstream, bubblewrap and Cline) a few seconds.
+Each test process keeps all its fixtures in one directory, `ccl-run-*` in the temporary directory (and
+`~/.ccl-run-*` for canaries that must be on persistent storage), removed when the process exits or is
+interrupted (SIGINT, SIGTERM, SIGHUP); one left by a killed process is removed by the next test run, which
+checks that it is a test root and that its owner has ended (`test/scratch.ts`, tested in `scratch.spec.ts`).
+`COCKPIT_TEST_KEEP=1` keeps them for debugging. Tests run one file at a time
 (`--test-concurrency=1`) and need the same prerequisites as the adapter, including a working bubblewrap: without
 one, the sandbox tests fail rather than skip. `COCKPIT_SCALE_N` sets the sequential-task scale test (default 2000).
 `scripts/typecheck.sh` looks for TypeScript 5.9.3 and `@types/node` in the npm `npx` cache; set `TSC` and

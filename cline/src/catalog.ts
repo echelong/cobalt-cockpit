@@ -1,6 +1,6 @@
 // Model resolution against the INSTALLED Cline: its own model registry (@cline/llms)
 // and its own provider settings. Displayed names are never taken as API ids.
-import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -40,10 +40,28 @@ export const trustedCline = (candidates: readonly string[] = [...runtimeRoots().
   throw new Error(`no trusted cline: ${problems.length ? problems.join('; ') : `none of ${candidates.join(', ')} exists`}; install it with \`npm install -g cline\` under the Node that runs Cockpit`)
 }
 
+/** Every regular file under `dir` (bounded): what the catalog import could load. A link or other entry is refused. */
+const registryFiles = (dir: string): string[] => {
+  const out: string[] = []
+  const walk = (d: string): void => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const p = join(d, e.name)
+      if (e.isDirectory()) walk(p)
+      else if (e.isFile()) out.push(p)
+      else throw new Error(`the installed Cline cannot be trusted: ${p} in its model registry is not a regular file`)
+      if (out.length > 5000) throw new Error(`the installed Cline cannot be trusted: more than 5000 files in ${dir}`)
+    }
+  }
+  if (existsSync(dir)) walk(dir)
+  return out
+}
+
 export const loadCatalog = async (root = trustedCline().root): Promise<Catalog> => {
   // its code runs in this process, which holds the person's sign-in: it must be theirs (or root's) and nobody else's
   const owners = [process.getuid?.() ?? -1, 0]
-  for (const f of [join(root, 'package.json'), join(root, 'node_modules', '@cline', 'llms', 'package.json'), join(root, 'node_modules', '@cline', 'llms', 'dist', 'models.js')]) {
+  // the package manifests and every file in the model registry's dist/ (models.js and anything beside it it could load)
+  const files = [join(root, 'package.json'), join(root, 'node_modules', '@cline', 'llms', 'package.json'), ...registryFiles(join(root, 'node_modules', '@cline', 'llms', 'dist'))]
+  for (const f of files) {
     const why = existsSync(f) ? trustedFileProblem(f, owners) : null
     if (why) throw new Error(`the installed Cline cannot be trusted: ${why}`)
   }
@@ -110,6 +128,8 @@ export const providerAuth = (provider: string, dataDir = join(homedir(), '.cline
     if (key) return { provider, configured: true, kind: 'api-key', expiresAt: null, note: 'api key present' }
     return { provider, configured: false, kind: 'none', expiresAt: null, note: 'entry has no credentials' }
   } catch (e) {
-    return { provider, configured: false, kind: 'none', expiresAt: null, note: `Cline settings unreadable (${(e as Error).message.split('\n')[0]})` }
+    // never the parser's own message: V8 quotes the input around the error, which can be part of a token
+    const code = (e as NodeJS.ErrnoException).code
+    return { provider, configured: false, kind: 'none', expiresAt: null, note: `Cline settings unreadable (${code ?? 'not valid JSON'})` }
   }
 }
