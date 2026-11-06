@@ -22,6 +22,7 @@ export const CLINE_API_ORIGIN = 'https://api.cline.bot'
 /** Providers whose requests the broker can carry: both are served by the Cline API with a Cline sign-in. */
 export const BROKERED_PROVIDERS: readonly string[] = ['cline', 'cline-pass']
 const MAX_BODY = 32 << 20
+const MAX_LOG_BYTES = 16 << 20
 const REFRESH_BUFFER_MS = 5 * 60_000
 /**
  * The only requests a worker's Cline may make, as observed from Cline 3.0.74 itself (a model turn, the
@@ -74,90 +75,113 @@ const withClineLock = async <T>(dataDir: string, provider: string, fn: () => Pro
   } finally { db.close() }
 }
 
+const readJsonRetry = (f: string): ProvidersDoc => {
+  // Cline may be writing the file: a torn read is retried briefly, never written over
+  let last: unknown
+  for (let i = 0; i < 5; i++) { try { return JSON.parse(readFileSync(f, 'utf8')) as ProvidersDoc } catch (e) { last = e; const until = Date.now() + 20; while (Date.now() < until) { /* brief wait */ } } }
+  throw new Error(`providers.json unreadable: ${(last as Error).message}`)
+}
 const readAuth = (dataDir: string, provider: string): { doc: ProvidersDoc; auth: NonNullable<NonNullable<NonNullable<ProvidersDoc['providers']>[string]['settings']>['auth']> } => {
-  const doc = JSON.parse(readFileSync(providersFile(dataDir), 'utf8')) as ProvidersDoc
+  const doc = readJsonRetry(providersFile(dataDir))
   const auth = doc.providers?.[provider]?.settings?.auth
-  if (!auth || typeof auth.accessToken !== 'string' || !auth.accessToken) throw new Error(`no Cline sign-in for provider "${provider}": run \`cline auth\` on the host`)
+  if (!auth || typeof auth.accessToken !== 'string' || !auth.accessToken) throw new SignInError(`no Cline sign-in for provider "${provider}": run \`cline auth\` on the host`)
   return { doc, auth }
 }
+/** The person's Cline sign-in cannot be used (missing, expired without refresh, refused by the server): the run is an authentication failure. */
+export class SignInError extends Error {}
 /** An expiry as Cline stores or returns it: epoch ms, epoch seconds or an ISO date; NaN when it is none of these. */
 export const expiry = (v: unknown): number => typeof v === 'number' && Number.isFinite(v) ? (v > 1e11 ? v : v * 1000) : typeof v === 'string' ? (/^\d+(?:\.\d+)?$/.test(v.trim()) ? expiry(Number(v)) : Date.parse(v)) : NaN
 const live = (v: unknown, now: number): boolean => { const e = expiry(v); return Number.isFinite(e) && e - now > REFRESH_BUFFER_MS }
 
 type RefreshAnswer = { success?: boolean; data?: { accessToken?: unknown; refreshToken?: unknown; expiresAt?: unknown; expiresIn?: unknown; tokenType?: unknown; userInfo?: Record<string, unknown> } }
-/** Refreshes that failed after the server had answered: no further refresh is tried with that (possibly spent) token. */
-const LATCHED = new Map<string, string>()
-const readJsonRetry = (f: string): ProvidersDoc => {
-  // Cline may be writing the file: a torn read is retried briefly, never written over
-  let last: unknown
-  for (let i = 0; i < 5; i++) { try { return JSON.parse(readFileSync(f, 'utf8')) as ProvidersDoc } catch (e) { last = e; const until = Date.now() + 50; while (Date.now() < until) { /* brief wait */ } } }
-  throw new Error(`providers.json unreadable: ${(last as Error).message}`)
+type Tokens = { accessToken: string; refreshToken: string | null; expiresAt: number; tokenType: string | null; userInfo: Record<string, unknown> | null }
+/** The tokens in a refresh answer, or null when it carries no access token (such an answer can never be applied). */
+const tokensOf = (text: string, now: number): Tokens | null => {
+  let b: RefreshAnswer | null = null
+  try { b = JSON.parse(text) as RefreshAnswer } catch { return null }
+  const d = b?.data
+  if (!b?.success || !d || typeof d.accessToken !== 'string' || !d.accessToken) return null
+  let e = expiry(d.expiresAt)
+  if (!Number.isFinite(e) && typeof d.expiresIn === 'number') e = now + d.expiresIn * 1000
+  if (!Number.isFinite(e)) e = now + 15 * 60_000
+  return { accessToken: d.accessToken, refreshToken: typeof d.refreshToken === 'string' && d.refreshToken ? d.refreshToken : null, expiresAt: e, tokenType: typeof d.tokenType === 'string' ? d.tokenType : null, userInfo: d.userInfo && typeof d.userInfo === 'object' ? d.userInfo : null }
 }
+const sha256 = (s: string): string => createHash('sha256').update(s).digest('hex')
+/** A kept refresh answer, bound to the refresh token that produced it (by hash) and to when it was received. */
+type Recovery = { v: 1; usedSha256: string; at: number; answer: string }
+const RECOVERY_MAX_AGE_MS = 24 * 3600_000
+/** Refreshes that failed after the server had answered, per sign-in: that refresh token is never tried again in this process. */
+const LATCHED = new Map<string, { used: string; msg: string }>()
 
 /**
  * The real access token, refreshed on the host when it is within 5 minutes of expiry, the way Cline does it
- * (POST /api/v1/auth/refresh under Cline's own lock). The owner's sign-in must never be lost:
- *  - a recovery file left by an earlier failed save (`providers.json.cockpit-refresh`) is applied first;
- *  - the server's answer is saved to that recovery file (0600) before anything that can fail;
+ * (POST /api/v1/auth/refresh under Cline's own lock). The person's sign-in must never be lost or overwritten:
+ *  - the server's answer is saved first to `providers.json.cockpit-refresh` (0600), bound to the hash of the refresh
+ *    token it came from; it is applied later only for that same token and within 24 hours, so an answer left
+ *    from an older sign-in is never written over a newer one (it is discarded), and an unusable one is deleted;
  *  - providers.json is read again immediately before the write: if the sign-in changed meanwhile (the person
- *    signed in again), the person's sign-in wins and nothing is written; otherwise only this provider's
- *    `auth` is replaced, keeping every other change;
- *  - the previous file is kept as `providers.json.cockpit-backup`; the write is atomic (temporary file, rename);
- *  - after a failure past the server's answer, this broker process never retries a refresh (a refresh token
- *    may be single-use); the error names what the person should do.
+ *    signed in again), the person's sign-in wins and nothing is written; otherwise only this provider's `auth`
+ *    is replaced, keeping every other change; the previous file is kept as `providers.json.cockpit-backup`;
+ *  - after a save fails, the same refresh token is never tried again in this process (a refresh token may be
+ *    single-use); the kept answer is applied on the next attempt that can save it.
  */
 export const realToken = async (dataDir: string, provider: string, upstream: string, now: () => number = Date.now): Promise<string> => {
   const key = `${dataDir}\0${provider}`
+  const latch = (used: string): void => { const l = LATCHED.get(key); if (l && l.used === used) throw new SignInError(l.msg) }
   const first = readAuth(dataDir, provider)
   if (live(first.auth.expiresAt, now())) return first.auth.accessToken as string
-  const latched = LATCHED.get(key); if (latched) throw new Error(latched)
+  if (typeof first.auth.refreshToken === 'string') latch(first.auth.refreshToken)
   return withClineLock(dataDir, provider, async () => {
     const file = providersFile(dataDir); const recovery = `${file}.cockpit-refresh`
-    // another process (Cline itself, another broker) may have refreshed while we waited for the lock
-    const { auth } = readAuth(dataDir, provider)
-    if (live(auth.expiresAt, now())) return auth.accessToken as string
-    if (typeof auth.refreshToken !== 'string' || !auth.refreshToken) throw new Error(`the Cline sign-in for "${provider}" has expired and has no refresh token: run \`cline auth\``)
-    const used = auth.refreshToken
-    let text: string | null = null
-    // an answer kept from an earlier failed save is newer than what providers.json holds: use it, do not refresh again
-    if (existsSync(recovery)) text = readFileSync(recovery, 'utf8')
-    else {
-      const r = await fetch(`${upstream}/api/v1/auth/refresh`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: used, grantType: 'refresh_token' }), signal: AbortSignal.timeout(30_000), redirect: 'error' })
-      const t = await r.text().catch(() => '')
-      if (!r.ok) throw new Error(`Cline token refresh failed (${r.status}): run \`cline auth\` on the host`)
-      writeFileSync(recovery, t, { mode: 0o600 }); text = t
-    }
-    const fail = (why: string): never => { const msg = `${why}; the server's answer is kept in ${recovery}: run \`cline auth\` on the host`; LATCHED.set(key, msg); throw new Error(msg) }
-    let body: RefreshAnswer | null = null
-    try { body = JSON.parse(text) as RefreshAnswer } catch { /* not JSON */ }
-    const d = body?.data
-    if (!body?.success || !d || typeof d.accessToken !== 'string' || !d.accessToken) fail('Cline token refresh returned no access token')
-    const data = d as NonNullable<RefreshAnswer['data']> & { accessToken: string }
-    let expiresAt = expiry(data.expiresAt)
-    if (!Number.isFinite(expiresAt) && typeof data.expiresIn === 'number') expiresAt = now() + data.expiresIn * 1000
-    if (!Number.isFinite(expiresAt)) expiresAt = now() + 15 * 60_000
-    // read again right before writing; the auth that is replaced is the one read now, not the one read earlier
-    let current: ProvidersDoc
-    try { current = readJsonRetry(file) } catch (e) { return fail(`could not re-read providers.json (${(e as Error).message})`) }
-    const entry = current.providers?.[provider]
-    const cur = entry?.settings?.auth
-    if (!entry?.settings || !cur) return fail(`the "${provider}" entry vanished from providers.json during the refresh`)
-    if (cur.refreshToken !== used) {
-      // the person (or Cline) signed in again meanwhile: their sign-in wins; ours is discarded, never written over it
+    for (let round = 0; round < 2; round++) {
+      // another process (Cline itself, another broker) may have refreshed while we waited for the lock
+      const { auth } = readAuth(dataDir, provider)
+      if (live(auth.expiresAt, now())) return auth.accessToken as string
+      if (typeof auth.refreshToken !== 'string' || !auth.refreshToken) throw new SignInError(`the Cline sign-in for "${provider}" has expired and has no refresh token: run \`cline auth\` on the host`)
+      const used = auth.refreshToken
+      latch(used)
+      // a kept answer counts only if it came from refreshing exactly this token, recently; anything else is discarded
+      let tokens: Tokens | null = null
+      if (existsSync(recovery)) {
+        let rec: Recovery | null = null
+        try { rec = JSON.parse(readFileSync(recovery, 'utf8')) as Recovery } catch { /* unreadable */ }
+        tokens = rec && rec.v === 1 && rec.usedSha256 === sha256(used) && now() - rec.at < RECOVERY_MAX_AGE_MS && typeof rec.answer === 'string' ? tokensOf(rec.answer, now()) : null
+        if (!tokens) rmSync(recovery, { force: true })
+      }
+      if (!tokens) {
+        const r = await fetch(`${upstream}/api/v1/auth/refresh`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: used, grantType: 'refresh_token' }), signal: AbortSignal.timeout(30_000), redirect: 'error' })
+        const text = await r.text().catch(() => '')
+        if (!r.ok) throw new SignInError(`Cline token refresh failed (${r.status}): run \`cline auth\` on the host`)
+        tokens = tokensOf(text, now())
+        if (!tokens) { const msg = 'Cline token refresh returned no access token: run `cline auth` on the host'; LATCHED.set(key, { used, msg }); throw new SignInError(msg) }
+        // kept before anything that can fail, bound to the token that was just spent
+        writeFileSync(recovery, JSON.stringify({ v: 1, usedSha256: sha256(used), at: now(), answer: text } satisfies Recovery), { mode: 0o600 })
+      }
+      // read again right before writing; the auth that is replaced is the one read now
+      const fail = (why: string): never => { const msg = `${why}; the server's answer is kept in providers.json.cockpit-refresh beside it and will be applied next time: if this persists, run \`cline auth\` on the host`; LATCHED.set(key, { used, msg }); throw new SignInError(msg) }
+      let current: ProvidersDoc
+      try { current = readJsonRetry(file) } catch (e) { return fail(`could not re-read providers.json (${(e as Error).message})`) }
+      const entry = current.providers?.[provider]
+      const cur = entry?.settings?.auth
+      if (!entry?.settings || !cur) return fail(`the "${provider}" entry vanished from providers.json during the refresh`)
+      if (cur.refreshToken !== used) {
+        // the person (or Cline) signed in again meanwhile: their sign-in wins; ours is discarded, never written over it
+        rmSync(recovery, { force: true })
+        continue
+      }
+      const userInfo = tokens.userInfo ?? (cur.metadata?.userInfo as Record<string, unknown> | undefined)
+      entry.settings.auth = { ...cur, accessToken: tokens.accessToken, refreshToken: tokens.refreshToken ?? used, expiresAt: tokens.expiresAt, ...(typeof userInfo?.clineUserId === 'string' ? { accountId: userInfo.clineUserId } : {}), metadata: { ...(cur.metadata ?? {}), ...(tokens.tokenType ? { tokenType: tokens.tokenType } : {}), ...(userInfo ? { userInfo } : {}) } }
+      entry.updatedAt = new Date().toISOString()
+      const tmp = `${file}.cockpit-${process.pid}.tmp`
+      try {
+        writeFileSync(`${file}.cockpit-backup`, readFileSync(file, 'utf8'), { mode: 0o600 })
+        writeFileSync(tmp, JSON.stringify(current, null, 2), { mode: 0o600 }); renameSync(tmp, file)
+      } catch (e) { try { rmSync(tmp, { force: true }) } catch { /* none */ } return fail(`could not save the refreshed Cline sign-in (${(e as Error).message})`) }
       rmSync(recovery, { force: true })
-      if (live(cur.expiresAt, now()) && typeof cur.accessToken === 'string') return cur.accessToken
-      return fail('the sign-in changed during the refresh and is not current')
+      // a kept answer can have expired since it was received: then refresh again from what was just saved
+      if (live(tokens.expiresAt, now())) return tokens.accessToken
     }
-    const userInfo = data.userInfo && typeof data.userInfo === 'object' ? data.userInfo : (cur.metadata?.userInfo as Record<string, unknown> | undefined)
-    entry.settings.auth = { ...cur, accessToken: data.accessToken, refreshToken: typeof data.refreshToken === 'string' && data.refreshToken ? data.refreshToken : used, expiresAt, ...(typeof userInfo?.clineUserId === 'string' ? { accountId: userInfo.clineUserId } : {}), metadata: { ...(cur.metadata ?? {}), ...(typeof data.tokenType === 'string' ? { tokenType: data.tokenType } : {}), ...(userInfo ? { userInfo } : {}) } }
-    entry.updatedAt = new Date().toISOString()
-    const tmp = `${file}.cockpit-${process.pid}.tmp`
-    try {
-      writeFileSync(`${file}.cockpit-backup`, readFileSync(file, 'utf8'), { mode: 0o600 })
-      writeFileSync(tmp, JSON.stringify(current, null, 2), { mode: 0o600 }); renameSync(tmp, file)
-    } catch (e) { try { rmSync(tmp, { force: true }) } catch { /* none */ } return fail(`could not save the refreshed Cline sign-in (${(e as Error).message})`) }
-    rmSync(recovery, { force: true })
-    return data.accessToken
+    throw new SignInError('could not obtain a current Cline sign-in: run `cline auth` on the host')
   })
 }
 
@@ -172,7 +196,7 @@ export const upstreamProblem = (u: string): string | null => {
   return 'https, or http on loopback for tests'
 }
 
-export type BrokerLimits = { budgetUsd?: number | null; budgetTokens?: number | null; maxRequests?: number; maxInflight?: number; allowUnmetered?: boolean }
+export type BrokerLimits = { budgetUsd?: number | null; budgetTokens?: number | null; maxRequests?: number; maxInflight?: number; allowUnmetered?: boolean; maxLogBytes?: number }
 /**
  * What a route may send as reasoning, enforced on every model turn:
  *  - { effort: 'max' }  an effort-level route: exactly this reasoning_effort, and thinking not switched off;
@@ -191,6 +215,8 @@ export type BrokerSpent = {
   usd: number; tokens: number; requests: number; inflight: number
   /** Model turns passed on to the API (counted when sent, whatever happened after). */ carried: number
   /** Carried turns whose usage (or cost) the API did not report: the attempt's spend is then not measured. */ unmeasured: number
+  /** Carried turns the API may have billed: accepted (2xx) or never answered; an error answer generated nothing. */ billed: number
+  /** Why the broker stopped carrying turns for this attempt (budget, unmeasured), or null: the worker stops with that class. */ stop: { cls: 'budget' | 'unmetered'; detail: string } | null
   usdKnown: boolean
 }
 
@@ -210,13 +236,23 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
   // carried requests are always kept (bounded by maxRequests); refusals only up to a cap, so a flood of refused
   // requests can never push the record of a real model turn out
   const records: BrokerRecord[] = []; let refusedKept = 0
-  const spent: BrokerSpent = { usd: 0, tokens: 0, requests: 0, inflight: 0, carried: 0, unmeasured: 0, usdKnown: true }
+  const spent: BrokerSpent = { usd: 0, tokens: 0, requests: 0, inflight: 0, carried: 0, unmeasured: 0, billed: 0, usdKnown: true, stop: null }
   const socketDir = mkdtempSync(join(tmpdir(), 'ccl-b-'))
   const socketPath = join(socketDir, 's')
-  const log = (r: BrokerRecord): void => { try { o.log?.(r) } catch { /* the log is evidence, not control */ } }
+  // the log is bounded: carried requests are always logged (they are bounded by maxRequests); refusals only up to a size
+  let logged = 0; let suppressed = 0
+  const log = (r: BrokerRecord): void => {
+    const size = JSON.stringify(r).length
+    const cap = o.maxLogBytes ?? MAX_LOG_BYTES
+    if (r.refused && logged + size > cap) { if (suppressed++ === 0) { try { o.log?.({ ...r, refused: `further refusals are not logged (log above ${cap} bytes)` }) } catch { /* evidence only */ } } return }
+    logged += size
+    try { o.log?.(r) } catch { /* the log is evidence, not control */ }
+  }
   const refuse = (res: ServerResponse, req: IncomingMessage, status: number, why: string, model: string | null = null, effort: string | null = null, detail?: string): void => {
     const r: BrokerRecord = { at: new Date().toISOString(), method: req.method ?? '?', path: (req.url ?? '').slice(0, 200), status, model, effort, bytesIn: 0, refused: detail ? `${why}: ${detail}` : why }
-    if (refusedKept < 1000) { records.push(r); refusedKept++ }
+    // refusals of model turns are always kept (they are evidence of a model or reasoning mismatch); others up to a cap
+    if (r.path.startsWith('/api/v1/chat/completions')) records.push(r)
+    else if (refusedKept < 1000) { records.push(r); refusedKept++ }
     log(r)
     // the worker is told why in general terms; host paths and details stay in the host-side record
     if (!res.headersSent) { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: `Cockpit broker: ${why}` } })) } else res.destroy()
@@ -235,9 +271,10 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
     // the attempt's spend, measured here from the API's own answers (not from what the worker prints); the
     // counters move before the first await, so concurrent requests cannot all pass the same check
     if (spent.requests >= maxRequests) return refuse(res, req, 429, `request limit ${maxRequests} for this attempt reached`)
-    if (o.budgetTokens != null && spent.tokens >= o.budgetTokens) return refuse(res, req, 402, `token budget ${o.budgetTokens} for this attempt reached (${spent.tokens} used, measured by the broker)`)
-    if (o.budgetUsd != null && spent.usd >= o.budgetUsd) return refuse(res, req, 402, `cost budget $${o.budgetUsd} for this attempt reached ($${spent.usd.toFixed(5)} reported by the API)`)
-    if (spent.unmeasured > 0 && !o.allowUnmetered && path === '/api/v1/chat/completions') return refuse(res, req, 402, 'an earlier model turn reported no usage: the budget cannot be enforced')
+    const stopWith = (cls: 'budget' | 'unmetered', why: string): void => { spent.stop ??= { cls, detail: why }; refuse(res, req, 402, why) }
+    if (o.budgetTokens != null && spent.tokens >= o.budgetTokens) return stopWith('budget', `token budget ${o.budgetTokens} for this attempt reached (${spent.tokens} used, measured by the broker)`)
+    if (o.budgetUsd != null && spent.usd >= o.budgetUsd) return stopWith('budget', `cost budget $${o.budgetUsd} for this attempt reached ($${spent.usd.toFixed(5)} reported by the API)`)
+    if (spent.unmeasured > 0 && !o.allowUnmetered && path === '/api/v1/chat/completions') return stopWith('unmetered', 'an earlier model turn the API accepted reported no usage: the budget cannot be enforced')
     if (spent.inflight >= maxInflight) return refuse(res, req, 429, `${maxInflight} requests already in flight`)
     spent.requests++; spent.inflight++
     const ac = new AbortController()
@@ -280,7 +317,12 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
       const auth = req.headers.authorization
       if (typeof auth === 'string') {
         const m = /^Bearer (workos:)?(.+)$/.exec(auth)
-        if (m && m[2] === fakeToken) headers.authorization = `Bearer ${m[1] ?? ''}${await realToken(o.dataDir, o.provider, upstream)}`
+        if (m && m[2] === fakeToken) {
+          // a sign-in that cannot be used is an authentication failure for the worker (it stops, with the remedy), never a retry
+          let token: string
+          try { token = await realToken(o.dataDir, o.provider, upstream) } catch (e) { return refuse(res, req, 401, 'the Cline sign-in on the host could not be used (authentication failed): run `cline auth` on the host', model, effort, (e as Error).message) }
+          headers.authorization = `Bearer ${m[1] ?? ''}${token}`
+        }
       }
       // recorded and counted as carried BEFORE it is sent: whatever happens next, the provider may have billed it
       const rec: BrokerRecord = { at: new Date().toISOString(), method: req.method, path, status: 0, model, effort, bytesIn: body?.length ?? 0, ...(turn ? { reasoningEnabled: enabled } : {}) }
@@ -288,7 +330,15 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
       if (turn) spent.carried++
       let gotUsage = false
       const count = (o2: unknown): void => { const u = usageOf(o2); if (!u) return; gotUsage = true; spent.tokens += u.tokens; rec.tokens = (rec.tokens ?? 0) + u.tokens; if (u.usd === null) { spent.usdKnown = false; rec.usd = null } else { spent.usd += u.usd; rec.usd = (rec.usd ?? 0) + u.usd } }
-      const finish = (): void => { if (turn && !gotUsage) { spent.unmeasured++; spent.usdKnown = false; rec.usd = null } log(rec) }
+      // unmeasured: the API accepted the turn (2xx) but reported no usage, or the answer never fully arrived; an error
+      // answer (4xx/5xx) generated nothing and is not spend
+      let cut = false
+      const finish = (): void => {
+        const mayBill = turn && (rec.status === 0 || (rec.status >= 200 && rec.status < 300) || cut)
+        if (mayBill) spent.billed++
+        if (mayBill && !gotUsage) { spent.unmeasured++; spent.usdKnown = false; rec.usd = null }
+        log(rec)
+      }
       let up: Response
       try { up = await fetch(`${upstream}${path}${query ? `?${query}` : ''}`, { method: req.method, headers, body, redirect: 'manual', signal: ac.signal }) } catch (e) { rec.status = 0; finish(); throw e }
       rec.status = up.status
@@ -310,7 +360,7 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
           for (const l of lines) sse(l)
         })
         s.on('end', () => { tail += dec.decode(); sse(tail); if (wholeOk && !/^\s*data:/m.test(whole)) { try { count(JSON.parse(whole)) } catch { /* not JSON */ } } res.end(); finish(); resolve() })
-        s.on('error', () => { res.destroy(); finish(); resolve() })
+        s.on('error', () => { cut = rec.status >= 200 && rec.status < 300; res.destroy(); finish(); resolve() })
       })
     } finally { spent.inflight-- }
   }
@@ -318,7 +368,8 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
   chmodSync(socketPath, 0o600)
   return {
     socketPath, socketDir, fakeToken, records, spent,
-    close: () => new Promise<void>(r => { server.closeAllConnections?.(); server.close(() => { try { rmSync(socketDir, { recursive: true, force: true }) } catch { /* gone */ } r() }) }),
+    // the counters are final only when no request is still being handled: wait briefly for those first
+    close: async () => { const until = Date.now() + 2000; while (spent.inflight > 0 && Date.now() < until) await new Promise(r => setTimeout(r, 20)); await new Promise<void>(r => { server.closeAllConnections?.(); server.close(() => { try { rmSync(socketDir, { recursive: true, force: true }) } catch { /* gone */ } r() }) }) },
   }
 }
 

@@ -224,8 +224,10 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
       foldLine(facts, line)
       // display passthrough only: what a worker prints is never trusted for decisions here
       if (on.event) { try { const o = JSON.parse(line) as unknown; if (o && typeof o === 'object') on.event(o as Record<string, unknown>) } catch { /* not JSON, or a failing viewer */ } }
-      const b = budgetVerdict(facts, w, broker.spent.carried)
+      // turns the API may have billed (an error answer generated nothing); and the broker's own stop, from the API's figures
+      const b = budgetVerdict(facts, w, broker.spent.billed)
       if (b) stopNow(b.stop, b.detail)
+      if (broker.spent.stop) stopNow(broker.spent.stop.cls, `broker: ${broker.spent.stop.detail}`)
       // A failing observer (for example a full disk while persisting) must not stop the
       // stream being read: budget enforcement and the run result depend on it.
       try { on.facts?.(facts) } catch (e) { observerError ??= (e as Error).message }
@@ -243,6 +245,8 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   // A clean exit is not proof: the census reads the sandbox init and the marker.
   const final = await terminate(targetOf(identity, marker, started), true, 5000)
   await broker.close()
+  // a stop the broker decided after the last stream line (the run then ended on the refused turn)
+  if (broker.spent.stop && stoppedBy === 'exit') { stoppedBy = broker.spent.stop.cls; stopDetail = `broker: ${broker.spent.stop.detail}` }
   let stderrHead = ''
   try { stderrHead = readUntrusted(join(w.runDir, 'stderr.txt'), 600) } catch { /* none */ }
   if (facts.lines === 0 && stoppedBy === 'exit' && /^bwrap: /m.test(stderrHead)) { stoppedBy = 'spawn_error'; stopDetail = `sandbox did not start: ${stderrHead.split('\n')[0]}` }
@@ -313,7 +317,10 @@ export const attestWire = (wire: WireVerdict, records: readonly BrokerRecord[], 
   }
   const wrong = carried.find(r => (r.effort !== null && r.effort !== 'none') || r.reasoningEnabled === true)
   if (wrong) return { ...wire, state: 'mismatch', detail: `broker carried a request for ${model} with reasoning ${wrong.effort ?? 'on'}, expected ${expectedWire}` }
-  return { ...wire, state: 'confirmed', requests: n, effective: expectedWire, models: [model], detail: `broker carried ${n} request(s) for ${model} without reasoning` }
+  // "no reasoning" is confirmed only from an explicit statement on every turn (effort none, or thinking switched off);
+  // a request that merely leaves the field out says nothing about a model that thinks by default
+  if (carried.every(r => r.effort === 'none' || r.reasoningEnabled === false)) return { ...wire, state: 'confirmed', requests: n, effective: expectedWire, models: [model], detail: `broker carried ${n} request(s) for ${model} with reasoning explicitly off` }
+  return wire.state === 'confirmed' ? { ...wire, state: 'unconfirmed', detail: `broker carried ${n} request(s) for ${model} that did not state reasoning off; ${wire.detail}` } : wire
 }
 
 export const targetOf = (id: Identity | null, marker: string, since: number): Target => ({ initPid: id?.initPid ?? null, initStart: id?.initStart ?? null, pidNs: id?.pidNs ?? null, marker, since: id?.since ?? since })

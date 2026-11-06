@@ -98,7 +98,9 @@ export const gitCovers = (commonDir: string): string[] => {
     for (const sub of ['worktrees', 'modules']) {
       let names: string[] = []
       try { names = readdirSync(join(dir, sub)) } catch { continue }
-      for (const n of names.slice(0, 256)) if (depth < 3) at(join(dir, sub, n), depth + 1)
+      // fail closed: a git directory too large to inspect is not mounted at all
+      if (names.length > 4096) throw new Error(`sandbox: ${join(dir, sub)} has ${names.length} entries; refusing to mount a git directory that cannot be inspected`)
+      for (const n of names) if (depth < 3) at(join(dir, sub, n), depth + 1)
     }
   }
   at(commonDir, 0)

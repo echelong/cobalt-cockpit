@@ -2,7 +2,7 @@
 // watch, cancel, recover, replay, list, smoke.
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { join, relative, resolve } from 'node:path'
 import { ROLES } from './core/engine.ts'
 import type { Role } from './core/engine.ts'
 import { loadConfig, rolesOf } from './config.ts'
@@ -89,7 +89,7 @@ export const shareDir = (repoRoot: string, s: string): { from: string; to: strin
   try { from = realpathSync(resolve(repoRoot, s)) } catch { throw new UsageError(`--share ${s}: no such directory in ${repoRoot}`) }
   if (!from.startsWith(`${rootReal}/`)) throw new UsageError(`--share ${s}: resolves outside the repository (${from})`)
   if (!statSync(from).isDirectory()) throw new UsageError(`--share ${s}: not a directory`)
-  if (from.split('/').some(seg => seg === '.git' || seg.startsWith('.env'))) throw new UsageError(`--share ${s}: resolves into .git or an .env path`)
+  if (relative(rootReal, from).split('/').some(seg => seg === '.git' || seg.startsWith('.env'))) throw new UsageError(`--share ${s}: resolves into .git or an .env path`)
   return { from, to: s.replace(/\/+$/, '') }
 }
 const root = (a: Args): string => str(a, 'state') ?? stateRoot()

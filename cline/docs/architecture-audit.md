@@ -301,6 +301,19 @@ bounded; submodule and per-worktree git configs and worktree fsmonitor sockets a
 the certificate stores (no `/etc/gitconfig`); system trees and both home directories are never mountable;
 `--share` refuses `.git`, `.env` and files; broker errors no longer reveal host paths to the worker.
 
+A third fresh review, of that follow-up (`d3b5672..66faa61`), again accepted the isolation and found five new
+defects in the follow-up itself, all fixed with tests (`isolation (review 11)`): a kept refresh answer was not
+bound to the token it came from (after a new sign-in it could have been applied over it; an unusable one could
+wedge later refreshes) — it is now stored with the hash of the refresh token that produced it, applied only for
+that token within 24 hours, and discarded otherwise, and the latch is per refresh token; an error answer (429,
+5xx) was counted as unmeasured spend, which stopped retries and the session — only turns the API accepted or
+never answered count; sign-in failures reached the worker as a generic 502 — they are now a 401 that the
+supervisor classifies as an authentication failure; refusals could grow the broker log without bound — it is
+capped; "no reasoning" was attested from a missing field — it now needs an explicit statement. Also: refusals of
+model turns are always kept, the broker waits for in-flight requests before its counters are read, a git
+directory too large to inspect is refused rather than partly covered, and `--share` checks only the path inside
+the repository.
+
 Accepted and documented (README limitations 22 and 23): no seccomp filter (keyring, io_uring, perf and bpf
 follow host settings), no resource limits, and the routed-model rule would refuse a different auxiliary model.
 
