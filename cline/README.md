@@ -6,28 +6,107 @@ model cannot satisfy for itself, measured cost and a live mission-control screen
 this repository is unchanged: the adapter imports the engine's pure modules (`hooks/swarm.ts`, `guard.ts`,
 `effort.ts`, `verification.ts`, `secrets.ts`, `router.ts`) through `src/core/engine.ts` and modifies none of them.
 
-Status: **local prototype**, Linux only, tested against Cline CLI 3.0.74 (`@cline/core`/`@cline/llms` 0.2.0).
-It is not a Cline plugin and does not claim Cline feature parity; see [Limitations](#limitations).
+Status: **experimental**, Linux only. Developed and tested on Fedora (kernel 7.2, bubblewrap 0.12.0, Node
+24.20.0) against Cline CLI 3.0.74 (`@cline/core`/`@cline/llms` 0.2.0); other distributions are expected to work
+when `doctor` passes but have not been tested. It is not a Cline plugin and does not claim Cline feature parity;
+see [Limitations](#limitations). It is also not part of the Claude Code plugin in this repository: installing
+that plugin does not install or enable this adapter, and this adapter needs no Claude Code.
 
 ## Requirements
 
-- Linux with unprivileged user namespaces and `bwrap` (bubblewrap) 0.8 or later (for `--disable-userns`).
-  `cockpit-cline doctor` checks that the full isolation can be established; without it nothing runs.
-- Node 24 (the one that runs `cline`), `git`, and the `cline` CLI on `PATH`, signed in (`cline auth`).
-- No npm install: the adapter has no dependencies. Type checking uses TypeScript 5.9.3 (`scripts/typecheck.sh`).
+| Requirement | Why | Check |
+|---|---|---|
+| Linux | bubblewrap and Linux namespaces are the isolation boundary; macOS and Windows are not supported | `uname -s` |
+| `bwrap` (bubblewrap) **0.8 or later** on `PATH` | every worker and gate runs in it; 0.8 added `--disable-userns`, which Cockpit requires | `bwrap --version` |
+| Unprivileged user namespaces allowed for `bwrap` | the sandbox is set up without root or setuid | `cockpit-cline doctor` (the `sandbox:` line) |
+| Node **24** (the same Node that runs `cline`) | the adapter is TypeScript run by Node's type stripping; tested on 24.20.0 | `node --version` |
+| `git` | missions run in Git worktrees | `git --version` |
+| The `cline` CLI on `PATH`, signed in | workers are stock `cline` processes; Cockpit resolves models from the installed catalog | `cline --version`, then `cline auth` |
 
-## Setup
+There is no npm install: the adapter has no dependencies. Install bubblewrap with your distribution's package
+manager, for example `sudo dnf install bubblewrap` (Fedora), `sudo apt install bubblewrap` (Debian, Ubuntu) or
+`sudo pacman -S bubblewrap` (Arch), and check that the version is at least 0.8. Install Cline with the npm of
+the same Node (`npm install -g cline`), so that it lands in that Node installation's `bin` directory: inside the
+sandbox `cline` is looked up only there, in `/usr/local/bin`, `/usr/bin` and `/bin`, and in any `sandbox.allowRead`
+path ending in `/bin`. A `cline` elsewhere on your `PATH` (for example a link in `~/.local/bin`) is not found by
+workers. Sign in once with `cline auth`. Only the `cline` (Cline credits) and `cline-pass`
+(ClinePass) providers are supported, because only they can be served by Cockpit's credential broker.
+Type checking the adapter itself uses TypeScript 5.9.3 (`scripts/typecheck.sh`); running it does not.
+
+## Install
+
+Use your own clone of the repository, on `main`. Do not run the adapter from the copy that Claude Code's
+plugin manager keeps: that copy is replaced when the plugin updates.
 
 ```sh
-git -C /path/to/cobalt-cockpit switch cline-adapter          # or use the worktree that holds the branch
-/path/to/cobalt-cockpit/cline/bin/cockpit-cline doctor        # installed Cline, sandbox, auth, model ids, reasoning
-# optional: put the launcher on PATH under a name that does not collide with anything you already use
-ln -s /path/to/cobalt-cockpit/cline/bin/cockpit-cline ~/.local/bin/cockpit-cline
+git clone https://github.com/echelong/cobalt-cockpit.git ~/src/cobalt-cockpit
+~/src/cobalt-cockpit/cline/bin/cockpit-cline doctor     # installed Cline, sandbox, auth, model ids, reasoning
 ```
 
 `doctor` must print `doctor: OK`. It resolves every role against the **installed** Cline model catalog, checks that
-the configured reasoning level exists for that model, and reports whether each provider has credentials (it
-never prints them).
+the configured reasoning level exists for that model, checks that the full sandbox can be established, and reports
+whether each provider has credentials (it never prints them). Nothing runs without the sandbox. To update, pull
+`main` in your clone and run `doctor` again; after a Cline upgrade, also run the live check
+`cockpit-cline smoke --yes` (it spends a few cents of real credits, capped by `--max-usd`).
+
+### Commands on `PATH`
+
+`bin/cockpit-cline` resolves its own location, so a symbolic link to it works from anywhere:
+
+```sh
+ln -s ~/src/cobalt-cockpit/cline/bin/cockpit-cline ~/.local/bin/cockpit-cline
+```
+
+A wrapper is useful when you want a fixed name and a default repository for when you are not inside one. This
+`cline-cockpit` is an example, not something the repository installs; save it as `~/.local/bin/cline-cockpit` and
+make it executable:
+
+```sh
+#!/usr/bin/env bash
+# cline-cockpit: open Cobalt Cockpit for Cline for the current Git repository.
+set -euo pipefail
+COCKPIT_DIR=${COBALT_COCKPIT_DIR:-"$HOME/src/cobalt-cockpit"}   # your clone of echelong/cobalt-cockpit
+COCKPIT="$COCKPIT_DIR/cline/bin/cockpit-cline"
+[ -x "$COCKPIT" ] || { echo "cline-cockpit: $COCKPIT not found (set COBALT_COCKPIT_DIR)" >&2; exit 2; }
+if git rev-parse --show-toplevel >/dev/null 2>&1; then
+  exec "$COCKPIT" "$@"
+elif [ -n "${CLINE_COCKPIT_REPO:-}" ]; then
+  exec "$COCKPIT" --repo "$CLINE_COCKPIT_REPO" "$@"           # optional default repository
+else
+  echo "cline-cockpit: not inside a Git repository (cd into one, or set CLINE_COCKPIT_REPO)" >&2; exit 2
+fi
+```
+
+Outside a repository, with `CLINE_COCKPIT_REPO` unset, this wrapper refuses every command, `doctor` included;
+run `bin/cockpit-cline doctor` (or the `cockpit-cline` link) directly there.
+
+Do not name a wrapper or alias `cline`: Cockpit starts `cline` from `PATH` for its workers, so a wrapper with that
+name would intercept them, and it would change a command you already rely on (see
+[below](#the-interactive-cockpit-one-command)). If your shell startup file defines both an alias and a function
+with the same name, define the alias after the function: Bash expands an alias that already exists while it reads
+the function's definition, and the function then gets the alias's target as its name.
+
+### Troubleshooting the sandbox
+
+`doctor` prints `sandbox: FAIL bwrap exit <n>: <bubblewrap's message>` when the isolation cannot be established.
+Cockpit does not fall back to a weaker sandbox, and none of the fixes below should be broader than the one binary
+that needs them.
+
+| Message from bubblewrap | Likely cause | What to do |
+|---|---|---|
+| `Unknown option --disable-userns` | bubblewrap older than 0.8 | install a newer bubblewrap from your distribution; do not edit Cockpit's arguments |
+| `setting up uid map: Permission denied`, `loopback: Failed RTM_NEWADDR` or `Creating new namespace failed` on Ubuntu 23.10 or later | AppArmor restricts unprivileged user namespaces to programs whose profile allows them (`kernel.apparmor_restrict_unprivileged_userns = 1`) | give the `bwrap` binary an AppArmor profile that allows `userns`, as Ubuntu documents for applications that need namespaces; do not set `kernel.apparmor_restrict_unprivileged_userns=0`, which lifts the restriction for every program. Not tested by this project |
+| `Creating new namespace failed` (for example with `No space left on device`; older versions: `No permissions to creating new namespace`) elsewhere | user namespaces are off: `user.max_user_namespaces` is 0, or, on older Debian kernels, `kernel.unprivileged_userns_clone` is 0 | ask whoever administers the machine; these are system-wide security settings and a policy may require them off |
+| `bwrap: setting up uid map` inside a container or CI runner | the container does not allow nested namespaces | run on the host or a VM; do not run the container privileged for this |
+| `spawn bwrap ENOENT` | bubblewrap is not installed or not on `PATH` | install it, or point `COCKPIT_CLINE_BWRAP` at the binary |
+
+A `bwrap` that is installed setuid root is not what Cockpit is designed around (it expects unprivileged user
+namespaces); check with `ls -l "$(command -v bwrap)"`.
+
+Other `doctor` lines: `auth <provider>: MISSING` means `cline auth` has not been run for that provider;
+`access token expired` is normal, the broker refreshes it on the host before a worker needs it; a role marked
+`FAIL` names why (a model missing from the installed catalog, a missing version pin, or a reasoning level the
+model does not list). After a Cline upgrade a changed catalog can refuse a pinned model; nothing is substituted.
 
 ## The interactive Cockpit (one command)
 
@@ -35,8 +114,8 @@ never prints them).
 cd ~/code/app && cockpit-cline            # or: cockpit-cline --repo ~/code/app --gate test="npm test"
 ```
 
-On this machine `cline-cockpit` (a personal launcher in `~/.local/bin` that runs `bin/cockpit-cline`) opens the
-same shell; any wrapper that execs `bin/cockpit-cline` with your arguments works the same way.
+A wrapper such as the [`cline-cockpit` example](#commands-on-path) opens the same shell; any wrapper that execs
+`bin/cockpit-cline` with your arguments works the same way.
 
 With no command, on a terminal, `cockpit-cline` opens the integrated Cockpit: a persistent live HUD on top, the
 conversation in the middle, an input line at the bottom. Type a request as you would in Cline. **Every message is
@@ -146,12 +225,13 @@ No `1017 Fast` DeepSeek variant exists in either Cline catalog (checked 2026-11-
 so a restart never falls back to the level last chosen in Cline's `/model`.
 
 **ClinePass:** `--profile cline-pass` (or `COCKPIT_CLINE_PROFILE=cline-pass`) switches every role to the
-`cline-pass/…` ids. ClinePass lists no version-pinned Qwen3.8 Max 0902, so in strict mode the frontend role is
-refused there (frontend tasks fail closed, nothing is substituted) until you add
+`cline-pass/…` ids. ClinePass lists no version-pinned Qwen3.8 Max 0902, so the frontend role is refused there,
+strict mode or not (frontend tasks fail closed, nothing is substituted), until you add
 `"unpinnedAllowed": ["cline-pass/cline-pass/qwen3.8-max"]` to your config.
 
-Your own overrides go in `~/.config/cobalt-cockpit-cline/config.json` (merged over `config/default.json`), or
-`--config FILE`. Validation is strict: an unknown role or reasoning level is an error, not a default.
+Your own overrides go in `~/.config/cobalt-cockpit-cline/config.json` (`$XDG_CONFIG_HOME` is honoured; merged over
+`config/default.json`), or `--config FILE`. Validation is strict: an unknown role or reasoning level is an error,
+not a default. Every key, its default and what it does: [docs/configuration.md](docs/configuration.md).
 
 ## Usage
 
@@ -198,18 +278,26 @@ cockpit-cline smoke --yes [--roles coder,utility] [--max-usd 0.25]           # L
 
 Each mission keeps, under `~/.local/state/cobalt-cockpit-cline/missions/<id>/` (0700): `mission.json`,
 `live.json`, `report.json`, the hash-chained `ledger/`, the paginated `archive/`, and per attempt `runs/<task>/<n>/`
-with the exact argv, the policy, the JSONL stream, stderr, the hook log, Cline's wire captures (full request
-bodies, kept as evidence; they contain your code and prompts, never credentials) and gate logs with SHA-256.
+with the exact argv, the policy, the JSONL stream, stderr, the hook log, Cline's wire captures (request bodies,
+up to 64 KiB each and a preview with size and SHA-256 for larger ones, kept as evidence; they contain your code and prompts, and any secret in the code or output the worker
+read, but never your Cline sign-in, which no worker holds) and gate logs with SHA-256.
 
 ## Tests
 
 ```sh
-scripts/test.sh            # offline: fake providers, real bubblewrap, real git, the real hook (≈ 90 s)
+scripts/test.sh            # offline: fake providers, real bubblewrap, real git, the real hook
+scripts/test.sh test/isolation.spec.ts   # only the sandbox attacks
 scripts/typecheck.sh       # TypeScript 5.9.3, strict
 bin/cockpit-cline smoke --yes --max-usd 0.25   # live, opt-in, budget bounded
 ```
 
-`COCKPIT_SCALE_N` sets the sequential-task scale test (default 2000).
+The offline suite is 337 tests in 73 suites; on the development machine it takes about 5 minutes (298 s measured
+on 2026-11-06) and the isolation tests alone (53) under a minute. Tests run one file at a time
+(`--test-concurrency=1`) and need the same prerequisites as the adapter, including a working bubblewrap: without
+one, the sandbox tests fail rather than skip. `COCKPIT_SCALE_N` sets the sequential-task scale test (default 2000).
+`scripts/typecheck.sh` looks for TypeScript 5.9.3 and `@types/node` in the npm `npx` cache; set `TSC` and
+`NODE_TYPES` to use other installs. The repository's GitHub Actions CI runs the Claude Code plugin's checks only;
+it does not run these tests.
 `test/isolation.spec.ts` attacks the sandbox from inside it (no hook in the way): other repositories, `.env`
 files, the real home and Cline data, local services and sockets, the internet, the broker's limits, symlinks,
 `/proc`, mounts, nested namespaces, privilege tools, persistence outside the worktree and surviving descendants.
@@ -309,15 +397,15 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
     by keyword, so "do not touch the UI" can still route a write task to the frontend role (the rule is named).
     A worker's own request for more work cannot choose its children's role: architecture work is refused, and
     risk and complexity are capped at the requesting task's, with no context-size claim.
+17. The interactive shell needs a real terminal (it refuses to start otherwise) and has been tested in
+    pseudo-terminals at 160×46 and 72×24; it is a line-oriented UI, not a full editor (no mouse, no syntax
+    highlighting).
 18. **Workers sometimes misuse the delegation marker.** Models have ended answers with `COCKPIT_REQUEST` and an
     empty list (now treated as no request) or with a duplicate request for work a sibling task already owns, in
     the wrong format. A malformed non-empty request is refused and recorded, and it keeps the mission from `DONE`
     (it may describe work that was not done): read the Guard line and the ledger's `delegation_refused` entry.
 19. **Verdicts are per conversation, not per turn.** A failed or cancelled turn keeps the conversation's outcome
     `PARTIAL` for the rest of that conversation; `/new` starts a fresh one. Each turn's own result line is exact.
-17. The interactive shell needs a real terminal (it refuses to start otherwise) and has been tested in
-    pseudo-terminals at 160×46 and 72×24; it is a line-oriented UI, not a full editor (no mouse, no syntax
-    highlighting).
 20. **HUD text edge cases**:
     - bidi overrides and isolates are removed from all displayed text; the plain marks (LRM/RLM) are kept;
     - ZWJ emoji sequences, flags and skin-tone modifiers are counted wider than terminals that join them draw
@@ -338,8 +426,9 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
     account's), an ancestor of it, or overlap `~/.cline`, `~/.ssh`, `~/.gnupg`, `~/.config`, `~/.cache`,
     `~/.local/share`, `~/.local/state`, shell histories and rc files or another credential store, and the
     launch fails rather than run with a wider view. `--share` takes a dependency directory only (never `.git`
-    or `.env`). Toolchains elsewhere (`~/.cargo`, a virtualenv) must be added to
-    `sandbox.allowRead`.
+    or `.env`). Toolchains elsewhere (`~/.cargo/bin` and `~/.rustup`, a virtualenv) must be added to
+    `sandbox.allowRead`; a directory that contains a credential store (`~/.cargo` itself, which holds
+    `~/.cargo/credentials`) is refused.
 22. **Not isolated by the sandbox** (the kernel interfaces bubblewrap leaves open): there is no seccomp filter, so
     system calls such as `keyctl` (the user's kernel keyring), `io_uring`, `perf_event_open` and `bpf` are
     available subject to the host's own settings; there are no memory, CPU or process-count limits; a worker can

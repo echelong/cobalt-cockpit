@@ -1,6 +1,6 @@
 # Privacy
 
-This policy describes what Cobalt Cockpit v0.6.0 observes, what it keeps, where it keeps it, how long it stays, how to remove it, and what can reach a model. It is written from the plugin's source. Where the plugin gives no guarantee, this page says so rather than implying one. Last updated 2026-10-12.
+This policy describes what Cobalt Cockpit v0.6.0 observes, what it keeps, where it keeps it, how long it stays, how to remove it, and what can reach a model. It is written from the plugin's source; its last section, [Cobalt Cockpit for Cline](#cobalt-cockpit-for-cline), is written from the separate Cline adapter's source. Where either gives no guarantee, this page says so rather than implying one. Last updated 2026-11-06.
 
 [SECURITY.md](SECURITY.md) covers the guards, process access and vulnerability reporting. This page covers data.
 
@@ -12,6 +12,7 @@ This policy describes what Cobalt Cockpit v0.6.0 observes, what it keeps, where 
 - It keeps session state in Claude Code's memory and saves two kinds of record on disk: a bounded record of each session, the Run Ledger, in the key-value store file that Claude Code manages for the plugin, and, with `telemetry` on (the default), a small local usage record in files of its own under your state directory (`~/.local/state/cobalt-cockpit/telemetry/` unless `XDG_STATE_HOME` is set). The two are bounded, kept and deleted under different rules; see [What is kept, and where](#what-is-kept-and-where) and [Retention](#retention).
 - Some of what it observes is added to the request Claude Code already sends to your model provider. Apart from the JEV router you may select for a session, that is the only route by which anything Cockpit observed leaves your machine, and it is listed below.
 - There is no command that erases the saved ledgers or the telemetry files. Removing them is a manual step, described under [Deleting your data](#deleting-your-data).
+- These points describe the Claude Code plugin. The separate Cline adapter in `cline/` sends model requests through Cline's API and keeps the request bodies (up to 64 KiB each) locally: see [Cobalt Cockpit for Cline](#cobalt-cockpit-for-cline).
 
 ## What Cockpit observes
 
@@ -214,6 +215,47 @@ Cockpit starts a small set of local programs: `git` (read-only commands for the 
 - It does not store, log, export or transmit credential values. The eight authentication variables are read only to test whether each is set.
 - It does not write outside two places: Claude Code's plugin store, and its own telemetry directory under your state directory. It writes nothing into a project and nothing into Claude Code's settings.
 - It does not sell or share data, because it holds none outside your machine.
+
+## Cobalt Cockpit for Cline
+
+Everything above describes the Claude Code plugin. The Cline adapter in [`cline/`](cline/README.md) is a separate program with different data handling, and the plugin's statements above (no network requests of its own, two places it writes, no credential values stored) **do not apply to it**. This section is written from the adapter's source as of Cline CLI 3.0.74; where the adapter gives no guarantee, it says so.
+
+### What leaves your machine
+
+- **Model requests, by design.** Every task is run by a `cline` worker that sends model requests to Cline's API (`https://api.cline.bot`), which passes them to the model provider behind the routed model (DeepSeek, Moonshot AI, Xiaomi, Alibaba's Qwen or Zhipu AI's GLM with the default roles). A request carries the task and its instructions, the bounded conversation transcript of the interactive shell (about 6 000 characters), results of the tasks it depends on, and whatever the worker read or ran in its worktree: source files, command output, test output. What Cline and those providers do with it is governed by their own terms; the adapter cannot change or verify it.
+- **Cline's start-up requests.** Model lists, recommended models and your Cline remote configuration (`GET` requests to the same API), made by each worker.
+- **Sign-in refresh.** When your access token is about to expire, the host-side broker sends your refresh token to Cline's API (`POST /api/v1/auth/refresh`) and stores the answer, as Cline itself would.
+- **The model catalog is read locally.** The supervisor reads model ids, reasoning levels and prices from the installed Cline package (a bundled file with no network code in Cline 3.0.74).
+- **Nothing else from a worker.** The broker allows only those requests, to that one host (unless the environment you start Cockpit in sets the test hook `COCKPIT_BROKER_UPSTREAM`; see [SECURITY.md](SECURITY.md#the-credential-broker)). Other requests a worker's Cline makes (to other hosts or paths, including any telemetry endpoint) are refused, not sent, and recorded as refused up to a bounded number of records.
+- **No telemetry of its own.** The adapter sends no analytics, usage statistics or crash reports to its authors or anyone else. Gates run with no network.
+
+The adapter does not scan content before it is sent. A secret that is committed to your repository, printed by a command, or pasted into a message can be read by a worker and sent to the model provider. Workers can read the repository's whole history through its read-only Git directory, so this includes a secret in any branch, tag, stash or past commit, not only in the current files. Keep secrets out of the repository and out of your messages. An untracked file in your checkout, such as a local `.env`, is not in the worker's worktree, which is created from your commits.
+
+### What is kept on your machine
+
+Under the state directory (`$XDG_STATE_HOME/cobalt-cockpit-cline`, by default `~/.local/state/cobalt-cockpit-cline`, or `COCKPIT_CLINE_STATE`), created with mode 0700:
+
+- **Per mission** (`missions/<id>/`): the mission header and live state, the report, the hash-chained ledger of every routing decision, admission, failure, retry, gate and verdict (it also holds the mission's goal and each task's prompt, up to 2 000 characters each), a paginated archive, and, for the interactive shell, the conversation transcript (`conversation.jsonl`: your messages and the workers' answers).
+- **Per attempt** (`missions/<id>/runs/<task>/<n>/`): the full prompt given to the worker (`prompt.txt`), the exact command line, the task's policy, Cline's JSON event stream (the model's output, tool calls and their arguments), stderr, the hook log, gate logs with SHA-256 digests, the broker's request log (`broker.jsonl`: time, method, path, status, model, effort, request size, reported tokens and cost, the thinking switch and refusal reasons; no bodies and no headers), and **Cline's wire captures: the full bodies of the model requests**, which contain your prompts, the conversation and the code and output the worker read, including any secret in them. Cline shortens a body over 64 KiB to a preview, its size and its SHA-256. The attempt's disposable home and Cline data directory, with whatever Cline stored there, are kept with it.
+- **Worktrees** (`worktrees/`): each task's working copy of your repository, with the changes the worker made, kept for inspection.
+
+In your repository: the branch `cockpit/<mission>` with one commit per verified task, created with your own Git identity, and Cockpit's claim records in the repository's Git directory (`.git/cobalt-cockpit-cline/`).
+
+Optional user configuration is read from `~/.config/cobalt-cockpit-cline/config.json` and never written.
+
+### Credentials
+
+- **Your real sign-in stays on the host.** The broker reads it from `~/.cline/data/settings/providers.json` and adds it only to requests it forwards. A worker's Cline sees only a fake token, so nothing a worker writes (its stream, captures, logs or worktree) can contain your real token. The broker's log records no headers.
+- **The adapter changes your credentials in one case:** after a refresh it writes the new token into `providers.json` (only that provider's entry changes) and keeps credential copies next to it, all mode 0600: the previous file as `providers.json.cockpit-backup`, the server's answer as `providers.json.cockpit-refresh-<provider>`, and answers that were applied or superseded moved aside with a time stamp (the newest three per provider kept). It also creates lock files there (`providers.json.oauth-<hash>.lock`, `providers.json.cockpit-write.lock`), which hold no secrets. These copies contain access and refresh tokens. [SECURITY.md](SECURITY.md#sign-in-refresh-and-its-concurrency-risks) describes the risks.
+- Error messages about an unreadable or corrupt `providers.json` never quote its content.
+
+### Retention and deletion
+
+Missions, attempts, captures, worktrees and ledgers are never deleted automatically: they stay until you remove them, and an archive or ledger is never trimmed to save space. The one automatic deletion is of saved refresh answers beyond the newest three (below). There is no delete command. To remove a mission's data:
+
+1. End it first: quit the interactive shell, or start a fresh conversation with `/new` so the old one is closed. Make sure no `cockpit-cline` process is running for it.
+2. Delete its directory under `missions/` and its worktrees under `worktrees/`, then run `git worktree prune` in your repository, and delete the `cockpit/<mission>` branch if you no longer want it.
+3. If the mission was not finished or closed, the repository still holds its marker (`.git/cobalt-cockpit-cline/missions/<id>.json`), and no new mission starts there until you run `cockpit-cline recover --lost <id> --repo <repository>`. `cockpit-cline doctor --repo <repository>` lists such missions. The credential copies in `~/.cline/data/settings` are yours to delete once you are signed in and Cline works; deleting the saved refresh answer while a refresh is in progress can cost you the sign-in. Cline's own data in `~/.cline` outside these files, and data held by Cline's service and the model providers, are outside the adapter.
 
 ## Changes and contact
 

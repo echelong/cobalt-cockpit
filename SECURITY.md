@@ -2,6 +2,8 @@
 
 Cobalt Cockpit runs as a Claude Code mod with your user privileges. It may observe tool calls, file paths, agent events/descriptions, requested and observed model IDs, token/context telemetry, Git state, verification results and submitted task text. The dashboard makes no model calls or independent network requests.
 
+Everything on this page up to [Cobalt Cockpit for Cline](#cobalt-cockpit-for-cline) describes the Claude Code plugin. The Cline adapter in `cline/` is a separate program with a different security model, described in that section: unlike the plugin, it starts processes that reach the network.
+
 ## Local persistence
 
 The host's plugin store holds sound/HUD preferences, up to eight bounded Run Ledgers, release-review records (commit ids), the Stop-hook verification guard's check records (outcome, exit code, a short fingerprint hash and up to six lines of the enrolled script's output, passed through the credential patterns) and script enrollments (project path, script path, sha-256 of the script). Ledgers include identifiers, tool/path metadata, counts, timings, model usage, sanitized NobodyWho receipts, successful bounded edit/write snapshots, deterministic checkpoints and, with `guardAlerts` on, alert outcomes. Checkpoints can contain explicit task goals, milestone labels and blockers; treat the store as private. Task and HUD state also survive hot reload within the session. Cockpit does not control Claude Code's own transcript retention.
@@ -89,6 +91,57 @@ An admitted Sonnet-led Opus consultation binds its `[task:ID]` and host agent id
 Command safety and repository hygiene use recognizable syntax and user confirmation. They are not a sandbox or an exhaustive security boundary. Verification records observations and user/agent-reported evidence; it cannot guarantee code correctness. Keep Claude Code permission controls enabled.
 
 Owner alerts are advisory. Quiet hours and `guardNotifyKinds` are your decision not to be notified: an alert that is deferred or whose kind is off is shown only on the HUD and by `/cockpit guard` until the window ends, and nobody is told if no one is looking. A critical (`security-failure`) alert is deferred only if you set `guardQuietCritical` to `defer`. None of these settings changes a gate, a hold, a review or a release approval, and they are accepted only from you in the config menu, never from a plugin or a model. Quiet hours trust the machine's clock and time-zone data; a zone or window that cannot be read turns them off rather than holding an alert back.
+
+## Cobalt Cockpit for Cline
+
+The adapter in [`cline/`](cline/README.md) is a supervisor you start yourself (`cline/bin/cockpit-cline`). It runs on the host with your user privileges, starts stock `cline` processes as workers, and runs your gate commands. The Claude Code plugin does not load or start it. Linux only; developed and tested on Fedora with bubblewrap 0.12.0 and Cline CLI 3.0.74. The full list of known limitations is [cline/README.md, Limitations](cline/README.md#limitations); this section summarises the boundary and what it does not cover.
+
+### The sandbox
+
+Every worker and every gate command runs in bubblewrap (`bwrap`, 0.8 or later). Cockpit refuses to run anything when `cockpit-cline doctor` cannot establish this sandbox; there is no weaker fallback.
+
+- **No host root.** The sandbox root is an empty tmpfs, remounted read-only once the mounts below are in place. Read-only: `/usr`, an allowlist of `/etc` (users and groups, name service, the dynamic linker, certificate stores, time zone; not `/etc/gitconfig`), the Node installation that runs Cline, Cockpit's own hook code, and the repository's Git directory, whose `config` is replaced by a stripped copy without remotes, credential helpers, hooks or commands. Writable: the task's own worktree for a write task (read-only for a read-only task; its `.git` link stays read-only), the writable part of the attempt's run directory, a disposable `HOME` with a disposable Cline data directory, and empty tmpfs mounts at `/tmp`, `/var/tmp` and `/run`.
+- **Namespaces.** User, pid, ipc, uts, network and, where available, cgroup namespaces; nested user namespaces are disabled (`--disable-userns`, asserted). The environment is cleared and rebuilt. The sandbox dies with its supervisor (`--die-with-parent`) and runs in a new session.
+- **Network.** A worker's network namespace has loopback only. Its one way out is the credential broker below, reached through a forwarder inside the sandbox and a read-only bound unix socket. Gates have no network at all.
+- **Mount checks.** The host paths whose location depends on your system or your settings, namely the Node installation, the repository's Git directory, your `sandbox.allowRead` paths, `--share` directories and a `cline` binary given by path, are checked on their real path first and refused if they are the root, a system tree, a home directory or an ancestor of one, or if they overlap a credential or private-state location (`~/.cline`, `~/.ssh`, `~/.gnupg`, `~/.config`, `~/.local/share`, `~/.local/state`, shell histories and others). The launch fails rather than run with a wider view. Cockpit's own code and the paths it creates for the attempt (the run directory, the worktree and the disposable home in its state directory, and the broker's socket directory, a fresh private temporary directory) are mounted without that check.
+- **Process accounting.** Each worker is its own pid namespace; ending it ends every process in it, detached ones included. Ownership of the task's files is released only after a census of the namespace finds nothing left.
+- **Second layers.** A Cline `PreToolUse` hook refuses tools outside the task's allowlist, agent launchers, and Git commands that change history, branches, remotes or configuration (`commit`, `push`, `fetch`, `checkout`, `branch`, `config` and others); the supervisor's GIT gate re-checks the diff's scope. These are layers inside the sandbox, not the boundary.
+
+`cline/test/isolation.spec.ts` (53 tests) attacks this boundary from inside a real sandbox, as shell commands with no hook in the way, and tests the broker and the sign-in refresh on the host: other repositories and `.env` files, the real home and Cline data, local services and sockets, the internet, the broker's limits, symbolic links, `/proc`, mounts, nested namespaces, privilege tools, persistence outside the worktree and surviving descendants. GitHub Actions does not run these tests; run them locally with `cline/scripts/test.sh` (they need a working bubblewrap).
+
+### The credential broker
+
+Your real Cline sign-in never enters a sandbox. Each attempt's disposable Cline data directory holds only the routed provider, with a fake token. A host-side broker, one per attempt:
+
+- accepts exactly four requests: `POST /api/v1/chat/completions`, and `GET /api/v1/ai/cline/recommended-models`, `/api/v1/users/me/remote-config` and `/api/v1/models`, and forwards them only to `https://api.cline.bot`, replacing the fake token with the real one (the supervisor's own environment can redirect this with `COCKPIT_BROKER_UPSTREAM`, a test hook limited to an `https` origin or a loopback `http` one; a worker cannot set it, but anyone who controls the environment you start Cockpit in can send your token elsewhere);
+- accepts a model turn only for the routed model, with exactly the routed reasoning effort (or thinking on for a toggle model), and with only the request fields Cline uses; the body it checked is the body it sends, and for a streamed turn, which is how Cline sends them, it always asks the API to report usage;
+- refuses everything else: other paths and hosts, other models and efforts, the authentication endpoints, fallback model lists;
+- enforces the attempt's cost and token budget from the usage the API returns, stops an attempt whose accepted turns report no usage (unless `budgets.allowUnmetered` is on), caps an attempt at 600 requests and 4 in flight, stops it after more than 5000 refused requests, and bounds its own log;
+- records every request it carried, and refused ones up to a bound (time, method, path, status, model, effort, request size, the tokens and cost the API reported, the thinking switch and a refusal's reason; no bodies and no headers) in `broker.jsonl` in the attempt's run directory.
+
+Only the `cline` and `cline-pass` providers can be brokered; a role on any other provider fails before its worker starts, and is never run with exposed credentials. What a worker sends inside an allowed model turn (prompts, and code it has read) does reach the model provider: that is the model's job, and the broker does not inspect content for secrets. A worker can therefore send anything it can read to the routed model: its worktree, and, through the read-only Git directory, the repository's entire history (every branch, tag, stash and reflog entry). A secret committed to any branch or past commit is readable by every worker.
+
+### Sign-in refresh and its concurrency risks
+
+When the access token is within five minutes of expiry, the broker refreshes it on the host the way Cline does (`POST /api/v1/auth/refresh`) and writes the new token into `~/.cline/data/settings/providers.json`. That refreshed entry is the only change the adapter makes to your credentials; in the same directory it also creates lock files (no secrets) and the credential copies listed below. To make that safe alongside Cline itself and other supervisors:
+
+- the refresh runs under Cline's own per-provider lock file, and the rewrite of `providers.json` also takes Cockpit's own lock (`providers.json.cockpit-write.lock`); the file is re-read just before the write and only the refreshed provider's entry changes;
+- the server's answer is saved first (`providers.json.cockpit-refresh-<provider>`, 0600) and applied later only for the same sign-in and within 24 hours; once the server has answered, any failure latches, so a supervisor never sends a possibly single-use refresh token twice. The latch is held in memory: if even the saved answer could not be written and the supervisor then restarts, a later run can send the old refresh token again;
+- the previous `providers.json` is kept as `providers.json.cockpit-backup` (0600), and a saved answer, once applied or superseded, is moved aside with a time stamp (the newest three per provider kept).
+
+Residual risks, documented rather than solved:
+
+- **Mutual exclusion holds only with programs that take the same lock.** It was checked against Cline CLI 3.0.74. Another tool that rewrites `providers.json` without that lock, or a future Cline that changes its locking, could race with a refresh. If both sides used the same single-use refresh token, the provider could invalidate the sign-in, and you would need to run `cline auth` again. A sign-in you complete while a refresh is running wins over the refresh.
+- **Credential copies on disk.** The backup, the saved answer and the moved-aside copies hold access and refresh tokens. They are written with mode 0600 in Cline's own settings directory, but they are additional copies of your credentials. Only moved-aside answers beyond the newest three are deleted automatically; the backup and the newest copies stay until you remove them.
+- **A crash at the wrong moment.** If the supervisor dies after the server answered and before the save, the saved answer restores the new token on the next refresh within 24 hours; after that it is moved aside, and you may have to sign in again.
+
+### What the sandbox does not cover
+
+- **Kernel interfaces.** There is no seccomp filter, so system calls such as `keyctl` (your kernel keyring), `io_uring`, `perf_event_open` and `bpf` are available subject to the host's own settings. `/proc` is the sandbox's own but still shows kernel information. A kernel or bubblewrap vulnerability is outside what Cockpit can defend against.
+- **Resources.** There are no memory, CPU, process-count or disk limits and no cgroup: a worker or gate can exhaust memory, fork heavily, or fill its tmpfs or the disk. Admission checks free memory and load before starting more workers, which does not limit a worker that is already running.
+- **Evidence written inside the sandbox.** A worker's event stream, Cline's wire captures and the cost Cline reports are written by processes in the sandbox and can be forged by an adversarial model. Gates, the scope check and the process census run outside it, and the model and effort of every request are recorded by the broker on the host.
+- **Gates run code the worker wrote.** They have no network and their side effects are re-checked before anything is committed, but they execute with the same sandbox view as a worker.
+- **What you mount.** `sandbox.allowRead` and `--share` widen what workers and gates can read. Cockpit refuses known credential locations, not every path that might hold a secret.
 
 ## Reporting a vulnerability
 

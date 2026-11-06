@@ -1,5 +1,13 @@
 # Cobalt Cockpit for Cline: architecture audit, compatibility matrix and risk register
 
+> **Historical record.** This is the development log of the adapter, kept as written while it was built on the
+> `cline-adapter` branch (merged into `main` as `512c8f6`). Early sections, including the risk register in
+> section 5, describe the design before the default-deny sandbox and the credential broker of section 6a; some
+> risks listed there as open (no network namespace, workers reading `~/.cline/data`, reachable abstract sockets)
+> were closed later in this document. For the current behaviour and limitations, read
+> [README.md](../README.md#limitations), [configuration.md](configuration.md) and the repository's
+> [SECURITY.md](../../SECURITY.md#cobalt-cockpit-for-cline).
+
 Stage A record for the `cline-adapter` branch, 2026-11-05. Base: `main` at `4e3b90a`. Installed host under test:
 Cline CLI 3.0.74 (`@cline/sdk`, `@cline/core`, `@cline/agents`, `@cline/llms`, `@cline/shared` 0.2.0), Node 24,
 bubblewrap, Fedora. Labels: **OBS** observed on this host, **DOC** upstream documentation, **SRC** read in the

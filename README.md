@@ -9,6 +9,7 @@
   <a href="#explore-commands">Commands</a> ·
   <a href="#safety-and-trust">Safety</a> ·
   <a href="#capabilities-at-a-glance">Disclosures</a> ·
+  <a href="#cobalt-cockpit-for-cline">Cline</a> ·
   <a href="#deep-documentation">Docs</a>
 </p>
 
@@ -27,6 +28,10 @@ claude plugin install cobalt-cockpit@cobalt-cockpit
 ```
 
 Restart Claude Code and open `/cockpit`. Requirements, first run and options: [Quick start](#quick-start).
+
+**Also in this repository: Cobalt Cockpit for Cline.** A separate, experimental, Linux-only terminal supervisor for
+the Cline CLI, in [`cline/`](cline/README.md). It is not part of the Claude Code plugin above and is not installed
+or enabled by it: see [Cobalt Cockpit for Cline](#cobalt-cockpit-for-cline).
 
 ## System overview
 
@@ -837,6 +842,25 @@ Your global router configuration is untouched, so nothing else on the machine re
 
 What a router may recommend, how Cockpit's rules judge its answer, what was measured, and the read-only NobodyWho telemetry (`localControl`): [docs/session-router.md](docs/session-router.md).
 
+## Cobalt Cockpit for Cline
+
+[`cline/`](cline/README.md) holds a second, separate program: a supervisor that runs the [Cline](https://github.com/cline/cline) CLI under Cobalt Cockpit's engine. It reuses the engine's pure modules from `hooks/` without changing them, and the Claude Code plugin does not load, start or depend on it. It is **experimental**, Linux only, and tested on Fedora against Cline CLI 3.0.74.
+
+- **Five model roles, deterministic routing.** Every task is routed by fixed rules to one of five configured roles, each pinned to a model in the installed Cline catalog: DeepSeek V4.1 Flash 1017 (`coder`, the default; `xhigh` requested, sent to the API as `max`), Kimi K3.1 Pro (`commander`), MiMo V2.6 Pro (`specialist`), Qwen3.8 Max 0902 (`frontend`) and GLM 5.3 Flash (`utility`). Every decision lists the rules that fired.
+- **Sandboxed workers.** Each worker is a stock `cline` process in bubblewrap, in its own Git worktree, with a disposable home and Cline data directory, its own user, pid and network namespaces, and a read-only allowlist of the host (system files, the Node runtime, the repository's Git objects): the rest of your home directory is not there. Its only network path is a host-side broker that allows four Cline API requests for the routed model and reasoning effort, enforces the budget from the API's own usage figures and keeps your real sign-in on the host.
+- **Verified, measured work.** Gates run outside the worker, a task is `DONE` only when they pass, work lands on a `cockpit/<mission>` branch for you to review and merge, and cost comes from Cline's reported usage, never invented.
+- **Its own HUD.** `cockpit-cline` opens an interactive terminal Cockpit with a live HUD and Mission Control.
+
+It needs Linux with bubblewrap 0.8 or later and unprivileged user namespaces, Node 24, Git, and a signed-in `cline` CLI. It is not a sandbox against kernel exploits, has no seccomp filter and sets no memory, CPU or process limits; [`cline/README.md`](cline/README.md#limitations) lists every known limitation.
+
+```sh
+git clone https://github.com/echelong/cobalt-cockpit.git ~/src/cobalt-cockpit
+~/src/cobalt-cockpit/cline/bin/cockpit-cline doctor     # must print: doctor: OK
+cd ~/code/your-repo && ~/src/cobalt-cockpit/cline/bin/cockpit-cline
+```
+
+Install, a `cline-cockpit` launcher, sandbox troubleshooting and usage: [cline/README.md](cline/README.md). Every setting: [cline/docs/configuration.md](cline/docs/configuration.md). Security model and data handling: [SECURITY.md](SECURITY.md#cobalt-cockpit-for-cline) and [PRIVACY.md](PRIVACY.md#cobalt-cockpit-for-cline).
+
 ## Deep documentation
 
 Nothing was dropped from the earlier README: the long sections live in topic files, and this page links to each.
@@ -851,6 +875,7 @@ Nothing was dropped from the earlier README: the long sections live in topic fil
 | Every option and default | [docs/configuration.md](docs/configuration.md) |
 | Development and release gates | [docs/development.md](docs/development.md) |
 | Privacy and security policies | [PRIVACY.md](PRIVACY.md) · [SECURITY.md](SECURITY.md) |
+| Cobalt Cockpit for Cline: install, usage, limitations, configuration, architecture audit | [cline/README.md](cline/README.md) · [cline/docs/configuration.md](cline/docs/configuration.md) · [cline/docs/architecture-audit.md](cline/docs/architecture-audit.md) |
 | Changes by version | [CHANGELOG.md](CHANGELOG.md) |
 | Implementation notes, release notes, delivery reports, submission preparation | [docs/README.md](docs/README.md) |
 | This page's artwork and demo | [docs/assets/README.md](docs/assets/README.md) |
