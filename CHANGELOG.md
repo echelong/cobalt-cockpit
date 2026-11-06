@@ -1,5 +1,11 @@
 # Changelog
 
+## Not in a release (manifest still 0.6.5) — Cobalt Cockpit for Cline: CI
+
+A workflow only (`.github/workflows/cline-adapter.yml`) and documentation; no adapter or plugin code changes.
+
+- **CI for the adapter.** A new `Cline adapter` workflow runs the typecheck and the offline suite with real bubblewrap on Ubuntu 24.04: read-only token, no secrets, actions pinned to commits, pinned and hash-checked Node, Cline, TypeScript and bubblewrap from the system package; it fails rather than skips when isolation cannot be established, on any skipped test and on leftover fixtures.
+
 ## Not in a release (manifest still 0.6.5) — Cobalt Cockpit for Cline: credential broker and executable hardening
 
 The Cline adapter only (`cline/`), plus its documentation in `SECURITY.md` and `PRIVACY.md`. The Claude Code plugin, `cline/config/default.json` and configuration fingerprints are unchanged.
