@@ -13,6 +13,7 @@ import type { ModelInfo, Resolution } from '../src/catalog.ts'
 import { ROLES } from '../src/core/engine.ts'
 import type { Role } from '../src/core/engine.ts'
 import { runWorker } from '../src/worker.ts'
+import { setTestSeams } from '../src/seams.ts'
 import { Mission } from '../src/supervisor.ts'
 import type { Deps, TaskRecord } from '../src/supervisor.ts'
 import type { GateSpec } from '../src/gates.ts'
@@ -23,13 +24,16 @@ export const HERE = dirname(fileURLToPath(import.meta.url))
 /**
  * A stand-in for the Cline API on loopback, used by every broker in this test process (and by shells it
  * starts): model turns get a small JSON answer with token usage and no cost, so the stream's own figures stay
- * the ones under test. Requests are kept for assertions.
+ * the ones under test. Requests are kept for assertions. Shells a test starts reach it through their own entry point
+ * (fixtures/cli-under-test.ts), which sets the same seam from its arguments.
  */
 export const API_SEEN: { method: string; url: string; authorization: string | undefined; body: string }[] = []
 const api = createServer((req, res) => { let body = ''; req.on('data', c => { body += c }); req.on('end', () => { if (API_SEEN.length < 5000) API_SEEN.push({ method: req.method ?? '', url: req.url ?? '', authorization: req.headers.authorization, body: body.slice(0, 2000) }); res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ id: 'standin', choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } })) }) })
 api.listen(0, '127.0.0.1'); api.unref()
 await new Promise<void>(r => api.once('listening', () => r()))
-process.env.COCKPIT_BROKER_UPSTREAM = `http://127.0.0.1:${(api.address() as { port: number }).port}`
+/** The stand-in's origin; every broker in this process uses it through the test seam (never an environment variable). */
+export const STANDIN = `http://127.0.0.1:${(api.address() as { port: number }).port}`
+setTestSeams({ brokerUpstream: STANDIN })
 export const FAKE = join(HERE, 'fixtures', 'fake-cline.mjs')
 
 export const tmp = (name: string): string => mkdtempSync(join(process.env.COCKPIT_TEST_TMP ?? tmpdir(), `ccl-${name}-`))

@@ -210,8 +210,50 @@ export type Identity = { supervisor: ProcessIdentity; outer: ProcessIdentity; in
 
 export type Launched = { child: ChildProcess; identity: Promise<Identity> }
 
+/**
+ * Why the executable or file at `p` cannot be trusted to run (or be loaded) with the person's privileges, or null.
+ * Judged on its real path (symlinks resolved): a regular file owned by one of `owners`, not writable by group or
+ * others, in directories that are all, up to /, owned by one of `owners` and not writable by group or others (so
+ * nobody else can replace it or anything it sits in).
+ */
+export const trustedFileProblem = (p: string, owners: readonly number[], o: { executable?: boolean } = {}): string | null => {
+  let r: string; try { r = realpathSync(p) } catch { return `${p} does not exist` }
+  const who = (uid: number): string => uid === 0 ? 'root' : `uid ${uid}`
+  const allowed = owners.map(who).join(' or ')
+  let st; try { st = statSync(r) } catch (e) { return `${r} cannot be inspected (${(e as NodeJS.ErrnoException).code ?? 'error'})` }
+  if (!st.isFile()) return `${r} is not a regular file`
+  if (o.executable && !(st.mode & 0o111)) return `${r} is not executable`
+  if (!owners.includes(st.uid)) return `${r} is owned by ${who(st.uid)}, not ${allowed}`
+  if (st.mode & 0o022) return `${r} is writable by group or others`
+  for (let d = dirname(r); ; d = dirname(d)) {
+    let ds; try { ds = statSync(d) } catch { return `${d} cannot be inspected` }
+    if (!owners.includes(ds.uid)) return `${d} (above ${r}) is owned by ${who(ds.uid)}, not ${allowed}`
+    if (ds.mode & 0o022) return `${d} (above ${r}) is writable by group or others`
+    if (d === '/') break
+  }
+  return null
+}
+/**
+ * Where a system bubblewrap may be: installed by the system's package manager, owned by root. Never looked up on
+ * PATH and never taken from the environment: a bubblewrap someone else could replace could run workers without
+ * any isolation.
+ */
+export const BWRAP_CANDIDATES: readonly string[] = ['/usr/bin/bwrap', '/bin/bwrap', '/usr/local/bin/bwrap', '/run/current-system/sw/bin/bwrap']
+/** The real path of the first trusted bubblewrap (root-owned, see trustedFileProblem); refuses when there is none. */
+export const trustedBwrap = (candidates: readonly string[] = BWRAP_CANDIDATES): string => {
+  const problems: string[] = []
+  for (const c of candidates) {
+    if (!existsSync(c)) continue
+    const why = trustedFileProblem(c, [0], { executable: true })
+    if (!why) return realpathSync(c)
+    problems.push(why)
+  }
+  throw new Error(`no trusted bubblewrap: ${problems.length ? problems.join('; ') : `none of ${candidates.join(', ')} exists`}; install bubblewrap with the system package manager`)
+}
+
 /** Starts `argv` inside the sandbox. The identity resolves once bwrap reports its init pid. */
-export const launch = (s: SandboxSpec, argv: string[], bwrap = process.env.COCKPIT_CLINE_BWRAP ?? 'bwrap'): Launched => {
+export const launch = (s: SandboxSpec, argv: string[]): Launched => {
+  const bwrap = trustedBwrap()
   const child = spawn(bwrap, [...bwrapArgs(s), '--', ...argv], {
     stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
     // bwrap itself needs only PATH; the sandboxed process gets the cleared environment built above
@@ -237,10 +279,12 @@ export const launch = (s: SandboxSpec, argv: string[], bwrap = process.env.COCKP
 }
 
 /** Whether the full isolation this module asks for can be established here (doctor, readiness). */
-export const bwrapAvailable = (bwrap = process.env.COCKPIT_CLINE_BWRAP ?? 'bwrap'): Promise<{ ok: boolean; detail: string }> => new Promise(resolve => {
+export const bwrapAvailable = (): Promise<{ ok: boolean; detail: string }> => new Promise(resolve => {
+  let bwrap: string
+  try { bwrap = trustedBwrap() } catch (e) { resolve({ ok: false, detail: (e as Error).message }); return }
   const c = spawn(bwrap, ['--unshare-user', '--unshare-pid', '--unshare-net', '--disable-userns', '--assert-userns-disabled', ...osMounts(), '--remount-ro', '/', '--', '/usr/bin/true'], { stdio: ['ignore', 'ignore', 'pipe'] })
   let err = ''
   c.stderr?.on('data', d => { err += d })
   c.on('error', e => resolve({ ok: false, detail: e.message }))
-  c.on('exit', code => resolve(code === 0 ? { ok: true, detail: 'bubblewrap: allowlisted root, user/pid/net namespaces, nested user namespaces disabled' } : { ok: false, detail: `bwrap exit ${code}: ${err.trim().slice(0, 200)}` }))
+  c.on('exit', code => resolve(code === 0 ? { ok: true, detail: `bubblewrap ${bwrap}: allowlisted root, user/pid/net namespaces, nested user namespaces disabled` } : { ok: false, detail: `bwrap exit ${code}: ${err.trim().slice(0, 200)}` }))
 })

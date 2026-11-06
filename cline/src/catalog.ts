@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { Role } from './core/engine.ts'
 import type { RoleSpec } from './config.ts'
+import { runtimeRoots, trustedFileProblem } from './sandbox.ts'
 
 export type ModelInfo = {
   id: string; name?: string; contextWindow?: number; maxTokens?: number
@@ -19,14 +20,33 @@ export type Catalog = {
   models: (provider: string) => Promise<Record<string, ModelInfo> | null>
 }
 
-/** The cline package root behind the `cline` on PATH (or COCKPIT_CLINE_CATALOG_BIN). Worker binaries (COCKPIT_CLINE_BIN) never change the catalog. */
-export const clinePackageRoot = (bin = process.env.COCKPIT_CLINE_CATALOG_BIN ?? 'cline'): string => {
-  const path = bin.includes('/') ? bin : (process.env.PATH ?? '').split(':').filter(Boolean).map(d => join(d, bin)).find(p => existsSync(p))
-  if (!path) throw new Error(`cline not found on PATH (${bin})`)
-  return dirname(dirname(realpathSync(path)))
+/**
+ * The installed Cline that Cockpit trusts, found where a worker's sandbox finds it: in the Node runtime that runs
+ * Cockpit, else /usr/local/bin or /usr/bin. Never chosen by an environment variable or by the host's PATH. Its
+ * package is imported into this (trusted) process to read the model catalog, and workers run exactly this file, so
+ * it must be owned by the person or by root and writable by nobody else, nor may anything it sits in be
+ * (sandbox.ts trustedFileProblem). `bin` is its real path; `root` the package directory.
+ */
+export const trustedCline = (candidates: readonly string[] = [...runtimeRoots().map(r => join(r, 'bin', 'cline')), '/usr/local/bin/cline', '/usr/bin/cline']): { bin: string; root: string } => {
+  const owners = [process.getuid?.() ?? -1, 0]
+  const problems: string[] = []
+  for (const c of candidates) {
+    if (!existsSync(c)) continue
+    const why = trustedFileProblem(c, owners, { executable: true })
+    if (why) { problems.push(why); continue }
+    const bin = realpathSync(c)
+    return { bin, root: dirname(dirname(bin)) }
+  }
+  throw new Error(`no trusted cline: ${problems.length ? problems.join('; ') : `none of ${candidates.join(', ')} exists`}; install it with \`npm install -g cline\` under the Node that runs Cockpit`)
 }
 
-export const loadCatalog = async (root = clinePackageRoot()): Promise<Catalog> => {
+export const loadCatalog = async (root = trustedCline().root): Promise<Catalog> => {
+  // its code runs in this process, which holds the person's sign-in: it must be theirs (or root's) and nobody else's
+  const owners = [process.getuid?.() ?? -1, 0]
+  for (const f of [join(root, 'package.json'), join(root, 'node_modules', '@cline', 'llms', 'package.json'), join(root, 'node_modules', '@cline', 'llms', 'dist', 'models.js')]) {
+    const why = existsSync(f) ? trustedFileProblem(f, owners) : null
+    if (why) throw new Error(`the installed Cline cannot be trusted: ${why}`)
+  }
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { name: string; version: string }
   if (pkg.name !== 'cline') throw new Error(`unexpected package at ${root}: ${pkg.name}`)
   const llmsDir = join(root, 'node_modules', '@cline', 'llms')

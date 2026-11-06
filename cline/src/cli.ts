@@ -7,7 +7,7 @@ import { ROLES } from './core/engine.ts'
 import type { Role } from './core/engine.ts'
 import { loadConfig, rolesOf } from './config.ts'
 import type { Config } from './config.ts'
-import { loadCatalog, providerAuth, resolveRole } from './catalog.ts'
+import { loadCatalog, providerAuth, resolveRole, trustedCline } from './catalog.ts'
 import type { Catalog, Resolution } from './catalog.ts'
 import { planReasoning } from './reasoning.ts'
 import { routeTask, KINDS, RISKS } from './router.ts'
@@ -15,6 +15,7 @@ import type { TaskSpec } from './router.ts'
 import { pricingFor, usd } from './cost.ts'
 import { bwrapAvailable } from './sandbox.ts'
 import { ALLOWED, BROKERED_PROVIDERS, CLINE_API_ORIGIN } from './broker.ts'
+import { testSeams } from './seams.ts'
 import { DEFAULT_CLINE_DATA, runWorker } from './worker.ts'
 import { detectGates } from './gates.ts'
 import type { GateSpec } from './gates.ts'
@@ -76,8 +77,13 @@ const setup = async (a: Args): Promise<{ config: Config; catalog: Catalog; resol
   const resolutions = Object.fromEntries(await Promise.all(ROLES.map(async r => [r, await resolveRole(catalog, r, roles[r], config.unpinnedAllowed)] as const))) as Record<Role, Resolution>
   return { config, catalog, resolutions }
 }
+/**
+ * The Cline workers run: the trusted installed one (catalog.ts trustedCline), by its real path. Only a test, through
+ * its own entry point, can substitute a stand-in (seams.ts); it still runs only inside the sandbox.
+ */
+const workerCline = (): string => testSeams().clineBin ?? trustedCline().bin
 const deps = (a: Args, repoRoot: string): Deps => ({
-  clineBin: process.env.COCKPIT_CLINE_BIN ?? 'cline', clineDataDir: process.env.COCKPIT_CLINE_DATA ?? DEFAULT_CLINE_DATA, now: Date.now, runWorker,
+  clineBin: workerCline(), clineDataDir: process.env.COCKPIT_CLINE_DATA ?? DEFAULT_CLINE_DATA, now: Date.now, runWorker,
   shareDirs: (a.multi.share ?? []).map(s => shareDir(repoRoot, s)),
   log: l => process.stderr.write(`${l}\n`),
 })
@@ -265,7 +271,7 @@ const smoke = async (a: Args): Promise<number> => {
     const spec = rolesOf(config)[role]; const plan = planReasoning(spec.reasoning, res.reasoningValues, res.reasoningToggle)
     if (!plan.ok) { results.push({ role, ok: false, reason: plan.reason }); print(`${role}: ${plan.reason}`); failures++; continue }
     if (spent >= maxUsd) { print(`${role}: skipped, smoke budget $${maxUsd} used`); results.push({ role, ok: false, reason: 'smoke budget used' }); failures++; continue }
-    const out = await runWorker({ attemptId: `smoke-${role}-${Date.now()}`, runDir: join(dir, role), workdir: join(dir, 'repo'), writable: false, gitCommonDir: null, gitAdminDir: null, provider: res.provider, model: res.model, cliThinking: plan.cliFlag, expectedWire: plan.expectedWire, prompt: 'Reply with exactly the word OK and finish. Do not call any tool.', policy: { workdir: join(dir, 'repo'), owned: [], mode: 'read', allowedTools: config.tools.readOnlyAllowed }, timeoutSeconds: 120, clineRetries: 1, hide: config.sandbox.hide, allowRead: config.sandbox.allowRead, clineBin: process.env.COCKPIT_CLINE_BIN ?? 'cline', clineDataDir: process.env.COCKPIT_CLINE_DATA ?? DEFAULT_CLINE_DATA, budgetUsd: Math.min(0.1, maxUsd - spent), budgetTokens: 120_000, pricing: (() => { const p = pricingFor(config, res.model, res.info); return p.source === 'none' ? null : p.pricing })(), allowUnmetered: false })
+    const out = await runWorker({ attemptId: `smoke-${role}-${Date.now()}`, runDir: join(dir, role), workdir: join(dir, 'repo'), writable: false, gitCommonDir: null, gitAdminDir: null, provider: res.provider, model: res.model, cliThinking: plan.cliFlag, expectedWire: plan.expectedWire, prompt: 'Reply with exactly the word OK and finish. Do not call any tool.', policy: { workdir: join(dir, 'repo'), owned: [], mode: 'read', allowedTools: config.tools.readOnlyAllowed }, timeoutSeconds: 120, clineRetries: 1, hide: config.sandbox.hide, allowRead: config.sandbox.allowRead, clineBin: workerCline(), clineDataDir: process.env.COCKPIT_CLINE_DATA ?? DEFAULT_CLINE_DATA, budgetUsd: Math.min(0.1, maxUsd - spent), budgetTokens: 120_000, pricing: (() => { const p = pricingFor(config, res.model, res.info); return p.source === 'none' ? null : p.pricing })(), allowUnmetered: false })
     spent += out.facts.usage.reportedUsd ?? 0
     const ok = out.facts.finishReason === 'completed' && out.facts.reportedModel === res.model && out.wire.state === 'confirmed' && out.census.state === 'gone' && out.facts.usage.reportedUsd !== null
     if (!ok) failures++

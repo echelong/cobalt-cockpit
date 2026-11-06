@@ -3,7 +3,11 @@
 // sandbox; inside, forward.mjs maps 127.0.0.1:8899 to it. The worker's Cline is given a fake,
 // far-future token; the broker
 //   - accepts only GET/POST requests for paths under /api/v1/ (never /api/v1/auth/*), in origin form;
-//   - sends them to one fixed origin (the Cline API), never to a host the request names;
+//   - sends them to one fixed origin (the Cline API), never to a host the request names, and never follows or
+//     relays a redirect; no environment variable, flag or configuration can change that origin (tests use the
+//     loopback-only seam in seams.ts);
+//   - refuses to run when Node is told to skip certificate checks, trust extra certificate authorities, log TLS
+//     keys or send requests through a proxy taken from the environment: each would let a third party read the token;
 //   - replaces the fake token with the real one, read from the person's Cline settings on the host;
 //   - refreshes an expiring token itself, under the same SQLite lock Cline uses, and writes it back
 //     the way Cline does (a backup first), so the real credentials never enter a sandbox;
@@ -16,6 +20,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { DatabaseSync } from 'node:sqlite'
+import { loopbackOriginProblem, testSeams } from './seams.ts'
 
 export const BROKER_PORT = 8899
 export const CLINE_API_ORIGIN = 'https://api.cline.bot'
@@ -44,6 +49,7 @@ export type BrokerRecord = { at: string; method: string; path: string; status: n
   /** Usage the API reported in this response (filled in when the response ends). */ tokens?: number; usd?: number | null
   /** For a model turn: the reasoning.enabled it sent, or null when it sent none. */ reasoningEnabled?: boolean | null }
 export type Broker = { socketPath: string; socketDir: string; fakeToken: string; records: BrokerRecord[]
+  /** The origin this broker sends requests (and the real token) to: always the Cline API outside tests. */ upstream: string
   /** What this attempt used, as the API reported it to the broker: tokens, cost (usdKnown false when a response carried no cost), requests. */
   spent: BrokerSpent
   close: () => Promise<void> }
@@ -160,6 +166,8 @@ export const recoveryFile = (dataDir: string, provider: string): string => `${pr
  *    server error, a rate limit, a network failure or a lock timeout is a temporary failure and may be retried.
  */
 export const realToken = async (dataDir: string, provider: string, upstream: string, now: () => number = Date.now): Promise<string> => {
+  const bad = upstreamProblem(upstream); if (bad) throw new Error(`Cline token refresh: upstream refused: ${bad}`)
+  const origin = new URL(upstream).origin
   const key = `${dataDir}\0${provider}`
   const latch = (used: string): void => { const l = LATCHED.get(key); if (l && l.used === used) throw new SignInError(l.msg) }
   const first = await readAuth(dataDir, provider)
@@ -189,7 +197,8 @@ export const realToken = async (dataDir: string, provider: string, upstream: str
       }
       if (!tokens) {
         let r: Response
-        try { r = await fetch(`${upstream}/api/v1/auth/refresh`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: used, grantType: 'refresh_token' }), signal: AbortSignal.timeout(30_000), redirect: 'error' }) }
+        const unsafe = transportProblem(); if (unsafe) throw new Error(`Cline token refresh refused: ${unsafe}`)
+        try { r = await fetch(upstreamUrl(origin, '/api/v1/auth/refresh'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: used, grantType: 'refresh_token' }), signal: AbortSignal.timeout(30_000), redirect: 'error' }) }
         catch (e) { throw new Error(`Cline token refresh could not reach the server (${(e as Error).message}); temporary`) }
         const text = await r.text().catch(() => '')
         if (r.status >= 400 && r.status < 500 && r.status !== 429 && r.status !== 408) { const msg = `Cline token refresh was refused (${r.status}): run \`cline auth\` on the host`; LATCHED.set(key, { used, msg }); throw new SignInError(msg) }
@@ -241,13 +250,42 @@ export const realToken = async (dataDir: string, provider: string, upstream: str
 
 /** Top-level fields of a model turn, as Cline 3.0.74 sends them; any other field (fallback models, routing, plugins) is refused. */
 export const TURN_FIELDS: ReadonlySet<string> = new Set(['model', 'messages', 'tools', 'tool_choice', 'max_tokens', 'reasoning_effort', 'reasoning', 'stream', 'stream_options', 'cache_control', 'temperature', 'top_p', 'stop', 'parallel_tool_calls'])
-/** Where the broker may send the real token: the Cline API, or (tests) a stand-in on this machine's loopback. */
+/**
+ * Why the broker may not send the real token to `u`, or null. Only the Cline API itself (https, port 443) is allowed,
+ * or a test stand-in on loopback (an IP literal; see seams.ts). Judged on the parsed URL: a path, query, fragment,
+ * user name, other port or other host is refused, whatever form the string takes.
+ */
 export const upstreamProblem = (u: string): string | null => {
   let url: URL; try { url = new URL(u) } catch { return 'not a URL' }
-  if (url.pathname !== '/' || url.search || url.username || url.password) return 'an origin only (no path, query or credentials)'
-  if (url.protocol === 'https:') return null
-  if (url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) return null
-  return 'https, or http on loopback for tests'
+  if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) return 'an origin only (no credentials, path, query or fragment)'
+  if (url.origin === CLINE_API_ORIGIN) return null
+  return loopbackOriginProblem(u) ? `only ${CLINE_API_ORIGIN} (or a test stand-in on 127.0.0.1 or [::1])` : null
+}
+/** The URL for an API path on the checked upstream; refuses anything that would leave its origin. */
+const upstreamUrl = (origin: string, pathAndQuery: string): string => {
+  const url = new URL(pathAndQuery, origin)
+  if (url.origin !== origin || !pathAndQuery.startsWith('/') || pathAndQuery.startsWith('//')) throw new Error('request target leaves the provider origin')
+  return url.href
+}
+/** Upstream answers the broker never follows or passes on: a redirect could carry the request (and the token) elsewhere. */
+const REDIRECT = new Set([300, 301, 302, 303, 305, 307, 308])
+/** Node options that weaken TLS or route requests through a proxy, given on the command line or in NODE_OPTIONS. */
+const UNSAFE_NODE_FLAG = /(?:^|\s)--(?:use-env-proxy|tls-keylog|openssl-config)\b/
+/**
+ * Why this process cannot carry the real token safely, or null. Node reads these from the environment, and each lets
+ * a third party read requests to the Cline API: certificate checks turned off, extra or replaced certificate
+ * authorities or OpenSSL configuration, TLS session keys written to a file, or requests sent through a proxy named
+ * in the environment.
+ * bin/cockpit-cline clears them before Node starts; any other way of starting Cockpit with them set is refused.
+ */
+export const transportProblem = (env: NodeJS.ProcessEnv = process.env, execArgv: readonly string[] = process.execArgv): string | null => {
+  const set = (k: string): boolean => env[k] !== undefined && env[k] !== ''
+  if (env.NODE_TLS_REJECT_UNAUTHORIZED !== undefined && env.NODE_TLS_REJECT_UNAUTHORIZED !== '1') return 'NODE_TLS_REJECT_UNAUTHORIZED is set (it can turn off certificate checks)'
+  for (const k of ['NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'SSLKEYLOGFILE', 'NODE_USE_ENV_PROXY', 'OPENSSL_CONF']) if (set(k)) return `${k} is set (it changes which servers Node trusts or where its requests go)`
+  const opts = `${execArgv.join(' ')} ${env.NODE_OPTIONS ?? ''}`
+  const m = UNSAFE_NODE_FLAG.exec(opts)
+  if (m) return `Node runs with ${m[0].trim()} (it changes which servers Node trusts or where its requests go)`
+  return null
 }
 
 export type BrokerLimits = { budgetUsd?: number | null; budgetTokens?: number | null; maxRequests?: number; maxInflight?: number; allowUnmetered?: boolean; maxLogBytes?: number }
@@ -274,7 +312,10 @@ export type BrokerSpent = {
   usdKnown: boolean
 }
 
-/** Starts a broker for one worker. `upstream` is fixed by the host (tests point it at a local stand-in on loopback). */
+/**
+ * Starts a broker for one worker. Production never passes `upstream`: requests go to the Cline API. Tests pass a
+ * stand-in on loopback here, or set it through the test seam (seams.ts); anything else is refused.
+ */
 export const startBroker = async (o: { dataDir: string; provider: string; upstream?: string; log?: (r: BrokerRecord) => void
   /** The routed model: a model turn for any other model is refused (a worker cannot spend on a model it was not given). */ model?: string
   /** What the route may send as reasoning (see ReasoningRule); absent: not checked. A string is shorthand for { effort }. */ effort?: string | null
@@ -282,9 +323,11 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
   /** Called once when the broker stops carrying turns (budget, unmeasured, request flood): the worker stops at once. */ onStop?: (stop: { cls: 'budget' | 'unmetered'; detail: string }) => void
 } & BrokerLimits): Promise<Broker> => {
   if (!BROKERED_PROVIDERS.includes(o.provider)) throw new Error(`provider "${o.provider}" cannot be brokered: only ${BROKERED_PROVIDERS.join(', ')} are supported, and workers have no other network`)
+  const unsafe = transportProblem(); if (unsafe) throw new Error(`the credential broker will not run: ${unsafe}; unset it, or start Cockpit with bin/cockpit-cline, which clears it`)
   await readAuth(o.dataDir, o.provider) // fail before launch when there is no sign-in at all
-  const upstream = o.upstream ?? process.env.COCKPIT_BROKER_UPSTREAM ?? CLINE_API_ORIGIN
-  const bad = upstreamProblem(upstream); if (bad) throw new Error(`broker upstream ${upstream}: ${bad}`)
+  const asked = o.upstream ?? testSeams().brokerUpstream ?? CLINE_API_ORIGIN
+  const bad = upstreamProblem(asked); if (bad) throw new Error(`broker upstream ${asked}: ${bad}`)
+  const upstream = new URL(asked).origin
   const maxRequests = o.maxRequests ?? 600, maxInflight = o.maxInflight ?? 4
   const rule: ReasoningRule | null = o.reasoning ?? (o.effort ? { effort: o.effort } : null)
   const fakeToken = fakeJwt()
@@ -410,9 +453,16 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
         log(rec)
       }
       let up: Response
-      try { up = await fetch(`${upstream}${path}${query ? `?${query}` : ''}`, { method: req.method, headers, body, redirect: 'manual', signal: ac.signal }) } catch (e) { rec.status = 0; finish(); throw e }
+      try { up = await fetch(upstreamUrl(upstream, `${path}${query ? `?${query}` : ''}`), { method: req.method, headers, body, redirect: 'manual', signal: ac.signal }) } catch (e) { rec.status = 0; finish(); throw e }
       rec.status = up.status
       try {
+      // a redirect is neither followed nor passed on (its Location could name another host): the worker gets an error
+      if (REDIRECT.has(up.status) || up.type === 'opaqueredirect') {
+        rec.refused = `the provider answered ${up.status} (a redirect); never followed or relayed`
+        try { await up.body?.cancel() } catch { /* nothing to read */ }
+        res.writeHead(502, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'Cockpit broker: the provider answered with a redirect, which is never followed' } }))
+        finish(); return
+      }
       const out: Record<string, string> = {}
       up.headers.forEach((v, k) => { if (!HOP_OUT.has(k)) out[k] = v })
       res.writeHead(up.status, out)
@@ -439,7 +489,7 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(socketPath, () => resolve()) })
   chmodSync(socketPath, 0o600)
   return {
-    socketPath, socketDir, fakeToken, records, spent,
+    socketPath, socketDir, fakeToken, records, spent, upstream,
     // the counters are final only when no request is still being handled: wait briefly for those first
     close: async () => { const until = Date.now() + 2000; while (spent.inflight > 0 && Date.now() < until) await new Promise(r => setTimeout(r, 20)); await new Promise<void>(r => { server.closeAllConnections?.(); server.close(() => { try { rmSync(socketDir, { recursive: true, force: true }) } catch { /* gone */ } r() }) }) },
   }
