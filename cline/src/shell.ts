@@ -28,6 +28,8 @@ import type { OverlayState, Tab } from './ui/render.ts'
 
 export { stripAnsi }
 const ESC = '\x1b['
+/** A bracketed paste with no data for this long is over, even if its end marker was lost. */
+const PASTE_IDLE_MS = 2000
 
 // ---------------------------------------------------------------------------
 // Conversation state
@@ -73,6 +75,8 @@ export class Shell {
   private pasting = false
   /** The start of a paste-end marker a read ended in, kept until the next read completes or refutes it. */
   private pasteHold = ''
+  /** When the last stdin read arrived: a paste that has been quiet for PASTE_IDLE_MS is over. */
+  private pasteAt = 0
   // HUD 2.0: the real-event timeline, the ledger it tails, and the frame writer
   private timeline = new Timeline()
   private tail: LedgerTail | null = null
@@ -210,6 +214,8 @@ export class Shell {
     // the conversation is background (context); only this turn's own request is routed
     const context = turnContext(this.transcript, this.integratedFiles())
     this.record(user); this.view.push(...this.entryLines(user))
+    // text held from a previous turn's stream never flushes into this one
+    this.escHold.clear()
     this.turn = { id, lines: [], text: '', startedAt: Date.now(), endedAt: null }
     if (swarm) {
       const r = this.mission.addTask({ id: `${id}.plan`, title: `Commander plan: ${text.slice(0, 80)}`, kind: 'architecture', risk: 'medium', complexity: 4, mode: 'read', owned: ['*'], dependencies: [], prompt: plannerPrompt(turnRequest(text), await this.mission.repoSummary()), ...(context ? { context } : {}), priority: 9, depth: 0, parent: null }, 'interactive /swarm')
@@ -402,25 +408,47 @@ export class Shell {
   // ----- keyboard ----------------------------------------------------------------------------------
   private onKey(buf: Buffer): void {
     let s = this.pasteHold + buf.toString('utf8'); this.pasteHold = ''
-    const END = '\x1b[201~'
+    this.pasteAt = Date.now()
+    const START = '\x1b[200~', END = '\x1b[201~'
     while (s.length) {
       // a paste is text for the request until its end marker, however many reads it spans: its newlines never
-      // submit and its escape and control bytes are dropped; it returns to the conversation
+      // submit and its escape and control bytes are dropped; it returns to the conversation. A paste whose end
+      // marker never comes is ended by Ctrl+C or Ctrl+D (a terminal sends neither inside a bracketed paste) or by
+      // a pause of PASTE_IDLE_MS, so the keyboard can never be lost to it.
       if (this.pasting) {
         const end = s.indexOf(END)
-        let body = end < 0 ? s : s.slice(0, end)
-        if (end < 0) { for (let n = Math.min(END.length - 1, body.length); n > 0; n--) if (END.startsWith(body.slice(-n))) { this.pasteHold = body.slice(-n); body = body.slice(0, -n); break } }
-        this.overlay = false; this.insert(body.replace(/\r\n?/g, '\n'))
-        if (end < 0) return
-        this.pasting = false; s = s.slice(end + END.length); continue
+        const ctl = s.search(/[\x03\x04]/)
+        const stop = ctl >= 0 && (end < 0 || ctl < end) ? ctl : end
+        let body = stop < 0 ? s : s.slice(0, stop)
+        if (stop < 0) { for (let n = Math.min(END.length - 1, body.length); n > 0; n--) if (END.startsWith(body.slice(-n))) { this.pasteHold = body.slice(-n); body = body.slice(0, -n); break } }
+        if (body) { this.overlay = false; this.insert(body.replace(/\r\n?/g, '\n')) }
+        if (stop < 0) return
+        this.pasting = false; s = s.slice(stop === end ? end + END.length : stop); continue
       }
-      if (s.startsWith('\x1b[200~')) { this.pasting = true; s = s.slice(6); continue }
+      if (s.startsWith(START)) { this.pasting = true; s = s.slice(START.length); continue }
+      // a read that ends inside a paste's start marker: kept until the next read (or the idle pause) decides
+      if (s.length >= 3 && s.length < START.length && START.startsWith(s)) { this.pasteHold = s; return }
+      s = this.keys(s, true)
+    }
+  }
+  /** Plain keys. With `one`, dispatches a single key and returns the rest. */
+  private keys(s: string, one = false): string {
+    while (s.length) {
       // Esc followed by a control key in the same read is two keys (Esc, then e.g. Ctrl-D), never an Alt chord;
       // only Alt+Enter and Alt+printable are chords
       const seq = /^(\x1b\[[0-9;]*[A-Za-z~]|\x1b\r|\x1b[\x20-\x7e]|.)/su.exec(s)?.[0] ?? s[0]
       s = s.slice(seq.length)
       this.key(seq)
+      if (one) return s
     }
+    return s
+  }
+  /** A paste (or a held start marker) that has gone quiet: what is held is resolved, and the keyboard returns. */
+  private settlePaste(now: number): void {
+    if ((!this.pasting && !this.pasteHold) || now - this.pasteAt < PASTE_IDLE_MS) return
+    const held = this.pasteHold; this.pasteHold = ''
+    if (this.pasting) { this.pasting = false; if (held) this.insert(held) } else this.keys(held)
+    this.dirty = true
   }
   private insert(raw: string): void { const t = sanitize(raw); this.input = this.input.slice(0, this.cursor) + t + this.input.slice(this.cursor); this.cursor += t.length; this.dirty = true }
   /** Mission Control navigation. Returns false for keys it leaves to the conversation (Ctrl+C, Ctrl+D). */
@@ -574,6 +602,7 @@ export class Shell {
   }
   /** One timer drives the screen: new ledger entries, the spinner (unless reduced motion) and the clocks. */
   private pulse(): void {
+    this.settlePaste(Date.now())
     if (!this.mission) return
     if (this.pumpLedger()) this.dirty = true
     // ownership changes outside the ledger's rhythm (a claim retired after the last event): re-read each

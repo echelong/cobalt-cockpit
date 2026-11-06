@@ -90,7 +90,7 @@ process per worker inside its own bubblewrap sandbox. A native plugin remains a 
 
 ## 6. Independent review
 
-Five fresh-context, read-only reviews (Sonnet, high effort), each given the code and the stated invariants, not
+Six fresh-context, read-only reviews (Sonnet, high effort), each given the code and the stated invariants, not
 the author's conclusions.
 
 - **Round 1** (on `18c5ca1`): NOT CLEAN, 9 MATERIAL and 3 SHOULD-FIX findings: gate side effects committed
@@ -161,6 +161,12 @@ the author's conclusions.
   - paste state is kept across reads, including an end marker split between reads;
   - `quit()` exits cleanly without a mission;
   - held text is flushed when a turn finishes.
+
+  A sixth review, of that fix delta (`dc2a52c`), accepted it. It found one regression the paste fix had
+  introduced: a paste whose end marker was lost kept every later key, including Ctrl+C and Ctrl+D, as text. Now
+  Ctrl+C or Ctrl+D ends such a paste, and so does 2 s without paste data. A paste start marker split across
+  reads is held, held stream text is cleared when a turn starts, and the early-quit test now proves it reached
+  the early path. Each change has a test.
 
   The remaining NITs are recorded under limitations: bidi controls are not stripped, and ZWJ and flag emoji are
   counted too narrow. A ledger seek that lands exactly on a line start skips one entry.

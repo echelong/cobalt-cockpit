@@ -308,13 +308,46 @@ describe('the integrated Cockpit shell', () => {
     assert.doesNotMatch(f, /1~/, 'the split end marker is consumed, not typed')
     p.send(KEYS.ctrlC); p.send(KEYS.ctrlD); assert.equal(await p.exited, 0)
   })
+  test('review 6: a paste whose end marker is lost never takes the keyboard: Ctrl+C ends it, a pause ends it', T, async () => {
+    const pause = (ms: number) => new Promise(r => setTimeout(r, ms))
+    {
+      const p = openShell({ ...env() }); await p.waitFor(/type a request to start/)
+      p.send('\x1b[200~lost end marker'); await p.waitFor(/lost end marker/)
+      // well inside the idle pause: Ctrl+C must still reach the shell (it clears the input), then Ctrl+D quits
+      p.send(KEYS.ctrlC); await pause(150); p.send(KEYS.ctrlD)
+      assert.equal(await p.exited, 0)
+    }
+    {
+      const p = openShell({ ...env() }); await p.waitFor(/type a request to start/)
+      p.send('\x1b[200~quiet paste'); await p.waitFor(/quiet paste/)
+      await pause(2600)
+      // the paste has gone quiet: Enter is a key again and submits the pasted text as a turn
+      p.send(KEYS.enter); await p.waitFor(/t1 [✓✗] /, 60_000)
+      p.send(KEYS.ctrlD); assert.equal(await p.exited, 0)
+    }
+    {
+      // a start marker split across reads is still a paste: its newline does not submit, its digits are not typed
+      const p = openShell({ ...env() }); await p.waitFor(/type a request to start/)
+      p.send('\x1b[20'); await pause(200); p.send('0~alpha\rbeta\x1b[201~')
+      await p.waitFor(/alpha/); await pause(600)
+      const f = p.frame()
+      assert.doesNotMatch(f, /t1 /); assert.doesNotMatch(f, /0~/)
+      p.send(KEYS.ctrlC); p.send(KEYS.ctrlD); assert.equal(await p.exited, 0)
+    }
+  })
   test('review 5 N3: Ctrl+D while the conversation is still opening exits cleanly', T, async () => {
-    const e = env(); const p = openShell({ ...e })
-    let gone = false; void p.exited.then(() => { gone = true })
-    // Ctrl+D until the shell exits; it must exit cleanly even when it lands before the conversation has opened
-    for (let i = 0; i < 40 && !gone && !p.frame().includes('type a request'); i++) { try { p.send(KEYS.ctrlD) } catch { /* exited */ } await new Promise(r => setTimeout(r, 25)) }
-    assert.equal(await p.exited, 0)
-    assert.doesNotMatch(p.raw(), /TypeError|Cannot read properties/)
+    // the early path must actually be hit: retry until a Ctrl+D lands before the conversation opens
+    let early = 0
+    for (let run = 0; run < 6 && !early; run++) {
+      const p = openShell({ ...env() })
+      let gone = false; void p.exited.then(() => { gone = true })
+      for (let i = 0; i < 40 && !gone && !p.frame().includes('type a request'); i++) { p.send(KEYS.ctrlD); await new Promise(r => setTimeout(r, 25)) }
+      if (!gone) p.send(KEYS.ctrlD)
+      assert.equal(await p.exited, 0)
+      assert.doesNotMatch(p.raw(), /TypeError|Cannot read properties/)
+      if (/closed before the conversation opened/.test(p.raw())) early++
+    }
+    assert.ok(early > 0, 'a Ctrl+D landed before the conversation opened and the shell exited cleanly')
   })
 
   test('a resize while the conversation is still opening repaints instead of crashing', T, async () => {
