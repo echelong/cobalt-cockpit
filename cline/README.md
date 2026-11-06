@@ -44,7 +44,7 @@ git clone https://github.com/echelong/cobalt-cockpit.git ~/src/cobalt-cockpit
 ```
 
 `doctor` must print `doctor: OK`. It resolves every role against the **installed** Cline model catalog, checks that
-the configured reasoning level exists for that model, checks that the full sandbox can be established, and reports
+the configured reasoning level exists for that model, checks that bubblewrap can set up its namespaces (user, pid and network, nested user namespaces disabled), and reports
 whether each provider has credentials (it never prints them). Nothing runs without the sandbox. To update, pull
 `main` in your clone and run `doctor` again; after a Cline upgrade, also run the live check
 `cockpit-cline smoke --yes` (it spends a few cents of real credits, capped by `--max-usd`).

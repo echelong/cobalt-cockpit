@@ -210,8 +210,9 @@ use it, and the sandbox still decides what that tool can reach.
 | `COCKPIT_CLINE_STATE` | The state directory (default `$XDG_STATE_HOME/cobalt-cockpit-cline`, `~/.local/state/cobalt-cockpit-cline`); the `--state DIR` option overrides it for one command. |
 | `COCKPIT_CLINE_DATA` | Cline's data directory, whose sign-in the broker reads and refreshes (default `~/.cline/data`). |
 | `NO_COLOR`, `COCKPIT_COLOR`, `COCKPIT_REDUCED_MOTION` | HUD colour and motion (README, HUD 2.0). |
+| `COCKPIT_WATCH_MS` | How long `watch` runs when its output is not a terminal (default 1500 ms). |
 
-No variable chooses where the broker sends your token or which programs Cockpit runs. `COCKPIT_BROKER_UPSTREAM`,
+No variable chooses where the broker sends your token, or which bubblewrap or Cline Cockpit runs. `COCKPIT_BROKER_UPSTREAM`,
 `COCKPIT_CLINE_BWRAP`, `COCKPIT_CLINE_BIN`, `COCKPIT_CLINE_CATALOG_BIN` and `COCKPIT_CLINE_NODE` were removed:
 the broker always uses `https://api.cline.bot`; bubblewrap is the root-owned system binary; Cline is the one in the
 Node installation that runs Cockpit (else `/usr/local/bin` or `/usr/bin`), owned by you or root and writable by

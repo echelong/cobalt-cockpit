@@ -8,7 +8,7 @@
 import { test, describe, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer, request } from 'node:http'
 import type { IncomingHttpHeaders, Server } from 'node:http'
 import { connect } from 'node:net'
@@ -86,7 +86,10 @@ describe('broker origin: only the Cline API, or a loopback stand-in through the 
     for (const bad of ['https://evil.example', 'http://localhost:1', 'http://127.0.0.1:1/path', 'https://api.cline.bot']) assert.throws(() => setTestSeams({ brokerUpstream: bad }), /test seam/, bad)
     assert.equal(testSeams().brokerUpstream, STANDIN, 'a refused seam leaves the old one')
     assert.equal(loopbackOriginProblem('http://[::1]:9'), null)
-    const src = ['broker.ts', 'sandbox.ts', 'catalog.ts', 'cli.ts', 'worker.ts', 'supervisor.ts', 'shell.ts', 'seams.ts', 'gates.ts'].map(f => readFileSync(join(PACKAGE_DIR, 'src', f), 'utf8')).join('\n')
+    const all = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap(e => e.isDirectory() ? all(join(d, e.name)) : /\.(ts|mjs|js)$/.test(e.name) ? [join(d, e.name)] : [])
+    const files = [...all(join(PACKAGE_DIR, 'src')), ...all(join(PACKAGE_DIR, 'loader'))]
+    assert.ok(files.length > 20 && files.some(f => f.endsWith('broker.ts')), 'positive control: the sources were found')
+    const src = files.map(f => readFileSync(f, 'utf8')).join('\n')
     for (const v of ['COCKPIT_BROKER_UPSTREAM', 'COCKPIT_CLINE_BIN', 'COCKPIT_CLINE_BWRAP', 'COCKPIT_CLINE_CATALOG_BIN', 'COCKPIT_CLINE_NODE']) assert.ok(!src.includes(v), `${v} is still read by production code`)
   })
 
