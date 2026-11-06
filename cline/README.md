@@ -266,3 +266,8 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
 17. The interactive shell needs a real terminal (it refuses to start otherwise) and has been tested in
     pseudo-terminals at 160×46 and 72×24; it is a line-oriented UI, not a full editor (no mouse, no syntax
     highlighting).
+20. **HUD text edge cases**:
+    - bidi control characters in model text are not stripped;
+    - ZWJ emoji sequences and flags are counted narrower than some terminals draw them, which can shift a row's
+      right edge (autowrap stays off, so a row never wraps);
+    - an Alt+key chord (Esc and a printable key in one read) is ignored rather than typed.

@@ -38,6 +38,8 @@ export const openShell = (o: { repo: string; root: string; data: string; cols?: 
       await new Promise(r => setTimeout(r, 100))
     }
   }
+  // a key sent as the shell exits meets a closed pipe (EPIPE): that is not a test failure, the exit code is checked
+  child.stdin?.on('error', () => {})
   const send = (s: string): void => { child.stdin?.write(s) }
   /** The node process running this shell (not `script` or the shell wrapper). */
   const pid = (): number | null => {

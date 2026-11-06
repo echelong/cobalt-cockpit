@@ -8,7 +8,7 @@ import { Paint, Screen, colorMode, fit, holdIncomplete, midcut, reducedMotion, s
 import { buildView, gateFamily, reasoningOf } from '../src/ui/model.ts'
 import type { View, ViewInput } from '../src/ui/model.ts'
 import { LedgerTail, Timeline, fromLedger, fromWorker } from '../src/ui/timeline.ts'
-import { TABS, hudLines, missionControlLines } from '../src/ui/render.ts'
+import { TABS, hudLines, missionControlLines, spendLines } from '../src/ui/render.ts'
 import type { Frame } from '../src/ui/render.ts'
 import type { AttemptRecord, Header, Live, TaskRecord } from '../src/supervisor.ts'
 import { ZERO_USAGE } from '../src/cost.ts'
@@ -297,6 +297,32 @@ describe('round 4 review: terminal safety and honest figures', () => {
     assert.match(costs, /task t2 · .*2 att\s+≥12k\/800\s+≥\$0\.012\s+1 not reported/)
     // no per-model or per-task row reads $0 or 0/0 for an attempt that reported nothing
     for (const l of costs.split('\n').filter(l => /^. (?:task |[A-Z]+ [a-z])/.test(l))) assert.doesNotMatch(l, /\s\$0\s|\s0\/0\s/, l)
+  })
+  test('review 5 N1: unknown cost is never $0 in the HUD spend panel or the timeline end event', async () => {
+    const none = attempt({ id: 'm.t1.1', role: 'commander', model: 'moonshotai/kimi-k3.1-pro', usageEvents: 0, iterations: 0, usage: ZERO_USAGE, charge: { usd: null, basis: 'unmetered' } })
+    const some = attempt({ id: 'm.t2.2', n: 2 })
+    const v = await viewOf([record('t1', 'failed', [none]), record('t2', 'completed', [{ ...none, id: 'm.t2.1', role: 'coder', model: 'deepseek/deepseek-v4.1-flash-1017' }, some])])
+    const spend = stripAnsi(spendLines(v, 160, new Paint('none')).join('\n'))
+    const byModel = spend.split('\n').find(l => /BY MODEL|RECENT/.test(l))!
+    assert.match(byModel, /kimi —/, 'a model whose attempts reported nothing reads —')
+    assert.match(byModel, /deepseek ≥\$0\.012/, 'a partly reported model is a lower bound')
+    assert.doesNotMatch(byModel, /\$0(?![.\d])/)
+    // the ledger's task_ended.usd sums unknown costs as 0: the timeline counts reported attempts itself
+    const tl = new Timeline()
+    const L = (seq: number, kind: string, task: string, data: Record<string, unknown>) => tl.ledger({ seq, at: '2026-11-05T12:00:00Z', kind, task, data })
+    L(1, 'worker_exited', 'u', { attempt: 'm.u.1', finish: 'error', charge: { usd: null, basis: 'unmetered' } })
+    L(2, 'task_ended', 'u', { state: 'failed', attempts: 1, usd: 0, tokens: 0 })
+    L(3, 'worker_exited', 'p', { attempt: 'm.p.1', charge: { usd: null, basis: 'unmetered' } })
+    L(4, 'worker_exited', 'p', { attempt: 'm.p.2', charge: { usd: 0.0042, basis: 'reported' } })
+    L(5, 'task_ended', 'p', { state: 'completed', attempts: 2, usd: 0.0042, tokens: 900 })
+    L(6, 'worker_exited', 'k', { attempt: 'm.k.1', charge: { usd: 0.001, basis: 'reported' } })
+    L(7, 'task_ended', 'k', { state: 'completed', attempts: 1, usd: 0.001, tokens: 90 })
+    const ended = tl.events.filter(e => e.kind === 'ended').map(e => e.text)
+    assert.match(ended[0], /cost —/); assert.doesNotMatch(ended[0], /\$0/)
+    assert.match(ended[1], /≥\$0\.0042/)
+    assert.match(ended[2], /· \$0\.0010/); assert.doesNotMatch(ended[2], /≥/)
+    // a task whose exits fell outside the tailed window is unknown, not $0
+    assert.match(fromLedger({ seq: 1, at: '2026-11-05T12:00:00Z', kind: 'task_ended', task: 'x', data: { state: 'completed', attempts: 1, usd: 0, tokens: 0 } })!.text, /cost —/)
   })
   test('S1: between the worker exiting and the supervisor classifying it, the task reads VERIFYING, not FAILED', async () => {
     const v = await viewOf([record('t1', 'running', [attempt({ failure: null })])])

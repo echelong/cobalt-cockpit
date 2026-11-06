@@ -33,7 +33,12 @@ const attemptNo = (attempt: unknown): string => { const m = /\.(\d+)$/.exec(Stri
 export type LedgerEntry = { seq: number; at: string; kind: string; task: string | null; data: Record<string, unknown> | null }
 
 /** One ledger entry as a timeline event, or null for bookkeeping that is not activity. */
-export const fromLedger = (e: LedgerEntry): Omit<TimelineEvent, 'seq'> | null => {
+/**
+ * `costKnown`: how many of the task's attempts reported a cost, counted from their `worker_exited` records
+ * (Timeline.ledger keeps the count). The ledger's `task_ended.usd` sums unknown costs as 0, so without that
+ * count the sum is shown as unknown, never as $0.
+ */
+export const fromLedger = (e: LedgerEntry, costKnown = 0): Omit<TimelineEvent, 'seq'> | null => {
   const d = (e.data ?? {}) as Record<string, any> // eslint-disable-line @typescript-eslint/no-explicit-any
   const at = Date.parse(e.at) || 0
   const base = { at, task: e.task, attempt: typeof d.attempt === 'string' ? d.attempt : null, source: 'supervisor' as const }
@@ -56,7 +61,7 @@ export const fromLedger = (e: LedgerEntry): Omit<TimelineEvent, 'seq'> | null =>
     case 'route_waiting': return ev('waiting', `admission waits · ${d.refusal ?? ''}`, 'warn')
     case 'route_refused': return ev('refused', `route refused · ${d.refusal ?? ''}`, 'fail', [(d.rules ?? []).join('; ')])
     case 'task_refused': return ev('refused', `refused · ${d.reason ?? ''}`, 'fail')
-    case 'task_ended': return ev('ended', `${d.state} · ${d.attempts} attempt(s)${typeof d.usd === 'number' ? ` · $${d.usd.toFixed(4)}` : ''}${d.verification ? ` · ${d.verification}` : ''}`, d.state === 'completed' ? 'ok' : d.state === 'cancelled' ? 'warn' : 'fail', d.reason ? [String(d.reason)] : [])
+    case 'task_ended': return ev('ended', `${d.state} · ${d.attempts} attempt(s)${typeof d.usd === 'number' && typeof d.attempts === 'number' && d.attempts > 0 ? ` · ${costKnown <= 0 ? 'cost —' : `${costKnown < d.attempts ? '≥' : ''}$${d.usd.toFixed(4)}`}` : ''}${d.verification ? ` · ${d.verification}` : ''}`, d.state === 'completed' ? 'ok' : d.state === 'cancelled' ? 'warn' : 'fail', d.reason ? [String(d.reason)] : [])
     case 'provider_health': return ev('health', `provider ${d.key} breaker ${d.unhealthy ? 'OPEN' : 'closed'} after ${d.consecutiveErrors} error(s) · concurrency ${d.concurrency ?? '?'}`, d.unhealthy ? 'fail' : 'warn')
     case 'budget_alert': return ev('budget', `budget ${d.scope ?? ''} ${Math.round(Number(d.at ?? 0) * 100)}% · ${d.detail ?? ''}`, 'warn')
     case 'session_cap': return ev('budget', `session cap reached · ${clip(JSON.stringify(d), 120)}`, 'fail')
@@ -107,8 +112,18 @@ export class Timeline {
   readonly activity = new Map<string, Activity>()
   /** attempt id → role, learned from each attempt's admission: every later event of it names its agent. */
   readonly roles = new Map<string, string>()
+  /** task id → attempts whose worker_exited record carried a cost (charge.usd a number). */
+  private readonly costKnown = new Map<string, number>()
   private seq = 0
   constructor(readonly max = 5000) {}
+  /** A supervisor ledger record: its timeline event, with cost knowledge carried to the task's end. */
+  ledger(e: LedgerEntry): void {
+    const d = (e.data ?? {}) as { charge?: { usd?: unknown } }
+    if (e.kind === 'worker_exited' && e.task && typeof d.charge?.usd === 'number') this.costKnown.set(e.task, (this.costKnown.get(e.task) ?? 0) + 1)
+    this.push(fromLedger(e, e.task ? this.costKnown.get(e.task) ?? 0 : 0))
+    if (e.kind === 'task_ended' && e.task) this.costKnown.delete(e.task)
+    if (this.costKnown.size > this.max * 2) this.costKnown.clear()
+  }
   push(e: Omit<TimelineEvent, 'seq'> | null): void {
     if (!e) return
     if (e.attempt && e.role) this.roles.set(e.attempt, e.role)

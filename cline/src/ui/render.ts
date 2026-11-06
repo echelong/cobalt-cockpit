@@ -3,7 +3,7 @@
 // the Claude Code Cockpit's: numbered dossier sections, `NAME / VALUE` labels, red for activity,
 // amber for waiting, green for completed, deep red for failure, cyan only for scanning and checks.
 import type { Paint, Token } from './term.ts'
-import { bar, duration, fit, midcut, money, right, sanitize, shortName, spinner, spread, tokens, vlen, wave, wrap } from './term.ts'
+import { bar, duration, fit, midcut, money, moneyOf, right, sanitize, shortName, spinner, spread, tokens, vlen, wave, wrap } from './term.ts'
 import type { AgentState, AttemptView, CostRow, GateState, GateView, ReasoningView, RoleView, View } from './model.ts'
 import { ROLE_LABEL } from './model.ts'
 import type { TimelineEvent } from './timeline.ts'
@@ -135,7 +135,8 @@ export const spendLines = (v: View, w: number, p: Paint): string[] => {
   const b = bar(frac, Math.max(6, Math.min(20, w - 40)))
   const tk: Token = c.capReached ? 'fail' : frac >= 0.8 ? 'warn' : 'ok'
   const inflight = Math.max(0, c.committed - c.spent)
-  const top = c.byModel.slice(0, 4).map(m => `${family(m.model)} ${m.estimated ? '~' : ''}${money(m.usd)}`).join(' · ') || 'no spend yet'
+  // a model whose attempts reported nothing reads —, a partly reported one ≥: never an unknown read as $0
+  const top = c.byModel.slice(0, 4).map(m => `${family(m.model)} ${m.known > 0 && m.estimated ? '~' : ''}${m.known === 0 && m.unmetered ? 'unmetered' : moneyOf(m.usd, m.known, m.attempts)}`).join(' · ') || 'no spend yet'
   return [
     field('SESSION', `${c.unmetered ? p.fg('warn', 'UNMETERED ') : ''}${p.fg('head', money(c.spent))} ${p.dim(`of $${c.budget.toFixed(2)}`)} ${p.fg(tk, '█'.repeat(b.filled))}${p.fg('rule', '░'.repeat(b.empty))} ${p.dim(`${Math.round(frac * 100)}%`)}`, w, p, 9),
     field('LEFT', `${p.fg('head', money(c.remaining))} ${p.dim(inflight > 0 ? `· ${money(inflight)} reserved for running workers` : '· nothing reserved')}`, w, p, 9),

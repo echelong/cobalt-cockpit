@@ -212,6 +212,8 @@ export const duration = (ms: number): string => {
 /** Token counts the way the Claude Cockpit prints them; null (not reported) is `—`, never 0. */
 export const tokens = (n: number | null): string => n === null ? '—' : n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 10_000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
 export const money = (v: number | null): string => v === null ? '—' : v === 0 ? '$0' : v < 0.01 ? `$${v.toFixed(4)}` : v < 10 ? `$${v.toFixed(3)}` : `$${v.toFixed(2)}`
+/** A sum over attempts: — when none reported a cost, ≥ when only some did. An unknown cost never reads as $0. */
+export const moneyOf = (usd: number, known: number, total: number): string => known <= 0 ? '—' : `${known < total ? '≥' : ''}${money(usd)}`
 export const bar = (fraction: number, n: number): { filled: number; empty: number } => { const f = Math.max(0, Math.min(n, Math.round(Math.max(0, Math.min(1, fraction)) * n))); return { filled: f, empty: n - f } }
 
 const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']

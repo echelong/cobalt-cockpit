@@ -106,6 +106,8 @@ const taskState = (t: TaskRecord, now: number): AgentState => {
   return t.state === 'completed' ? 'completed' : t.state === 'cancelled' ? 'cancelled' : t.state === 'refused' ? 'refused' : t.state === 'failed' ? 'failed' : 'queued'
 }
 const usageKnown = (a: AttemptRecord): boolean => a.usageEvents > 0
+/** An attempt's cost is known only when it was reported or estimated from real usage. */
+export const costKnown = (a: AttemptRecord): boolean => a.charge.usd !== null && (usageKnown(a) || a.charge.basis !== 'unmetered')
 
 /** Which of the five gate rows a configured command gate belongs to, by its name or command. */
 export const gateFamily = (name: string, command = ''): Exclude<GateName, 'OTHER'> | null => {
@@ -231,7 +233,7 @@ export const buildView = (i: ViewInput): View => {
   // an attempt counts as known only when its cost was reported or estimated from real usage
   const add = (r: CostRow, a: AttemptRecord): void => {
     r.attempts++
-    if (a.charge.usd !== null && (usageKnown(a) || a.charge.basis !== 'unmetered')) { r.known++; r.usd += a.charge.usd }
+    if (costKnown(a)) { r.known++; r.usd += a.charge.usd! }
     if (usageKnown(a)) { r.tokensIn += a.usage.inputTokens; r.tokensOut += a.usage.outputTokens; r.cacheRead += a.usage.cacheReadTokens }
     r.estimated ||= a.charge.basis === 'estimate'; if (a.charge.basis === 'unmetered' && (a.usageEvents > 0 || a.iterations > 0)) r.unmetered++
   }

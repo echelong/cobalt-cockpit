@@ -18,10 +18,10 @@ import type { Entry } from './turn.ts'
 import { routeTask } from './router.ts'
 import { plannerPrompt } from './planner.ts'
 import { repoInfo } from './git.ts'
-import { Paint, Screen, colorMode, fit, holdIncomplete, money, reducedMotion, sanitize, stripAnsi, vlen, wrap } from './ui/term.ts'
+import { Paint, Screen, colorMode, fit, holdIncomplete, money, moneyOf, reducedMotion, sanitize, stripAnsi, vlen, wrap } from './ui/term.ts'
 import type { Token } from './ui/term.ts'
-import { LedgerTail, Timeline, fromLedger } from './ui/timeline.ts'
-import { buildView } from './ui/model.ts'
+import { LedgerTail, Timeline } from './ui/timeline.ts'
+import { buildView, costKnown } from './ui/model.ts'
 import type { View } from './ui/model.ts'
 import { TABS, hudLines, missionControlLines } from './ui/render.ts'
 import type { OverlayState, Tab } from './ui/render.ts'
@@ -68,7 +68,11 @@ export class Shell {
   /** The attempt whose text is being appended to the last transcript line. */
   private streaming: string | null = null
   /** Per attempt: the start of an escape sequence its stream chunk ended in, until the next chunk completes it. */
-  private escHold = new Map<string, string>()
+  private escHold = new Map<string, { text: string; tag: string }>()
+  /** Inside a bracketed paste that has not ended yet: later reads are pasted text until ESC [201~. */
+  private pasting = false
+  /** The start of a paste-end marker a read ended in, kept until the next read completes or refutes it. */
+  private pasteHold = ''
   // HUD 2.0: the real-event timeline, the ledger it tails, and the frame writer
   private timeline = new Timeline()
   private tail: LedgerTail | null = null
@@ -162,15 +166,9 @@ export class Shell {
     if (e.type === 'agent_event' && ev.type === 'content_start' && ev.contentType === 'text' && typeof ev.text === 'string') {
       // model text never reaches the terminal raw: escape sequences and control characters are dropped
       // an escape sequence split across stream chunks is held until it is complete, then removed whole
-      const [ready, pending] = holdIncomplete((this.escHold.get(attemptId) ?? '') + ev.text)
-      if (pending) this.escHold.set(attemptId, pending); else this.escHold.delete(attemptId)
-      const clean = sanitize(ready)
-      this.turn.text += clean
-      const last = this.view.at(-1)
-      const parts = clean.split('\n')
-      if (last && this.streaming === attemptId) { last.text += parts[0]; for (const p of parts.slice(1)) this.view.push({ text: `  ${tag}${p}` }) }
-      else for (const [i, p] of parts.entries()) this.view.push({ text: `  ${i === 0 ? tag : ''}${p}` })
-      this.streaming = attemptId
+      const [ready, pending] = holdIncomplete((this.escHold.get(attemptId)?.text ?? '') + ev.text)
+      if (pending) this.escHold.set(attemptId, { text: pending, tag }); else this.escHold.delete(attemptId)
+      this.appendText(attemptId, tag, sanitize(ready))
     } else if (e.type === 'agent_event' && ev.type === 'content_start' && ev.contentType === 'tool' && typeof ev.toolName === 'string') {
       const input = (ev.input ?? {}) as Record<string, unknown>
       const what = typeof input.path === 'string' ? input.path.replace(`${this.mission.live.integration.dir}/`, '') : Array.isArray(input.commands) ? String(input.commands[0]).slice(0, 80) : Array.isArray(input.paths) ? `${input.paths.length} file(s)` : ''
@@ -180,6 +178,21 @@ export class Shell {
       this.view.push({ text: sanitize(`  ${tag}■ run aborted: ${String(e.message ?? e.reason ?? '')}`), style: 'yellow' })
     }
     this.dirty = true
+  }
+
+  private appendText(attemptId: string, tag: string, clean: string): void {
+    if (!this.turn || !clean) return
+    this.turn.text += clean
+    const last = this.view.at(-1)
+    const parts = clean.split('\n')
+    if (last && this.streaming === attemptId) { last.text += parts[0]; for (const p of parts.slice(1)) this.view.push({ text: `  ${tag}${p}` }) }
+    else for (const [i, p] of parts.entries()) this.view.push({ text: `  ${i === 0 ? tag : ''}${p}` })
+    this.streaming = attemptId
+  }
+  /** A stream that ended on an escape sequence that never completed: the text held behind it is shown, the escape dropped. */
+  private flushHeld(): void {
+    for (const [attemptId, h] of this.escHold) this.appendText(attemptId, h.tag, sanitize(h.text))
+    this.escHold.clear()
   }
 
   // ----- turns --------------------------------------------------------------------------------------
@@ -221,6 +234,7 @@ export class Shell {
 
   private finishTurn(id: string): void {
     if (!this.turn) return
+    this.flushHeld()
     let text = this.turn.text.trim()
     if (!text) {
       // nothing was streamed (a provider that sends the answer only at the end): show the final answer
@@ -236,14 +250,16 @@ export class Shell {
     for (const [tid, t] of mine) {
       const a = t.attempts.at(-1)
       const gates = (a?.gates ?? []).map(g => `${g.name} ${g.state}`).join(' · ')
-      const cost = t.attempts.reduce((s, x) => s + (x.charge.usd ?? 0), 0)
-      const basis = t.attempts.some(x => x.charge.basis === 'estimate') ? ' est.' : t.attempts.some(x => x.charge.basis === 'unmetered') ? ' unmetered' : ''
+      // a cost nobody reported is unknown (—), a partly reported one a lower bound (≥), never $0
+      const known = t.attempts.filter(costKnown)
+      const cost = known.reduce((s, x) => s + x.charge.usd!, 0)
+      const basis = known.some(x => x.charge.basis === 'estimate') ? ' est.' : t.attempts.some(x => !costKnown(x)) ? ' unmetered' : ''
       const ok = t.state === 'completed'
       const integrated = ok && a?.commit && t.integratedHead
       // a completed write turn without changes is reported plainly, not as delivered work
       const noChange = ok && !integrated && t.spec.mode === 'write'
       const changed = integrated ? `integrated ${a.commit?.slice(0, 8)} (${a.changes.length} file(s))` : t.spec.mode === 'read' ? 'read-only' : noChange ? 'NO CHANGES' : 'nothing integrated'
-      this.system(`${tid} ${ok ? '✓' : '✗'} ${t.state}${t.reason && !ok ? `: ${t.reason}` : ''} · ${a ? `${a.role} ${a.model}` : 'not started'} · ${changed}${gates ? ` · ${gates}` : ''} · ${money(cost)}${basis}`, !ok ? 'red' : noChange ? 'cyan' : 'green')
+      this.system(`${tid} ${ok ? '✓' : '✗'} ${t.state}${t.reason && !ok ? `: ${t.reason}` : ''} · ${a ? `${a.role} ${a.model}` : 'not started'} · ${changed}${gates ? ` · ${gates}` : ''} · ${moneyOf(cost, known.length, t.attempts.length)}${basis}`, !ok ? 'red' : noChange ? 'cyan' : 'green')
     }
     const v = this.mission.live.verdict
     if (v && v.state !== 'DONE' && v.state !== 'UNVERIFIED') for (const r of v.reasons.slice(0, 3)) this.system(`verdict ${v.state}: ${r}`, 'yellow')
@@ -269,7 +285,7 @@ export class Shell {
   /** New ledger entries become timeline events. */
   private pumpLedger(): boolean {
     const entries = this.tail?.poll() ?? []
-    for (const e of entries) this.timeline.push(fromLedger(e))
+    for (const e of entries) this.timeline.ledger(e)
     return entries.length > 0
   }
   private viewModel(): View {
@@ -373,19 +389,32 @@ export class Shell {
   private async quit(): Promise<void> {
     if (this.quitting) return
     this.quitting = true
-    if (this.busy) { this.system('stopping the running turn before exit…', 'yellow'); this.mission.requestStop('shell exit'); this.render(); await this.busy }
-    unlock(this.shellLock)
-    this.teardown()
-    this.out.write(`Cobalt Cockpit: conversation ${this.mission.header.id} · branch ${this.mission.live.integration.branch} · ${this.mission.live.session.unmetered ? 'unmetered' : money(this.mission.live.session.spentUsd)} spent\n`)
-    process.exit(0)
+    // before the conversation has opened there is no mission to stop or summarise; the exit still happens
+    const m = this.mission as Mission | undefined
+    try {
+      if (this.busy && m) { this.system('stopping the running turn before exit…', 'yellow'); m.requestStop('shell exit'); this.render(); await this.busy }
+      unlock(this.shellLock)
+      this.teardown()
+      this.out.write(m ? `Cobalt Cockpit: conversation ${m.header.id} · branch ${m.live.integration.branch} · ${m.live.session.unmetered ? 'unmetered' : money(m.live.session.spentUsd)} spent\n` : 'Cobalt Cockpit: closed before the conversation opened\n')
+    } finally { process.exit(0) }
   }
 
   // ----- keyboard ----------------------------------------------------------------------------------
   private onKey(buf: Buffer): void {
-    let s = buf.toString('utf8')
-    // a paste is text for the request: its escape and control bytes are dropped; it returns to the conversation
-    if (s.includes('\x1b[200~')) { const body = s.replace('\x1b[200~', '').replace('\x1b[201~', ''); this.overlay = false; this.insert(body.replace(/\r\n?/g, '\n')); return }
+    let s = this.pasteHold + buf.toString('utf8'); this.pasteHold = ''
+    const END = '\x1b[201~'
     while (s.length) {
+      // a paste is text for the request until its end marker, however many reads it spans: its newlines never
+      // submit and its escape and control bytes are dropped; it returns to the conversation
+      if (this.pasting) {
+        const end = s.indexOf(END)
+        let body = end < 0 ? s : s.slice(0, end)
+        if (end < 0) { for (let n = Math.min(END.length - 1, body.length); n > 0; n--) if (END.startsWith(body.slice(-n))) { this.pasteHold = body.slice(-n); body = body.slice(0, -n); break } }
+        this.overlay = false; this.insert(body.replace(/\r\n?/g, '\n'))
+        if (end < 0) return
+        this.pasting = false; s = s.slice(end + END.length); continue
+      }
+      if (s.startsWith('\x1b[200~')) { this.pasting = true; s = s.slice(6); continue }
       // Esc followed by a control key in the same read is two keys (Esc, then e.g. Ctrl-D), never an Alt chord;
       // only Alt+Enter and Alt+printable are chords
       const seq = /^(\x1b\[[0-9;]*[A-Za-z~]|\x1b\r|\x1b[\x20-\x7e]|.)/su.exec(s)?.[0] ?? s[0]

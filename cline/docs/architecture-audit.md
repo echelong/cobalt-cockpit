@@ -90,7 +90,7 @@ process per worker inside its own bubblewrap sandbox. A native plugin remains a 
 
 ## 6. Independent review
 
-Four fresh-context, read-only reviews (Sonnet, high effort), each given the code and the stated invariants, not
+Five fresh-context, read-only reviews (Sonnet, high effort), each given the code and the stated invariants, not
 the author's conclusions.
 
 - **Round 1** (on `18c5ca1`): NOT CLEAN, 9 MATERIAL and 3 SHOULD-FIX findings: gate side effects committed
@@ -146,6 +146,24 @@ the author's conclusions.
 
   The review found the DONE gating, read-only use of routing, claims and archive, the reasoning `✓` rule, frame
   geometry, key handling and the ledger-tail offsets sound.
+- **Round 5** (fix verification of `3029ccc` and `88a9d13`, by code reading): 11 of the 12 round-4 findings
+  were closed. M3 was only partly closed, and three new issues were found:
+  - **M3 residue (MATERIAL):** unknown cost still read `$0` in three places: the HUD's BY MODEL line, the
+    timeline's task-end event (the ledger's `task_ended.usd` sums unknown costs as 0) and the turn summary.
+  - **SHOULD-FIX:** a bracketed paste split across reads was typed key by key, so a pasted newline could submit
+    a turn.
+  - **SHOULD-FIX:** Ctrl+D or a signal before the conversation opened threw after the terminal was restored.
+  - **NIT:** text held behind an escape sequence that never completed was dropped at the end of a turn.
+
+  All four are fixed, with regression tests:
+  - unknown cost reads `—` and partial cost reads `≥` in every sink. The timeline counts reported attempts from
+    their `worker_exited` charges; the ledger format is unchanged;
+  - paste state is kept across reads, including an end marker split between reads;
+  - `quit()` exits cleanly without a mission;
+  - held text is flushed when a turn finishes.
+
+  The remaining NITs are recorded under limitations: bidi controls are not stripped, and ZWJ and flag emoji are
+  counted too narrow. A ledger seek that lands exactly on a line start skips one entry.
 - The reviews found sound: the census logic after the inode fix, the ledger hash chain, claim overlap
   normalisation, DeepSeek-never-substituted routing, bounded `nextStep`, wire judging, and that no stop or cancel
   path releases ownership without a clean census.

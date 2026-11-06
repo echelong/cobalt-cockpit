@@ -293,6 +293,29 @@ describe('the integrated Cockpit shell', () => {
     assert.doesNotMatch(p.raw().slice(raw.length), /\x1b\]52/)
     p.send(KEYS.ctrlC); p.send(KEYS.ctrlD); await p.exited
   })
+  test('review 5 N2: a paste split across reads stays text: its newlines never submit a turn', T, async () => {
+    const e = env(); const p = openShell({ ...e })
+    await p.waitFor(/type a request to start/)
+    const pause = () => new Promise(r => setTimeout(r, 200))
+    // the start marker, a submitting newline, and an end marker itself split across reads
+    p.send('\x1b[200~[[write:src/p.txt=p]] first\r'); await pause()
+    p.send('second\r\x1b[20'); await pause()
+    p.send('1~ typed')
+    await p.waitFor(/typed/)
+    await new Promise(r => setTimeout(r, 600))
+    const f = p.frame()
+    assert.doesNotMatch(f, /t1 /, 'no turn was submitted by a pasted newline')
+    assert.doesNotMatch(f, /1~/, 'the split end marker is consumed, not typed')
+    p.send(KEYS.ctrlC); p.send(KEYS.ctrlD); assert.equal(await p.exited, 0)
+  })
+  test('review 5 N3: Ctrl+D while the conversation is still opening exits cleanly', T, async () => {
+    const e = env(); const p = openShell({ ...e })
+    let gone = false; void p.exited.then(() => { gone = true })
+    // Ctrl+D until the shell exits; it must exit cleanly even when it lands before the conversation has opened
+    for (let i = 0; i < 40 && !gone && !p.frame().includes('type a request'); i++) { try { p.send(KEYS.ctrlD) } catch { /* exited */ } await new Promise(r => setTimeout(r, 25)) }
+    assert.equal(await p.exited, 0)
+    assert.doesNotMatch(p.raw(), /TypeError|Cannot read properties/)
+  })
 
   test('a resize while the conversation is still opening repaints instead of crashing', T, async () => {
     const e = env(); const p = openShell({ ...e })
