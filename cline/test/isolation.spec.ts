@@ -473,7 +473,7 @@ describe('isolation (review 11): the owner\'s sign-in, error answers and the log
     const stale = readdirSync(join(f, '..')).filter(n => n.startsWith('providers.json.cockpit-refresh-cline.stale-'))
     assert.ok(stale.some(n => /STALE-R/.test(readFileSync(join(f, '..', n), 'utf8'))), 'the stale answer was moved aside under a time stamp, not destroyed')
   })
-  test('an unusable kept answer (no access token, unreadable, too old) is deleted, never applied, and does not wedge later refreshes', T, async () => {
+  test('an unusable kept answer (no access token, unreadable, too old) is moved aside, never applied, and does not wedge later refreshes', T, async () => {
     for (const content of ['not json', JSON.stringify({ v: 1, usedSha256: createHash('sha256').update('test-refresh').digest('hex'), at: Date.now(), answer: '{"success":false}' }), JSON.stringify({ v: 1, usedSha256: createHash('sha256').update('test-refresh').digest('hex'), at: Date.now() - 48 * 3600_000, answer: JSON.stringify(answer('OLD-A', 'OLD-R')) })]) {
       const data = clineData(); const f = expire(data); writeFileSync(`${f}.cockpit-refresh-cline`, content, { mode: 0o600 })
       const up = await upstream({ refresh: () => answer('NEW-A', 'NEW-R') })

@@ -243,7 +243,7 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
    expiry, refreshes it the way Cline does (`POST /api/v1/auth/refresh`, under Cline's own SQLite lock file) and
    writes the new token back to `~/.cline/data/settings/providers.json` (other entries untouched, a backup of the
    previous file kept as `providers.json.cockpit-backup`, mode 0600). The server's answer is saved first
-   (`providers.json.cockpit-refresh-<provider>`, 0600, removed after a successful save) and the file is re-read just before
+   (`providers.json.cockpit-refresh-<provider>`, 0600, moved aside after a confirmed save, the newest three kept) and the file is re-read just before
    the write, so neither a failed save nor a concurrent change by Cline itself loses your sign-in or your
    settings. If you sign in again while a refresh is running, your sign-in wins. The kept answer is bound to the
    refresh token it came from: it is applied later only for that same sign-in and within 24 hours (an answer
