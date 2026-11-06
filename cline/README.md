@@ -247,8 +247,12 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
    the write, so neither a failed save nor a concurrent change by Cline itself loses your sign-in or your
    settings. If you sign in again while a refresh is running, your sign-in wins. The kept answer is bound to the
    refresh token it came from: it is applied later only for that same sign-in and within 24 hours (an answer
-   from an older sign-in is set aside as `….stale`, never written over a newer one and never deleted), and after a
-   failed save the broker never retries with the same refresh token. A sign-in the server refuses reaches the
+   from an older sign-in is moved aside under a time stamp, the newest three kept, and never written over a newer
+   one), and after a failed save or a refused refresh the broker never retries with the same refresh token. If
+   even the recovery file cannot be written, the new sign-in is still saved. Cockpit's rewrite of providers.json
+   takes its own lock (`providers.json.cockpit-write.lock`) besides Cline's per-provider one, so two supervisors
+   refreshing different providers cannot overwrite each other; the recovery file is removed only once the saved
+   sign-in is confirmed in the file. A missing or corrupt providers.json is reported as a sign-in problem. A sign-in the server refuses reaches the
    worker as an authentication failure, so the run stops with "run `cline auth`"; a refresh that fails for a
    temporary reason (server error, rate limit, network, lock) is retried. That is the only write Cockpit makes to
    your Cline data. Only the `cline` and `cline-pass` providers can be brokered; a role configured for any other

@@ -9,7 +9,7 @@
 //     the way Cline does (a backup first), so the real credentials never enter a sandbox;
 //   - records every request (path, status, model, reasoning effort) as host-side evidence.
 import { createHash, randomBytes } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -58,10 +58,10 @@ const fakeJwt = (): string => {
   return `${b64({ alg: 'none', typ: 'JWT' })}.${b64({ sub: 'cockpit-broker', exp, jti: randomBytes(16).toString('hex') })}.${randomBytes(24).toString('base64url')}`
 }
 
-/** Runs fn holding Cline's own refresh lock for this provider (an SQLite file, BEGIN EXCLUSIVE), as Cline does. */
-const withClineLock = async <T>(dataDir: string, provider: string, fn: () => Promise<T>): Promise<T> => {
-  const lock = `${providersFile(dataDir)}.oauth-${createHash('sha256').update(provider).digest('hex')}.lock`
-  const db = new DatabaseSync(lock)
+/** Runs fn holding an SQLite lock file (BEGIN EXCLUSIVE), the mechanism Cline uses for its refresh locks. */
+const withSqliteLock = async <T>(lock: string, fn: () => Promise<T>): Promise<T> => {
+  let db: DatabaseSync
+  try { db = new DatabaseSync(lock) } catch (e) { throw new SignInError(`the Cline credential lock ${lock.split('/').pop()} cannot be opened (${(e as Error).message}): check ~/.cline/data/settings`) }
   try {
     db.exec('PRAGMA busy_timeout = 0;')
     const until = Date.now() + 60_000
@@ -74,12 +74,26 @@ const withClineLock = async <T>(dataDir: string, provider: string, fn: () => Pro
     try { return await fn() } finally { try { db.exec('COMMIT;') } catch { /* nothing held */ } }
   } finally { db.close() }
 }
+/** Cline's own refresh lock for this provider, as Cline takes it. */
+const withClineLock = <T>(dataDir: string, provider: string, fn: () => Promise<T>): Promise<T> => withSqliteLock(`${providersFile(dataDir)}.oauth-${createHash('sha256').update(provider).digest('hex')}.lock`, fn)
+/**
+ * Cockpit's lock around its read-modify-write of providers.json: Cline's locks are per provider, so two supervisors
+ * refreshing two providers at once would otherwise both rewrite the whole file and one would lose the other's token.
+ */
+export const writeLockFile = (dataDir: string): string => `${providersFile(dataDir)}.cockpit-write.lock`
 
 const readJsonRetry = (f: string): ProvidersDoc => {
-  // Cline may be writing the file: a torn read is retried briefly, never written over
+  // Cline may be writing the file: a torn read is retried briefly, never written over; a file that is missing,
+  // unreadable or stays corrupt is a sign-in problem the person must fix, not a temporary one
   let last: unknown
-  for (let i = 0; i < 5; i++) { try { return JSON.parse(readFileSync(f, 'utf8')) as ProvidersDoc } catch (e) { last = e; const until = Date.now() + 20; while (Date.now() < until) { /* brief wait */ } } }
-  throw new Error(`providers.json unreadable: ${(last as Error).message}`)
+  for (let i = 0; i < 5; i++) {
+    try { return JSON.parse(readFileSync(f, 'utf8')) as ProvidersDoc } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code
+      if (code === 'ENOENT' || code === 'EACCES' || code === 'EISDIR') throw new SignInError(`no usable Cline settings (${code}): run \`cline auth\` on the host`)
+      last = e; const until = Date.now() + 20; while (Date.now() < until) { /* brief wait */ }
+    }
+  }
+  throw new SignInError(`Cline's providers.json stays unreadable (${(last as Error).message}): run \`cline auth\` on the host`)
 }
 const readAuth = (dataDir: string, provider: string): { doc: ProvidersDoc; auth: NonNullable<NonNullable<NonNullable<ProvidersDoc['providers']>[string]['settings']>['auth']> } => {
   const doc = readJsonRetry(providersFile(dataDir))
@@ -138,7 +152,11 @@ export const realToken = async (dataDir: string, provider: string, upstream: str
   if (typeof first.auth.refreshToken === 'string') latch(first.auth.refreshToken)
   return withClineLock(dataDir, provider, async () => {
     const file = providersFile(dataDir); const recovery = recoveryFile(dataDir, provider)
-    const aside = (): void => { try { renameSync(recovery, `${recovery}.stale`) } catch { /* none */ } }
+    // moved aside under its own time stamp (the newest three are kept), never silently replaced
+    const aside = (): void => {
+      try { renameSync(recovery, `${recovery}.stale-${now()}`) } catch { return }
+      try { const dir = join(file, '..'); const base = `${recovery.split('/').pop()}.stale-`; const old = readdirSync(dir).filter(n => n.startsWith(base)).sort((x, y) => Number(y.slice(base.length)) - Number(x.slice(base.length))); for (const n of old.slice(3)) rmSync(join(dir, n), { force: true }) } catch { /* best effort */ }
+    }
     for (let round = 0; round < 2; round++) {
       // another process (Cline itself, another broker) may have refreshed while we waited for the lock
       const { auth } = readAuth(dataDir, provider)
@@ -147,7 +165,7 @@ export const realToken = async (dataDir: string, provider: string, upstream: str
       const used = auth.refreshToken
       latch(used)
       // a kept answer counts only if it came from refreshing exactly this token, recently; anything else is moved aside
-      let tokens: Tokens | null = null
+      let tokens: Tokens | null = null; let keptFailed = false
       if (existsSync(recovery)) {
         let rec: Recovery | null = null
         try { rec = JSON.parse(readFileSync(recovery, 'utf8')) as Recovery } catch { /* unreadable */ }
@@ -159,36 +177,42 @@ export const realToken = async (dataDir: string, provider: string, upstream: str
         try { r = await fetch(`${upstream}/api/v1/auth/refresh`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: used, grantType: 'refresh_token' }), signal: AbortSignal.timeout(30_000), redirect: 'error' }) }
         catch (e) { throw new Error(`Cline token refresh could not reach the server (${(e as Error).message}); temporary`) }
         const text = await r.text().catch(() => '')
-        if (r.status >= 400 && r.status < 500 && r.status !== 429 && r.status !== 408) throw new SignInError(`Cline token refresh was refused (${r.status}): run \`cline auth\` on the host`)
+        if (r.status >= 400 && r.status < 500 && r.status !== 429 && r.status !== 408) { const msg = `Cline token refresh was refused (${r.status}): run \`cline auth\` on the host`; LATCHED.set(key, { used, msg }); throw new SignInError(msg) }
         if (!r.ok) throw new Error(`Cline token refresh failed (${r.status}); temporary`)
         tokens = tokensOf(text, now())
         if (!tokens) { const msg = 'Cline token refresh returned no access token: run `cline auth` on the host'; LATCHED.set(key, { used, msg }); throw new SignInError(msg) }
-        // kept before anything that can fail, bound to the token that was just spent
-        writeFileSync(recovery, JSON.stringify({ v: 1, usedSha256: sha256(used), at: now(), answer: text } satisfies Recovery), { mode: 0o600 })
+        // kept before anything that can fail, bound to the token that was just spent; if even that cannot be written,
+        // the tokens are still saved below (they exist only in memory now), and nothing retries the spent token
+        try { writeFileSync(recovery, JSON.stringify({ v: 1, usedSha256: sha256(used), at: now(), answer: text } satisfies Recovery), { mode: 0o600 }) } catch { keptFailed = true }
       }
       // read again right before writing; the auth that is replaced is the one read now (this section is synchronous:
       // nothing else in this process can write between the read and the rename)
-      const fail = (why: string): never => { const msg = `${why}; the server's answer is kept beside providers.json and the next supervisor run applies it: if this persists, run \`cline auth\` on the host`; LATCHED.set(key, { used, msg }); throw new SignInError(msg) }
-      let current: ProvidersDoc
-      try { current = readJsonRetry(file) } catch (e) { return fail(`could not re-read providers.json (${(e as Error).message})`) }
-      const entry = current.providers?.[provider]
-      const cur = entry?.settings?.auth
-      if (!entry?.settings || !cur) return fail(`the "${provider}" entry vanished from providers.json during the refresh`)
-      if (cur.refreshToken !== used) {
+      const fail = (why: string): never => { const msg = `${why}; ${keptFailed ? 'the server\'s answer could not be kept either' : 'the server\'s answer is kept beside providers.json and the next supervisor run applies it'}: if this persists, run \`cline auth\` on the host`; LATCHED.set(key, { used, msg }); throw new SignInError(msg) }
+      const t = tokens
+      const saved = await withSqliteLock(writeLockFile(dataDir), async (): Promise<'saved' | 'superseded'> => {
+        let current: ProvidersDoc
+        try { current = readJsonRetry(file) } catch (e) { return fail(`could not re-read providers.json (${(e as Error).message})`) }
+        const entry = current.providers?.[provider]
+        const cur = entry?.settings?.auth
+        if (!entry?.settings || !cur) return fail(`the "${provider}" entry vanished from providers.json during the refresh`)
         // the person (or Cline) signed in again meanwhile: their sign-in wins; ours is set aside, never written over it
-        aside()
-        continue
-      }
-      const userInfo = tokens.userInfo ?? (cur.metadata?.userInfo as Record<string, unknown> | undefined)
-      entry.settings.auth = { ...cur, accessToken: tokens.accessToken, refreshToken: tokens.refreshToken ?? used, expiresAt: tokens.expiresAt, ...(typeof userInfo?.clineUserId === 'string' ? { accountId: userInfo.clineUserId } : {}), metadata: { ...(cur.metadata ?? {}), ...(tokens.tokenType ? { tokenType: tokens.tokenType } : {}), ...(userInfo ? { userInfo } : {}) } }
-      entry.updatedAt = new Date().toISOString()
-      const tmp = `${file}.cockpit-${provider.replace(/[^A-Za-z0-9._-]/g, '_')}-${process.pid}.tmp`
-      try {
-        writeFileSync(`${file}.cockpit-backup`, readFileSync(file, 'utf8'), { mode: 0o600 })
-        writeFileSync(tmp, JSON.stringify(current, null, 2), { mode: 0o600 }); renameSync(tmp, file)
-      } catch (e) { try { rmSync(tmp, { force: true }) } catch { /* none */ } return fail(`could not save the refreshed Cline sign-in (${(e as Error).message})`) }
-      // saved: the kept answer is now in providers.json itself
-      rmSync(recovery, { force: true })
+        if (cur.refreshToken !== used) return 'superseded'
+        const userInfo = t.userInfo ?? (cur.metadata?.userInfo as Record<string, unknown> | undefined)
+        entry.settings.auth = { ...cur, accessToken: t.accessToken, refreshToken: t.refreshToken ?? used, expiresAt: t.expiresAt, ...(typeof userInfo?.clineUserId === 'string' ? { accountId: userInfo.clineUserId } : {}), metadata: { ...(cur.metadata ?? {}), ...(t.tokenType ? { tokenType: t.tokenType } : {}), ...(userInfo ? { userInfo } : {}) } }
+        entry.updatedAt = new Date().toISOString()
+        const tmp = `${file}.cockpit-${provider.replace(/[^A-Za-z0-9._-]/g, '_')}-${process.pid}.tmp`
+        try {
+          writeFileSync(`${file}.cockpit-backup`, readFileSync(file, 'utf8'), { mode: 0o600 })
+          writeFileSync(tmp, JSON.stringify(current, null, 2), { mode: 0o600 }); renameSync(tmp, file)
+        } catch (e) { try { rmSync(tmp, { force: true }) } catch { /* none */ } return fail(`could not save the refreshed Cline sign-in (${(e as Error).message})`) }
+        return 'saved'
+      })
+      if (saved === 'superseded') { aside(); continue }
+      // the kept answer is removed only once the file is confirmed to hold the new sign-in (another writer, such as
+      // Cline itself for another provider, could have replaced the file meanwhile)
+      let confirmed = false
+      try { const a = readJsonRetry(file).providers?.[provider]?.settings?.auth; confirmed = a?.accessToken === t.accessToken } catch { /* unconfirmed */ }
+      if (confirmed) rmSync(recovery, { force: true })
       // a kept answer can have expired since it was received: then refresh again from what was just saved
       if (live(tokens.expiresAt, now())) return tokens.accessToken
     }
@@ -311,7 +335,7 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
         let j: Record<string, unknown>
         try { const v = JSON.parse(Buffer.from(body as Uint8Array).toString('utf8')) as unknown; if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('not an object'); j = v as Record<string, unknown> } catch (e) { return refuse(res, req, 400, `model turn body: ${(e as Error).message}`) }
         model = typeof j.model === 'string' ? j.model : null
-        if (j.reasoning_effort !== undefined && typeof j.reasoning_effort !== 'string') return refuse(res, req, 403, 'reasoning_effort must be a string', model)
+        if (j.reasoning_effort !== undefined && (typeof j.reasoning_effort !== 'string' || j.reasoning_effort.length > 40)) return refuse(res, req, 403, 'reasoning_effort must be a short string', model)
         effort = (j.reasoning_effort as string | undefined) ?? null
         const extra = Object.keys(j).find(k => !TURN_FIELDS.has(k))
         if (extra !== undefined) return refuse(res, req, 403, `field "${extra.slice(0, 40)}" is not part of a Cline model turn`, model, effort)

@@ -11,7 +11,7 @@
 import { test, describe, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer, request } from 'node:http'
 import type { IncomingHttpHeaders, Server } from 'node:http'
@@ -19,7 +19,7 @@ import { connect as netConnect, createServer as netServer } from 'node:net'
 import { homedir, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { launch, mountProblem, strippedGitConfig } from '../src/sandbox.ts'
-import { expiry, realToken, startBroker } from '../src/broker.ts'
+import { expiry, realToken, SignInError, startBroker, writeLockFile } from '../src/broker.ts'
 import { classifyFailureText } from '../src/router.ts'
 import type { Broker, BrokerLimits } from '../src/broker.ts'
 import { attestWire, runWorker, viaBroker, workerSandbox } from '../src/worker.ts'
@@ -470,7 +470,8 @@ describe('isolation (review 11): the owner\'s sign-in, error answers and the log
     assert.equal(await realToken(data, 'cline', up.url), 'FRESH-A')
     const a = JSON.parse(readFileSync(f, 'utf8')).providers.cline.settings.auth
     assert.equal(a.accessToken, 'FRESH-A'); assert.ok(!JSON.stringify(a).includes('STALE')); assert.ok(!existsSync(`${f}.cockpit-refresh-cline`))
-    assert.match(readFileSync(`${f}.cockpit-refresh-cline.stale`, 'utf8'), /STALE-R/, 'the stale answer was moved aside, not destroyed')
+    const stale = readdirSync(join(f, '..')).filter(n => n.startsWith('providers.json.cockpit-refresh-cline.stale-'))
+    assert.equal(stale.length, 1); assert.match(readFileSync(join(f, '..', stale[0]), 'utf8'), /STALE-R/, 'the stale answer was moved aside under a time stamp, not destroyed')
   })
   test('an unusable kept answer (no access token, unreadable, too old) is deleted, never applied, and does not wedge later refreshes', T, async () => {
     for (const content of ['not json', JSON.stringify({ v: 1, usedSha256: createHash('sha256').update('test-refresh').digest('hex'), at: Date.now(), answer: '{"success":false}' }), JSON.stringify({ v: 1, usedSha256: createHash('sha256').update('test-refresh').digest('hex'), at: Date.now() - 48 * 3600_000, answer: JSON.stringify(answer('OLD-A', 'OLD-R')) })]) {
@@ -594,5 +595,53 @@ describe('isolation (review 12): transient failures, bounded records, two provid
     assert.equal(await realToken(data, 'cline', up.url), 'NEXT-A')
     assert.deepEqual(seen, ['KEPT-R'], 'the kept answer was saved first and its (rotated) refresh token used, not the spent one')
     assert.equal(JSON.parse(readFileSync(f, 'utf8')).providers.cline.settings.auth.refreshToken, 'NEXT-R')
+  })
+})
+
+describe('isolation (review 13): the sign-in survives write failures and concurrent writers', () => {
+  const expireP = (data: string, provider = 'cline'): string => { const f = join(data, 'settings', 'providers.json'); const d = JSON.parse(readFileSync(f, 'utf8')); d.providers[provider].settings.auth.expiresAt = Date.now() - 60_000; writeFileSync(f, JSON.stringify(d)); return f }
+  const ans = (a: string, r: string) => ({ success: true, data: { accessToken: a, refreshToken: r, expiresAt: new Date(Date.now() + 3600_000).toISOString(), userInfo: { clineUserId: 'acct-test' } } })
+  test('if the recovery file cannot be written, the new sign-in is still saved, and the spent token is never sent again', T, async () => {
+    const data = clineData(); const f = expireP(data)
+    mkdirSync(`${f}.cockpit-refresh-cline`) // the recovery file cannot be created
+    const seen: string[] = []
+    const up = await upstream({ refresh: s2 => { seen.push(JSON.parse(s2.body).refreshToken); return ans('W-A', 'W-R') } })
+    assert.equal(await realToken(data, 'cline', up.url), 'W-A')
+    assert.equal(await realToken(data, 'cline', up.url), 'W-A')
+    assert.deepEqual(seen, ['test-refresh'], 'one refresh; the spent token was not replayed')
+    assert.equal(JSON.parse(readFileSync(f, 'utf8')).providers.cline.settings.auth.refreshToken, 'W-R')
+  })
+  test('Cockpit\'s providers.json write lock serialises saves across processes (a second supervisor waits for it)', T, async () => {
+    const data = clineData(); const f = expireP(data)
+    const lock = writeLockFile(data)
+    const holder = spawn(process.execPath, ['-e', `const {DatabaseSync}=require('node:sqlite');const d=new DatabaseSync(${JSON.stringify(lock)});d.exec('BEGIN EXCLUSIVE');process.stdout.write('held\\n');setTimeout(()=>{d.exec('COMMIT');d.close();process.exit(0)},1500)`], { stdio: ['ignore', 'pipe', 'inherit'] })
+    await new Promise<void>(r => holder.stdout?.once('data', () => r()))
+    const up = await upstream({ refresh: () => ans('X-A', 'X-R') })
+    const t0 = Date.now()
+    assert.equal(await realToken(data, 'cline', up.url), 'X-A')
+    assert.ok(Date.now() - t0 >= 1000, `the save waited for the other process's lock (${Date.now() - t0} ms)`)
+    assert.equal(JSON.parse(readFileSync(f, 'utf8')).providers.cline.settings.auth.accessToken, 'X-A')
+    await new Promise(r => holder.on('exit', r))
+  })
+  test('a missing or corrupt providers.json is a sign-in problem, and a refused refresh is not retried', T, async () => {
+    const missing = tmp('nodata')
+    await assert.rejects(startBroker({ dataDir: missing, provider: 'cline' }), (e: Error) => e instanceof SignInError)
+    const corrupt = clineData(); writeFileSync(join(corrupt, 'settings', 'providers.json'), '{not json')
+    await assert.rejects(startBroker({ dataDir: corrupt, provider: 'cline' }), (e: Error) => e instanceof SignInError)
+    const data = clineData(); expireP(data)
+    let posts = 0
+    const server = createServer((req, res) => { req.resume(); req.on('end', () => { posts++; res.writeHead(400); res.end('{}') }) }); servers.push(server)
+    await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r()))
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+    await assert.rejects(realToken(data, 'cline', url), (e: Error) => e instanceof SignInError)
+    await assert.rejects(realToken(data, 'cline', url), (e: Error) => e instanceof SignInError)
+    assert.equal(posts, 1, 'a refusal is latched: the refused token is not sent again')
+  })
+  test('an over-long reasoning effort is refused, so no worker string reaches the records unbounded', T, async () => {
+    const up = await upstream()
+    const b = await startBroker({ dataDir: clineData(), provider: 'cline', upstream: up.url, model: 'xiaomi/mimo-v2.6-pro', reasoning: { toggle: 'on' } })
+    const code = await new Promise<number>(res => { const r = request({ socketPath: b.socketPath, path: '/api/v1/chat/completions', method: 'POST', headers: { authorization: `Bearer workos:${b.fakeToken}`, 'content-type': 'application/json' } }, s2 => { s2.resume(); s2.on('end', () => res(s2.statusCode ?? 0)) }); r.end(JSON.stringify({ model: 'xiaomi/mimo-v2.6-pro', reasoning_effort: 'e'.repeat(100_000) })) })
+    await b.close()
+    assert.equal(code, 403); assert.equal(up.seen.length, 0); assert.ok(b.records.every(r => (r.effort ?? '').length <= 40))
   })
 })

@@ -326,6 +326,19 @@ are per provider and a kept answer that does not apply is moved aside, never del
 when it was received, a budget stop is decided only by a model turn, and a missing sign-in at launch is an
 authentication failure.
 
+A fifth fresh review, of `d25e0d9..ca7b225`, again accepted the isolation and found two sign-in risks, fixed with
+tests (`isolation (review 13)`): if the recovery file itself could not be written, the rotated token existed only
+in memory and the next request would have replayed the spent token — the new sign-in is now saved regardless and
+any failure after the server's answer latches; Cline's locks are per provider, so two supervisors refreshing
+`cline` and `cline-pass` at once could each rewrite the whole file and lose the other's token — Cockpit now takes
+its own write lock around the read-modify-write (a test holds it from a second process and shows the save
+waits) and removes the recovery file only once its sign-in is confirmed in the file. Also: a missing, unreadable
+or persistently corrupt providers.json and an unopenable lock are sign-in problems (not temporary), a refused
+refresh is latched, stale recovery files are time-stamped (newest three kept), an over-long reasoning effort is
+refused, and the launch-time authentication mapping no longer relies on a text match. Residual (accepted): Cline
+itself does not take Cockpit's write lock, so Cline refreshing one provider while Cockpit saves another can still
+race, as Cline's own two-provider refreshes can; the recovery file then still holds Cockpit's answer.
+
 Accepted and documented (README limitations 22 and 23): no seccomp filter (keyring, io_uring, perf and bpf
 follow host settings), no resource limits, and the routed-model rule would refuse a different auxiliary model.
 
