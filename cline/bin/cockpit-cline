@@ -4,9 +4,10 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 # Cockpit's process holds the person's Cline sign-in. Node settings that would let a third party read its requests
 # to the Cline API (no certificate checks, extra certificate authorities or OpenSSL configuration, TLS key logs, a
-# proxy from the environment) and NODE_OPTIONS (which can load code into the process) are cleared here; the broker
+# proxy from the environment) and settings that can load code into the process (NODE_OPTIONS, NODE_PATH,
+# NODE_COMPILE_CACHE, LD_PRELOAD, LD_AUDIT) are cleared here; the broker
 # refuses to run if any of them is still set. Removed test-only overrides are cleared too, so a stale export does
 # nothing. No variable chooses the upstream, the bubblewrap or the cline that Cockpit runs.
-unset NODE_OPTIONS NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS NODE_USE_ENV_PROXY SSL_CERT_FILE SSL_CERT_DIR SSLKEYLOGFILE OPENSSL_CONF \
+unset NODE_OPTIONS NODE_PATH NODE_COMPILE_CACHE LD_PRELOAD LD_AUDIT NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS NODE_USE_ENV_PROXY SSL_CERT_FILE SSL_CERT_DIR SSLKEYLOGFILE OPENSSL_CONF \
   COCKPIT_BROKER_UPSTREAM COCKPIT_CLINE_BIN COCKPIT_CLINE_BWRAP COCKPIT_CLINE_CATALOG_BIN COCKPIT_CLINE_NODE
 exec node --experimental-transform-types --no-warnings --import "$HERE/loader/register.mjs" "$HERE/src/cli.ts" "$@"

@@ -216,6 +216,6 @@ No variable chooses where the broker sends your token or which programs Cockpit 
 the broker always uses `https://api.cline.bot`; bubblewrap is the root-owned system binary; Cline is the one in the
 Node installation that runs Cockpit (else `/usr/local/bin` or `/usr/bin`), owned by you or root and writable by
 nobody else; Node is the `node` on `PATH` (see [SECURITY.md](../../SECURITY.md#what-cockpit-runs-and-what-chooses-it)).
-`bin/cockpit-cline` also clears `NODE_OPTIONS` and Node's TLS and proxy settings (`NODE_TLS_REJECT_UNAUTHORIZED`,
+`bin/cockpit-cline` also clears `NODE_OPTIONS`, `NODE_PATH`, `NODE_COMPILE_CACHE`, `LD_PRELOAD`, `LD_AUDIT` and Node's TLS and proxy settings (`NODE_TLS_REJECT_UNAUTHORIZED`,
 `NODE_EXTRA_CA_CERTS`, `NODE_USE_ENV_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `SSLKEYLOGFILE`, `OPENSSL_CONF`)
 before Node starts; started any other way with one of them set (or any `NODE_OPTIONS`), the broker refuses to run.

@@ -282,7 +282,7 @@ export const launch = (s: SandboxSpec, argv: string[]): Launched => {
 export const bwrapAvailable = (): Promise<{ ok: boolean; detail: string }> => new Promise(resolve => {
   let bwrap: string
   try { bwrap = trustedBwrap() } catch (e) { resolve({ ok: false, detail: (e as Error).message }); return }
-  const c = spawn(bwrap, ['--unshare-user', '--unshare-pid', '--unshare-net', '--disable-userns', '--assert-userns-disabled', ...osMounts(), '--remount-ro', '/', '--', '/usr/bin/true'], { stdio: ['ignore', 'ignore', 'pipe'] })
+  const c = spawn(bwrap, ['--unshare-user', '--unshare-pid', '--unshare-net', '--disable-userns', '--assert-userns-disabled', ...osMounts(), '--remount-ro', '/', '--', '/usr/bin/true'], { stdio: ['ignore', 'ignore', 'pipe'], env: { PATH: process.env.PATH ?? '/usr/bin:/bin' } })
   let err = ''
   c.stderr?.on('data', d => { err += d })
   c.on('error', e => resolve({ ok: false, detail: e.message }))

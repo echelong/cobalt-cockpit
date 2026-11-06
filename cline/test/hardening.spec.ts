@@ -201,7 +201,7 @@ describe('Node TLS and proxy settings: stripped by the launcher, refused by the 
     // a `node` first on PATH that reports what it was given, instead of running Cockpit
     const dir = mkdtempSync(join(CANARY, 'node-'))
     writeFileSync(join(dir, 'node'), `#!/usr/bin/env bash\nenv > ${JSON.stringify(join(dir, 'env.txt'))}\nprintf '%s\\n' "$@" > ${JSON.stringify(join(dir, 'args.txt'))}\n`); chmodSync(join(dir, 'node'), 0o755)
-    const cleared = ['NODE_OPTIONS', 'NODE_TLS_REJECT_UNAUTHORIZED', 'NODE_EXTRA_CA_CERTS', 'NODE_USE_ENV_PROXY', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'SSLKEYLOGFILE', 'OPENSSL_CONF', 'COCKPIT_BROKER_UPSTREAM', 'COCKPIT_CLINE_BIN', 'COCKPIT_CLINE_BWRAP', 'COCKPIT_CLINE_CATALOG_BIN', 'COCKPIT_CLINE_NODE']
+    const cleared = ['NODE_OPTIONS', 'NODE_PATH', 'NODE_COMPILE_CACHE', 'LD_AUDIT', 'NODE_TLS_REJECT_UNAUTHORIZED', 'NODE_EXTRA_CA_CERTS', 'NODE_USE_ENV_PROXY', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'SSLKEYLOGFILE', 'OPENSSL_CONF', 'COCKPIT_BROKER_UPSTREAM', 'COCKPIT_CLINE_BIN', 'COCKPIT_CLINE_BWRAP', 'COCKPIT_CLINE_CATALOG_BIN', 'COCKPIT_CLINE_NODE']
     execFileSync(join(PACKAGE_DIR, 'bin', 'cockpit-cline'), ['doctor'], { env: { PATH: `${dir}:${process.env.PATH}`, HOME: homedir(), COCKPIT_CLINE_DATA: '/kept', ...Object.fromEntries(cleared.map(k => [k, k === 'NODE_OPTIONS' ? `--require=${join(dir, 'evil.cjs')}` : 'https://evil.example'])) } })
     const env = readFileSync(join(dir, 'env.txt'), 'utf8'); const args = readFileSync(join(dir, 'args.txt'), 'utf8').split('\n')
     for (const k of cleared) assert.ok(!new RegExp(`^${k}=`, 'm').test(env), `${k} reached node`)

@@ -17,7 +17,7 @@ that plugin does not install or enable this adapter, and this adapter needs no C
 | Requirement | Why | Check |
 |---|---|---|
 | Linux | bubblewrap and Linux namespaces are the isolation boundary; macOS and Windows are not supported | `uname -s` |
-| `bwrap` (bubblewrap) **0.8 or later**, from the system's package manager | every worker and gate runs in it; 0.8 added `--disable-userns`, which Cockpit requires. Only a root-owned `/usr/bin/bwrap`, `/bin/bwrap`, `/usr/local/bin/bwrap` or `/run/current-system/sw/bin/bwrap` is used, never one found on `PATH` | `bwrap --version` |
+| `bwrap` (bubblewrap) **0.8 or later**, from the system's package manager | every worker and gate runs in it; 0.8 added `--disable-userns`, which Cockpit requires. Only a root-owned `/usr/bin/bwrap`, `/bin/bwrap` or `/usr/local/bin/bwrap` is used, never one found on `PATH` (NixOS, which keeps it elsewhere, is not supported: Cockpit refuses to start workers there) | `bwrap --version` |
 | Unprivileged user namespaces allowed for `bwrap` | the sandbox is set up without root or setuid | `cockpit-cline doctor` (the `sandbox:` line) |
 | Node **24** (the same Node that runs `cline`) | the adapter is TypeScript run by Node's type stripping; tested on 24.20.0 | `node --version` |
 | `git` | missions run in Git worktrees | `git --version` |
@@ -185,9 +185,8 @@ supervised `cline` runs. The stock `cline` command and installation are left exa
 
 **Optional integration with the normal `cline` command: investigated, not built.** The only reversible hooks
 into `cline` itself are a plugin command (text replies only, see above) or a shell alias/wrapper named `cline`.
-A wrapper would also intercept every other tool that runs `cline`, including Cockpit itself (it finds `cline`
-on `PATH`, so its sandboxed workers would start the wrapper instead of Cline), and it would change a command you
-already rely on. So the interactive Cockpit stays a separate command, `cockpit-cline`. If you want one anyway, a personal
+A wrapper would intercept every other tool that runs `cline` from `PATH` (Cockpit itself does not: its workers
+run the installed Cline by its real path), and it would change a command you already rely on. So the interactive Cockpit stays a separate command, `cockpit-cline`. If you want one anyway, a personal
 alias such as `alias clc=cockpit-cline` is reversible and touches nothing else.
 
 `/new` opens the new conversation first and closes the old one only when none of its tasks holds ownership;
@@ -291,15 +290,16 @@ scripts/typecheck.sh       # TypeScript 5.9.3, strict
 bin/cockpit-cline smoke --yes --max-usd 0.25   # live, opt-in, budget bounded
 ```
 
-The offline suite is 368 tests in 81 suites; on the development machine it takes about 5 minutes (310 s measured
+The offline suite is 369 tests in 81 suites; on the development machine it takes about 5 minutes (310 s measured
 on 2026-11-06 with `/tmp` on tmpfs; a disk-backed temporary directory is much slower, and the archive test's
 30-second bound can fail there), the isolation tests alone (53) under a minute and the hardening tests
 (`hardening.spec.ts`, 24: what chooses the broker's upstream, bubblewrap and Cline) a few seconds.
 Each test process keeps all its fixtures in one directory, `ccl-run-*` in the temporary directory (and
 `~/.ccl-run-*` for canaries that must be on persistent storage), removed when the process exits or is
 interrupted (SIGINT, SIGTERM, SIGHUP); one left by a killed process is removed by the next test run, which
-checks that it is a test root and that its owner has ended (`test/scratch.ts`, tested in `scratch.spec.ts`).
-`COCKPIT_TEST_KEEP=1` keeps them for debugging. Tests run one file at a time
+checks that it is a test root and that its owner has provably ended; when that cannot be established, it is kept
+(`test/scratch.ts`, tested in `scratch.spec.ts`). `COCKPIT_TEST_KEEP=1` keeps a run's fixtures for debugging; they
+are never swept, so remove them yourself. Tests run one file at a time
 (`--test-concurrency=1`) and need the same prerequisites as the adapter, including a working bubblewrap: without
 one, the sandbox tests fail rather than skip. `COCKPIT_SCALE_N` sets the sequential-task scale test (default 2000).
 `scripts/typecheck.sh` looks for TypeScript 5.9.3 and `@types/node` in the npm `npx` cache; set `TSC` and

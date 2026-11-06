@@ -4,7 +4,7 @@
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { PACKAGE_DIR } from '../src/config.ts'
 import { startTimeOf } from '../src/proc.ts'
@@ -14,9 +14,10 @@ import { homeTmp, tmp } from './helpers.ts'
 const T = { timeout: 60_000 }
 const deadPid = (): number => { const r = spawnSync('true'); return r.pid as number }
 /** A directory shaped like a root, with an owner record (which may name anything). */
+const BOOT = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(); const PIDNS = readlinkSync('/proc/self/ns/pid')
 const fakeRoot = (base: string, name: string, owner: Record<string, unknown> | null, root = join(base, name)): string => {
   const p = join(base, name); mkdirSync(p); writeFileSync(join(p, 'data.txt'), 'fixture')
-  if (owner) writeFileSync(join(p, OWNER_FILE), JSON.stringify({ v: 1, root, ...owner }))
+  if (owner) writeFileSync(join(p, OWNER_FILE), JSON.stringify({ v: 1, root, boot: BOOT, pidns: PIDNS, ...owner }))
   return p
 }
 const node = (args: string[], env: Record<string, string>): ReturnType<typeof spawn> => spawn(process.execPath, ['--experimental-transform-types', '--no-warnings', '--import', join(PACKAGE_DIR, 'loader', 'register.mjs'), ...args], { env: { PATH: process.env.PATH ?? '/usr/bin:/bin', ...env }, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -49,13 +50,30 @@ describe('scratch roots: what a sweep may remove', () => {
     writeFileSync(join(base, 'evidence.log'), 'keep me'); writeFileSync(join(base, 'ccl-run-JJJJJJ'), 'a file, not a root')
     const target = fakeRoot(tmp('link-target'), 'ccl-run-KKKKKK', { pid: deadPid(), start: null })
     symlinkSync(target, join(base, 'ccl-run-LLLLLL'))
+    // never provably gone, or not a root of ours: kept
+    const otherBoot = fakeRoot(base, 'ccl-run-MMMMMM', { pid: deadPid(), start: null, boot: 'another-boot' })
+    const otherNs = fakeRoot(base, 'ccl-run-NNNNNN', { pid: deadPid(), start: null, pidns: 'pid:[1]' })
+    const noBoot = fakeRoot(base, 'ccl-run-OOOOOO', { pid: deadPid(), start: null, boot: null })
+    const kept = fakeRoot(base, 'ccl-run-PPPPPP', { pid: deadPid(), start: null, keep: true })
+    const malformed = ['ccl-run-QQQQQ0', 'ccl-run-QQQQQ1', 'ccl-run-QQQQQ2', 'ccl-run-QQQQQ3', 'ccl-run-QQQQQ4'].map((n, i) => fakeRoot(base, n, [{ pid: 0, start: 'x' }, { pid: -5, start: 'x' }, { pid: 1.5, start: null }, { pid: deadPid(), start: 42 }, { pid: '123', start: null }][i]))
     const removed = sweep(base)
+    // a live owner whose start time cannot be read is kept, not taken for a reused pid
+    const unreadable = fakeRoot(base, 'ccl-run-RRRRRR', { pid: live, start: startTimeOf(live) })
+    assert.equal(sweepProblem(unreadable, 'ccl-run-RRRRRR', { startOf: () => null, boot: () => BOOT, pidns: () => PIDNS }), 'owner not provably gone')
+    const oldStart = fakeRoot(base, 'ccl-run-SSSSSS', { pid: live, start: 'old' })
+    assert.equal(sweepProblem(oldStart, 'ccl-run-SSSSSS', { startOf: () => null, boot: () => BOOT, pidns: () => PIDNS }), 'owner not provably gone', 'an unreadable start time is not a reused pid')
+    const deadHere = fakeRoot(base, 'ccl-run-TTTTTT', { pid: deadPid(), start: null })
+    assert.equal(sweepProblem(deadHere, 'ccl-run-TTTTTT', { startOf: startTimeOf, boot: () => null, pidns: () => PIDNS }), 'owner not provably gone', 'no readable boot id: kept')
+    assert.equal(sweepProblem(deadHere, 'ccl-run-TTTTTT'), null, 'positive control: the same root is sweepable with a readable boot id')
     sleeper.kill()
+    for (const p of [otherBoot, otherNs, noBoot, kept, unreadable, ...malformed]) assert.ok(existsSync(join(p, 'data.txt')), `${p} was swept`)
+    assert.equal(sweepProblem(kept, 'ccl-run-PPPPPP'), 'kept for debugging (COCKPIT_TEST_KEEP)')
+    for (const [i, p] of malformed.entries()) assert.equal(sweepProblem(p, `ccl-run-QQQQQ${i}`), 'malformed owner record', p)
     assert.deepEqual(removed.sort(), [dead, hidden, reused].sort())
     for (const p of [dead, hidden, reused]) assert.ok(!existsSync(p), p)
     for (const p of [active, self, noRecord, elsewhere, legacy, longName, userDir, target, join(base, 'ccl-run-LLLLLL')]) assert.ok(existsSync(join(p, 'data.txt')), `${p} was touched`)
     assert.equal(readFileSync(join(base, 'evidence.log'), 'utf8'), 'keep me'); assert.equal(readFileSync(join(base, 'ccl-run-JJJJJJ'), 'utf8'), 'a file, not a root')
-    assert.equal(sweepProblem(active, 'ccl-run-DDDDDD'), 'owner still running'); assert.equal(sweepProblem(noRecord, 'ccl-run-FFFFFF'), 'no owner record')
+    assert.equal(sweepProblem(active, 'ccl-run-DDDDDD'), 'owner not provably gone'); assert.equal(sweepProblem(noRecord, 'ccl-run-FFFFFF'), 'no owner record')
     assert.equal(sweepProblem(join(base, 'ccl-run-LLLLLL'), 'ccl-run-LLLLLL'), 'not a real directory')
   })
 })
@@ -93,6 +111,17 @@ describe('scratch roots: removed however a test process ends', () => {
     assert.ok(existsSync(join(active.info.fixture, 'f.txt')) && existsSync(active.info.homeRoot), 'an active root was swept')
     active.kill('SIGTERM'); await active.exited
     assert.deepEqual(readdirSync(b.tmp), []); assert.deepEqual(readdirSync(b.home), [])
+  })
+
+  test('COCKPIT_TEST_KEEP=1 keeps the roots for debugging, and a later run does not sweep them', T, async () => {
+    const b = bases()
+    const kept = await new Promise<Child>((resolve, reject) => {
+      const c = node([join(PACKAGE_DIR, 'test', 'fixtures', 'scratch-child.ts'), 'ok'], { COCKPIT_TEST_TMP: b.tmp, HOME: b.home, COCKPIT_TEST_KEEP: '1' })
+      let out = ''; c.stdout?.on('data', d => { out += d }); c.on('exit', () => { try { resolve(JSON.parse(out.split('\n')[0]) as Child) } catch (e) { reject(e) } })
+    })
+    assert.ok(existsSync(join(kept.fixture, 'f.txt')), 'kept after exit')
+    const next = await child('ok', b); await next.exited
+    assert.ok(existsSync(join(kept.fixture, 'f.txt')) && existsSync(kept.homeRoot), 'a kept root was swept by the next run')
   })
 
   test('a node:test file whose test times out still removes its root', T, async () => {
