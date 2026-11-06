@@ -41,8 +41,10 @@ const startedAtMs = (start: string): number | null => {
  * 2. The marker: any readable process of this user, inside or outside the namespace,
  *    whose environment carries the attempt marker (catches escapes that keep their
  *    environment). A process started through a service manager inherits the manager's
- *    environment, not the marker: that route is closed instead, by hiding the user
- *    manager's and the buses' sockets from every sandbox (sandbox.ts alwaysHidden).
+ *    environment, not the marker: that route is narrowed instead, by hiding the user
+ *    manager's and the buses' socket paths from every sandbox (sandbox.ts alwaysHidden).
+ *    Workers share the host network namespace, so abstract unix sockets stay reachable
+ *    to them (README, Limitations 2); gates run without network and cannot reach them.
  * 3. Without a known init, a process of this user that cannot be inspected and started
  *    after the attempt began makes the answer 'unknown', never 'gone'.
  * The pid namespace inode is NOT used to find processes: the kernel reuses namespace

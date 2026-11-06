@@ -216,7 +216,9 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
 1. **Linux only**, and it needs unprivileged user namespaces for bubblewrap.
 2. **Network and loopback are shared.** Workers need the provider API, so they can reach the network and
    localhost services, including a running Cline hub daemon (`doctor` warns). The hook refuses `cline` and other
-   agent launchers, but a determined model could talk to a local service directly. Stop local services you do
+   agent launchers, but a determined model could talk to a local service directly. Abstract-namespace unix
+   sockets (some X11 and D-Bus setups) are reachable the same way; socket paths under `/run/user/<uid>` and the
+   system bus are hidden. Gates run without network and reach none of these. Stop local services you do
    not trust a worker with, or run missions on a machine without them.
 3. **Cline's data directory (`~/.cline/data`) is writable inside the sandbox**: Cline needs it for its sessions
    and to refresh OAuth tokens. A worker can therefore read the Cline credentials it is already using, and it can

@@ -1,6 +1,7 @@
 // Release-candidate review (round 7): regression tests for every defect it found and that was fixed.
 import { test, describe, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { parsePlan, parseRequest } from '../src/planner.ts'
@@ -14,6 +15,7 @@ import { Ledger, listClaims } from '../src/store.ts'
 import { alwaysHidden, bwrapArgs } from '../src/sandbox.ts'
 import { runCommandGate } from '../src/gates.ts'
 import { sanitize } from '../src/ui/term.ts'
+import { startTimeOf } from '../src/proc.ts'
 import { allTasks, config, env, mission, resolutions, task, tmp } from './helpers.ts'
 import { KEYS, killShells, openShell } from './fixtures/pty.ts'
 
@@ -150,6 +152,29 @@ describe('review 7: sandboxes, gates and the ledger', () => {
     writeFileSync(seg, `${readFileSync(seg, 'utf8')}{"seq":2,"torn`)
     const again = new Ledger(dir); again.append('two', null, {})
     assert.equal(again.verify().ok, false)
+  })
+})
+
+describe('review 7 (fix review): a hold on a gate\'s processes survives a restart', () => {
+  test('a restarted supervisor censuses the held gate sandbox (not the ended worker) and stops what still runs before releasing anything', T, async () => {
+    const e = env()
+    const m = await mission(e, { tasks: [task('a')] })
+    // a gate process still running after its gate returned: the shape the supervisor records when it holds
+    const loose = spawn('sleep', ['60'], { env: { ...process.env, COCKPIT_CLINE_ATTEMPT: `gate-${m.header.id}.a.1-test` }, stdio: 'ignore' })
+    await new Promise(r => setTimeout(r, 200))
+    const pid = loose.pid as number
+    const heldTarget = { initPid: pid, initStart: startTimeOf(pid), pidNs: null, marker: `COCKPIT_CLINE_ATTEMPT=gate-${m.header.id}.a.1-test`, since: Date.now() - 5000 }
+    const t = m.live.tasks.a
+    t.state = 'held'; t.reason = 'gate test: processes not accounted for'
+    t.attempts.push({ n: 1, id: `${m.header.id}.a.1`, role: 'coder', provider: 'cline', model: 'deepseek/deepseek-v4.1-flash-1017', requestedReasoning: 'xhigh', cliThinking: 'xhigh', expectedWire: 'max', mapping: null, route: { rules: [] } as never, engineId: 'a@1', phase: 'held', startedAt: new Date(Date.now() - 10_000).toISOString(), endedAt: null, identity: null, worktree: null, base: null, usage: { inputTokens: 10, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: null, reportedUsd: 0.001 }, usageEvents: 1, toolCalls: {}, iterations: 1, finishReason: 'completed', reportedModel: null, reportedProvider: null, wire: null, census: { state: 'gone', pids: [], detail: 'worker ended' }, stoppedBy: 'exit', exitCode: 0, charge: { usd: 0.001, basis: 'reported' }, estimateUsd: null, failure: null, failureDetail: null, gates: [], changes: [], commit: null, resultExcerpt: null, hookRefusals: [], alerts: [], heldTarget } as AttemptRecord)
+    const exited = new Promise(r => loose.on('exit', r))
+    await m.reconcile()
+    await Promise.race([exited, new Promise(r => setTimeout(r, 5000))])
+    assert.notEqual(loose.exitCode === null && loose.signalCode === null, true, 'the held gate process was stopped by the census')
+    const kinds = [...m.ledger.entries()].filter(x => x.task === 'a').map(x => x.kind)
+    assert.ok(kinds.includes('reconcile_kill') && kinds.includes('reconciled'), kinds.join(','))
+    // the worker had ended normally: its cost is complete, not marked a lower bound
+    assert.ok(!(m.live.session.lowerBoundTasks ?? []).includes(`${m.header.id}.a.1`))
   })
 })
 

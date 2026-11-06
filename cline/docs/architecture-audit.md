@@ -90,7 +90,7 @@ process per worker inside its own bubblewrap sandbox. A native plugin remains a 
 
 ## 6. Independent review
 
-Six fresh-context, read-only reviews (Sonnet, high effort), each given the code and the stated invariants, not
+Ten fresh-context, read-only reviews (Sonnet, high effort), each given the code and the stated invariants, not
 the author's conclusions.
 
 - **Round 1** (on `18c5ca1`): NOT CLEAN, 9 MATERIAL and 3 SHOULD-FIX findings: gate side effects committed
@@ -205,6 +205,16 @@ the author's conclusions.
   catalog price without `cacheWrite` counts it as $0; a stale `reportedUsd` with growing tokens keeps the
   `reported` label; the DONE wording counts read-only tasks as gate-verified; a crash between archiving a task and
   writing `live.json` can list it twice in the report; the streamed answer can continue on a system line.
+
+  A tenth review, of that fix delta (`4cf029a`), accepted it. It found that a hold on a gate's processes lasted
+  only until the next supervisor start (recovery censused the ended worker, not the gate sandbox). The gate's
+  sandbox identity is now kept on the attempt and in the repository claim, and `reconcile` and `recover --lost`
+  census it (test in `review7.spec.ts`). Also fixed: final-gate artifacts are removed only when the tree was
+  inspected before the gates ran. Remaining from that review: a worker can still request `review` or `frontend`
+  children whose wording routes them to the commander or the frontend role (bounded by the task and session
+  caps); abstract unix sockets stay reachable to workers on the shared network (README limitation 2); a lone
+  Esc followed by a key within 200 ms reads as an Alt chord; a commander plan in a turn may not name a task
+  `task` or `final-review`; LRM/RLM and zero-width characters are not stripped.
 - The reviews found sound: the census logic after the inode fix, the ledger hash chain, claim overlap
   normalisation, DeepSeek-never-substituted routing, bounded `nextStep`, wire judging, and that no stop or cancel
   path releases ownership without a clean census.

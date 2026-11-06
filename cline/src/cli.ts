@@ -194,8 +194,9 @@ const recover = async (a: Args): Promise<number> => {
     const claims = listClaims(info.commonDir).claims.filter(c => c.missionId === lost)
     let held = 0
     for (const c of claims) {
-      const id = c.identity as { initPid?: number | null; initStart?: string | null; pidNs?: string | null; since?: number } | null
-      const cen = census({ initPid: id?.initPid ?? null, initStart: id?.initStart ?? null, pidNs: id?.pidNs ?? null, marker: `COCKPIT_CLINE_ATTEMPT=${lost}.${c.taskId}.${c.attempt}`, since: id?.since ?? Date.parse(c.at) })
+      const id = c.identity as { initPid?: number | null; initStart?: string | null; pidNs?: string | null; marker?: string | null; since?: number } | null
+      // the claim's own marker when it has one: a hold on a gate's processes records the gate sandbox's marker
+      const cen = census({ initPid: id?.initPid ?? null, initStart: id?.initStart ?? null, pidNs: id?.pidNs ?? null, marker: id?.marker ?? `COCKPIT_CLINE_ATTEMPT=${lost}.${c.taskId}.${c.attempt}`, since: id?.since ?? Date.parse(c.at) })
       print(`claim ${c.taskId}#${c.attempt} [${c.owned.join(',')}]: ${cen.state} (${cen.detail})`)
       if (cen.state === 'gone') retireClaim(info.commonDir, lost, c.taskId); else held++
     }

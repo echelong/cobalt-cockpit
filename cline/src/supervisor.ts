@@ -19,7 +19,7 @@ import { emptyFacts, foldLine, runWorker, targetOf } from './worker.ts'
 import type { StreamFacts, WorkerOutcome, WorkerSpec, Control } from './worker.ts'
 import type { Identity } from './sandbox.ts'
 import { census, processIdentity, sameProcess, terminate } from './proc.ts'
-import type { Census, ProcessIdentity } from './proc.ts'
+import type { Census, ProcessIdentity, Target } from './proc.ts'
 import type { WireVerdict } from './reasoning.ts'
 import { gateTaint, gitGate, packageScripts, runCommandGate, securityGate } from './gates.ts'
 import type { GateResult, GateSpec } from './gates.ts'
@@ -48,6 +48,7 @@ export type AttemptRecord = {
   hookRefusals: { tool: string; reason: string }[]; alerts: number[]
   /** The git admin dir of this attempt's worktree: host git is pinned to it. */ adminDir?: string | null
   /** Gate definition files (e.g. package.json, a test entry point) this attempt changed. */ gateTaint?: string[]
+  /** Processes of this attempt still to be accounted for after the worker itself ended (a gate's sandbox): recovery censuses these. */ heldTarget?: Target | null
 }
 export type TaskState = 'queued' | 'running' | 'verifying' | 'completed' | 'failed' | 'cancelled' | 'held' | 'refused'
 export type TaskRecord = {
@@ -733,7 +734,14 @@ export class Mission {
     a.gates = gates
     // a gate whose sandbox processes are not confirmed gone may still be running worker code: ownership is kept
     const loose = gates.find(x => x.unaccounted)
-    if (loose) { this.ledger.append('gates', t.spec.id, { attempt: a.id, gates: gates.map(x => ({ name: x.name, state: x.state })) }); this.hold(t, a, `gate ${loose.name}: processes not accounted for (${loose.unaccounted}); ownership retained`); return }
+    if (loose) {
+      // the attempt is held on the gate's processes, durably: a restarted supervisor (and recover --lost, through the
+      // claim) censuses the gate sandbox, not the worker that already ended
+      a.heldTarget = loose.target ?? null; a.phase = 'held'
+      if (t.spec.mode === 'write') writeClaim(this.header.commonDir, { missionId: this.header.id, taskId: t.spec.id, attempt: a.n, owned: t.spec.owned, mode: t.spec.mode, state: 'uncertain', identity: { ...(a.identity ?? {}), ...(loose.target ?? {}) }, supervisor: processIdentity(process.pid), stateDir: this.dir, at: new Date().toISOString() })
+      this.ledger.append('gates', t.spec.id, { attempt: a.id, gates: gates.map(x => ({ name: x.name, state: x.state })), held: loose.target ?? null })
+      this.hold(t, a, `gate ${loose.name}: processes not accounted for (${loose.unaccounted}); ownership retained`); return
+    }
     this.ledger.append('gates', t.spec.id, { attempt: a.id, gates: gates.map(x => ({ name: x.name, state: x.state, exit: x.exitCode ?? null, sha: x.outputSha256 ?? null, evidence: x.evidence.slice(0, 600) })) })
     const bad = gates.filter(x => x.state !== 'pass')
     const structural = bad.find(x => x.kind === 'git' || x.kind === 'security')
@@ -871,7 +879,7 @@ export class Mission {
     for (const t of Object.values(this.live.tasks)) {
       for (const a of t.attempts) {
         if (a.phase === 'ended') continue
-        const target = targetOf(a.identity, `COCKPIT_CLINE_ATTEMPT=${a.id}`, Date.parse(a.startedAt))
+        const target = a.heldTarget ?? targetOf(a.identity, `COCKPIT_CLINE_ATTEMPT=${a.id}`, Date.parse(a.startedAt))
         let c = census(target)
         if (c.state === 'alive') { this.ledger.append('reconcile_kill', t.spec.id, { attempt: a.id, pids: c.pids }); c = await terminate(target, true, 5000) }
         a.census = c
@@ -883,8 +891,9 @@ export class Mission {
         const sawResult = text.includes('"type":"run_result"')
         // usage the stream recorded after the last persist is folded in; a request still in flight when the
         // supervisor ended may be billed but never reported, so the attempt's cost is a lower bound
-        if (text) { const f = emptyFacts(); for (const line of text.split('\n')) if (line.trim()) foldLine(f, line); if (f.usageEvents >= a.usageEvents) { this.absorb(a, f); this.chargeSession() } }
-        const lb = (this.live.session.lowerBoundTasks ??= []); if (!lb.includes(a.id)) lb.push(a.id)
+        if (text && !a.heldTarget) { const f = emptyFacts(); for (const line of text.split('\n')) if (line.trim()) foldLine(f, line); if (f.usageEvents >= a.usageEvents) { this.absorb(a, f); this.chargeSession() } }
+        // (a hold on a gate's processes came after the worker ended normally: its usage is complete)
+        if (!a.heldTarget) { const lb = (this.live.session.lowerBoundTasks ??= []); if (!lb.includes(a.id)) lb.push(a.id) }
         await this.failed(t, a, 'unknown_outcome', `supervisor ended while the attempt ran; ${sawResult ? 'a run result was written but was never verified' : 'no run result'}`, [])
       }
       // Processes ended (census gone when the attempt ended) but no outcome was recorded: a crash or
@@ -931,13 +940,15 @@ export class Mission {
     this.live.finalGatesHead = null
     if (this.live.integration.head !== this.live.integration.base) {
       const head = this.live.integration.head
-      const before = new Set((await changesOf(this.live.integration.dir, null).catch(() => [])).map(c => c.path))
+      // without a reliable picture of the tree before the gates, nothing is removed afterwards
+      const pre = await changesOf(this.live.integration.dir, null).catch(() => null)
+      const before = new Set((pre ?? []).map(c => c.path))
       for (const g of this.header.gates) this.live.finalGates.push(await runCommandGate(g, this.live.integration.dir, join(this.dir, 'final-gates'), { hide: this.config.sandbox.hide, shareDirs: this.deps.shareDirs.map(s => ({ from: s.from, to: join(this.live.integration.dir, s.to) })), timeoutSeconds: this.config.limits.gateTimeoutSeconds, gitCommonDir: this.header.commonDir }, `${this.header.id}-final`))
       this.live.finalGatesHead = head
       // The final gates ran worker-authored code in the integration worktree, which later turns read and pick
       // onto: new untracked paths are their artifacts and are removed; anything else they changed is reported.
       const after = await changesOf(this.live.integration.dir, null).catch(() => null)
-      if (after === null) this.problem('final gates: the integration worktree could not be inspected afterwards')
+      if (after === null || pre === null) this.problem(`final gates: the integration worktree could not be inspected ${pre === null ? 'before' : 'after'} they ran; nothing was removed`)
       else {
         const dir = this.live.integration.dir; const removed: string[] = []
         for (const c of after) if (c.status === '??' && !before.has(c.path)) { const abs = resolve(dir, c.path); if (abs.startsWith(`${dir}/`) && !c.path.split('/').includes('.git')) { rmSync(abs, { force: true, recursive: true }); removed.push(c.path) } }
