@@ -275,15 +275,16 @@ const UNSAFE_NODE_FLAG = /^--(?:use-env-proxy|tls-keylog|openssl-config|openssl-
  * Why this process cannot carry the real token safely, or null. Node reads these from the environment, and each lets
  * a third party read requests to the Cline API: certificate checks turned off, extra or replaced certificate
  * authorities or OpenSSL configuration, TLS session keys written to a file, or requests sent through a proxy named
- * in the environment.
+ * in the environment; and variables that load code into the process (NODE_OPTIONS, NODE_PATH, NODE_COMPILE_CACHE,
+ * LD_PRELOAD, LD_AUDIT; a preload has already run by now, so refusing it only stops the token being used there).
  * bin/cockpit-cline clears them before Node starts; any other way of starting Cockpit with them set is refused.
  */
 export const transportProblem = (env: NodeJS.ProcessEnv = process.env, execArgv: readonly string[] = process.execArgv): string | null => {
   const set = (k: string): boolean => env[k] !== undefined && env[k] !== ''
   if (env.NODE_TLS_REJECT_UNAUTHORIZED !== undefined && env.NODE_TLS_REJECT_UNAUTHORIZED !== '1') return 'NODE_TLS_REJECT_UNAUTHORIZED is set (it can turn off certificate checks)'
   for (const k of ['NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'SSLKEYLOGFILE', 'NODE_USE_ENV_PROXY', 'OPENSSL_CONF']) if (set(k)) return `${k} is set (it changes which servers Node trusts or where its requests go)`
-  // NODE_OPTIONS can load code into this process or change TLS and proxies in many spellings: any value is refused
-  if (set('NODE_OPTIONS')) return 'NODE_OPTIONS is set (it can load code into this process or change which servers Node trusts)'
+  // these can load code into this process (NODE_OPTIONS also changes TLS and proxies, in many spellings): any value is refused
+  for (const k of ['NODE_OPTIONS', 'NODE_PATH', 'NODE_COMPILE_CACHE', 'LD_PRELOAD', 'LD_AUDIT']) if (set(k)) return `${k} is set (it can load code into this process, which holds the token)`
   for (const a of execArgv) {
     const name = a.split('=')[0].replace(/_/g, '-')
     if (UNSAFE_NODE_FLAG.test(name)) return `Node runs with ${name} (it changes which servers Node trusts or where its requests go)`

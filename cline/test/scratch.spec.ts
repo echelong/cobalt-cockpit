@@ -56,7 +56,19 @@ describe('scratch roots: what a sweep may remove', () => {
     const noBoot = fakeRoot(base, 'ccl-run-OOOOOO', { pid: deadPid(), start: null, boot: null })
     const kept = fakeRoot(base, 'ccl-run-PPPPPP', { pid: deadPid(), start: null, keep: true })
     const malformed = ['ccl-run-QQQQQ0', 'ccl-run-QQQQQ1', 'ccl-run-QQQQQ2', 'ccl-run-QQQQQ3', 'ccl-run-QQQQQ4'].map((n, i) => fakeRoot(base, n, [{ pid: 0, start: 'x' }, { pid: -5, start: 'x' }, { pid: 1.5, start: null }, { pid: deadPid(), start: 42 }, { pid: '123', start: null }][i]))
+    // more uncertainty: no pid namespace on either side, a live pid of another user (EPERM), records of the wrong shape
+    const nsNull = fakeRoot(base, 'ccl-run-UUUUUU', { pid: deadPid(), start: null, pidns: null })
+    const eperm = fakeRoot(base, 'ccl-run-VVVVVV', { pid: 2, start: 'x' })
+    const shapes = [['ccl-run-WWWWW0', [1, 2]], ['ccl-run-WWWWW1', 7], ['ccl-run-WWWWW2', { v: 1, pid: deadPid(), start: null }]].map(([n, rec]) => {
+      const p = join(base, n as string); mkdirSync(p); writeFileSync(join(p, 'data.txt'), 'fixture')
+      writeFileSync(join(p, OWNER_FILE), JSON.stringify(Array.isArray(rec) || typeof rec === 'number' ? rec : { ...(rec as object), root: p })); return p
+    })
     const removed = sweep(base)
+    for (const p of [nsNull, eperm, ...shapes]) assert.ok(existsSync(join(p, 'data.txt')), `${p} was swept`)
+    assert.equal(sweepProblem(eperm, 'ccl-run-VVVVVV'), 'owner not provably gone')
+    for (const p of shapes) assert.equal(sweepProblem(p, p.split('/').pop() as string), 'malformed owner record', p)
+    const probeNs = fakeRoot(base, 'ccl-run-XXXXX9', { pid: deadPid(), start: null })
+    assert.equal(sweepProblem(probeNs, 'ccl-run-XXXXX9', { startOf: startTimeOf, boot: () => BOOT, pidns: () => null }), 'owner not provably gone')
     // a live owner whose start time cannot be read is kept, not taken for a reused pid
     const unreadable = fakeRoot(base, 'ccl-run-RRRRRR', { pid: live, start: startTimeOf(live) })
     assert.equal(sweepProblem(unreadable, 'ccl-run-RRRRRR', { startOf: () => null, boot: () => BOOT, pidns: () => PIDNS }), 'owner not provably gone')
