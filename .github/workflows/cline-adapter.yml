@@ -171,6 +171,8 @@ jobs:
           tmpd=${TMPDIR:-/tmp}
           find "$tmpd" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "$RUNNER_TEMP/tmp-entries-before.txt"
           df -i "$tmpd" | tee "$RUNNER_TEMP/tmp-before.txt"
+          # bubblewrap processes that already exist (none on a fresh runner) are not the tests'
+          { pgrep -u "$(id -u)" -x bwrap || true; } | sort > "$RUNNER_TEMP/bwrap-before.txt"
           cline/scripts/test.sh test/isolation.spec.ts test/hardening.spec.ts test/scratch.spec.ts 2>&1 | tee "$RUNNER_TEMP/isolation.log"
 
       - name: Full adapter suite
@@ -211,8 +213,14 @@ jobs:
           if [ -s "$RUNNER_TEMP/tmp-entries-new.txt" ]; then echo "new entries in $tmpd since the tests started:"; cat "$RUNNER_TEMP/tmp-entries-new.txt"; fi
           left=$(find "$tmpd" /tmp "$HOME" -maxdepth 1 \( -name 'ccl-*' -o -name '.ccl-*' \) -user "$(id -un)" | sort -u | tee "$RUNNER_TEMP/fixtures-left.txt" | wc -l)
           if [ "$left" != 0 ]; then echo "::error::$left test fixture director(ies) were left behind" >&2; exit 1; fi
-          if pgrep -u "$(id -u)" -x bwrap > "$RUNNER_TEMP/bwrap-left.txt"; then echo "::error::bubblewrap processes are still running after the tests" >&2; exit 1; fi
-          echo "no test fixtures left in $tmpd, /tmp or HOME; no bubblewrap process running"
+          { pgrep -u "$(id -u)" -x bwrap || true; } | sort > "$RUNNER_TEMP/bwrap-after.txt"
+          comm -13 "$RUNNER_TEMP/bwrap-before.txt" "$RUNNER_TEMP/bwrap-after.txt" > "$RUNNER_TEMP/bwrap-left.txt"
+          if [ -s "$RUNNER_TEMP/bwrap-left.txt" ]; then
+            echo "::error::bubblewrap processes started during the tests are still running" >&2
+            xargs -r ps -o pid,lstart,args -p < "$RUNNER_TEMP/bwrap-left.txt" >&2 || true
+            exit 1
+          fi
+          echo "no test fixtures left in $tmpd, /tmp or HOME; no bubblewrap process from the tests still running"
 
       - name: Summary
         if: always()

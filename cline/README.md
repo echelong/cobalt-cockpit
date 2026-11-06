@@ -310,7 +310,7 @@ and `@types/node` npm tarballs, each checked against a pinned hash (their own np
 bubblewrap from Ubuntu's package (not version-pinned; 0.8 or later is required and the version is recorded). It
 checks with the adapter's own code that real isolation can be established (`test/ci-preflight.ts`), and fails on
 any failed, skipped, cancelled or todo test, on fewer tests than expected, on a test fixture left behind or on a
-bubblewrap process still running. If Ubuntu's AppArmor restriction blocks bubblewrap, it allows user namespaces for
+bubblewrap process started by the tests still running. If Ubuntu's AppArmor restriction blocks bubblewrap, it allows user namespaces for
 `/usr/bin/bwrap` only, never for the whole runner. On failure or cancellation it keeps the test output (as printed
 in the job log) for 7 days, never fixture directories.
 `test/isolation.spec.ts` attacks the sandbox from inside it (no hook in the way): other repositories, `.env`
