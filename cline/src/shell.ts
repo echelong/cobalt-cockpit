@@ -678,4 +678,3 @@ export class Shell {
     this.render()
   }
 }
-
