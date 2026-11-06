@@ -6,7 +6,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { PACKAGE_DIR } from './config.ts'
 import { cockpitRoots, launch, MARKER_VAR, mountProblem, readUntrusted, strippedGitConfig } from './sandbox.ts'
-import { BROKER_PORT, prepareClineData, startBroker } from './broker.ts'
+import { BROKER_PORT, prepareClineData, SignInError, startBroker } from './broker.ts'
 import type { Broker, BrokerRecord, BrokerSpent, ReasoningRule } from './broker.ts'
 import type { Identity, SandboxSpec } from './sandbox.ts'
 import { census, terminate } from './proc.ts'
@@ -168,8 +168,10 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
   const home = join(rw, 'home'), data = join(rw, 'cline-data')
   mkdirSync(home, { recursive: true, mode: 0o700 })
   let broker: Broker
-  try { broker = await startBroker({ dataDir: w.clineDataDir, provider: w.provider, model: w.model, reasoning: reasoningRule(w.expectedWire, w.cliThinking), budgetUsd: w.budgetUsd, budgetTokens: w.budgetTokens, allowUnmetered: w.allowUnmetered, log: r => { try { appendFileSync(join(w.runDir, 'broker.jsonl'), `${JSON.stringify(r)}\n`, { mode: 0o600 }) } catch { /* evidence only */ } } }) }
-  catch (e) { return { identity: null, exitCode: null, signal: null, facts: emptyFacts(), wire: judgeWire([], w.model, w.expectedWire), census: census({ initPid: null, initStart: null, pidNs: null, marker: `${MARKER_VAR}=${w.attemptId}`, since: Date.now() - 60_000 }), stoppedBy: 'spawn_error', stopDetail: `provider broker: ${(e as Error).message}`, hookRefusals: [], observerError: null } }
+  // the broker's stop (budget from the API's figures, unmeasured spend, a request flood) ends the attempt at once
+  let onBrokerStop: (s: { cls: 'budget' | 'unmetered'; detail: string }) => void = () => {}
+  try { broker = await startBroker({ dataDir: w.clineDataDir, provider: w.provider, model: w.model, reasoning: reasoningRule(w.expectedWire, w.cliThinking), budgetUsd: w.budgetUsd, budgetTokens: w.budgetTokens, allowUnmetered: w.allowUnmetered, onStop: s => onBrokerStop(s), log: r => { try { appendFileSync(join(w.runDir, 'broker.jsonl'), `${JSON.stringify(r)}\n`, { mode: 0o600 }) } catch { /* evidence only */ } } }) }
+  catch (e) { return { identity: null, exitCode: null, signal: null, facts: emptyFacts(), wire: judgeWire([], w.model, w.expectedWire), census: census({ initPid: null, initStart: null, pidNs: null, marker: `${MARKER_VAR}=${w.attemptId}`, since: Date.now() - 60_000 }), stoppedBy: 'spawn_error', stopDetail: e instanceof SignInError ? `Cline authentication unavailable on the host: ${(e as Error).message}` : `provider broker: ${(e as Error).message}`, hookRefusals: [], observerError: null } }
   prepareClineData(data, w.provider, w.model, broker.fakeToken)
   const sandbox = workerSandbox(w, { ro, rw, home }, broker.socketDir)
   const argv = [...viaBroker(broker.socketPath), w.clineBin, '--json', '-P', w.provider, '-m', w.model, '--thinking', w.cliThinking, '-c', w.workdir, '--config', cfg, '--data-dir', data, '--hooks-dir', join(ro, 'hooks'), '-t', String(w.timeoutSeconds), '--retries', String(w.clineRetries), w.prompt]
@@ -194,6 +196,8 @@ export const runWorker = async (w: WorkerSpec, on: { identity?: (id: Identity) =
     void terminate(targetOf(identity, marker, started), true, 0)
   }
   on.control?.({ cancel: why => stopNow('cancel', why) })
+  onBrokerStop = s => stopNow(s.cls, `broker: ${s.detail}`)
+  if (broker.spent.stop) onBrokerStop(broker.spent.stop)
   const exited = new Promise<{ code: number | null; signal: string | null }>(res => {
     child.on('exit', (code, signal) => res({ code, signal }))
     child.on('error', e => { stopDetail = e.message; stoppedBy = 'spawn_error'; res({ code: null, signal: null }) })

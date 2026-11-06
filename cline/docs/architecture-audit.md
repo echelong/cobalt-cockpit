@@ -314,6 +314,18 @@ model turns are always kept, the broker waits for in-flight requests before its 
 directory too large to inspect is refused rather than partly covered, and `--share` checks only the path inside
 the repository.
 
+A fourth fresh review, of `66faa61..d25e0d9`, again accepted the isolation and found four defects in that
+follow-up, fixed with tests (`isolation (review 12)`): every refresh failure had become a final authentication
+error, so a temporary outage of the refresh endpoint ended the task — only a definite refusal is now; model-turn
+refusals were kept without bound and with the worker's raw strings — they are capped and cut short, and an
+attempt that keeps sending refused requests is stopped at once (the broker's stop now reaches the worker
+immediately, not on its next output line); `cline` and `cline-pass` shared one recovery and temporary file under
+per-provider locks, so one provider's refresh could delete the other's only copy of a rotated token — the files
+are per provider and a kept answer that does not apply is moved aside, never deleted; gateway errors (502, 504,
+52x) can follow a billed generation — they count as unmeasured. Also: a kept answer's relative expiry counts from
+when it was received, a budget stop is decided only by a model turn, and a missing sign-in at launch is an
+authentication failure.
+
 Accepted and documented (README limitations 22 and 23): no seccomp filter (keyring, io_uring, perf and bpf
 follow host settings), no resource limits, and the routed-model rule would refuse a different auxiliary model.
 

@@ -228,7 +228,9 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
    endpoints). A toggle model must send its routed effort with thinking on, a route without reasoning none.
    It also enforces the attempt's cost and token budget from the usage the API itself returns (it always asks
    the API for usage, and a turn the API accepted without reporting usage leaves the attempt unmeasured and stops
-   it; an error answer such as 429 or 503 generated nothing and is not counted as spend), caps
+   it; an error answer such as 429 or 503 generated nothing and is not counted as spend, while a gateway error
+   such as 502, 504 or 52x may have been billed and counts as unmeasured), stops an attempt that keeps sending
+   refused requests, caps
    requests and concurrent requests (so at most a few turns can be in flight past a budget), and records every
    request (`broker.jsonl`). Worker output (stream, stderr, gate logs) is bounded on the host. Host localhost services, abstract and filesystem unix sockets, DNS and the internet
    are unreachable; gates have no network at all. A worker therefore cannot `npm install`, `pip install` or
@@ -241,13 +243,14 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
    expiry, refreshes it the way Cline does (`POST /api/v1/auth/refresh`, under Cline's own SQLite lock file) and
    writes the new token back to `~/.cline/data/settings/providers.json` (other entries untouched, a backup of the
    previous file kept as `providers.json.cockpit-backup`, mode 0600). The server's answer is saved first
-   (`providers.json.cockpit-refresh`, 0600, removed after a successful save) and the file is re-read just before
+   (`providers.json.cockpit-refresh-<provider>`, 0600, removed after a successful save) and the file is re-read just before
    the write, so neither a failed save nor a concurrent change by Cline itself loses your sign-in or your
    settings. If you sign in again while a refresh is running, your sign-in wins. The kept answer is bound to the
    refresh token it came from: it is applied later only for that same sign-in and within 24 hours (an answer
-   from an older sign-in is discarded, never written over a newer one), and after a failed save the broker never
-   retries with the same refresh token. A sign-in that cannot be used reaches the worker as an authentication
-   failure, so the run stops with "run `cline auth`" instead of retrying. That is the only write Cockpit makes to
+   from an older sign-in is set aside as `….stale`, never written over a newer one and never deleted), and after a
+   failed save the broker never retries with the same refresh token. A sign-in the server refuses reaches the
+   worker as an authentication failure, so the run stops with "run `cline auth`"; a refresh that fails for a
+   temporary reason (server error, rate limit, network, lock) is retried. That is the only write Cockpit makes to
    your Cline data. Only the `cline` and `cline-pass` providers can be brokered; a role configured for any other
    provider is refused, not run with exposed credentials.
 4. **Evidence from inside a sandbox can be forged by an adversarial model**: the JSONL stream, wire captures and

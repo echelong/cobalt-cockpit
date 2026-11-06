@@ -95,15 +95,16 @@ const live = (v: unknown, now: number): boolean => { const e = expiry(v); return
 
 type RefreshAnswer = { success?: boolean; data?: { accessToken?: unknown; refreshToken?: unknown; expiresAt?: unknown; expiresIn?: unknown; tokenType?: unknown; userInfo?: Record<string, unknown> } }
 type Tokens = { accessToken: string; refreshToken: string | null; expiresAt: number; tokenType: string | null; userInfo: Record<string, unknown> | null }
-/** The tokens in a refresh answer, or null when it carries no access token (such an answer can never be applied). */
-const tokensOf = (text: string, now: number): Tokens | null => {
+/** The tokens in a refresh answer received at `receivedAt`, or null when it carries no access token (it can never be applied). */
+const tokensOf = (text: string, receivedAt: number): Tokens | null => {
   let b: RefreshAnswer | null = null
   try { b = JSON.parse(text) as RefreshAnswer } catch { return null }
   const d = b?.data
   if (!b?.success || !d || typeof d.accessToken !== 'string' || !d.accessToken) return null
+  // a relative or missing expiry counts from when the answer was received, not from when it is applied
   let e = expiry(d.expiresAt)
-  if (!Number.isFinite(e) && typeof d.expiresIn === 'number') e = now + d.expiresIn * 1000
-  if (!Number.isFinite(e)) e = now + 15 * 60_000
+  if (!Number.isFinite(e) && typeof d.expiresIn === 'number') e = receivedAt + d.expiresIn * 1000
+  if (!Number.isFinite(e)) e = receivedAt + 15 * 60_000
   return { accessToken: d.accessToken, refreshToken: typeof d.refreshToken === 'string' && d.refreshToken ? d.refreshToken : null, expiresAt: e, tokenType: typeof d.tokenType === 'string' ? d.tokenType : null, userInfo: d.userInfo && typeof d.userInfo === 'object' ? d.userInfo : null }
 }
 const sha256 = (s: string): string => createHash('sha256').update(s).digest('hex')
@@ -112,18 +113,22 @@ type Recovery = { v: 1; usedSha256: string; at: number; answer: string }
 const RECOVERY_MAX_AGE_MS = 24 * 3600_000
 /** Refreshes that failed after the server had answered, per sign-in: that refresh token is never tried again in this process. */
 const LATCHED = new Map<string, { used: string; msg: string }>()
+/** Where a provider's kept refresh answer lives (one per provider: Cline's locks are per provider). */
+export const recoveryFile = (dataDir: string, provider: string): string => `${providersFile(dataDir)}.cockpit-refresh-${provider.replace(/[^A-Za-z0-9._-]/g, '_')}`
 
 /**
  * The real access token, refreshed on the host when it is within 5 minutes of expiry, the way Cline does it
  * (POST /api/v1/auth/refresh under Cline's own lock). The person's sign-in must never be lost or overwritten:
- *  - the server's answer is saved first to `providers.json.cockpit-refresh` (0600), bound to the hash of the refresh
- *    token it came from; it is applied later only for that same token and within 24 hours, so an answer left
- *    from an older sign-in is never written over a newer one (it is discarded), and an unusable one is deleted;
+ *  - the server's answer is saved first to `providers.json.cockpit-refresh-<provider>` (0600), bound to the hash of
+ *    the refresh token it came from; it is applied later only for that same token and within 24 hours; a kept
+ *    answer that does not apply is never deleted but moved aside (`….stale`), so no copy of a token is destroyed;
  *  - providers.json is read again immediately before the write: if the sign-in changed meanwhile (the person
  *    signed in again), the person's sign-in wins and nothing is written; otherwise only this provider's `auth`
  *    is replaced, keeping every other change; the previous file is kept as `providers.json.cockpit-backup`;
  *  - after a save fails, the same refresh token is never tried again in this process (a refresh token may be
- *    single-use); the kept answer is applied on the next attempt that can save it.
+ *    single-use); the next supervisor run applies the kept answer;
+ *  - only a definite refusal (the refresh endpoint's 4xx, a missing or unusable sign-in) is a SignInError; a
+ *    server error, a rate limit, a network failure or a lock timeout is a temporary failure and may be retried.
  */
 export const realToken = async (dataDir: string, provider: string, upstream: string, now: () => number = Date.now): Promise<string> => {
   const key = `${dataDir}\0${provider}`
@@ -132,7 +137,8 @@ export const realToken = async (dataDir: string, provider: string, upstream: str
   if (live(first.auth.expiresAt, now())) return first.auth.accessToken as string
   if (typeof first.auth.refreshToken === 'string') latch(first.auth.refreshToken)
   return withClineLock(dataDir, provider, async () => {
-    const file = providersFile(dataDir); const recovery = `${file}.cockpit-refresh`
+    const file = providersFile(dataDir); const recovery = recoveryFile(dataDir, provider)
+    const aside = (): void => { try { renameSync(recovery, `${recovery}.stale`) } catch { /* none */ } }
     for (let round = 0; round < 2; round++) {
       // another process (Cline itself, another broker) may have refreshed while we waited for the lock
       const { auth } = readAuth(dataDir, provider)
@@ -140,43 +146,48 @@ export const realToken = async (dataDir: string, provider: string, upstream: str
       if (typeof auth.refreshToken !== 'string' || !auth.refreshToken) throw new SignInError(`the Cline sign-in for "${provider}" has expired and has no refresh token: run \`cline auth\` on the host`)
       const used = auth.refreshToken
       latch(used)
-      // a kept answer counts only if it came from refreshing exactly this token, recently; anything else is discarded
+      // a kept answer counts only if it came from refreshing exactly this token, recently; anything else is moved aside
       let tokens: Tokens | null = null
       if (existsSync(recovery)) {
         let rec: Recovery | null = null
         try { rec = JSON.parse(readFileSync(recovery, 'utf8')) as Recovery } catch { /* unreadable */ }
-        tokens = rec && rec.v === 1 && rec.usedSha256 === sha256(used) && now() - rec.at < RECOVERY_MAX_AGE_MS && typeof rec.answer === 'string' ? tokensOf(rec.answer, now()) : null
-        if (!tokens) rmSync(recovery, { force: true })
+        tokens = rec && rec.v === 1 && rec.usedSha256 === sha256(used) && typeof rec.at === 'number' && now() - rec.at < RECOVERY_MAX_AGE_MS && typeof rec.answer === 'string' ? tokensOf(rec.answer, rec.at) : null
+        if (!tokens) aside()
       }
       if (!tokens) {
-        const r = await fetch(`${upstream}/api/v1/auth/refresh`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: used, grantType: 'refresh_token' }), signal: AbortSignal.timeout(30_000), redirect: 'error' })
+        let r: Response
+        try { r = await fetch(`${upstream}/api/v1/auth/refresh`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: used, grantType: 'refresh_token' }), signal: AbortSignal.timeout(30_000), redirect: 'error' }) }
+        catch (e) { throw new Error(`Cline token refresh could not reach the server (${(e as Error).message}); temporary`) }
         const text = await r.text().catch(() => '')
-        if (!r.ok) throw new SignInError(`Cline token refresh failed (${r.status}): run \`cline auth\` on the host`)
+        if (r.status >= 400 && r.status < 500 && r.status !== 429 && r.status !== 408) throw new SignInError(`Cline token refresh was refused (${r.status}): run \`cline auth\` on the host`)
+        if (!r.ok) throw new Error(`Cline token refresh failed (${r.status}); temporary`)
         tokens = tokensOf(text, now())
         if (!tokens) { const msg = 'Cline token refresh returned no access token: run `cline auth` on the host'; LATCHED.set(key, { used, msg }); throw new SignInError(msg) }
         // kept before anything that can fail, bound to the token that was just spent
         writeFileSync(recovery, JSON.stringify({ v: 1, usedSha256: sha256(used), at: now(), answer: text } satisfies Recovery), { mode: 0o600 })
       }
-      // read again right before writing; the auth that is replaced is the one read now
-      const fail = (why: string): never => { const msg = `${why}; the server's answer is kept in providers.json.cockpit-refresh beside it and will be applied next time: if this persists, run \`cline auth\` on the host`; LATCHED.set(key, { used, msg }); throw new SignInError(msg) }
+      // read again right before writing; the auth that is replaced is the one read now (this section is synchronous:
+      // nothing else in this process can write between the read and the rename)
+      const fail = (why: string): never => { const msg = `${why}; the server's answer is kept beside providers.json and the next supervisor run applies it: if this persists, run \`cline auth\` on the host`; LATCHED.set(key, { used, msg }); throw new SignInError(msg) }
       let current: ProvidersDoc
       try { current = readJsonRetry(file) } catch (e) { return fail(`could not re-read providers.json (${(e as Error).message})`) }
       const entry = current.providers?.[provider]
       const cur = entry?.settings?.auth
       if (!entry?.settings || !cur) return fail(`the "${provider}" entry vanished from providers.json during the refresh`)
       if (cur.refreshToken !== used) {
-        // the person (or Cline) signed in again meanwhile: their sign-in wins; ours is discarded, never written over it
-        rmSync(recovery, { force: true })
+        // the person (or Cline) signed in again meanwhile: their sign-in wins; ours is set aside, never written over it
+        aside()
         continue
       }
       const userInfo = tokens.userInfo ?? (cur.metadata?.userInfo as Record<string, unknown> | undefined)
       entry.settings.auth = { ...cur, accessToken: tokens.accessToken, refreshToken: tokens.refreshToken ?? used, expiresAt: tokens.expiresAt, ...(typeof userInfo?.clineUserId === 'string' ? { accountId: userInfo.clineUserId } : {}), metadata: { ...(cur.metadata ?? {}), ...(tokens.tokenType ? { tokenType: tokens.tokenType } : {}), ...(userInfo ? { userInfo } : {}) } }
       entry.updatedAt = new Date().toISOString()
-      const tmp = `${file}.cockpit-${process.pid}.tmp`
+      const tmp = `${file}.cockpit-${provider.replace(/[^A-Za-z0-9._-]/g, '_')}-${process.pid}.tmp`
       try {
         writeFileSync(`${file}.cockpit-backup`, readFileSync(file, 'utf8'), { mode: 0o600 })
         writeFileSync(tmp, JSON.stringify(current, null, 2), { mode: 0o600 }); renameSync(tmp, file)
       } catch (e) { try { rmSync(tmp, { force: true }) } catch { /* none */ } return fail(`could not save the refreshed Cline sign-in (${(e as Error).message})`) }
+      // saved: the kept answer is now in providers.json itself
       rmSync(recovery, { force: true })
       // a kept answer can have expired since it was received: then refresh again from what was just saved
       if (live(tokens.expiresAt, now())) return tokens.accessToken
@@ -225,6 +236,7 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
   /** The routed model: a model turn for any other model is refused (a worker cannot spend on a model it was not given). */ model?: string
   /** What the route may send as reasoning (see ReasoningRule); absent: not checked. A string is shorthand for { effort }. */ effort?: string | null
   reasoning?: ReasoningRule
+  /** Called once when the broker stops carrying turns (budget, unmeasured, request flood): the worker stops at once. */ onStop?: (stop: { cls: 'budget' | 'unmetered'; detail: string }) => void
 } & BrokerLimits): Promise<Broker> => {
   if (!BROKERED_PROVIDERS.includes(o.provider)) throw new Error(`provider "${o.provider}" cannot be brokered: only ${BROKERED_PROVIDERS.join(', ')} are supported, and workers have no other network`)
   readAuth(o.dataDir, o.provider) // fail before launch when there is no sign-in at all
@@ -235,7 +247,8 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
   const fakeToken = fakeJwt()
   // carried requests are always kept (bounded by maxRequests); refusals only up to a cap, so a flood of refused
   // requests can never push the record of a real model turn out
-  const records: BrokerRecord[] = []; let refusedKept = 0
+  const records: BrokerRecord[] = []; let refusedKept = 0, turnRefusalsKept = 0, refusals = 0
+  const stopAll = (cls: 'budget' | 'unmetered', detail: string): void => { if (spent.stop) return; spent.stop = { cls, detail }; try { o.onStop?.(spent.stop) } catch { /* the worker's own stop */ } }
   const spent: BrokerSpent = { usd: 0, tokens: 0, requests: 0, inflight: 0, carried: 0, unmeasured: 0, billed: 0, usdKnown: true, stop: null }
   const socketDir = mkdtempSync(join(tmpdir(), 'ccl-b-'))
   const socketPath = join(socketDir, 's')
@@ -249,11 +262,15 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
     try { o.log?.(r) } catch { /* the log is evidence, not control */ }
   }
   const refuse = (res: ServerResponse, req: IncomingMessage, status: number, why: string, model: string | null = null, effort: string | null = null, detail?: string): void => {
-    const r: BrokerRecord = { at: new Date().toISOString(), method: req.method ?? '?', path: (req.url ?? '').slice(0, 200), status, model, effort, bytesIn: 0, refused: detail ? `${why}: ${detail}` : why }
-    // refusals of model turns are always kept (they are evidence of a model or reasoning mismatch); others up to a cap
-    if (r.path.startsWith('/api/v1/chat/completions')) records.push(r)
+    // worker-chosen strings are cut short: a refusal record is small whatever the worker sent
+    const r: BrokerRecord = { at: new Date().toISOString(), method: (req.method ?? '?').slice(0, 10), path: (req.url ?? '').slice(0, 200), status, model: model === null ? null : model.slice(0, 100), effort: effort === null ? null : effort.slice(0, 40), bytesIn: 0, refused: (detail ? `${why}: ${detail}` : why).slice(0, 600) }
+    // model-turn refusals (evidence of a model or reasoning mismatch) and other refusals are kept up to separate caps,
+    // so a flood of one kind never hides the other, and memory stays bounded
+    if (r.path.startsWith('/api/v1/chat/completions')) { if (turnRefusalsKept < 1000) { records.push(r); turnRefusalsKept++ } }
     else if (refusedKept < 1000) { records.push(r); refusedKept++ }
     log(r)
+    // a worker that keeps knocking on a closed door is stopped, not served refusals until its timeout
+    if (++refusals > 5000) stopAll('budget', `more than 5000 refused requests to the broker`)
     // the worker is told why in general terms; host paths and details stay in the host-side record
     if (!res.headersSent) { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: `Cockpit broker: ${why}` } })) } else res.destroy()
   }
@@ -270,8 +287,10 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
     if (!ALLOWED.some(a => a.method === req.method && a.path === path)) return refuse(res, req, 403, `${req.method} ${path.slice(0, 120)} is not a request Cline needs`)
     // the attempt's spend, measured here from the API's own answers (not from what the worker prints); the
     // counters move before the first await, so concurrent requests cannot all pass the same check
-    if (spent.requests >= maxRequests) return refuse(res, req, 429, `request limit ${maxRequests} for this attempt reached`)
-    const stopWith = (cls: 'budget' | 'unmetered', why: string): void => { spent.stop ??= { cls, detail: why }; refuse(res, req, 402, why) }
+    // a stop is decided only by a model turn (a refused GET after a finished run does not turn it into a budget stop)
+    const isTurn = path === '/api/v1/chat/completions'
+    const stopWith = (cls: 'budget' | 'unmetered', why: string): void => { if (isTurn) stopAll(cls, why); refuse(res, req, 402, why) }
+    if (spent.requests >= maxRequests) { if (isTurn) stopAll('budget', `request limit ${maxRequests} for this attempt reached`); return refuse(res, req, 429, `request limit ${maxRequests} for this attempt reached`) }
     if (o.budgetTokens != null && spent.tokens >= o.budgetTokens) return stopWith('budget', `token budget ${o.budgetTokens} for this attempt reached (${spent.tokens} used, measured by the broker)`)
     if (o.budgetUsd != null && spent.usd >= o.budgetUsd) return stopWith('budget', `cost budget $${o.budgetUsd} for this attempt reached ($${spent.usd.toFixed(5)} reported by the API)`)
     if (spent.unmeasured > 0 && !o.allowUnmetered && path === '/api/v1/chat/completions') return stopWith('unmetered', 'an earlier model turn the API accepted reported no usage: the budget cannot be enforced')
@@ -320,7 +339,12 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
         if (m && m[2] === fakeToken) {
           // a sign-in that cannot be used is an authentication failure for the worker (it stops, with the remedy), never a retry
           let token: string
-          try { token = await realToken(o.dataDir, o.provider, upstream) } catch (e) { return refuse(res, req, 401, 'the Cline sign-in on the host could not be used (authentication failed): run `cline auth` on the host', model, effort, (e as Error).message) }
+          try { token = await realToken(o.dataDir, o.provider, upstream) } catch (e) {
+            // a definite refusal of the sign-in is an authentication failure (the run stops with the remedy); anything
+            // else (a server error, a timeout, the lock) is temporary and the worker may retry
+            if (e instanceof SignInError) return refuse(res, req, 401, 'the Cline sign-in on the host could not be used (authentication failed): run `cline auth` on the host', model, effort, (e as Error).message)
+            return refuse(res, req, 503, 'the Cline sign-in could not be refreshed just now (temporary, service unavailable)', model, effort, (e as Error).message)
+          }
           headers.authorization = `Bearer ${m[1] ?? ''}${token}`
         }
       }
@@ -332,9 +356,12 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
       const count = (o2: unknown): void => { const u = usageOf(o2); if (!u) return; gotUsage = true; spent.tokens += u.tokens; rec.tokens = (rec.tokens ?? 0) + u.tokens; if (u.usd === null) { spent.usdKnown = false; rec.usd = null } else { spent.usd += u.usd; rec.usd = (rec.usd ?? 0) + u.usd } }
       // unmeasured: the API accepted the turn (2xx) but reported no usage, or the answer never fully arrived; an error
       // answer (4xx/5xx) generated nothing and is not spend
-      let cut = false
+      // gateway answers (timeouts, bad gateway, Cloudflare 52x) can arrive after the provider generated and billed
+      let cut = false; let finished = false
       const finish = (): void => {
-        const mayBill = turn && (rec.status === 0 || (rec.status >= 200 && rec.status < 300) || cut)
+        if (finished) return; finished = true
+        const s2 = rec.status
+        const mayBill = turn && (s2 === 0 || (s2 >= 200 && s2 < 300) || cut || [408, 499, 502, 504].includes(s2) || (s2 >= 520 && s2 <= 527))
         if (mayBill) spent.billed++
         if (mayBill && !gotUsage) { spent.unmeasured++; spent.usdKnown = false; rec.usd = null }
         log(rec)
@@ -342,6 +369,7 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
       let up: Response
       try { up = await fetch(`${upstream}${path}${query ? `?${query}` : ''}`, { method: req.method, headers, body, redirect: 'manual', signal: ac.signal }) } catch (e) { rec.status = 0; finish(); throw e }
       rec.status = up.status
+      try {
       const out: Record<string, string> = {}
       up.headers.forEach((v, k) => { if (!HOP_OUT.has(k)) out[k] = v })
       res.writeHead(up.status, out)
@@ -362,6 +390,7 @@ export const startBroker = async (o: { dataDir: string; provider: string; upstre
         s.on('end', () => { tail += dec.decode(); sse(tail); if (wholeOk && !/^\s*data:/m.test(whole)) { try { count(JSON.parse(whole)) } catch { /* not JSON */ } } res.end(); finish(); resolve() })
         s.on('error', () => { cut = rec.status >= 200 && rec.status < 300; res.destroy(); finish(); resolve() })
       })
+      } finally { if (!finished) { cut = rec.status >= 200 && rec.status < 300; finish() } }
     } finally { spent.inflight-- }
   }
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(socketPath, () => resolve()) })

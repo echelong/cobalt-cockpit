@@ -669,7 +669,7 @@ export class Mission {
     const errText = `${f.resultText ?? ''}\n${f.aborted ?? ''}\n${out.stderrHead ?? ''}\n${out.stopDetail ?? ''}`
     const textClass = classifyFailureText(errText)
     const errLine = (errText.split('\n').map(s => s.trim()).find(s => s && classifyFailureText(s)) ?? errText.trim().split('\n')[0] ?? '').slice(0, 300)
-    if (out.stoppedBy === 'spawn_error') return textClass === 'resource_error' ? { cls: 'resource_error', detail: `sandbox could not start: ${errLine}`, evidence: [] } : { cls: 'sandbox_error', detail: out.stopDetail ?? 'sandbox failed to start', evidence: [] }
+    if (out.stoppedBy === 'spawn_error') return textClass === 'auth_error' ? { cls: 'auth_error', detail: out.stopDetail ?? 'Cline sign-in unavailable', evidence: [] } : textClass === 'resource_error' ? { cls: 'resource_error', detail: `sandbox could not start: ${errLine}`, evidence: [] } : { cls: 'sandbox_error', detail: out.stopDetail ?? 'sandbox failed to start', evidence: [] }
     if (out.wire.state === 'unconfirmed' && this.header.strict && (f.finishReason === 'completed')) return { cls: 'wire_mismatch', detail: `strict: ${out.wire.detail}`, evidence: [] }
     if (f.finishReason === 'error') return { cls: textClass ?? 'provider_error', detail: errLine || 'provider error', evidence: [] }
     if (f.finishReason !== 'completed') return { cls: textClass ?? 'unknown_outcome', detail: `${textClass ? `${errLine} · ` : ''}finish ${f.finishReason ?? 'none'}${f.aborted ? ` (${f.aborted})` : ''}, exit ${out.exitCode}`, evidence: [] }
