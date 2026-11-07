@@ -2,7 +2,7 @@
 
 > Part of the [Cobalt Cockpit documentation](README.md). The milestone: [roadmap-v0.7.0-diff-aware-verification.md](roadmap-v0.7.0-diff-aware-verification.md).
 
-Status: **Phase 1 is implemented as four pure modules that nothing registers or calls.** Phase 1.5 revised, in the same modules, the report a person reads: its layout, its width in terminal columns, and files whose text is not UTF-8. Cockpit's behaviour is unchanged: no option, hook, command, tool or capability was added, and the published version is still 0.6.5. Everything this page describes beyond those modules is design for later phases, each of which needs its own review and the owner's approval.
+Status: **Phase 1 is implemented as four pure modules that nothing registers or calls.** Phase 1.5 revised, in the same modules, the report a person reads: its layout, its width in terminal columns, and files whose text is not UTF-8. Cockpit's behaviour is unchanged: no option, hook, command, tool or capability was added, and the published version is 0.6.6. Everything this page describes beyond those modules is design for later phases, each of which needs its own review and the owner's approval.
 
 | | |
 | --- | --- |

@@ -1,6 +1,6 @@
 # Proposed roadmap: Cobalt Recall (optional reference memory)
 
-Status: **research proposal only**. Not implemented, not approved for implementation, and not part of any published version (the current version is v0.6.5) or of v0.7.0 Diff-Aware Verification. No release number or delivery date is assigned. First decision is whether a controlled research spike justifies any integration.
+Status: **research proposal only**. Not implemented, not approved for implementation, and not part of any published version (the current version is v0.6.6) or of v0.7.0 Diff-Aware Verification. No release number or delivery date is assigned. First decision is whether a controlled research spike justifies any integration.
 
 Kept from draft pull request #5 (proposed 2026-10-13). Its references to v0.6.3 as the next release were brought up to date for v0.6.5; the proposal itself is unchanged.
 
@@ -12,8 +12,8 @@ The proposal is explicitly **not** a promise that an indexed corpus makes agents
 
 ## Existing roadmap and boundary
 
-1. **Published on `main` through v0.6.5**: v0.6.3 Cobalt Guard Calibration ([implementation](implementation-v0.6.3.md)), v0.6.4 fingerprint resource hardening and the v0.6.5 maintenance version ([implementation](implementation-v0.6.4.md)). This proposal changes none of them.
-2. **v0.7.0 Diff-Aware Verification**: the planned milestone after v0.6.5, in design and not implemented; independent of this proposal. [Scope](roadmap-v0.7.0-diff-aware-verification.md).
+1. **Published on `main` through v0.6.6**: v0.6.3 Cobalt Guard Calibration ([implementation](implementation-v0.6.3.md)), v0.6.4 fingerprint resource hardening, the v0.6.5 maintenance version ([implementation](implementation-v0.6.4.md)) and v0.6.6 completion evidence and reporting ([verification](verification.md#what-done-rests-on)). This proposal changes none of them.
+2. **v0.7.0 Diff-Aware Verification**: the planned milestone after v0.6.6, in design and not implemented; independent of this proposal. [Scope](roadmap-v0.7.0-diff-aware-verification.md).
 3. **Cobalt Recall research spike**, after v0.7.0 or in a separately approved non-blocking investigation: benchmark XERJ against the native agent workflow.
 4. **Optional integration prototype**, only if the spike passes a documented go/no-go review.
 5. **Potential subsequent features**: durable decision memory, staleness detection, reviewed Corpus Hub imports, evidence-linked verification. No version assigned.

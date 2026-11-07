@@ -85,7 +85,7 @@ case $cmd in
     probe() { local label=$1 n=$2; shift 2; local out rc=0; out=$("$@" 2>&1 < /dev/null) || rc=$?; printf '%s\n' "--- $label (exit $rc):"; printf '%s\n' "$out" | head -"$n"; }
     echo "candidate: $(cat "$dir/candidate-sha")"
     probe 'installed plugins in the disposable configuration (expect none)' 5 in_host "$dir" "$claude_bin" plugin list
-    probe 'what is loaded, and from where (expect version 0.6.3 and the SOURCE under this directory)' 12 in_host "$dir" timeout 90 "$claude_bin" -p '/cockpit version' --plugin-dir "$dir/plugin" --settings "$(settingsOf record)"
+    probe 'what is loaded, and from where (expect version 0.6.6 and the SOURCE under this directory)' 12 in_host "$dir" timeout 90 "$claude_bin" -p '/cockpit version' --plugin-dir "$dir/plugin" --settings "$(settingsOf record)"
     probe 'strict validation of the snapshot' 12 in_host "$dir" "$claude_bin" plugin validate --strict "$dir/plugin"
     ;;
   launch)

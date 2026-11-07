@@ -1,6 +1,6 @@
 # Changelog
 
-## Not in a release (manifest still 0.6.5) — Cobalt Cockpit for Cline: portable defaults and configuration compatibility
+## Not in a release — Cobalt Cockpit for Cline: portable defaults and configuration compatibility
 
 The Cline adapter only (`cline/`). The Claude Code plugin is unchanged.
 
@@ -10,13 +10,13 @@ The Cline adapter only (`cline/`). The Claude Code plugin is unchanged.
 - **`cockpit-cline migrate-config`.** A dry run that reports the current and proposed configuration fingerprints, every differing setting and whether it is security-relevant, and per mission whether it continues or needs acceptance. `--apply` records the snapshot that open conversations made before this version need to continue across a description-only change (created only if absent; conversations held by a running shell or supervisor are skipped); it writes no ledger record, never accepts a change and never edits configuration.
 - **Changing these defaults changes the configuration digest.** Conversations started under the earlier defaults are refused on resume (as before for any configuration change) unless the hide list is kept in your user file and their snapshots are recorded with `migrate-config --apply`, or you accept the change.
 
-## Not in a release (manifest still 0.6.5) — Cobalt Cockpit for Cline: CI
+## Not in a release — Cobalt Cockpit for Cline: CI
 
 A workflow (`.github/workflows/cline-adapter.yml`), its test-only preflight (`cline/test/ci-preflight.ts`) and documentation; no adapter runtime or plugin code changes. Not yet run on GitHub-hosted runners.
 
 - **CI for the adapter.** A new `Cline adapter` workflow runs the typecheck and the offline suite with real bubblewrap on Ubuntu 24.04: read-only token, no secrets, actions pinned to commits; Node 24.20.0 and the `cline`, `typescript` and `@types/node` tarballs checked against pinned hashes (their npm dependencies are not pinned), bubblewrap from Ubuntu's package (version recorded, 0.8 or later required). It fails rather than skips when isolation cannot be established, on any skipped test, on fewer tests than expected, on leftover fixtures and on a bubblewrap process the tests left running.
 
-## Not in a release (manifest still 0.6.5) — Cobalt Cockpit for Cline: credential broker and executable hardening
+## Not in a release — Cobalt Cockpit for Cline: credential broker and executable hardening
 
 The Cline adapter only (`cline/`), plus its documentation in `SECURITY.md` and `PRIVACY.md`. The Claude Code plugin, `cline/config/default.json` and configuration fingerprints are unchanged.
 
@@ -29,9 +29,9 @@ The Cline adapter only (`cline/`), plus its documentation in `SECURITY.md` and `
 - **Test fixtures no longer accumulate.** Each test run left every temporary repository, state directory and Cline data directory behind in `/tmp` (about 15 000 directories had filled a 1 M-inode tmpfs). Each test process now keeps its fixtures in one root, removed on exit and on SIGINT, SIGTERM and SIGHUP; roots of killed processes are swept by the next run, only when the name, owner record and directory are right and the owning process has provably ended on the same boot and in the same pid namespace (an unreadable `/proc` entry or a malformed record keeps the root). `COCKPIT_TEST_KEEP=1` keeps a run's fixtures and they are never swept (`cline/test/scratch.ts`, 8 tests in `scratch.spec.ts`). 369 tests in total.
 - **Not covered.** Whoever controls the environment you start Cockpit from still chooses the `node` (`PATH`), can load code through `BASH_ENV` or `LD_PRELOAD`, and chooses whose sign-in is used (`COCKPIT_CLINE_DATA`, `HOME`). Files you own are trusted: anything running as you can replace your Cline installation.
 
-## On `main`, not in a release (manifest still 0.6.5) — Cobalt Cockpit for Cline
+## On `main`, not in a release — Cobalt Cockpit for Cline
 
-A second, separate program in [`cline/`](cline/README.md), merged into `main` as `512c8f6` (whitespace fix `5aa7056`). The Claude Code plugin is unchanged: the merge changed no file outside `cline/`, this documentation change touches only the root README, `SECURITY.md`, `PRIVACY.md` and this changelog outside it, the plugin does not load or start the adapter, and its version stays 0.6.5. No release or tag includes the adapter. Because the plugin's marketplace source is the repository root, which Claude Code copies whole (without `.git`) into its plugin cache, a plugin installed from a commit that contains `cline/` is expected to carry that directory too (55 files, about 0.86 MB), where nothing uses it. This was inferred from the installed 0.6.5 copy, not observed in an installation made from such a commit.
+A second, separate program in [`cline/`](cline/README.md), merged into `main` as `512c8f6` (whitespace fix `5aa7056`). The Claude Code plugin is unchanged: the merge changed no file outside `cline/`, this documentation change touches only the root README, `SECURITY.md`, `PRIVACY.md` and this changelog outside it, the plugin does not load or start the adapter, and the plugin version is 0.6.6. No release or tag includes the adapter. Because the plugin's marketplace source is the repository root, which Claude Code copies whole (without `.git`) into its plugin cache, a plugin installed from a commit that contains `cline/` is expected to carry that directory too (55 files, about 0.86 MB), where nothing uses it. This was inferred from the installed 0.6.5 copy, not observed in an installation made from such a commit.
 
 - **Cobalt Cockpit for Cline (experimental, Linux only).** A supervisor that runs stock Cline CLI workers under Cockpit's engine, reusing the engine's pure modules from `hooks/` without modifying them. Tested on Fedora against Cline CLI 3.0.74.
 - **Five model roles, deterministic routing.** Fixed, explained rules route every task to a role pinned to a model in the installed Cline catalog: DeepSeek V4.1 Flash 1017 as the default coder (`xhigh` requested, sent as `max`), Kimi K3.1 Pro as commander, MiMo V2.6 Pro as specialist, Qwen3.8 Max 0902 for frontend work and GLM 5.3 Flash for utility work. Reasoning levels are checked against the catalog and on the wire, never silently downgraded. Bounded corrections and escalations; no model substitution.
@@ -42,9 +42,9 @@ A second, separate program in [`cline/`](cline/README.md), merged into `main` as
 - **Tests.** `cline/scripts/test.sh` runs 337 offline tests (fake providers, real bubblewrap, real Git), 53 of them in `isolation.spec.ts`: attacks on the sandbox from inside it and tests of the broker and the sign-in refresh; `cline/scripts/typecheck.sh` type-checks the adapter. GitHub Actions does not run them.
 - **Limits.** No seccomp filter and no memory, CPU or process limits; evidence written inside a sandbox can be forged by an adversarial model; the spending cap can be exceeded by one in-flight request; refresh safety depends on Cline's locking. The full list: [cline/README.md, Limitations](cline/README.md#limitations).
 
-## On `main`, not in a release (manifest still 0.6.5) — completion evidence and reporting
+## 0.6.6 — completion evidence and reporting
 
-These commits follow the 0.6.5 version commit (`7a7ca1a`). The manifest still reads 0.6.5, and no release or tag includes them. An installation of 0.6.5 made from that version commit does not have them, and `claude plugin update` does not offer them while the version is unchanged. Detail: [What DONE rests on](docs/verification.md#what-done-rests-on).
+These changes are included in 0.6.6. The previous version was 0.6.5 (`7a7ca1a`); an installation of 0.6.5 made from that version commit does not have them. `claude plugin update` offers 0.6.6 because the version changed. Detail: [What DONE rests on](docs/verification.md#what-done-rests-on).
 
 - **An exit 0 on an unidentified tree is not a qualified pass** (`b025b7b`). Where a goal-checked task's working tree in a Git repository cannot be identified, a command's exit 0 is recorded as a pending gate that keeps what ran and why it is unqualified. A command run outside every Git repository is read as before. For any task, a Stop-guard check that exits 0 on a tree the guard cannot identify is a pending TEST gate, not a completion. For a goal-checked task, the passes observed on a measured tree become stale. `ALIGNED` is refused while a required gate passes with no tree binding. The first check on a measured tree binds only the gates observed in that step, and an older unbound required pass goes back to pending.
 - **A Stop-guard completion rests on the trust in force** (`342d5ab`). A completion the guard verified counts only while the trust its check ran under is still in force. A typed `/cockpit guard untrust` or a new enrolment withdraws it for the current task at once, unless its check record shows another script's verifier. A changed script or pin is found the next time completion is checked. Withdrawal makes the TEST pass the guard wrote stale and starts the goal check over; the Run Ledger keeps the record of what ran.
