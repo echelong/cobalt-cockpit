@@ -20,10 +20,10 @@
 
 | Gate | Result |
 | --- | --- |
-| Plugin test harness | **3,164 pass, 0 fail, 81 files** (`claude plugin test .`, 145.59 s) |
-| Parser tests | 15 focused tests in `tests/diffcov-git.test.ts`: raw NUL lists, renames/deletions, unsafe paths, zero-context hunks, binary/mode-only blocks, hunk-count mismatches, attributes, stat and identity |
+| Plugin test harness | **3,164 pass, 0 fail, 81 files** (`claude plugin test .`, 150.76 s) |
+| Parser tests | 14 focused tests in `tests/diffcov-git.test.ts`: raw NUL lists, renames/deletions, unsafe paths, zero-context hunks, binary/mode-only blocks, hunk-count mismatches, attributes, stat and identity |
 | Disabled behavior | `tests/diffcov-off.test.ts`: `/cockpit coverage diff` renders the off state and adds **zero** process calls |
-| Real-host acceptance | Claude Code **2.1.319**, isolated `CLAUDE_CONFIG_DIR`, disposable repository, **live capture**: a real host Bash call ran `npm test` and wrote `coverage/lcov.info`; the capture record carried project, HEAD, identity, report SHA-256/stat and `npm test (ok)`. A second real session rendered `MATCHED`, `COVERED 2`, `UNCOVERED 1`, `src/price.ts:3` and the advisory closing. With `coverageDiff:false`: explicit off state. The assistant turn came from a local scripted Messages endpoint; no model credential was used. |
+| Real-host acceptance | Claude Code **2.1.319**, isolated `CLAUDE_CONFIG_DIR`, disposable repository, **live capture**: a real host Bash call ran `npm test` and wrote `coverage/lcov.info`; the capture record carried project, HEAD, identity, report SHA-256/stat and `npm test (ok)`. A second real session rendered `MATCHED`, `COVERED 2`, `UNCOVERED 1`, `UNAVAILABLE 1`, `src/price.ts:3` and the advisory closing. With `coverageDiff:false`: explicit off state. The assistant turn came from a local scripted Messages endpoint; no model credential was used. |
 | Strict plugin validation | **PASS** (`claude plugin validate --strict .`, exit 0) |
 | Capability-shape | **PASS**: 18/18 self-test, no findings in `hooks/` |
 | Public security audit | **PASS** on the final candidate: 316 files, manifest/defaults/license checks, icon checks, 0 portability/credential findings; exact byte total and full output are in the delivery report. |
@@ -54,7 +54,7 @@
 
 - Only the existing hardened `bounded` runner is used for Git/stat; no unbounded process is added.
 - Git output and report bytes are untrusted. Paths that are absolute, traverse, enter `.git`, use backslashes/globs/control characters or are not UTF-8 are refused.
-- The report must be an ordinary file with exactly one hard link, not reached through a linked parent, of bounded size, read whole and unchanged by the read. A symlink, FIFO, socket, device, hard link, linked parent, empty/oversized report or a read race is refused.
+- The report must be an ordinary file with exactly one hard link, not reached through a linked parent, of bounded size, read whole and unchanged by the read. A symlink, FIFO, socket, device, hard link, linked parent, empty/oversized report or a read race detected by the before/after stat check is refused; the check is not atomic against a replacement between the stat and the open/read.
 - The report path is excluded from the source identity, so a coverage write cannot masquerade as a source change.
 - Evidence binds only to a capture for the same project and report path, the exact report SHA-256, a report whose stat changed during the run, and the same content identity now and after all reads. Stale, mismatched or tampered records are dropped, never repaired.
 - The feature is unavailable rather than weakened when the platform does not enforce the measurement memory limit, when Git is too old, when filters/partial clone make identity unreliable, or when a required safety property cannot be established.
