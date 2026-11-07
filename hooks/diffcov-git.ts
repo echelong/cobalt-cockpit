@@ -82,8 +82,9 @@ export const parseGitChanges = (raw: string): GitChange[] => {
     const match = RAW.exec(head)
     if (match === null) throw new DiffParseError('DIFF_MALFORMED', 'a malformed raw change record')
     const [, oldMode, newMode, , , word] = match
+    if (word === undefined) throw new DiffParseError('DIFF_MALFORMED', 'a raw change record has no status')
     const status = statusOf(word)
-    const names = status === 'modified' && (word![0] === 'R' || word![0] === 'C') ? 2 : 1
+    const names = status === 'modified' && (word[0] === 'R' || word[0] === 'C') ? 2 : 1
     const paths = tokens.slice(i, i + names)
     if (paths.length !== names) throw new DiffParseError('DIFF_MALFORMED', 'a raw change record has no path')
     i += names

@@ -20,26 +20,35 @@
 
 | Gate | Result |
 | --- | --- |
-| Plugin test harness | **3,163 pass, 0 fail, 81 files** (`claude plugin test .`, 143.55 s) |
+| Plugin test harness | **3,164 pass, 0 fail, 81 files** (`claude plugin test .`, 145.59 s) |
 | Parser tests | 15 focused tests in `tests/diffcov-git.test.ts`: raw NUL lists, renames/deletions, unsafe paths, zero-context hunks, binary/mode-only blocks, hunk-count mismatches, attributes, stat and identity |
 | Disabled behavior | `tests/diffcov-off.test.ts`: `/cockpit coverage diff` renders the off state and adds **zero** process calls |
-| Real-host acceptance | Claude Code **2.1.319**, isolated `CLAUDE_CONFIG_DIR`, disposable repository, seeded valid capture: MATCHED evidence, `COVERED 1`, `src/price.ts:1`, advisory closing. With `coverageDiff:false`: explicit off state. |
+| Real-host acceptance | Claude Code **2.1.319**, isolated `CLAUDE_CONFIG_DIR`, disposable repository, **live capture**: a real host Bash call ran `npm test` and wrote `coverage/lcov.info`; the capture record carried project, HEAD, identity, report SHA-256/stat and `npm test (ok)`. A second real session rendered `MATCHED`, `COVERED 2`, `UNCOVERED 1`, `src/price.ts:3` and the advisory closing. With `coverageDiff:false`: explicit off state. The assistant turn came from a local scripted Messages endpoint; no model credential was used. |
 | Strict plugin validation | **PASS** (`claude plugin validate --strict .`, exit 0) |
 | Capability-shape | **PASS**: 18/18 self-test, no findings in `hooks/` |
-| Public security audit | **PASS**: 316 files, 6,958,920 bytes, manifest/defaults/license checks, icon checks, 0 portability/credential findings |
+| Public security audit | **PASS** on the final candidate: 316 files, manifest/defaults/license checks, icon checks, 0 portability/credential findings; exact byte total and full output are in the delivery report. |
 | Whitespace | **PASS** (`git diff --check` and the new files) |
 | Gitleaks | **PASS**: history 0 findings; worktree 0 findings; clean |
-| Typecheck against 2.1.296 | **Not run.** The host here is 2.1.319 and the generated 2.1.296 declarations are absent; the repository's mandatory script refuses rather than attesting. |
-| Claude Code 2.1.296 / 2.1.316 | **Not run.** No compatibility with either version is claimed from the 2.1.319 acceptance. |
+| Typecheck against 2.1.296 | **PASS**: `scripts/typecheck-host.sh` with the pinned 2.1.296 binary and declarations written by that host, TypeScript 5.9.3, exit 0. The declarations were attached to gitignored `.claude-plugin/types/`; this unauthenticated environment cannot regenerate them. |
+| Claude Code 2.1.296 / 2.1.316 live sessions | **Not run.** 2.1.296 is covered by TYPE only; 2.1.316 is not covered. No runtime compatibility with either is claimed from the 2.1.319 acceptance. |
 | Independent review | **None available.** The author performed an explicit adversarial self-review; no independent approval is claimed. |
 | Candidate diff | The final changed-path list and diff SHA-256 are in the delivery report for the exact committed candidate; no publication is performed. |
 
+### Defects found by these gates, and fixed
+
+1. `hush` discarded the work result, so the capture frame never reached the store. It now returns the result.
+2. Identity after reads was re-measured from `ChangedFile` without Git modes, which could call a tracked change stale. It now uses the selected identity files, modes included.
+3. Claude Code 2.1.319 adds `subagentCapApplied`, `tailInputPath`, `tailInputNote`, `memoryLimitNote` and `triggeredNote` to the result. The capture adapter now accepts the result only while these annotations are absent; a set annotation yields `RESULT_UNRECOGNISED` and no capture.
+4. The raw Git parser now raises an explicit `DiffParseError` for an undefined rename word instead of passing it to a path check.
+
 ### Known coverage gaps
 
-1. The live capture wrapper was not exercised by a model-driven test command. Its pure decisions (`captureBefore`, `captureAfter`, `captureRecordOf`, `bindEvidence`) have focused and end-to-end synthetic tests; the host adapter that snapshots Git/stat around a real Bash call is covered by the disabled-path test, not by a real successful test command. The MATCHED real-host acceptance used a capture record written in the exact validated shape, not one produced live.
-2. The report reader and classifier are exercised by the Phase 1.5/1.6 suites; the real-host command read a real report and real Git tree.
-3. The Git adapter is tested with synthetic raw/patch fixtures; it was also exercised against a disposable repository in the real-host acceptance.
-4. No independent reviewer was available. Treat the self-review as a limitation, not a substitute.
+1. The 2.1.319 live acceptance was host-real but not model-real. The assistant turn was served by a local scripted Messages endpoint; the real host executed the Bash tool, `npm test`, the Git/stat/report reads, the capture write and the second `/cockpit coverage diff` session. The model's choice to run the command remains untested.
+2. The 2.1.296 declarations used by TYPE were written by the pinned 2.1.296 host in the devtools store and attached to gitignored `.claude-plugin/types/`; this environment cannot generate fresh ones because the host requires login. TYPE compiled the exact candidate source against those declarations, but the declarations were not regenerated for this tree.
+3. A live session on 2.1.296 or 2.1.316 was not run. No runtime compatibility with either version is claimed; 2.1.296 is covered by TYPE, 2.1.316 by neither.
+4. The report reader and classifier are exercised by the Phase 1.5/1.6 suites; the real-host command read a real report and real Git tree.
+5. The Git adapter is tested with synthetic raw/patch fixtures and was exercised against the disposable repository.
+6. No independent reviewer was available. Treat the self-review as a limitation, not a substitute.
 
 ## Security properties established by the implementation
 
@@ -53,7 +62,7 @@
 
 ## Changed paths in this candidate
 
-Modified: `.claude-plugin/marketplace.json`, `.claude-plugin/plugin.json`, `CHANGELOG.md`, `PRIVACY.md`, `README.md`, `SECURITY.md`, `docs/README.md`, `docs/configuration.md`, `docs/design-v0.7.0-diff-aware-verification.md`, `docs/roadmap-v0.7.0-diff-aware-verification.md`, `hooks/register.tsx`, `scripts/audit-public.py`.
+Modified: `.claude-plugin/marketplace.json`, `.claude-plugin/plugin.json`, `CHANGELOG.md`, `PRIVACY.md`, `README.md`, `SECURITY.md`, `docs/README.md`, `docs/configuration.md`, `docs/design-v0.7.0-diff-aware-verification.md`, `docs/roadmap-v0.7.0-diff-aware-verification.md`, `hooks/diffcov-capture.ts`, `hooks/register.tsx`, `scripts/audit-public.py`, `tests/diffcov-capture.test.ts`.
 
 Added: `docs/release-v0.7.0.md`, `hooks/diffcov-git.ts`, `tests/diffcov-git.test.ts`, `tests/diffcov-off.test.ts`.
 

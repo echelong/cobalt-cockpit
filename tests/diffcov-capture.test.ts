@@ -3,7 +3,7 @@ import { CAPTURES_KEPT, RECORD_TIME, bindEvidence, captureAfter, captureBefore, 
 import type { CaptureRecord } from '../hooks/diffcov-capture'
 
 // Diff coverage, Phase 1: which observed test runs may later stand as evidence, what a record of one holds, and when a
-// report binds to it. Nothing here runs; the host fields below are the shapes measured on Claude Code 2.1.301.
+// report binds to it. Nothing here runs; the host fields below are the shapes measured on Claude Code 2.1.301 and 2.1.319.
 
 const label = (command: string) => { const r = captureLabelOf(command); return 'label' in r ? r.label : r.skip }
 
@@ -94,11 +94,16 @@ describe('after the call: only an answer that shows a foreground success, field 
     expect(captureAfter(success({ returnCodeInterpretation: 'No matches found' }))).toEqual({ skip: 'DID_NOT_SUCCEED' })
   })
   test('the exact success shape measured on 2.1.301 is ok; any field the host does not declare is refused, not guessed at', () => {
-    const measured = Object.fromEntries(['backgroundCwdHint', 'backgroundEndsWithFinalResponse', 'backgroundTaskId', 'backgroundedByTurnAbort', 'backgroundedByUser', 'backgroundedToDeliverMessage', 'bashEditDiff', 'dangerouslyDisableSandbox', 'ghRateLimitHint', 'gitOperation', 'interrupted', 'isImage', 'noOutputExpected', 'persistedOutputPath', 'persistedOutputSize', 'returnCodeInterpretation', 'staleReadFileStateHint', 'stderr', 'stdout', 'timedOutAfterMs'].map(k => [k, k === 'stdout' || k === 'stderr' ? '' : k === 'interrupted' ? false : undefined]))
+    const measured = Object.fromEntries(['backgroundCwdHint', 'backgroundEndsWithFinalResponse', 'backgroundTaskId', 'backgroundedByTurnAbort', 'backgroundedByUser', 'backgroundedToDeliverMessage', 'bashEditDiff', 'dangerouslyDisableSandbox', 'ghRateLimitHint', 'gitOperation', 'interrupted', 'isImage', 'noOutputExpected', 'persistedOutputPath', 'persistedOutputSize', 'returnCodeInterpretation', 'staleReadFileStateHint', 'stderr', 'stdout', 'timedOutAfterMs', 'subagentCapApplied', 'tailInputPath', 'tailInputNote', 'memoryLimitNote', 'triggeredNote'].map(k => [k, k === 'stdout' || k === 'stderr' ? '' : k === 'interrupted' ? false : undefined]))
     expect(captureAfter({ ref: 'r', isReadOnly: false, text: 'ok', result: measured })).toEqual({ outcome: 'ok' })
     expect(captureAfter(success({ exitCode: 1 }))).toEqual({ skip: 'RESULT_UNRECOGNISED' })
     expect(captureAfter({ ...success(), exitCode: 1 })).toEqual({ skip: 'RESULT_UNRECOGNISED' })
     expect(captureAfter({ ref: 'r', text: 'ok', result: ['ok'] })).toEqual({ skip: 'RESULT_UNRECOGNISED' })
+  })
+  test('the 2.1.319 annotations are accepted only while absent', () => {
+    for (const [key, value] of [['subagentCapApplied', true], ['tailInputPath', '/tmp/tail'], ['tailInputNote', 'noted'], ['memoryLimitNote', 'noted'], ['triggeredNote', 'noted']] as const) {
+      expect(captureAfter(success({ [key]: value }))).toEqual({ skip: 'RESULT_UNRECOGNISED' })
+    }
   })
   test('any shape not recognised is refused', () => {
     for (const ran of [null, undefined, 7, 'ok', {}, { result: null }, { result: 'text' }, success({ interrupted: undefined }), success({ stdout: 1 }), { result: { stdout: '', interrupted: false } }]) expect(captureAfter(ran)).toEqual({ skip: 'RESULT_UNRECOGNISED' })

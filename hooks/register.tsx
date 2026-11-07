@@ -3173,7 +3173,7 @@ const resumeAtom = atom({ plugin: 'cobalt-cockpit', key: 'ledger-resume' } as co
 const LEDGER_PANE = 'cobalt-run-ledger'
 const REPLAY_PANE = 'cobalt-replay'
 const STORE_MAX_SESSIONS = 8
-const hush = async (work: () => Promise<unknown>) => { try { await work() } catch { /* bookkeeping never fails an engine action */ } }
+const hush = async <T,>(work: () => Promise<T>): Promise<T | undefined> => { try { return await work() } catch { /* bookkeeping never fails an engine action */ } }
 export const mutateLedger = async ($: EngineInterface, f: (l: Ledger) => Ledger): Promise<void> => {
   const old = await read($, ledgerAtom)
   if (f(old) !== old) await update($, ledgerAtom, f)
@@ -4262,7 +4262,7 @@ const coverageIdentity = async ($: EngineInterface, root: string, files: readonl
 }
 
 /** The Git selection and the text facts it may classify. `includeSources` is false around an observed run: only identity is needed. */
-const coverageSelection = async ($: EngineInterface, root: string, base: DiffEvidence['base'], includeSources: boolean): Promise<{ files: ChangedFile[]; identity: string | null } | { why: ReportUnavailable }> => {
+const coverageSelection = async ($: EngineInterface, root: string, base: DiffEvidence['base'], includeSources: boolean): Promise<{ files: ChangedFile[]; identity: string | null; identityFiles: readonly GitChange[] } | { why: ReportUnavailable }> => {
   const changes = await coverageChanges($, root, base.sha)
   if ('why' in changes) return changes
   // The coverage report is the observation's own output, not source: including it would make the report's write look like a
@@ -4270,7 +4270,7 @@ const coverageSelection = async ($: EngineInterface, root: string, base: DiffEvi
   const reportPath = 'rel' in coverageConfig.reportPath ? coverageConfig.reportPath.rel : null
   const selected = reportPath === null ? changes.files : changes.files.filter(f => f.path !== reportPath)
   const files: ChangedFile[] = selected.map(f => ({ ...f, source: null }))
-  if (!includeSources) return { files, identity: await coverageIdentity($, root, selected) }
+  if (!includeSources) return { files, identity: await coverageIdentity($, root, selected), identityFiles: selected }
   let total = 0
   for (const f of files) {
     if (f.status === 'deleted' || f.kind !== 'file' || f.modeOnly || f.binaryPatch) continue
@@ -4280,7 +4280,7 @@ const coverageSelection = async ($: EngineInterface, root: string, base: DiffEvi
     if (total > CLASSIFY_LIMITS.maxChangedLines * 8) return { why: 'DIFF_TOO_LARGE' }
   }
 
-  return { files, identity: await coverageIdentity($, root, selected) }
+  return { files, identity: await coverageIdentity($, root, selected), identityFiles: selected }
 }
 
 const coverageStore = async ($: EngineInterface, project: string): Promise<CaptureRecord[]> => capturesOf(await $.store.get(coverageKey(project)).catch(() => undefined), project)
@@ -4362,7 +4362,7 @@ const coverageReport = async ($: EngineInterface, columns: number, page: number,
   const report = await coverageReadReport($, root, coverageConfig.reportPath.rel)
   const project = await coverageProjectOf(root)
   const captures = await coverageStore($, project)
-  const identityAfterReads = await coverageIdentity($, root, selection.files)
+  const identityAfterReads = await coverageIdentity($, root, selection.identityFiles)
   const binding = bindEvidence({
     project, reportPath: coverageConfig.reportPath.rel,
     report: 'ok' in report ? { sha256: report.sha256 } : { refuse: report.refuse },
@@ -5105,7 +5105,7 @@ export const register: Register = (on, options) => {
       await quiet(() => e.agentId ? editAgent($, e.agentId, a => ({ ...a, state: 'waiting', tool: 'Needs input' })) : update($, visualAtom, old => ({ ...old, waiting: old.waiting + 1 })))
       stopTicker()
     }
-    let ran
+    let ran: Awaited<ReturnType<typeof next>>
     try {
       // Recheck after asynchronous guards; this does not revoke an already admitted native effect.
       if (config.hasOrchestration && e.agentId !== undefined) {
@@ -5114,7 +5114,7 @@ export const register: Register = (on, options) => {
         if (refused) { await ledgerToolEnd($, call, { deny: refused }); return { deny: refused } }
       }
       ran = await next(isChanged() ? call : e)
-      if (coverageFrame !== null) await hush(() => coverageAfter($, coverageFrame, ran))
+      if (coverageFrame != null) await hush(() => coverageAfter($, coverageFrame, ran))
     }
     catch (error) { await ledgerToolEnd($, call, { isError: true }); throw error }
     finally {

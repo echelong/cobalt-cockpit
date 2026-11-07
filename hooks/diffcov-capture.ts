@@ -114,12 +114,17 @@ const isAbsent = (value: unknown): boolean => value === undefined || value === n
 
 /** What a tool answer may carry beside the result (`ToolCallResult`); anything else is a shape not recognised. */
 const ANSWER_KEYS = new Set(['ref', 'result', 'text', 'isReadOnly', 'context', 'isError', 'deny'])
-/** Every field the host declares for a Bash result (Claude Code 2.1.296's declarations; 2.1.301 sent a subset: measured). */
+/**
+ * Every field the host declares for a Bash result (Claude Code 2.1.296's declarations; 2.1.301 and 2.1.319 sent subsets:
+ * measured). The five 2.1.319 annotations are accepted only while absent, like the background and timeout fields: a host
+ * that starts setting one has a shape this decision has not measured, and the run is not recorded.
+ */
 const RESULT_KEYS = new Set([
   'stdout', 'stderr', 'rawOutputPath', 'interrupted', 'isImage', 'backgroundTaskId', 'backgroundedByUser', 'backgroundedByTurnAbort',
   'backgroundedToDeliverMessage', 'timedOutAfterMs', 'backgroundCwdHint', 'backgroundEndsWithFinalResponse', 'dangerouslyDisableSandbox',
   'returnCodeInterpretation', 'noOutputExpected', 'structuredContent', 'persistedOutputPath', 'persistedOutputSize', 'staleReadFileStateHint',
   'ghRateLimitHint', 'gitOperation', 'bashEditDiff',
+  'subagentCapApplied', 'tailInputPath', 'tailInputNote', 'memoryLimitNote', 'triggeredNote',
 ])
 
 /**
@@ -142,6 +147,8 @@ export const captureAfter = (ran: unknown): { outcome: 'ok' } | { skip: CaptureS
   if (r['interrupted'] !== false) return { skip: 'INTERRUPTED' }
   if (!isAbsent(r['timedOutAfterMs'])) return { skip: 'TIMED_OUT' }
   if (['backgroundTaskId', 'backgroundedByUser', 'backgroundedByTurnAbort', 'backgroundedToDeliverMessage', 'backgroundEndsWithFinalResponse'].some(k => !isAbsent(r[k]))) return { skip: 'BACKGROUNDED' }
+  // 2.1.319's annotations are not failure fields, but they are accepted only when absent: a set one is unmeasured
+  if (['subagentCapApplied', 'tailInputPath', 'tailInputNote', 'memoryLimitNote', 'triggeredNote'].some(k => !isAbsent(r[k]))) return { skip: 'RESULT_UNRECOGNISED' }
   // a non-zero exit the host interprets as no error (`grep` finding nothing) is still not a success
   if (!isAbsent(r['returnCodeInterpretation'])) return { skip: 'DID_NOT_SUCCEED' }
 
