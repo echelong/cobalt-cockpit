@@ -107,6 +107,15 @@ export class Shell {
   }
 
   // ----- mission selection: resume the repository's open conversation, or start one -------------
+  private takeShellLock(dir: string, id: string): void {
+    this.shellLock = join(dir, 'shell.lock')
+    const l = tryLock(this.shellLock, 'interactive shell')
+    if (!l.ok) {
+      if (!l.stale || !l.holder) throw new Error(`conversation ${id} is open in another cockpit-cline (pid ${l.holder?.holder.pid ?? '?'}); close it, or start a separate one with --new`)
+      if (!breakStaleLock(this.shellLock, l.holder) || !tryLock(this.shellLock, 'interactive shell').ok) throw new Error('could not take over the shell lock of an ended session; retry')
+    }
+  }
+
   private async openMission(): Promise<void> {
     const repo = await repoInfo(this.o.repoDir)
     const deps: Deps = { ...this.o.deps, onEvent: (task, attempt, e) => this.onWorkerEvent(task, attempt, e) }
@@ -118,9 +127,11 @@ export class Shell {
         let h: Header, l: Live & { closed?: boolean }
         try { h = readJson<Header>(join(missionDir(this.o.stateRoot, id), 'mission.json')); l = readJson<Live & { closed?: boolean }>(join(missionDir(this.o.stateRoot, id), 'live.json')) } catch { continue }
         if (h.mode !== 'conversation' || h.repoRoot !== repo.root || l.closed) continue
+        // one interactive shell per conversation, taken before opening it: opening may write to its ledger
+        this.takeShellLock(missionDir(this.o.stateRoot, id), id)
         // a resume that is refused (e.g. a different configuration) is reported, never silently replaced
         try { resumed = Mission.open(this.o.stateRoot, id, this.o.config, this.o.resolutions, deps, { acceptConfigChange: this.o.acceptConfigChange, clineVersion: this.o.clineVersion }) }
-        catch (e) { throw new Error(`cannot resume conversation ${id}: ${(e as Error).message} (or start a new conversation with --new)`) }
+        catch (e) { unlock(this.shellLock); this.shellLock = ''; throw new Error(`cannot resume conversation ${id}: ${(e as Error).message} (or start a new conversation with --new)`) }
         break
       }
     }
@@ -128,13 +139,8 @@ export class Shell {
     // the timeline starts from this mission's own ledger (a resumed conversation shows its history)
     this.timeline = new Timeline(); this.tail = new LedgerTail(join(this.mission.dir, 'ledger')); this.archiveCache = { key: '', recs: [] }
     this.pumpLedger()
-    // one interactive shell per conversation mission
-    this.shellLock = join(this.mission.dir, 'shell.lock')
-    const l = tryLock(this.shellLock, 'interactive shell')
-    if (!l.ok) {
-      if (!l.stale || !l.holder) throw new Error(`conversation ${this.mission.header.id} is open in another cockpit-cline (pid ${l.holder?.holder.pid ?? '?'}); close it, or start a separate one with --new`)
-      if (!breakStaleLock(this.shellLock, l.holder) || !tryLock(this.shellLock, 'interactive shell').ok) throw new Error('could not take over the shell lock of an ended session; retry')
-    }
+    // one interactive shell per conversation mission (a resumed one already holds it)
+    if (!resumed) this.takeShellLock(this.mission.dir, this.mission.header.id)
     this.loadTranscript()
     if (resumed) {
       this.system(`resumed conversation ${this.mission.header.id} (${this.transcript.filter(e => e.role === 'user').length} earlier turn(s)); reconciling any work a previous session left open…`, 'cyan')

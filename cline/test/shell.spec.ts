@@ -190,6 +190,21 @@ describe('the integrated Cockpit shell', () => {
     q.send(KEYS.esc); q.send(KEYS.ctrlD); await q.exited
   })
 
+  test('a second shell is refused before it opens the conversation: its ledger is not written', T, async () => {
+    const e = env(); const cfg = testConfigFile()
+    const p = openShell({ ...e, config: cfg }); await p.waitFor(/type a request to start/)
+    const id = lastConversation(e.root) as string
+    const ledger = (): string => readdirSync(join(e.root, 'missions', id, 'ledger')).sort().map(n => `${n}:${readFileSync(join(e.root, 'missions', id, 'ledger', n), 'utf8')}`).join('|')
+    const before = ledger()
+    // an accepted runtime change: opening it writes config_changed to the ledger at once, so only the lock taken
+    // before opening keeps the second shell from writing into a conversation another shell holds
+    const q = openShell({ ...e, config: testConfigFile({ budgets: { sessionUsd: 9 } }), args: ['--accept-config-change'] })
+    assert.notEqual(await q.exited, 0)
+    assert.match(q.raw(), /is open in another cockpit-cline/)
+    assert.equal(ledger(), before)
+    p.send(KEYS.ctrlD); await p.exited
+  })
+
   test('a second shell on the same conversation is refused while the first is open', T, async () => {
     const e = env(); const cfg = testConfigFile()
     const p = openShell({ ...e, config: cfg }); await p.waitFor(/type a request to start/)

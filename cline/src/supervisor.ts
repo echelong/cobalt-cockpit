@@ -1,7 +1,6 @@
 // The mission supervisor: admission, scheduling, workers, verification, integration,
 // escalation and the mission verdict. Host-side policy is authoritative; models
 // propose, the supervisor decides. Everything durable goes through store.ts.
-import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync } from 'node:fs'
 import { cpus, freemem, loadavg } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -10,6 +9,7 @@ import {
 } from './core/engine.ts'
 import type { Role, Swarm } from './core/engine.ts'
 import type { Config } from './config.ts'
+import { compatibility, configDigest, describeChanges, readSnapshot, runtimeFingerprint, SNAPSHOT_FILE, snapshotFor } from './compat.ts'
 import type { Resolution } from './catalog.ts'
 import { routeTask, nextStep, healthKey, classifyFailureText, IMPLEMENTATION, backoffMs } from './router.ts'
 import type { FailureClass, Health, RouteDecision, TaskSpec } from './router.ts'
@@ -100,11 +100,8 @@ export const missionDir = (root: string, id: string): string => join(root, 'miss
 /** Whether an attempt's cost is known: measured (reported or estimated from usage), or it never launched and spent nothing. */
 export const costMeasured = (a: AttemptRecord): boolean => (a.charge.usd !== null && (a.usageEvents > 0 || a.charge.basis !== 'unmetered')) || (a.identity === null && a.usageEvents === 0 && (a.iterations ?? 0) === 0)
 
-/** Stable digest of the effective configuration (keys sorted), fixed at mission creation. */
-export const configDigest = (c: Config): string => {
-  const sorted = (v: unknown): unknown => Array.isArray(v) ? v.map(sorted) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v as Record<string, unknown>).sort().map(k => [k, sorted((v as Record<string, unknown>)[k])])) : v
-  return createHash('sha256').update(JSON.stringify(sorted(c))).digest('hex').slice(0, 16)
-}
+/** Stable digest of the effective configuration (keys sorted), fixed at mission creation (see compat.ts). */
+export { configDigest }
 
 // ---------------------------------------------------------------------------
 export class Mission {
@@ -118,6 +115,8 @@ export class Mission {
   private lastPersist = 0
   private lockFile: string
   private storeChecked = { at: 0, bytes: 0 }
+  /** Ledger records made while opening, written once the supervisor lock is held. */
+  readonly pendingRecords: [string, unknown][] = []
 
   constructor(readonly dir: string, readonly header: Header, public live: Live, readonly config: Config, readonly resolutions: Record<Role, Resolution>, readonly deps: Deps) {
     this.ledger = new Ledger(join(dir, 'ledger'))
@@ -144,6 +143,8 @@ export class Mission {
     const integrationDir = join(o.stateRoot, 'worktrees', id, '_integration')
     mkdirSync(join(o.stateRoot, 'worktrees', id), { recursive: true, mode: 0o700 })
     writeAtomic(join(dir, 'mission.json'), JSON.stringify(header, null, 1))
+    // the exact configuration it starts with, so a later change to descriptive settings alone is recognised as one
+    writeAtomic(join(dir, SNAPSHOT_FILE), JSON.stringify(snapshotFor(id, header.configDigest, o.config, 'created'), null, 1))
     writeMarker(repo.commonDir, { missionId: id, stateDir: dir, epoch, createdAt: header.createdAt })
     await createIntegration(repo, id, repo.head, integrationDir)
     const pools = o.config.limits.concurrency.total
@@ -179,13 +180,23 @@ export class Mission {
     if (live.epoch !== header.epoch) throw new Error(`mission ${id}: live state epoch differs from header (store replaced); refusing`)
     const digest = configDigest(config)
     const versionChanged = opts.clineVersion !== undefined && opts.clineVersion !== header.clineVersion
-    if ((digest !== header.configDigest || versionChanged) && !opts.acceptConfigChange) {
-      throw new Error(`mission ${id} was created with config ${header.configDigest} on Cline ${header.clineVersion}; now config ${digest}${opts.clineVersion ? ` on Cline ${opts.clineVersion}` : ''}. Resume with the original profile, flags and config, or pass --accept-config-change to continue under the new one (recorded in the ledger).`)
+    // unchanged, or only descriptive settings changed against the mission's verified snapshot: nothing to accept
+    const snap = readSnapshot(dir, header)
+    const compat = compatibility(header.configDigest, snap, config)
+    const changed = compat.outcome === 'changed' || versionChanged
+    if (changed && !opts.acceptConfigChange) {
+      const detail = compat.outcome === 'changed' ? ` (${compat.changes ? describeChanges(compat.changes.filter(c => c.category !== 'descriptive')).join('; ') : compat.why})` : ''
+      throw new Error(`mission ${id} was created with config ${header.configDigest} on Cline ${header.clineVersion}; now config ${digest}${opts.clineVersion ? ` on Cline ${opts.clineVersion}` : ''}${detail}. Resume with the original profile, flags and config, or pass --accept-config-change to continue under the new one (recorded in the ledger).`)
     }
     const m = new Mission(dir, header, live, config, resolutions, deps)
-    if (digest !== header.configDigest || versionChanged) {
-      m.ledger.append('config_changed', null, { from: header.configDigest, to: digest, clineFrom: header.clineVersion, clineTo: opts.clineVersion ?? header.clineVersion, accepted: 'by --accept-config-change' })
+    if (changed) {
+      m.ledger.append('config_changed', null, { from: header.configDigest, to: digest, clineFrom: header.clineVersion, clineTo: opts.clineVersion ?? header.clineVersion, accepted: 'by --accept-config-change', changes: compat.outcome === 'changed' && compat.changes ? describeChanges(compat.changes) : null })
       m.problem(`resumed under a different configuration (${header.configDigest} -> ${digest}) accepted by the person`)
+    } else if (compat.outcome === 'equivalent') {
+      // recorded once this process holds the supervisor lock (acquire): opening alone takes no lock, and another
+      // process (a running shell) may be appending to this ledger
+      const sn = snap.state === 'valid' ? snap.snapshot : null
+      m.pendingRecords.push(['config_equivalent', { from: header.configDigest, to: digest, runtime: runtimeFingerprint(config), descriptive: compat.changes.map(c => c.path), snapshot: sn && { method: sn.method, recordedAt: sn.recordedAt, source: sn.source, by: sn.by ?? null } }])
     }
     return m
   }
@@ -200,6 +211,8 @@ export class Mission {
       if (!again.ok) throw new Error('could not take over the supervisor lock')
       this.ledger.append('supervisor_takeover', null, { previous: r.holder })
     }
+    // a record that cannot be written (disk full) must not leave this process holding the lock
+    try { while (this.pendingRecords.length) { const [kind, data] = this.pendingRecords[0]; this.ledger.append(kind, null, data); this.pendingRecords.shift() } } catch (e) { unlock(this.lockFile); throw e }
     this.live.supervisor = processIdentity(process.pid)
   }
   release(): void { unlock(this.lockFile) }

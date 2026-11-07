@@ -242,6 +242,7 @@ cockpit-cline watch            # mission control for the latest mission (q quits
 cockpit-cline status [MISSION] [--json] · list · replay [MISSION] · cancel MISSION [TASK…]
 cockpit-cline recover [MISSION]                 # after a crash: reconcile by process identity, then continue
 cockpit-cline recover --lost MISSION --repo DIR # the mission's state directory was deleted
+cockpit-cline migrate-config [--previous-defaults F] [--proposed-config F] [--apply]   # what a config change does to existing conversations (dry run unless --apply)
 cockpit-cline route --kind debug --complexity 3 --mode write --prompt "…"   # explain one routing decision
 cockpit-cline smoke --yes [--roles coder,utility] [--max-usd 0.25]           # LIVE, spends credits
 ```
@@ -397,7 +398,10 @@ Verified facts and known gaps, as of Cline 3.0.74 on Fedora, 2026-11-05:
     `UNVERIFIED`, not `DONE`: review it. The heuristic covers common conventions, not every ecosystem.
 12. **Resuming a mission** (`recover`) uses the mission's own profile and strictness; any other difference in the
     effective configuration (budgets, a `--config` file, a Cline or package upgrade) is refused unless you pass
-    `--accept-config-change`, which is recorded and keeps that mission from `DONE`.
+    `--accept-config-change`, which is recorded and keeps that mission from `DONE`. Only a changed profile
+    description is not a difference, and only for a mission whose configuration snapshot is intact; conversations made
+    before snapshots existed get one through `migrate-config --apply`
+    ([docs/configuration.md](docs/configuration.md#existing-conversations-and-new-defaults-migrate-config)).
 13. **Lock takeover** after a crash renames the stale lock aside and verifies it; three contenders racing in the
     same instant can still both proceed (narrow, documented in `src/store.ts`).
 14. A worker that is **held** (its processes could not be accounted for) keeps its slot, its claim and its

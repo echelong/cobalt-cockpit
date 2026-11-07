@@ -110,17 +110,28 @@ export const validateConfig = (raw: unknown): Config => {
  */
 export const allowReadProblem = (raw: unknown): string | null => typeof raw === 'string' ? mountProblem(raw) : 'a path is required'
 
-export type LoadOptions = { file?: string; profile?: string; strict?: boolean; overrides?: unknown }
+export type LoadOptions = { /** A user file; null for none (not even the default user file). */ file?: string | null; profile?: string; strict?: boolean; overrides?: unknown; /** Another defaults file (migrate-config compares against earlier shipped defaults). */ defaultsFile?: string }
 
-export const loadConfig = (opts: LoadOptions = {}): Config => {
-  let raw = JSON.parse(readFileSync(DEFAULT_CONFIG_FILE, 'utf8')) as unknown
-  const user = opts.file ?? (existsSync(USER_CONFIG_FILE) ? USER_CONFIG_FILE : undefined)
-  if (user) raw = merge(raw, JSON.parse(readFileSync(user, 'utf8')))
+/** Keys that would reach an object's prototype when merged by assignment: refused anywhere in a configuration file. */
+const plainKeys = (v: unknown, file: string, path = ''): unknown => {
+  if (Array.isArray(v)) v.forEach((x, i) => plainKeys(x, file, `${path}[${i}]`))
+  else if (isObj(v)) for (const k of Object.keys(v)) { if (k === '__proto__' || k === 'constructor' || k === 'prototype') throw new Error(`config ${file}: key "${k}" is not allowed (at ${path || 'top level'})`); plainKeys(v[k], file, path ? `${path}.${k}` : k) }
+  return v
+}
+
+/** The merged configuration before validation: defaults, then the user file, then overrides, profile and strictness. */
+export const mergedConfig = (opts: LoadOptions = {}): unknown => {
+  const defaults = opts.defaultsFile ?? DEFAULT_CONFIG_FILE
+  let raw = plainKeys(JSON.parse(readFileSync(defaults, 'utf8')), defaults)
+  const user = opts.file === null ? undefined : opts.file ?? (existsSync(USER_CONFIG_FILE) ? USER_CONFIG_FILE : undefined)
+  if (user) raw = merge(raw, plainKeys(JSON.parse(readFileSync(user, 'utf8')), user))
   if (opts.overrides !== undefined) raw = merge(raw, opts.overrides)
   const profile = opts.profile ?? process.env.COCKPIT_CLINE_PROFILE
   if (profile) raw = merge(raw, { profile })
   if (opts.strict !== undefined) raw = merge(raw, { strict: opts.strict })
-  return validateConfig(raw)
+  return raw
 }
+
+export const loadConfig = (opts: LoadOptions = {}): Config => validateConfig(mergedConfig(opts))
 
 export const rolesOf = (c: Config): Record<Role, RoleSpec> => c.profiles[c.profile].roles

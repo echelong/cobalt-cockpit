@@ -14,7 +14,7 @@
       }
     },
     "cline-pass": {
-      "description": "ClinePass subscription models. Switch with --profile cline-pass or COCKPIT_CLINE_PROFILE=cline-pass. ClinePass lists no version-pinned Qwen3.8 Max 0902, so the frontend role is refused in strict mode until you opt in with allowUnpinned.",
+      "description": "ClinePass subscription models. Switch with --profile cline-pass or COCKPIT_CLINE_PROFILE=cline-pass. ClinePass lists no version-pinned Qwen3.8 Max 0902, so the frontend role is refused (in strict and non-strict mode alike) until you add \"cline-pass/cline-pass/qwen3.8-max\" to unpinnedAllowed.",
       "roles": {
         "commander": { "provider": "cline-pass", "model": "cline-pass/kimi-k3.1-pro", "reasoning": "high" },
         "coder": { "provider": "cline-pass", "model": "cline-pass/deepseek-v4.1-flash-1017", "reasoning": "xhigh", "requireName": "1017" },
@@ -67,7 +67,7 @@
   },
   "unpinnedAllowed": [],
   "sandbox": {
-    "hide": ["~/.ssh", "~/.gnupg", "~/.aws", "~/.config/gcloud", "~/.claude", "~/.claude-main", "~/.local/share/cobalt-cockpit-evidence", "~/.local/share/cobalt-cockpit-backup-key", "~/.local/state/cobalt-cockpit-cline"],
+    "hide": ["~/.ssh", "~/.gnupg", "~/.aws", "~/.config/gcloud", "~/.claude", "~/.local/state/cobalt-cockpit-cline"],
     "allowRead": []
   },
   "tools": {

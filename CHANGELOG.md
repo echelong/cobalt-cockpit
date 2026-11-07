@@ -1,5 +1,15 @@
 # Changelog
 
+## Not in a release (manifest still 0.6.5) — Cobalt Cockpit for Cline: portable defaults and configuration compatibility
+
+The Cline adapter only (`cline/`). The Claude Code plugin is unchanged.
+
+- **Portable defaults.** `sandbox.hide` no longer names `~/.claude-main`, `~/.local/share/cobalt-cockpit-evidence` or `~/.local/share/cobalt-cockpit-backup-key` (paths of one machine). Roles, models, reasoning, version pins, budgets, limits, tools, `strict` and the rest of the sandbox are unchanged. To keep hiding paths of your own, list them, with the defaults you want to keep, in your user file (a list there replaces the default).
+- **ClinePass description.** It named `allowUnpinned`, which does not exist, and said the frontend role is refused in strict mode; it is refused in both modes until `"cline-pass/cline-pass/qwen3.8-max"` is in `unpinnedAllowed`.
+- **Configuration snapshots.** A new mission keeps the exact configuration it started with (`config-snapshot.json`). A mission may continue without `--accept-config-change` when only profile descriptions changed and the snapshot hashes to the mission's own digest; it is recorded as `config_equivalent`. Every other difference is refused as before, now with the differing settings listed. The digest in mission headers is unchanged.
+- **`cockpit-cline migrate-config`.** A dry run that reports the current and proposed configuration fingerprints, every differing setting and whether it is security-relevant, and per mission whether it continues or needs acceptance. `--apply` records the snapshot that open conversations made before this version need to continue across a description-only change (created only if absent; conversations held by a running shell or supervisor are skipped); it writes no ledger record, never accepts a change and never edits configuration.
+- **Changing these defaults changes the configuration digest.** Conversations started under the earlier defaults are refused on resume (as before for any configuration change) unless the hide list is kept in your user file and their snapshots are recorded with `migrate-config --apply`, or you accept the change.
+
 ## Not in a release (manifest still 0.6.5) — Cobalt Cockpit for Cline: CI
 
 A workflow (`.github/workflows/cline-adapter.yml`), its test-only preflight (`cline/test/ci-preflight.ts`) and documentation; no adapter runtime or plugin code changes. Not yet run on GitHub-hosted runners.
