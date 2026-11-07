@@ -145,6 +145,15 @@ import { dirFor, filesFor, gather, health, healthOf, limits, newSid, prepared, q
 import { flowGrid, flowOf, flowRow, flowText, layoutOf as flowLayout } from './flow'
 import type { FlowInput, FlowTier } from './flow'
 import { agentRole, cleanEvent, encode, expiredFiles, isTelemetryFile, modelTier, monthKey, parseWindow, segmentName, shedFiles, statsCsv, statsJson, statsText, TOTAL_CAP_BYTES } from './telemetry'
+import { CAPTURES_KEPT, bindEvidence, captureAfter, captureBefore, captureRecordOf, capturesOf, keepCapture } from './diffcov-capture'
+import type { CaptureLabel, CaptureRecord } from './diffcov-capture'
+import { CLASSIFY_LIMITS, classifyChange, diffEvidenceOf, renderDiffEvidence, renderOff, sourceFactsOf, unavailableEvidenceOf } from './diffcov-classify'
+import type { ChangedFile, DiffEvidence, Evidence, ReportUnavailable } from './diffcov-classify'
+import { LCOV_LIMITS, parseLcov, reportReadVerdict } from './diffcov-lcov'
+import type { ReportReadRefusal, ReportStat } from './diffcov-lcov'
+import { excludePrefixesOf, reportPathOf, sfMatcher } from './diffcov-paths'
+import { coverageConfigOf, mergePatches, parseGeneratedAttributes, parseGitChanges, parsePatch, parseUntracked, reportStatOf, REPORT_STAT_GNU, sourceIdentityOf } from './diffcov-git'
+import type { CoverageConfig, GitChange, IdentityEntry } from './diffcov-git'
 import type { HudInput, Row, Segment } from './view'
 
 const PANE = 'cobalt-cockpit'
@@ -1218,6 +1227,7 @@ const HELP =
   '/cockpit agents    the agent inspector: tasks, agents, waves, ownership, requested versus applied effort, and why a task is waiting (read-only); agents <task> explains one\n' +
   '/cockpit ready     which recorded conditions stand between the task and DONE: gates, review, goal check, guard, escalations (read-only; approves nothing)\n' +
   '/cockpit flow      the Neural Flow in words: which of input, discovery, routing, workers, verify and done are complete\n' +
+  '/cockpit coverage diff  changed lines the observed run reported as run/not run; advisory only, never a gate (options coverageDiff, coverageDiffReport, coverageDiffExclude)\n' +
   '/cockpit guard     Cobalt Guard owner alerts: status, priorities, quiet hours and active conditions; ack, silence or unsilence; test and seen check that a notification reaches you (none changes a verdict)\n' +
   '/cockpit alerts   the alert inbox: recorded alerts with their notification outcome, acknowledgment and whether the condition is still open; alerts digest summarises the unacknowledged and what is new since your last look; alerts ack <id> acknowledges one (changes no verdict); alerts review lists incidents to label, alerts label <id> notify|record|noise|clear records whether you would have wanted a notification, and alerts calibration reports how the alert policy would have done against your labels (simulated: nothing is sent and no setting changes)\n' +
   '/cockpit doctor    read-only checks: installs, profile, telemetry storage, host and prompt-cache policy\n' +
@@ -4018,6 +4028,7 @@ const confirmSeen = async ($: EngineInterface, typed: string): Promise<string> =
 // --- Optional Stop-hook verification guard (policy and wording: stopguard.ts). ---
 let stopOptions: Readonly<Record<string, unknown>> = {}
 let stopCfg: StopConfig = stopConfigOf({}, null)
+let coverageConfig: CoverageConfig = coverageConfigOf({})
 /** The guard's settings with ~ resolved against HOME; refreshed whenever the guard is consulted. */
 /** The guard can be asked for a verdict: ENFORCE with a usable script. Only then is DONE the guard's to give. */
 const guardEnforcing = (): boolean => stopCfg.policy === 'ENFORCE' && stopCfg.problems.length === 0 && stopCfg.script !== null
@@ -4042,6 +4053,344 @@ const rawSha = async ($: EngineInterface, path: string): Promise<string | null> 
 
     return hex(await crypto.subtle.digest('SHA-256', bytes))
   } catch { return null }
+}
+
+// --- Diff-aware verification v0.7.0: the host adapter. The pure modules decide what may be counted; this is the only
+// place where Git, stat and the report are actually touched. Every command is bounded, root-relative, and read-only.
+
+type CoverageFrame = {
+  label: CaptureLabel
+  root: string
+  project: string
+  base: DiffEvidence['base']
+  head: string
+  reportPath: string
+  identityBefore: string
+  reportBefore: { sha: string | 'absent'; stamp: string | 'absent'; size: number }
+}
+
+const COVERAGE_KEY = 'coverage-captures'
+const COVERAGE_MAX_BYTES = 64 * 1024 * 1024
+const coverageKey = (project: string): string => `${COVERAGE_KEY}:${project}`
+
+const coverageProjectOf = async (root: string): Promise<string> => (await sha256Text(`cobalt-cockpit/coverage/v1\0${root}`)).slice(0, 32)
+const coverageAbs = (root: string, rel: string): string => `${root}/${rel}`
+
+const coverageStat = async ($: EngineInterface, path: string): Promise<ReportStat | 'unknown' | null> => {
+  const r = await bounded($, ['stat', '--printf', REPORT_STAT_GNU, '--', path], { timeoutMs: GIT_TIMEOUT_MS, env: { LC_ALL: 'C' } }).catch(() => null)
+  if (r === null || r.isStdoutTruncated || r.isStderrTruncated) return 'unknown'
+  if (r.exitCode === 0 && r.stderr.trim() === '') {
+    const one = reportStatOf(r.stdout)
+    return one === null ? 'unknown' : { kind: one.kind, size: one.size, links: one.links, identity: one.identity }
+  }
+  if (r.exitCode !== 0 && r.stdout === '' && ENOENT.test(r.stderr.replace(/\n$/, ''))) return null
+
+  return 'unknown'
+}
+
+const coverageParents = async ($: EngineInterface, root: string, rel: string): Promise<ReportStat[] | null> => {
+  const parts = rel.split('/')
+  const out: ReportStat[] = []
+  for (let n = 1; n < parts.length; n++) {
+    const got = await coverageStat($, coverageAbs(root, parts.slice(0, n).join('/')))
+    if (got === null || got === 'unknown') return null
+    out.push(got)
+  }
+
+  return out
+}
+
+const bytesOfBase64 = (base64: string): Uint8Array => {
+  const bin = atob(base64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+
+  return bytes
+}
+
+const coverageReadReport = async ($: EngineInterface, root: string, rel: string): Promise<{ ok: true; bytes: Uint8Array; sha256: string; stat: ReportStat } | { refuse: ReportReadRefusal }> => {
+  const parents = await coverageParents($, root, rel)
+  if (parents === null) return { refuse: 'REPORT_UNREADABLE' }
+  const report = await coverageStat($, coverageAbs(root, rel))
+  if (report === 'unknown') return { refuse: 'REPORT_UNREADABLE' }
+  if (report === null) return { refuse: 'REPORT_MISSING' }
+  const before = { report, parents }
+  // A missing or unsuitable report is refused from the stat alone; the reader is never asked for something it may not read.
+  const pre = reportReadVerdict(before, { bytes: report.size }, before)
+  if ('refuse' in pre) return pre
+  let bytes: Uint8Array
+  try {
+    bytes = bytesOfBase64((await $.fs.read(coverageAbs(root, rel), { as: 'bytes' })).base64)
+  } catch { return { refuse: 'REPORT_UNREADABLE' } }
+  const after = await coverageStat($, coverageAbs(root, rel))
+  if (after === 'unknown' || after === null) return { refuse: 'REPORT_CHANGED_WHILE_READ' }
+  const afterParents = await coverageParents($, root, rel)
+  if (afterParents === null) return { refuse: 'REPORT_CHANGED_WHILE_READ' }
+  const verdict = reportReadVerdict(before, { bytes: bytes.length }, { report: after, parents: afterParents })
+  if ('refuse' in verdict) return verdict
+
+  return { ok: true, bytes, sha256: await sha256Bytes(bytes), stat: after }
+}
+
+const sha256Bytes = async (bytes: Uint8Array): Promise<string> => hex(await crypto.subtle.digest('SHA-256', bytes))
+
+const coverageGit = async ($: EngineInterface, root: string, args: string[]) => bounded($, ['git', ...GIT_SAFE, '-C', root, ...args], { timeoutMs: GIT_TIMEOUT_MS })
+const coverageGitDiffOk = (r: { exitCode: number | null; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean }): boolean =>
+  (r.exitCode === 0 || r.exitCode === 1) && !r.isStdoutTruncated && !r.isStderrTruncated && r.stderr.trim() === ''
+
+/** A commit id, an LCOV report path and the repository's supported Git, or why the layer cannot report. */
+const coverageHead = async ($: EngineInterface, root: string): Promise<string | null> => {
+  const r = await coverageGit($, root, ['rev-parse', '--verify', 'HEAD^{commit}']).catch(() => null)
+  const sha = r !== null && gitAnswered(r) ? r.stdout.replace(/\n$/, '') : ''
+
+  return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha) ? sha : null
+}
+
+const coverageBase = async ($: EngineInterface, root: string, head: string, task: Task | null, given: string | null): Promise<{ base: DiffEvidence['base'] } | { why: ReportUnavailable }> => {
+  if (given !== null && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(given)) return { why: 'BASE_NOT_HEX' }
+  let sha = head
+  let how: 'given' | 'task-start' = 'task-start'
+  if (given !== null) {
+    const r = await coverageGit($, root, ['rev-parse', '--verify', `${given}^{commit}`]).catch(() => null)
+    const got = r !== null && gitAnswered(r) ? r.stdout.replace(/\n$/, '') : ''
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(got)) return { why: 'BASE_UNRESOLVED' }
+    sha = got
+    how = 'given'
+  } else if (task !== null && task.startSha !== null && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(task.startSha)) {
+    sha = task.startSha
+  }
+  const ancestor = await coverageGit($, root, ['merge-base', '--is-ancestor', sha, head]).catch(() => null)
+  if (ancestor === null || (ancestor.exitCode !== 0 && ancestor.exitCode !== 1)) return { why: 'BASE_AMBIGUOUS' }
+
+  return { base: { sha, how, ...(given === null ? {} : { given }), ancestor: ancestor.exitCode === 0 } }
+}
+
+const coveragePartialClone = async ($: EngineInterface, root: string): Promise<boolean | null> => {
+  const r = await coverageGit($, root, ['config', '--get-regexp', '^(extensions\\.partialClone|remote\\..*\\.promisor)$']).catch(() => null)
+  if (r === null || r.isStdoutTruncated || r.isStderrTruncated || r.stderr.trim() !== '' || (r.exitCode !== 0 && r.exitCode !== 1)) return null
+
+  return r.exitCode === 0 && r.stdout.trim() !== ''
+}
+
+const coverageGitVersion = async ($: EngineInterface, root: string): Promise<boolean> => {
+  const r = await coverageGit($, root, ['--version']).catch(() => null)
+  if (r === null || !gitAnswered(r)) return false
+  const m = /^git version (\d+)\.(\d+)(?:\.(\d+))?/.exec(r.stdout.trim())
+  if (m === null) return false
+  const [major, minor] = [Number(m[1]), Number(m[2])]
+
+  return major > 2 || (major === 2 && minor >= 30)
+}
+
+/** The raw change list, its zero-context hunks, untracked files and the generated attribute, with no file bytes read. */
+const coverageChanges = async ($: EngineInterface, root: string, base: string): Promise<{ files: GitChange[] } | { why: ReportUnavailable }> => {
+  const raw = await coverageGit($, root, ['diff', '--raw', '-z', '--no-abbrev', '--find-renames=50%', base, '--']).catch(() => null)
+  if (raw === null || !coverageGitDiffOk(raw)) return { why: raw !== null && (raw.isStdoutTruncated || raw.isStderrTruncated) ? 'DIFF_TOO_LARGE' : 'DIFF_FAILED' }
+  let tracked: GitChange[]
+  try { tracked = parseGitChanges(raw.stdout) } catch { return { why: 'DIFF_MALFORMED' } }
+  const untrackedRun = await coverageGit($, root, ['ls-files', '--others', '--exclude-standard', '-z']).catch(() => null)
+  if (untrackedRun === null || !gitAnswered(untrackedRun)) return { why: 'DIFF_FAILED' }
+  let untracked: GitChange[]
+  try { untracked = parseUntracked(untrackedRun.stdout) } catch { return { why: 'PATH_NOT_UTF8' } }
+  if (tracked.length + untracked.length > CLASSIFY_LIMITS.maxFiles) return { why: 'TOO_MANY_FILES' }
+  if (tracked.length > 0) {
+    for (let i = 0; i < tracked.length; i += 64) {
+      const part = tracked.slice(i, i + 64)
+      const patch = await coverageGit($, root, ['diff', '--unified=0', '--no-color', '--no-ext-diff', '--no-textconv', '--find-renames=50%', base, '--', ...part.map(f => f.path)]).catch(() => null)
+      if (patch === null || !coverageGitDiffOk(patch)) return { why: patch !== null && (patch.isStdoutTruncated || patch.isStderrTruncated) ? 'DIFF_TOO_LARGE' : 'DIFF_FAILED' }
+      let hunks
+      try { hunks = parsePatch(patch.stdout, part.length) } catch { return { why: 'DIFF_INCONSISTENT' } }
+      tracked.splice(i, part.length, ...mergePatches(part, hunks))
+    }
+  }
+  const paths = [...tracked, ...untracked].map(f => f.path)
+  if (paths.length > 0) {
+    // The attribute command needs the names; it is started through the same bounded runner and never reads a path itself.
+    const named = paths.join('\0') + '\0'
+    const withInput = await bounded($, ['git', ...GIT_SAFE, '-C', root, 'check-attr', '-z', '--stdin', 'linguist-generated'], { stdin: named, timeoutMs: GIT_TIMEOUT_MS }).catch(() => null)
+    if (withInput === null || !gitAnswered(withInput)) return { why: 'ATTRIBUTES_UNREADABLE' }
+    let generated: Set<string>
+    try { generated = parseGeneratedAttributes(withInput.stdout) } catch { return { why: 'ATTRIBUTES_UNREADABLE' } }
+    for (const f of [...tracked, ...untracked]) f.generatedByAttribute = generated.has(f.path)
+  }
+
+  return { files: [...tracked, ...untracked] }
+}
+
+const coverageReadSource = async ($: EngineInterface, root: string, path: string): Promise<ChangedFile['source']> => {
+  const seen = await inspectPaths($, root, [path])
+  if (seen === null || seen.length !== 1) return { refuse: 'SOURCE_UNREADABLE' }
+  const s = seen[0]!
+  if (s.kind === 'missing') return { refuse: 'SOURCE_MISSING' }
+  if (s.kind !== 'file') return { refuse: 'SOURCE_NOT_A_REGULAR_FILE' }
+  if (s.size > LCOV_LIMITS.maxBytes) return { refuse: 'SOURCE_TOO_LARGE' }
+  let bytes: Uint8Array
+  try { bytes = bytesOfBase64((await $.fs.read(coverageAbs(root, path), { as: 'bytes' })).base64) } catch { return { refuse: 'SOURCE_UNREADABLE' } }
+  if (bytes.length > LCOV_LIMITS.maxBytes) return { refuse: 'SOURCE_TOO_LARGE' }
+
+  return sourceFactsOf(bytes)
+}
+
+const coverageIdentity = async ($: EngineInterface, root: string, files: readonly Pick<GitChange, 'path' | 'status' | 'kind' | 'oldMode' | 'newMode'>[]): Promise<string | null> => {
+  const entries: IdentityEntry[] = []
+  const regular = files.filter(f => f.status !== 'deleted' && f.kind === 'file')
+  const hashes = new Map<string, string>()
+  for (let i = 0; i < regular.length; i += 128) {
+    const part = regular.slice(i, i + 128)
+    const r = await coverageGit($, root, ['hash-object', '--no-filters', '--', ...part.map(f => f.path)]).catch(() => null)
+    if (r === null || !gitAnswered(r)) return null
+    const lines = r.stdout.split('\n').filter(Boolean)
+    if (lines.length !== part.length) return null
+    for (const [k, f] of part.entries()) {
+      const hash = lines[k]!
+      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hash)) return null
+      hashes.set(f.path, hash)
+    }
+  }
+  for (const f of files) {
+    const mode = f.kind === 'symlink' ? '120000' : f.status === 'untracked' ? '100644' : f.newMode
+    if (f.status === 'deleted') entries.push({ path: f.path, status: f.status, mode: f.oldMode, blob: 'deleted' })
+    else if (f.kind === 'file') entries.push({ path: f.path, status: f.status, mode, blob: hashes.get(f.path) ?? '' })
+    else if (f.kind === 'symlink') {
+      const link = await bounded($, ['readlink', '-z', '--', f.path], { cwd: root, timeoutMs: GIT_TIMEOUT_MS }).catch(() => null)
+      if (link === null || link.exitCode !== 0 || link.stdout === '' || link.isStdoutTruncated || link.stderr.trim() !== '') return null
+      entries.push({ path: f.path, status: f.status, mode, blob: await sha256Bytes(new TextEncoder().encode(link.stdout.replace(/\0$/, ''))) })
+    } else return null
+  }
+
+  return sourceIdentityOf(entries)
+}
+
+/** The Git selection and the text facts it may classify. `includeSources` is false around an observed run: only identity is needed. */
+const coverageSelection = async ($: EngineInterface, root: string, base: DiffEvidence['base'], includeSources: boolean): Promise<{ files: ChangedFile[]; identity: string | null } | { why: ReportUnavailable }> => {
+  const changes = await coverageChanges($, root, base.sha)
+  if ('why' in changes) return changes
+  // The coverage report is the observation's own output, not source: including it would make the report's write look like a
+  // source change and would count it as a changed file. It is excluded by its configured, already-validated relative path.
+  const reportPath = 'rel' in coverageConfig.reportPath ? coverageConfig.reportPath.rel : null
+  const selected = reportPath === null ? changes.files : changes.files.filter(f => f.path !== reportPath)
+  const files: ChangedFile[] = selected.map(f => ({ ...f, source: null }))
+  if (!includeSources) return { files, identity: await coverageIdentity($, root, selected) }
+  let total = 0
+  for (const f of files) {
+    if (f.status === 'deleted' || f.kind !== 'file' || f.modeOnly || f.binaryPatch) continue
+    const source = await coverageReadSource($, root, f.path)
+    if (source !== null && !('refuse' in source)) total += source.lineCount
+    f.source = source
+    if (total > CLASSIFY_LIMITS.maxChangedLines * 8) return { why: 'DIFF_TOO_LARGE' }
+  }
+
+  return { files, identity: await coverageIdentity($, root, selected) }
+}
+
+const coverageStore = async ($: EngineInterface, project: string): Promise<CaptureRecord[]> => capturesOf(await $.store.get(coverageKey(project)).catch(() => undefined), project)
+
+const coverageSnapshot = async ($: EngineInterface, root: string, rel: string): Promise<{ sha: string | 'absent'; stamp: string | 'absent'; size: number } | null> => {
+  const stat = await coverageStat($, coverageAbs(root, rel))
+  if (stat === 'unknown') return null
+  if (stat === null) return { sha: 'absent', stamp: 'absent', size: 0 }
+  if (stat.kind !== 'file' || stat.links !== 1 || stat.size > LCOV_LIMITS.maxBytes) return null
+  const reportRead = await coverageReadReport($, root, rel)
+  if ('refuse' in reportRead) return null
+
+  return { sha: reportRead.sha256, stamp: reportRead.stat.identity, size: reportRead.stat.size }
+}
+
+const coverageBefore = async ($: EngineInterface, call: Record<string, unknown>): Promise<CoverageFrame | null> => {
+  if (!coverageConfig.enabled || !('rel' in coverageConfig.reportPath) || 'refuse' in coverageConfig.exclude) return null
+  const cwd = await $.session.cwd().catch(() => '')
+  const root = await verifiedGitRoot($)
+  if (root === null) return null
+  const before = captureBefore(call, { cwd, root })
+  if ('skip' in before) return null
+  const head = await coverageHead($, root)
+  if (head === null) return null
+  const base = await coverageBase($, root, head, await read($, taskAtom), null)
+  if ('why' in base) return null
+  const selection = await coverageSelection($, root, base.base, false)
+  if ('why' in selection || selection.identity === null) return null
+  const report = await coverageSnapshot($, root, coverageConfig.reportPath.rel)
+  if (report === null) return null
+
+  return { label: before.label, root, project: await coverageProjectOf(root), base: base.base, head, reportPath: coverageConfig.reportPath.rel, identityBefore: selection.identity, reportBefore: report }
+}
+
+const coverageAfter = async ($: EngineInterface, frame: CoverageFrame, ran: unknown): Promise<void> => {
+  const after = captureAfter(ran)
+  if ('skip' in after) return
+  const cwd = await $.session.cwd().catch(() => '')
+  if (cwd !== frame.root) return
+  const selection = await coverageSelection($, frame.root, frame.base, false)
+  if ('why' in selection || selection.identity === null) return
+  const report = await coverageSnapshot($, frame.root, frame.reportPath)
+  if (report === null || report.sha === 'absent' || report.stamp === 'absent') return
+  const record = captureRecordOf({
+    at: await $.clock.now(), label: frame.label, project: frame.project, head: frame.head,
+    identityBefore: frame.identityBefore, identityAfter: selection.identity,
+    report: { path: frame.reportPath, sha256: report.sha, size: report.size, stampBefore: frame.reportBefore.stamp, stampAfter: report.stamp, shaBefore: frame.reportBefore.sha },
+  })
+  if ('skip' in record) return
+  const kept = await coverageStore($, frame.project)
+  await $.store.set(coverageKey(frame.project), { v: 1, captures: keepCapture(kept, record.record) }).catch(() => undefined)
+}
+
+const coverageUnavailable = (why: ReportUnavailable, head: string, base: DiffEvidence['base'], coverage: DiffEvidence['coverage'], columns = 80): string =>
+  renderDiffEvidence(unavailableEvidenceOf({ source: { head, identity: null, tracked: 0, untracked: 0 }, base, coverage, why }), columns)
+
+/** The chance to classify the report against a selection, with every refusal rendered through the one Phase 1 contract. */
+const coverageReport = async ($: EngineInterface, columns: number, page: number, given: string | null): Promise<string> => {
+  if (!coverageConfig.enabled) return renderOff(columns)
+  const unavailable = (why: ReportUnavailable, head = '', base: DiffEvidence['base'] = { sha: '', how: 'task-start', ancestor: true }, coverage: DiffEvidence['coverage'] = null): string => coverageUnavailable(why, head, base, coverage, columns)
+  if (!('rel' in coverageConfig.reportPath)) return unavailable(coverageConfig.reportPath.refuse === 'PATH_UNSET' ? 'REPORT_PATH_UNSET' : 'REPORT_PATH_REFUSED')
+  if ('refuse' in coverageConfig.exclude) return unavailable('EXCLUDE_REFUSED', '', { sha: '', how: 'task-start', ancestor: true }, { path: coverageConfig.reportPath.rel, sha256: null, run: null })
+  const root = await verifiedGitRoot($)
+  if (root === null) return unavailable('NOT_A_VERIFIED_ROOT')
+  const bounds = await boundOf($)
+  if (bounds.script !== 'memory' || bounds.enforced !== true) return unavailable('MEMORY_LIMIT_NOT_ENFORCED')
+  if (!(await coverageGitVersion($, root))) return unavailable('GIT_TOO_OLD')
+  if ('why' in await gitInputs($, root)) return unavailable('CONFIG_UNREADABLE')
+  if (!(await coverageGitFiltersReliableSafe($, root))) return unavailable('FILTER_CONFIGURED')
+  const partial = await coveragePartialClone($, root)
+  if (partial === null) return unavailable('CONFIG_UNREADABLE')
+  if (partial) return unavailable('PARTIAL_CLONE')
+  const head = await coverageHead($, root)
+  if (head === null) return unavailable('DIFF_FAILED')
+  const base = await coverageBase($, root, head, await read($, taskAtom), given)
+  if ('why' in base) return unavailable(base.why)
+  const selection = await coverageSelection($, root, base.base, true)
+  if ('why' in selection) return unavailable(selection.why, head, base.base, { path: coverageConfig.reportPath.rel, sha256: null, run: null })
+  const report = await coverageReadReport($, root, coverageConfig.reportPath.rel)
+  const project = await coverageProjectOf(root)
+  const captures = await coverageStore($, project)
+  const identityAfterReads = await coverageIdentity($, root, selection.files)
+  const binding = bindEvidence({
+    project, reportPath: coverageConfig.reportPath.rel,
+    report: 'ok' in report ? { sha256: report.sha256 } : { refuse: report.refuse },
+    identityNow: selection.identity, identityAfterReads, captures,
+  })
+  let evidence: Evidence
+  if (binding.state === 'UNBOUND') evidence = { state: 'UNBOUND', why: binding.why }
+  else {
+    const changed = new Map<string, ReadonlySet<number>>()
+    for (const f of selection.files) {
+      const lines = f.status === 'untracked'
+        ? f.source !== null && !('refuse' in f.source) ? Array.from({ length: f.source.lineCount }, (_, k) => k + 1) : []
+        : [...new Set([...f.added, ...f.modified])]
+      changed.set(f.path, new Set(lines))
+    }
+    const parsed = await parseLcov('ok' in report ? report.bytes : new Uint8Array(), sfMatcher(changed, { root }), { now: () => Date.now(), pause: async () => undefined }).catch(() => null)
+    evidence = parsed === null ? { state: 'REJECTED', code: 'MALFORMED', line: 0 } : parsed.ok ? { state: 'BOUND', report: parsed, notes: binding.notes } : { state: 'REJECTED', code: parsed.code, line: parsed.line }
+  }
+  const coverage = { path: coverageConfig.reportPath.rel, sha256: 'ok' in report ? report.sha256 : null, run: binding.capture === null ? null : { at: binding.capture.at, label: binding.capture.label } }
+  const classification = classifyChange(selection.files, evidence, coverageConfig.exclude.prefixes)
+  if ('refuse' in classification) return unavailable(classification.refuse, head, base.base, coverage)
+  const view = diffEvidenceOf({ source: { head, identity: selection.identity, tracked: selection.files.filter(f => f.status !== 'untracked').length, untracked: selection.files.filter(f => f.status === 'untracked').length }, base: base.base, coverage, evidence, classification })
+
+  return renderDiffEvidence(view, columns, page)
+}
+
+const coverageGitFiltersReliableSafe = async ($: EngineInterface, root: string): Promise<boolean> => {
+  try { return await gitFiltersReliable($, root) } catch { return false }
 }
 
 /** The Stop guard's and the alerts' own settings: they decide whether a task may finish, so only the person changes them. */
@@ -4399,6 +4748,7 @@ export const register: Register = (on, options) => {
   stopOptions = options
   guardCfg = guardConfigOf(options)
   stopCfg = stopConfigOf(options, null)
+  coverageConfig = coverageConfigOf(options)
   // what limits a measurement process runs under is probed again for this registration's host
   boundMode = null
   boundRetryAt = 0
@@ -4742,6 +5092,9 @@ export const register: Register = (on, options) => {
     const beforeWrite = e.tool === 'Write' ? await ledgerBeforeWrite($, call['file_path']) : undefined
 
     await quiet(() => noteStart($, call))
+    // Phase 3: observe only a plain foreground test call, after the guards and only when the person enabled the layer.
+    // The capture is wrapped so a failing Git/stat/report read can never affect the tool call.
+    const coverageFrame = coverageConfig.enabled ? await hush(() => coverageBefore($, call)) : null
     // The Activity Field's tape: one entry when a call really starts, closed
     // when it really returns. `callOf` reduces it to safe fields, and a call it
     // does not recognize contributes nothing at all.
@@ -4761,6 +5114,7 @@ export const register: Register = (on, options) => {
         if (refused) { await ledgerToolEnd($, call, { deny: refused }); return { deny: refused } }
       }
       ran = await next(isChanged() ? call : e)
+      if (coverageFrame !== null) await hush(() => coverageAfter($, coverageFrame, ran))
     }
     catch (error) { await ledgerToolEnd($, call, { isError: true }); throw error }
     finally {
@@ -5379,6 +5733,21 @@ export const register: Register = (on, options) => {
         const input = await hudInput($, (await read($, activityAtom)).isWorking)
 
         return { text: flowText(flowOf(flowInputOf({ ...input, task }, session.agents, input.isWorking))) }
+      }
+      case 'coverage': {
+        const words = e.args.trim().split(/\s+/)
+        if (words[1] !== 'diff') return { text: 'Usage: /cockpit coverage diff [--page N] [--base <commit>]\nThe layer is off unless coverageDiff is true; no test is ever run by this command. It approves nothing.' }
+        let page = 1
+        let given: string | null = null
+        for (let k = 2; k < words.length; k++) {
+          const word = words[k]!
+          if (word === '--page' && words[k + 1] !== undefined && /^[1-9]\d{0,3}$/.test(words[k + 1]!)) { page = Number(words[++k]); continue }
+          if (word === '--base' && words[k + 1] !== undefined) { given = words[++k]!.toLowerCase(); continue }
+          return { text: 'Usage: /cockpit coverage diff [--page N] [--base <commit>]' }
+        }
+        const columns = (e as { presentation?: { columns?: number } }).presentation?.columns ?? 80
+        try { return { text: await coverageReport($, columns, page, given) } }
+        catch { return { text: coverageUnavailable('DIFF_FAILED', '', { sha: '', how: 'task-start', ancestor: true }, null, columns) } }
       }
       case 'guard': {
         const words = e.args.trim().toLowerCase().split(/\s+/)

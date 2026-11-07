@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0 — Diff-aware verification (advisory)
+
+This release implements Phases 2–4 of the v0.7.0 design: Git selection and source identity, opt-in capture around observed test commands, and `/cockpit coverage diff`. The feature is off by default, stores no raw command, argument, environment, output or coverage content, and changes no gate, DONE decision, guard, review, release decision, agent ownership rule or permission. Phase 1, 1.5 and 1.6 behavior is preserved.
+
+- **Options.** `coverageDiff` (false), `coverageDiffReport` (empty) and `coverageDiffExclude` (empty). Enabling the layer adds Git, stat and report reads. With it off, the command returns the explicit off state and the capture path performs no Git inspection, report reading or added process work.
+- **Capture.** Only a plain, foreground, successful test command observed from the main session in the verified repository root can leave a bounded record. The record carries a closed label, time, project, HEAD, content identity and report stat/hash; it never carries the command text, arguments, environment, token, test output or report bytes. The report path is excluded from the source identity.
+- **Command.** `/cockpit coverage diff [--page N] [--base <commit>]` reads the current change and the configured LCOV report, binds the report to a recorded run, and renders changed lines as covered, uncovered, excluded/non-executable, unavailable or untrusted. It refuses stale, mismatched, malformed or untrusted evidence with the Phase 1 vocabulary and never invents a percentage or threshold.
+- **Limits.** The command is bounded by the existing process limits and the Phase 1 parser, path and classification limits. Git output is treated as untrusted; paths leave the repository, enter `.git`, traverse, use backslashes/globs/control characters or are not UTF-8 are refused. The report is never followed through a link, hard link or linked parent.
+- **Verification.** 3,161 plugin tests pass on 81 files (0 failures). A real-host acceptance on Claude Code 2.1.319, with an isolated configuration and a disposable repository, rendered MATCHED evidence with `COVERED 1`, and the disabled option rendered the off state. Claude Code 2.1.296 and 2.1.316 were not available here; no compatibility with them is claimed from the 2.1.319 run. A live model-driven test-command capture was not exercised; the capture decision and binding functions have their existing focused and end-to-end synthetic tests.
+- **Not changed.** C1, C2, C3 and C8 disclosures, the F01/A2 and v0.6.6 Stage A/B NO-GO decisions, the experimental Cline adapter, model routing and credential handling. No publication, tag, merge or installed-plugin update is part of this candidate.
+
 ## Not in a release — Cobalt Cockpit for Cline: portable defaults and configuration compatibility
 
 The Cline adapter only (`cline/`). The Claude Code plugin is unchanged.

@@ -586,7 +586,7 @@ claude plugin install cobalt-cockpit@cobalt-cockpit
 
 **2. Restart** Claude Code, open `/cockpit`, and inspect `/cockpit version`. By default Cockpit **observes**; orchestration enforcement is opt-in.
 
-**Which code you have.** This page describes 0.6.6. The manifest read 0.6.5 from the 0.6.5 version commit (`7a7ca1a`) until the 0.6.6 version commit; the commits after `7a7ca1a` are included in 0.6.6, including the completion reporting and Stop-guard trust rule described here. An installation of 0.6.5 made from that version commit does not have them. On the older code a finished task reads `VERIFIED`, not `DONE` followed by its evidence state. `claude plugin update` compares versions, so an installation of 0.6.5 is told 0.6.6 is available ([CHANGELOG](CHANGELOG.md)).
+**Which code you have.** This page describes the **0.7.0 release candidate**, not a published release. The candidate adds the opt-in, advisory `/cockpit coverage diff` and its three options; it leaves every existing gate, DONE decision, guard, review, release rule, ownership rule and permission unchanged. If it is not published, the installed release remains 0.6.6. The candidate is isolated; publishing requires the owner's approval ([release notes](docs/release-v0.7.0.md), [CHANGELOG](CHANGELOG.md)).
 
 **3. Optional: enforce orchestration** with the supported configuration CLI:
 
@@ -652,6 +652,7 @@ Sounds try PipeWire, PulseAudio, ALSA, ffplay, mpv, SoX, Canberra, macOS afplay,
 | `/cockpit flow` | Print the Neural Flow row in words |
 | `/cockpit agents` / `/cockpit agents <task>` | The agent inspector: every swarm task, or one in full. Read-only |
 | `/cockpit ready` | Which recorded conditions stand between the task and DONE. Read-only; approves nothing |
+| `/cockpit coverage diff` | Changed lines the observed test run reported as run or not run. Advisory only; off unless `coverageDiff` is enabled |
 | `/cockpit guard` | Owner-alert status, acknowledgment and silence, and the Stop guard's script enrollment |
 | `/cockpit alerts` | The alert inbox |
 | `/cockpit doctor` | Read-only installation, host, Auto-mode, telemetry-storage and prompt-cache diagnostics |
@@ -679,6 +680,7 @@ The complete reference. The `/cockpit guard` and `/cockpit alerts` commands that
 | `/cockpit guard` / `/cockpit guard ack\|silence\|unsilence\|trust [hash]\|untrust\|release` | Owner-alert status (open conditions, reminders used, persistence and sound, notification transport), acknowledgment and silence, and the Stop guard's script enrollment and release (typed by a person only) |
 | `/cockpit agents` / `/cockpit agents <task>` | The agent inspector: every swarm task with its tier, state, wave, ownership, dependencies, requested versus applied effort, last observed activity, the reported outcome versus the commander's recorded verdict, and why it is waiting. Read-only |
 | `/cockpit ready` | Which recorded conditions stand between the task and DONE: milestones, the six gates (with stale and reported-only evidence called out), the Stop guard, the Opus review, the goal check, and pending agent escalations. Read-only; approves nothing |
+| `/cockpit coverage diff [--page N] [--base <commit>]` | Read the current change and the one configured LCOV report; show changed lines as covered, uncovered, excluded/non-executable, unavailable or untrusted, with the evidence state. It never runs tests, invents a percentage or threshold, or changes a gate, DONE, review or release. Off by default; enabling it requires `coverageDiff` and a `coverageDiffReport` path |
 | `/cockpit alerts export` / `/cockpit alerts legacy [delete <code>]` | A bounded, closed-vocabulary JSON export of this project's alert occurrences (typed by you; printed, never written or sent), and a dry-run-first cleanup of the v0.5.7/v0.5.8 history keys that deletes only what exists elsewhere |
 | `/cockpit alerts [page]` / `/cockpit alerts digest` / `/cockpit alerts ack <id>` | The alert inbox: recorded alerts with their notification outcome, acknowledgment and whether the condition is still open (or UNKNOWN, when another session raised it); `digest` adds an Attention section for acknowledged incidents still open; acknowledge exactly one occurrence. Person-only to acknowledge; changes no gate, hold, review, approval or verdict |
 | `/cockpit alerts review [page]` | The recorded incidents, unreviewed first, with any label. Read-only; writes no look marker and acknowledges nothing |
@@ -804,7 +806,7 @@ Every capability call is in `hooks/register.tsx`, written `$.noun.method(...)` o
 
 ### Privacy
 
-The Run Ledger and the local model telemetry are local. Cockpit observes tool calls, paths, agent events, token/context telemetry, Git state and verification. In-session task state can contain user text; persisted checkpoints retain explicit goals and milestone labels. Hidden reasoning is never stored. Redaction is heuristic: review exports before sharing, and never export secrets. The full policy is in [PRIVACY.md](PRIVACY.md); see also [SECURITY.md](SECURITY.md).
+The Run Ledger and the local model telemetry are local. Cockpit observes tool calls, paths, agent events, token/context telemetry, Git state and verification. In-session task state can contain user text; persisted checkpoints retain explicit goals and milestone labels. Hidden reasoning is never stored. With `coverageDiff` on, Cockpit also reads the changed working-tree content, the configured LCOV report, its no-follow `stat` and Git object ids; it stores a closed label, time, project, HEAD, content identity and report stat/hash, never command text, arguments, environment, test output or report content. Redaction is heuristic: review exports before sharing, and never export secrets. The full policy is in [PRIVACY.md](PRIVACY.md); see also [SECURITY.md](SECURITY.md).
 
 ### What Cockpit runs, reads and sends
 

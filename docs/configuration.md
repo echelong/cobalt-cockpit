@@ -19,7 +19,7 @@ No option was added for [Guard Calibration](implementation-v0.6.3.md). With `gua
 
 ## Every option and its default
 
-43 options. "empty" is an empty string.
+46 options. "empty" is an empty string.
 
 The descriptions are the manifest's own words. Where one says "verified" (the `sounds` cue, `verifyScript`), it means the task reached DONE, or the enrolled script exited 0 (on `main`, on a working tree the Stop guard could identify). It does not mean independent verification or a security attestation: [What DONE rests on](verification.md#what-done-rests-on).
 
@@ -68,6 +68,9 @@ The descriptions are the manifest's own words. Where one says "verified" (the `s
 | `maxEffort` | string (`low` / `medium` / `high` / `xhigh` / `max`) | `max` | **Reasoning effort ceiling.** Nothing above this level is ever requested for a subagent; a higher ask falls back and is recorded. Each model also has its own supported ceiling, so the applied level may still be lower. The main loop's own level is not Cockpit's to cap: use maxEffortLevel in settings for that. |
 | `maxSonnetAgents` | number | `-1` | **Sonnet pool resource budget.** Independent Sonnet concurrency budget: -1 selects AUTO (8); 0 disables this pool; 1–128 selects an explicit budget, subject to the total budget. |
 | `maxHaikuAgents` | number | `-1` | **Haiku pool resource budget.** Independent Haiku concurrency budget: -1 selects AUTO (16); 0 disables this pool; 1–128 selects an explicit budget, subject to the total budget. |
+| `coverageDiff` | boolean | `false` | **Diff-aware coverage (advisory).** Off by default. Observe eligible foreground test commands in the repository root and later correlate the changed lines they measured with the one configured LCOV report. It never runs tests, never approves or blocks DONE, and changes no gate, review or release. Enabling it adds local Git, stat and report reads; disabling it adds none. |
+| `coverageDiffReport` | string | empty | **Diff coverage report path.** Repository-relative path of the one LCOV report the advisory layer reads, for example `coverage/lcov.info`. Empty means none. It must be a plain relative path: no absolute path, `..`, backslash, glob or `.git`. The path is excluded from the changed-source identity. |
+| `coverageDiffExclude` | string | empty | **Diff coverage exclusions.** Comma-separated repository-relative path prefixes whose changed lines are reported as excluded, for example `test/,generated/`. Whole path segments only, never globs. Empty means none. An invalid entry refuses the whole option rather than repairing it. |
 
 ## The defaults in short
 
@@ -92,3 +95,5 @@ The summary table the README carries:
 | `maxEffort` | `max`; lower ceilings cap every subagent request and are recorded |
 | `profile` | `OPUS_LED` (legacy: Opus main loop); `SONNET_LED` runs the main loop on Sonnet and consults Opus on admission |
 | `routerConfigDir` | empty; a decision-router configuration directory you created for the JEV router mode, used only while a session's router is JEV |
+| `coverageDiff` | false; the advisory diff-coverage layer performs no Git inspection, report reading or added process work while off |
+| `coverageDiffReport`, `coverageDiffExclude` | empty; no report and no exclusions |

@@ -2,13 +2,13 @@
 
 > Part of the [Cobalt Cockpit documentation](README.md). The milestone: [roadmap-v0.7.0-diff-aware-verification.md](roadmap-v0.7.0-diff-aware-verification.md).
 
-Status: **Phase 1 is implemented as four pure modules that nothing registers or calls.** Phase 1.5 revised, in the same modules, the report a person reads: its layout, its width in terminal columns, and files whose text is not UTF-8. Cockpit's behaviour is unchanged: no option, hook, command, tool or capability was added, and the published version is 0.6.6. Everything this page describes beyond those modules is design for later phases, each of which needs its own review and the owner's approval.
+Status: **Phases 2–4 are implemented in the v0.7.0 release candidate.** Phase 1 supplies the pure parsers, renderer, capture policy and binding rules; Phase 1.5 supplies the report presentation; Phase 2 adds Git selection, path safety, source identity and no-follow report reading; Phase 3 adds the three person-only options and capture around observed test commands; Phase 4 adds `/cockpit coverage diff`. The layer is off by default and remains advisory: it changes no gate, DONE decision, review, release, guard, ownership rule or permission. It is implemented through bounded local Git, `stat` and report reads; no test is ever started to obtain coverage. The published version remains 0.6.6 until the owner publishes this candidate.
 
 | | |
 | --- | --- |
 | Implemented (Phase 1) | `hooks/diffcov-lcov.ts`, `hooks/diffcov-paths.ts`, `hooks/diffcov-classify.ts`, `hooks/diffcov-capture.ts` and their tests: parsing, path matching, classification, rendering, the recording policy and the binding conditions, all as pure functions over data handed in |
 | Implemented (Phase 1.5) | the report's presentation ([below](#the-report-a-person-reads)), terminal columns for wide characters, and a separate refusal for text that is not UTF-8, in the same modules; golden renderings in `tests/diffcov-render.test.ts` and `tests/diffcov-render-fixtures.ts` |
-| Designed, not implemented | reading Git and the working tree (Phase 2), the options and the capture around test commands (Phase 3), `/cockpit coverage diff` (Phase 4) |
+| Implemented in the v0.7.0 candidate | reading Git and the working tree (Phase 2), the options and capture around observed test commands (Phase 3), `/cockpit coverage diff` (Phase 4) |
 | Not planned | running tests to obtain coverage, source-map remapping, percentages or thresholds, any effect on gates, DONE, reviews, releases or guards |
 
 ## What it is, and what it is not
@@ -21,7 +21,7 @@ It is evidence of a limited kind: a coverage tool's claim about which lines ran,
 
 | Decision | Approved |
 | --- | --- |
-| The command | `/cockpit coverage diff` (not registered in Phase 1) |
+| The command | `/cockpit coverage diff` |
 | Options | three, person-only, all off or empty by default (below) |
 | Report size | at most 4 MiB, the host's own read limit; no streaming fallback |
 | What a record of a test run may hold | the test program's closed label, the outcome (success only), the main session as provenance, the project's identity, the commit and the source identity, the report's path, hash, size and stat stamps, and closed-vocabulary reasons. Never a command, an argument, an environment variable, a token, output, or report content |
