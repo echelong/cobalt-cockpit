@@ -26,7 +26,7 @@
 | Real-host acceptance | Claude Code **2.1.319**, isolated `CLAUDE_CONFIG_DIR`, disposable repository, seeded valid capture: MATCHED evidence, `COVERED 1`, `src/price.ts:1`, advisory closing. With `coverageDiff:false`: explicit off state. |
 | Strict plugin validation | **PASS** (`claude plugin validate --strict .`, exit 0) |
 | Capability-shape | **PASS**: 18/18 self-test, no findings in `hooks/` |
-| Public security audit | **PASS**: 316 files, 6,957,080 bytes, manifest/defaults/license checks, icon checks, 0 portability/credential findings |
+| Public security audit | **PASS**: 316 files, 6,958,920 bytes, manifest/defaults/license checks, icon checks, 0 portability/credential findings |
 | Whitespace | **PASS** (`git diff --check` and the new files) |
 | Gitleaks | **PASS**: history 0 findings; worktree 0 findings; clean |
 | Typecheck against 2.1.296 | **Not run.** The host here is 2.1.319 and the generated 2.1.296 declarations are absent; the repository's mandatory script refuses rather than attesting. |
