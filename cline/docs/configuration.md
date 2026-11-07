@@ -28,12 +28,21 @@ and nothing runs; nothing falls back to a default. `cockpit-cline doctor` and `c
 effective profile, roles, models and reasoning; they do not print budgets, limits or sandbox settings.
 
 **Changing settings and existing conversations.** A mission records a digest of its effective configuration
-when it starts. Reopening it under a different effective configuration (other budgets, limits, roles, a
-`--config` file, a different Cline or package version) is refused. Start a fresh conversation (`--new` in the
-interactive shell), or pass `--accept-config-change` (to the shell or to `recover`) to continue anyway: that is
-recorded, and the mission can then no longer reach `DONE`. `recover` resumes a mission with that mission's own
-profile and strictness; reopening a conversation in the interactive shell uses the current settings, so a
-different `--profile` or `--no-strict` there counts as a configuration change.
+when it starts, and a copy of that configuration (`config-snapshot.json` in its state directory, mode 0600).
+Reopening it under a different effective configuration is refused, with the settings that differ listed: other
+budgets, limits, roles, models, reasoning, version pins, tools, sandbox paths, strictness, a different Cline version.
+Start a fresh conversation (`--new` in the interactive shell), or pass `--accept-config-change` (to the shell or to
+`recover`) to continue anyway: that is recorded, and the mission can then no longer reach `DONE`. `recover` resumes
+a mission with that mission's own profile and strictness; reopening a conversation in the interactive shell uses
+the current settings, so a different `--profile` or `--no-strict` there counts as a configuration change.
+
+The one exception is text that changes nothing: a profile's `description`, which only `doctor` prints. When the
+snapshot is intact (it must hash to the digest the mission started with) and nothing but descriptions differ, the
+mission continues without acceptance, and its ledger records `config_equivalent` with the descriptions that
+changed (written once the reopened mission runs and holds its supervisor lock). Every other setting counts,
+including an unknown key, a reordered list and a change that looks safer (an extra `sandbox.hide` entry or a lower
+budget); see
+[Existing conversations and new defaults](#existing-conversations-and-new-defaults-migrate-config).
 
 A minimal user file:
 
@@ -185,11 +194,52 @@ Workers and gates see only an allowlist of the host (README limitations 2, 3, 21
 | Key | Default | Meaning |
 |---|---|---|
 | `sandbox.allowRead` | `[]` | Extra **read-only** host paths for workers and gates, such as a toolchain or a virtualenv. Each must be absolute or start with `~/`. Each is checked on its real path and refused if it is `/`, a system tree (`/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/boot`, `/root`), a home directory or an ancestor of one, or if it is, contains or lies inside a credential or private-state location (among them `~/.cline`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config`, `~/.cache`, `~/.local/share`, `~/.local/state`, `~/.npm`, `~/.npmrc`, `~/.docker`, `~/.kube`, `~/.cargo/credentials`, shell histories and rc files; the full list is `SECRET_HOME_PATHS` in [`src/sandbox.ts`](../src/sandbox.ts)). `~/.cargo/bin` is accepted; `~/.cargo` is refused because it contains `~/.cargo/credentials`. |
-| `sandbox.hide` | `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.claude`, `~/.claude-main`, `~/.local/share/cobalt-cockpit-evidence`, `~/.local/share/cobalt-cockpit-backup-key`, `~/.local/state/cobalt-cockpit-cline` | A second layer: each existing path that lies inside something already mounted is covered (a directory by an empty tmpfs, a file by `/dev/null`). Paths outside every mount are already invisible and are skipped. Your list replaces this one. |
+| `sandbox.hide` | `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.claude`, `~/.local/state/cobalt-cockpit-cline` | A second layer: each existing path that lies inside something already mounted is covered (a directory by an empty tmpfs, a file by `/dev/null`). Paths outside every mount are already invisible and are skipped. Your list replaces this one: to add a path of your own, list the defaults you want to keep as well. |
 | `sandbox.allowNetwork` | (removed) | An error if present. Workers reach only the Cline API through the broker; gates have no network. |
 
 The `--share DIR` option is separate: it read-only-binds a dependency directory of your repository, such as
 `node_modules`, into worker and gate sandboxes, and refuses `.git`, `.env` and paths outside the repository.
+
+## Existing conversations and new defaults: `migrate-config`
+
+Earlier, the shipped `sandbox.hide` also named three paths of one machine (`~/.claude-main`,
+`~/.local/share/cobalt-cockpit-evidence`, `~/.local/share/cobalt-cockpit-backup-key`), and the `cline-pass`
+description named a setting that does not exist (`allowUnpinned`). Both are gone from the defaults. If you want to
+keep hiding paths of your own, put the whole list in your user file, because a list in your file replaces the
+default one:
+
+```json
+{ "sandbox": { "hide": ["~/.ssh", "~/.gnupg", "~/.aws", "~/.config/gcloud", "~/.claude", "~/.local/state/cobalt-cockpit-cline", "~/.my-private-dir"] } }
+```
+
+Any change to the defaults changes the digest that existing conversations were started with. Missions made before
+snapshots existed have no copy of their configuration, so nothing can prove that only a description changed for
+them. `migrate-config` shows what a change would do and, only when you ask, records the missing snapshots:
+
+```sh
+git show <old-commit>:cline/config/default.json > /tmp/old-default.json      # the defaults they ran under
+cockpit-cline migrate-config --previous-defaults /tmp/old-default.json \
+  --proposed-config ~/my-new-config.json                                       # dry run: reads, writes nothing
+cockpit-cline migrate-config --previous-defaults /tmp/old-default.json --apply # after copying the file into place
+```
+
+The report shows the current and the proposed configuration (digest and runtime fingerprint), every setting that
+differs and whether any of them is security-relevant, and for each mission: the digest it started with, whether its
+original configuration is proven (by its snapshot, or by rebuilding it from the defaults and user file you name and
+matching its digest), whether the interactive shell would resume it, and the outcome: `unchanged`, `continues`
+(descriptions only), `continues once its snapshot is recorded`, or `REQUIRES --accept-config-change`.
+
+`--apply` creates `config-snapshot.json` only in open conversations whose outcome is `continues once its snapshot
+is recorded`. It creates that one file, only if it does not exist yet, complete or not at all, so it is safe to run
+twice, at the same time or after an interruption. It skips a conversation held by a running shell or supervisor
+(and one whose lock it cannot read or that belongs to another host), and leaves a stale lock for `recover`. It writes
+nothing to the mission's ledger: the snapshot records how and from which files it was made, and the ledger records
+that as `config_equivalent` when the conversation next runs. It never edits a configuration file or a mission
+header, never records a snapshot it cannot prove, never overwrites an existing snapshot (an invalid one is reported
+and left alone), leaves closed conversations and other missions as they are, and never accepts a configuration
+change. Each mission is judged as reopened with its own profile and strictness, as `recover` does; the interactive
+shell uses the current `--profile` and `--no-strict`. Pass `--config FILE` for the user file the missions ran under if
+it is not the default one, and `--json` for the report as data.
 
 ## Tools
 

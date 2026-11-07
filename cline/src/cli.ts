@@ -27,12 +27,13 @@ import { render } from './hud.ts'
 import { repoInfo } from './git.ts'
 import { validateTasks } from './planner.ts'
 import { statusOf } from './status.ts'
+import { migrationReport, reportText } from './migrate.ts'
 
 type Args = { _: string[]; flags: Record<string, string | boolean>; multi: Record<string, string[]> }
 /** A command-line mistake: printed with the usage, exit 2, and nothing has run. */
 export class UsageError extends Error {}
-const VALUE_FLAGS: readonly string[] = ['repo', 'plan', 'profile', 'gate', 'budget-usd', 'config', 'roles', 'max-usd', 'kind', 'risk', 'complexity', 'mode', 'title', 'prompt', 'owned', 'lost', 'share', 'state']
-const SWITCHES: readonly string[] = ['no-strict', 'json', 'watch', 'single', 'swarm', 'no-review', 'allow-dirty', 'no-detect-gates', 'accept-config-change', 'new', 'yes', 'help']
+const VALUE_FLAGS: readonly string[] = ['previous-defaults', 'proposed-config', 'repo', 'plan', 'profile', 'gate', 'budget-usd', 'config', 'roles', 'max-usd', 'kind', 'risk', 'complexity', 'mode', 'title', 'prompt', 'owned', 'lost', 'share', 'state']
+const SWITCHES: readonly string[] = ['no-strict', 'json', 'watch', 'single', 'swarm', 'no-review', 'allow-dirty', 'no-detect-gates', 'accept-config-change', 'apply', 'new', 'yes', 'help']
 /**
  * Strict: an unknown or misspelt flag, a missing or empty value, or a value given to a switch is
  * an error. A typo such as `--budget 0.5` must not quietly run under the default budget.
@@ -53,7 +54,7 @@ export const parseArgs = (argv: string[]): Args => {
         if (inline !== undefined) throw new UsageError(`--${k} takes no value (got --${k}=${inline})`)
         val = true
       } else throw new UsageError(`unknown option --${k}`)
-      if (k === 'gate' || k === 'share') (a.multi[k] ??= []).push(String(val))
+      if (k === 'gate' || k === 'share' || k === 'previous-defaults') (a.multi[k] ??= []).push(String(val))
       else a.flags[k] = val
     } else a._.push(v)
   }
@@ -296,6 +297,19 @@ const shell = async (a: Args): Promise<number> => {
   return new Promise<number>(() => { /* the shell exits the process itself */ })
 }
 
+/**
+ * What a configuration change would do to existing missions (a dry run that writes nothing), and with --apply the
+ * snapshots that let conversations continue across a change of descriptive settings alone. It never accepts a
+ * configuration change, never edits a configuration file and never changes a mission's header.
+ */
+const migrateConfig = async (a: Args): Promise<number> => {
+  let clineVersion: string | undefined
+  try { clineVersion = (await loadCatalog()).clineVersion } catch { /* reported as unknown: only the configuration is compared */ }
+  const r = migrationReport({ stateRoot: root(a), userFile: str(a, 'config'), proposedFile: str(a, 'proposed-config'), previousDefaults: a.multi['previous-defaults'], clineVersion, apply: !!a.flags.apply })
+  print(a.flags.json ? JSON.stringify(r, null, 1) : `${clineVersion ? `installed Cline ${clineVersion}` : 'installed Cline: unknown (versions not compared)'}\n${reportText(r, !!a.flags.apply)}`)
+  return a.flags.apply && r.missions.some(m => m.applied?.startsWith('skipped')) ? 1 : 0
+}
+
 const HELP = `cockpit-cline — Cobalt Cockpit for Cline
   (no command, in a terminal)    the interactive Cockpit: live HUD, conversation, every turn supervised
   shell [--repo DIR] [--new] [--gate name=cmd]... [--share node_modules] [--allow-dirty]
@@ -306,6 +320,7 @@ const HELP = `cockpit-cline — Cobalt Cockpit for Cline
   status [MISSION] [--json] · watch [MISSION] · cancel MISSION [TASK...] · list
   recover [MISSION] [--accept-config-change] | recover --lost MISSION --repo DIR
   replay [MISSION]               ledger timeline and hash-chain verification
+  migrate-config [--proposed-config F] [--previous-defaults F]... [--json] [--apply]   what a config change does to existing conversations (dry run unless --apply)
   smoke --yes [--roles coder,utility] [--max-usd 0.25]   LIVE: spends real credits
 Global: --profile cline|cline-pass · --config FILE · --no-strict · --budget-usd N · --state DIR`
 
@@ -323,6 +338,7 @@ export const main = async (argv: string[]): Promise<number> => {
       case 'cancel': return cancel(a)
       case 'recover': return await recover(a)
       case 'replay': return replay(a)
+      case 'migrate-config': return await migrateConfig(a)
       case 'list': return list(a)
       case 'smoke': return await smoke(a)
       case 'shell': return await shell(a)
