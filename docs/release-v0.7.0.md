@@ -20,7 +20,7 @@
 
 | Gate | Result |
 | --- | --- |
-| Plugin test harness | **3,163 pass, 0 fail, 81 files** (`claude plugin test .`, 140.40 s) |
+| Plugin test harness | **3,163 pass, 0 fail, 81 files** (`claude plugin test .`, 143.55 s) |
 | Parser tests | 15 focused tests in `tests/diffcov-git.test.ts`: raw NUL lists, renames/deletions, unsafe paths, zero-context hunks, binary/mode-only blocks, hunk-count mismatches, attributes, stat and identity |
 | Disabled behavior | `tests/diffcov-off.test.ts`: `/cockpit coverage diff` renders the off state and adds **zero** process calls |
 | Real-host acceptance | Claude Code **2.1.319**, isolated `CLAUDE_CONFIG_DIR`, disposable repository, seeded valid capture: MATCHED evidence, `COVERED 1`, `src/price.ts:1`, advisory closing. With `coverageDiff:false`: explicit off state. |
