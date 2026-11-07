@@ -1,0 +1,256 @@
+# Cobalt Cockpit for Cline: offline adapter suite with real bubblewrap isolation.
+# No secrets and no network beyond downloading pinned tools; the suite itself uses fake providers and a loopback
+# stand-in for the Cline API. Isolation must be established or the job fails: nothing is skipped or weakened.
+name: Cline adapter
+
+on:
+  push:
+    branches: [main]
+    paths: ['cline/**', 'hooks/**', 'types/**', '.github/workflows/cline-adapter.yml']
+  pull_request:
+    branches: [main]
+    paths: ['cline/**', 'hooks/**', 'types/**', '.github/workflows/cline-adapter.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cline-adapter-${{ github.ref }}
+  # superseded pull-request runs are cancelled; runs on main always finish
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  adapter:
+    name: Adapter typecheck and offline suite (Linux, bubblewrap)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    env:
+      # pinned toolchain; every download below is checked against these values
+      NODE_VERSION: "24.20.0"
+      NODE_SHA256: "2f2c0da162318f0de47665410c7c8c2ed3d36c8f3105de4bbc61176c70a7cbf2"
+      CLINE_SPEC: "cline@3.0.74"
+      CLINE_VERSION: "3.0.74"
+      CLINE_SHA512: "sha512-pCaRaJ6Jx50Urej+BYjpGkpZnFbPDCPsibKEbIjEuVxETXbZ/A1SMij8Thy8FobercevXX6hV7joAzU7OG5lzA=="
+      TS_SPEC: "typescript@5.9.3"
+      TS_SHA512: "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="
+      NODE_TYPES_SPEC: "@types/node@20.11.0"
+      NODE_TYPES_SHA512: "sha512-o9bjXmDNcF7GbM4CNQpmi+TutCgap/K3w1JyKgxAjqx41zp9qlIAVFi0IhCNsJcXolEqLWhbFbEeL0PvYm4pcQ=="
+      # the suite has 369 tests; fewer means a file or test silently did not run
+      MIN_TESTS: "369"
+      MIN_ISOLATION_TESTS: "85"
+      NO_COLOR: "1"
+      COCKPIT_REDUCED_MOTION: "1"
+      npm_config_audit: "false"
+      npm_config_fund: "false"
+      npm_config_update_notifier: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Node.js (official tarball, SHA-256 pinned)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          # installed under HOME, owned by the runner user and not group- or world-writable: the adapter only trusts a
+          # Cline installation that nobody else can replace, and the Cline it uses lives in this Node's prefix
+          dl="$RUNNER_TEMP/dl"; mkdir -p "$dl"
+          tarball="node-v${NODE_VERSION}-linux-x64.tar.xz"
+          curl -fsSL --retry 3 -o "$dl/$tarball" "https://nodejs.org/dist/v${NODE_VERSION}/${tarball}"
+          echo "${NODE_SHA256}  $dl/$tarball" | sha256sum -c -
+          prefix="$HOME/.cockpit-ci/node"
+          mkdir -p "$prefix"
+          tar -xJf "$dl/$tarball" -C "$prefix" --strip-components=1
+          chmod -R go-w "$HOME/.cockpit-ci"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          "$prefix/bin/node" --version
+
+      - name: Pinned npm packages (integrity checked)
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          dl="$RUNNER_TEMP/dl"
+          # npm pack downloads the published tarball; its sha512 must equal the value pinned above
+          fetch() {
+            local spec=$1 want=$2 file got
+            file=$(cd "$dl" && npm pack "$spec" --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s)[0].filename))')
+            got="sha512-$(openssl dgst -sha512 -binary "$dl/$file" | base64 -w0)"
+            if [ "$got" != "$want" ]; then echo "::error::$spec integrity $got, expected $want" >&2; exit 1; fi
+            echo "$dl/$file"
+          }
+          cline_tgz=$(fetch "$CLINE_SPEC" "$CLINE_SHA512")
+          ts_tgz=$(fetch "$TS_SPEC" "$TS_SHA512")
+          types_tgz=$(fetch "$NODE_TYPES_SPEC" "$NODE_TYPES_SHA512")
+          # Cline: only its model catalog is used (the catalog drift test and the trusted-Cline checks); never signed in
+          npm install -g --ignore-scripts "$cline_tgz"
+          ts="$RUNNER_TEMP/ts"
+          npm install --prefix "$ts" --no-save --ignore-scripts "$ts_tgz" "$types_tgz"
+          chmod -R go-w "$HOME/.cockpit-ci"
+          echo "TSC=$ts/node_modules/typescript/bin/tsc" >> "$GITHUB_ENV"
+          echo "NODE_TYPES=$ts/node_modules/@types" >> "$GITHUB_ENV"
+
+      - name: bubblewrap 0.8 or later (system package)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
+          # not version-pinned (the runner image's Ubuntu archive decides); recorded here and checked for 0.8 or later
+          dpkg-query -W bubblewrap | tee "$RUNNER_TEMP/versions.txt"
+          ls -l /usr/bin/bwrap
+          v=$(/usr/bin/bwrap --version | awk '{print $2}')
+          if [ "$(printf '%s\n0.8.0\n' "$v" | sort -V | head -1)" != "0.8.0" ]; then echo "::error::bubblewrap $v is older than 0.8" >&2; exit 1; fi
+
+      - name: User namespaces for bwrap only (when the runner restricts them)
+        timeout-minutes: 3
+        working-directory: cline
+        run: |
+          set -euo pipefail
+          # the adapter's own probe (sandbox.ts bwrapAvailable, through the trusted bubblewrap), not a copy of it
+          probe() { node --experimental-transform-types --no-warnings --import ./loader/register.mjs test/ci-preflight.ts --probe; }
+          echo "user.max_user_namespaces=$(cat /proc/sys/user/max_user_namespaces)"
+          restrict=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)
+          echo "kernel.apparmor_restrict_unprivileged_userns=$restrict"
+          if probe; then echo "bubblewrap can create its namespaces as is"; exit 0; fi
+          if [ "$restrict" != "1" ]; then echo "::error::bubblewrap cannot create namespaces, and AppArmor's restriction is not the cause" >&2; exit 1; fi
+          # Ubuntu restricts unprivileged user namespaces to programs whose AppArmor profile allows them. Allow them
+          # for /usr/bin/bwrap only, the way Ubuntu documents for such programs; the restriction stays on for
+          # everything else, and Cockpit's sandbox still disables nested user namespaces inside.
+          printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' \
+            'profile cockpit-ci-bwrap /usr/bin/bwrap flags=(unconfined) {' '  userns,' '}' \
+            | sudo tee /etc/apparmor.d/cockpit-ci-bwrap >/dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/cockpit-ci-bwrap
+          if ! probe; then echo "::error::bubblewrap still cannot create namespaces with a userns profile for /usr/bin/bwrap" >&2; exit 1; fi
+          echo "bubblewrap can create its namespaces with the narrow profile"
+
+      - name: Preflight with the adapter's own checks
+        timeout-minutes: 3
+        working-directory: cline
+        run: |
+          set -euo pipefail
+          # the same settings scripts/test.sh clears before the suite (the broker refuses to run with any of them)
+          unset NODE_OPTIONS NODE_PATH NODE_COMPILE_CACHE LD_PRELOAD LD_AUDIT NODE_TLS_REJECT_UNAUTHORIZED NODE_EXTRA_CA_CERTS NODE_USE_ENV_PROXY SSL_CERT_FILE SSL_CERT_DIR SSLKEYLOGFILE OPENSSL_CONF \
+            COCKPIT_BROKER_UPSTREAM COCKPIT_CLINE_BIN COCKPIT_CLINE_BWRAP COCKPIT_CLINE_CATALOG_BIN COCKPIT_CLINE_NODE
+          { npm ls -g --all; npm ls --prefix "$RUNNER_TEMP/ts" --all; } >> "$RUNNER_TEMP/versions.txt" 2>&1 || true
+          node --experimental-transform-types --no-warnings --import ./loader/register.mjs test/ci-preflight.ts "$CLINE_VERSION" 2>&1 | tee "$RUNNER_TEMP/preflight.log"
+
+      - name: Git identity for test fixtures
+        run: |
+          git config --global user.name "cockpit-ci"
+          git config --global user.email "cockpit-ci@example.invalid"
+          git config --global init.defaultBranch main
+
+      - name: Synthetic host secrets for the isolation tests
+        run: |
+          set -euo pipefail
+          # The isolation tests check that a sandbox cannot see the person's real secrets and other projects, and
+          # require enough of them to exist for that to mean something. A fresh runner HOME has none, so plant
+          # clearly synthetic ones where a developer's would be. Nothing here is a real credential.
+          umask 077
+          mkdir -p "$HOME/.ssh" "$HOME/.cline/data/settings" "$HOME/.claude-main" "$HOME/Projects/other-project"
+          echo "SYNTHETIC-CI-CANARY not a key" > "$HOME/.ssh/id_ci_canary"
+          [ -e "$HOME/.cline/data/settings/providers.json" ] || echo '{"providers":{}}' > "$HOME/.cline/data/settings/providers.json"
+          echo "SYNTHETIC-CI-CANARY" > "$HOME/.claude-main/canary"
+          echo "SYNTHETIC-CI-CANARY" > "$HOME/Projects/other-project/README.md"
+
+      - name: Typecheck
+        timeout-minutes: 5
+        run: cline/scripts/typecheck.sh
+
+      - name: Isolation, hardening and fixture-cleanup tests
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          # no core dumps (they could hold test data) and no single file above 8 GiB; the job and every step have timeouts
+          ulimit -c 0; ulimit -f 8388608
+          # what is in the temporary directory before any test runs, to find anything the tests leave behind
+          tmpd=${TMPDIR:-/tmp}
+          find "$tmpd" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "$RUNNER_TEMP/tmp-entries-before.txt"
+          df -i "$tmpd" | tee "$RUNNER_TEMP/tmp-before.txt"
+          # bubblewrap processes that already exist (none on a fresh runner) are not the tests'
+          { pgrep -u "$(id -u)" -x bwrap || true; } | sort > "$RUNNER_TEMP/bwrap-before.txt"
+          cline/scripts/test.sh test/isolation.spec.ts test/hardening.spec.ts test/scratch.spec.ts 2>&1 | tee "$RUNNER_TEMP/isolation.log"
+
+      - name: Full adapter suite
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          # no core dumps (they could hold test data) and no single file above 8 GiB; the job and every step have timeouts
+          ulimit -c 0; ulimit -f 8388608
+          cline/scripts/test.sh 2>&1 | tee "$RUNNER_TEMP/suite.log"
+
+      - name: No skipped tests, and the expected number ran
+        run: |
+          set -euo pipefail
+          check() {
+            local log=$1 min=$2 v k bad=0
+            for k in tests pass fail cancelled skipped todo; do
+              v=$(grep -E "^ℹ $k [0-9]+$" "$log" | tail -1 | awk '{print $3}' || true)
+              [ -n "$v" ] || { echo "::error::$log has no '$k' count" >&2; bad=1; continue; }
+              eval "$k=$v"
+            done
+            [ "$bad" = 0 ] || exit 1
+            echo "$log: tests $tests, pass $pass, fail $fail, cancelled $cancelled, skipped $skipped, todo $todo"
+            if [ "$fail" != 0 ] || [ "$cancelled" != 0 ] || [ "$skipped" != 0 ] || [ "$todo" != 0 ] || [ "$pass" != "$tests" ]; then
+              echo "::error::$log: every test must run and pass (failed, cancelled, skipped or todo tests found)" >&2; exit 1
+            fi
+            if [ "$tests" -lt "$min" ]; then echo "::error::$log: only $tests tests ran, at least $min expected" >&2; exit 1; fi
+          }
+          check "$RUNNER_TEMP/isolation.log" "$MIN_ISOLATION_TESTS"
+          check "$RUNNER_TEMP/suite.log" "$MIN_TESTS"
+
+      - name: Test fixtures cleaned up, no sandbox left running
+        run: |
+          set -euo pipefail
+          tmpd=${TMPDIR:-/tmp}
+          df -i "$tmpd" | tee "$RUNNER_TEMP/tmp-after.txt"
+          find "$tmpd" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "$RUNNER_TEMP/tmp-entries-after.txt"
+          comm -13 "$RUNNER_TEMP/tmp-entries-before.txt" "$RUNNER_TEMP/tmp-entries-after.txt" > "$RUNNER_TEMP/tmp-entries-new.txt"
+          if [ -s "$RUNNER_TEMP/tmp-entries-new.txt" ]; then echo "new entries in $tmpd since the tests started:"; cat "$RUNNER_TEMP/tmp-entries-new.txt"; fi
+          left=$(find "$tmpd" /tmp "$HOME" -maxdepth 1 \( -name 'ccl-*' -o -name '.ccl-*' \) -user "$(id -un)" | sort -u | tee "$RUNNER_TEMP/fixtures-left.txt" | wc -l)
+          if [ "$left" != 0 ]; then echo "::error::$left test fixture director(ies) were left behind" >&2; exit 1; fi
+          { pgrep -u "$(id -u)" -x bwrap || true; } | sort > "$RUNNER_TEMP/bwrap-after.txt"
+          comm -13 "$RUNNER_TEMP/bwrap-before.txt" "$RUNNER_TEMP/bwrap-after.txt" > "$RUNNER_TEMP/bwrap-left.txt"
+          if [ -s "$RUNNER_TEMP/bwrap-left.txt" ]; then
+            echo "::error::bubblewrap processes started during the tests are still running" >&2
+            xargs -r ps -o pid,lstart,args -p < "$RUNNER_TEMP/bwrap-left.txt" >&2 || true
+            exit 1
+          fi
+          echo "no test fixtures left in $tmpd, /tmp or HOME; no bubblewrap process from the tests still running"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Cline adapter"
+            for f in preflight isolation suite; do
+              [ -f "$RUNNER_TEMP/$f.log" ] || continue
+              echo "#### $f"
+              echo '```'
+              grep -E '^(ℹ (tests|pass|fail|cancelled|skipped|todo|duration_ms) |sandbox:|cline |node |preflight:)' "$RUNNER_TEMP/$f.log" || true
+              grep -E '^\s*✖' "$RUNNER_TEMP/$f.log" | head -40 || true
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnostics on failure (test output only, no fixture directories)
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cline-adapter-logs
+          path: |
+            ${{ runner.temp }}/versions.txt
+            ${{ runner.temp }}/preflight.log
+            ${{ runner.temp }}/isolation.log
+            ${{ runner.temp }}/suite.log
+            ${{ runner.temp }}/tmp-before.txt
+            ${{ runner.temp }}/tmp-after.txt
+            ${{ runner.temp }}/fixtures-left.txt
+            ${{ runner.temp }}/tmp-entries-new.txt
+          if-no-files-found: ignore
+          retention-days: 7
