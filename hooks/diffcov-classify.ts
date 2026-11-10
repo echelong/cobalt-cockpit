@@ -809,6 +809,13 @@ export const renderDiffEvidence = (view: DiffEvidence, columns: number, page = 1
   }
   out.push('')
   say('Changed', `${grouped(view.lines.added)} added, ${grouped(view.lines.modified)} modified, ${grouped(view.lines.deleted)} deleted (deleted lines: nothing to measure)`)
+  // Generated files are excluded, not measured; say how many and why here, in addition to their own rows in Files.
+  const generated = view.files.filter(f => f.reason === 'GENERATED_ATTRIBUTE' || f.reason === 'GENERATED_MARKER')
+  if (generated.length > 0) {
+    const attribute = generated.filter(f => f.reason === 'GENERATED_ATTRIBUTE').length
+    const marker = generated.length - attribute
+    say('Generated', `${plural(generated.length, 'file', 'files')} excluded (${grouped(attribute)} attribute, ${grouped(marker)} marker); their changed lines are counted as excluded, not measured.`)
+  }
   // a file whose changed lines could not be classified is counted nowhere below: say so here, not only in its row
   const unread = view.files.filter(f => NOT_COUNTED.has(f.reason)).length
   if (unread > 0) say('Uncounted', `${plural(unread, 'file', 'files')} whose changed lines could not be classified (see Files)`)

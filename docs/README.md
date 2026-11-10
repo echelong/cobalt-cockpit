@@ -29,7 +29,8 @@ The root [README](../README.md) is the front page. These files hold the detail.
 
 | Version | Page |
 | --- | --- |
-| 0.7.0 (candidate) | [Diff-aware verification release notes](release-v0.7.0.md) |
+| 0.8.0 | [Read claims and generated-file reporting](implementation-v0.8.0.md) |
+| 0.7.0 | [Diff-aware verification release notes](release-v0.7.0.md) |
 | 0.6.6 | [Completion evidence and reporting](verification.md#what-done-rests-on) |
 | 0.6.5 | [v0.6.4 maintenance: CI and the Plugin Directory](implementation-v0.6.4.md#after-publication) |
 | 0.6.4 | [Fingerprint resource hardening (security)](implementation-v0.6.4.md) |

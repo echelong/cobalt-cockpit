@@ -81,7 +81,7 @@ for p in sorted((root / 'hooks').glob('*.tsx')):
   for name in ('h', 'Fragment'):
    if re.search(r'\b(?:const|let|var|function)\s+' + name + r'\b|[(,]\s*' + name + r'\s*[:,)=]|\b' + name + r'\s*=>', code): findings.append(f'hooks/{p.name}:{n}: binds the reserved JSX identifier `{name}`')
 m=json.loads((root/'.claude-plugin/plugin.json').read_text()); market=json.loads((root/'.claude-plugin/marketplace.json').read_text())
-assert m['version']==market['plugins'][0]['version']=='0.7.0'
+assert m['version']==market['plugins'][0]['version']=='0.8.0'
 assert m['name']==market['plugins'][0]['name']=='cobalt-cockpit'
 assert market['plugins'][0]['source']=='./'
 # This marketplace lists Cockpit and nothing else: the optional companion has its

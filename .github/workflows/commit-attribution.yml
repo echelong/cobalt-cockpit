@@ -1,0 +1,40 @@
+name: Commit attribution
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cobalt-cockpit-attribution-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  attribution:
+    name: No Codebuff / Freebuff attribution in commits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Refuse a banned author, committer or trailer
+        shell: bash
+        run: |
+          set -euo pipefail
+          # One record per commit: the author and committer lines and the full message, NUL-separated so a message
+          # cannot forge a field. Only the history reachable from this checkout is read; nothing is fetched or written.
+          git log --format='%H%x00%an <%ae>%x00%cn <%ce>%x00%B%x00' HEAD > "$RUNNER_TEMP/commits.bin"
+          if grep -aEqi 'codebuff|freebuff' "$RUNNER_TEMP/commits.bin"; then
+            echo "::error title=Banned commit attribution::A commit on this branch records Codebuff or Freebuff in its author, committer or message. Remove it with a reviewed history rewrite before merging."
+            grep -aoEi 'codebuff|freebuff' "$RUNNER_TEMP/commits.bin" | sort | uniq -c | sed 's/^/  /'
+            exit 1
+          fi
+          echo "No Codebuff or Freebuff attribution in $(git rev-list --count HEAD) commits."

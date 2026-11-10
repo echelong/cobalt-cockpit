@@ -1,6 +1,6 @@
 # Planned for v0.7.0: Diff-Aware Verification
 
-Status: implementation complete in the isolated v0.7.0 release candidate; not published. Phases 1, 1.5 and 1.6 remain the pure modules and tests, Phase 2 adds Git selection and source identity, Phase 3 adds the three off-by-default options and capture around observed test commands, and Phase 4 adds `/cockpit coverage diff`. The layer is advisory and changes no gate, DONE, review, release, guard, ownership or permission behavior. It is a milestone of its own, separate from [Persistent Attention](roadmap-v0.6.2-persistent-attention.md).
+Status: implemented and published in v0.7.0. Phases 1, 1.5 and 1.6 remain the pure modules and tests, Phase 2 adds Git selection and source identity, Phase 3 adds the three off-by-default options and capture around observed test commands, and Phase 4 adds `/cockpit coverage diff`. The layer is advisory and changes no gate, DONE, review, release, guard, ownership or permission behavior. It is a milestone of its own, separate from [Persistent Attention](roadmap-v0.6.2-persistent-attention.md).
 
 ## Objective
 

@@ -1,6 +1,6 @@
 # Proposed roadmap: Cobalt Recall (optional reference memory)
 
-Status: **research proposal only**. Not implemented, not approved for implementation, and not part of any published version (the current version is v0.6.6) or of v0.7.0 Diff-Aware Verification. No release number or delivery date is assigned. First decision is whether a controlled research spike justifies any integration.
+Status: **research proposal only**. Not implemented, not approved for implementation, and not part of any published version (the current version is v0.8.0) or of v0.7.0 Diff-Aware Verification. No release number or delivery date is assigned. First decision is whether a controlled research spike justifies any integration.
 
 Kept from draft pull request #5 (proposed 2026-10-13). Its references to v0.6.3 as the next release were brought up to date for v0.6.5; the proposal itself is unchanged.
 

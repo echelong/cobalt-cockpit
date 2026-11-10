@@ -28,7 +28,23 @@ export const normalizeOwned = (path: string): string => {
   for (const part of value.split('/')) { if (!part || part === '.') continue; if (part === '..') { if (!parts.length) return '*'; parts.pop() } else parts.push(part) }
   return parts.length ? `/${parts.join('/')}` : '*'
 }
-export const overlaps = (a: string, b: string): boolean => { const x = normalizeOwned(a), y = normalizeOwned(b); return x === '*' || y === '*' || x === y || x.startsWith(`${y}/`) || y.startsWith(`${x}/`) }
+/** A path that names one resource: `*` alone is the wildcard, and brackets are ordinary characters in a file name.
+ * Null when the text is empty, a pattern, a home path or a path that climbs above the root. */
+export const normalizeLiteralOwned = (path: string): string | null => {
+  const value = path.trim().replace(/\\/g, '/')
+  if (value === '*') return '*'
+  if (!value || /[*?]/.test(value) || value.startsWith('~')) return null
+  const parts: string[] = []
+  for (const part of value.split('/')) { if (!part || part === '.') continue; if (part === '..') { if (!parts.length) return null; parts.pop() } else parts.push(part) }
+  return parts.length ? `/${parts.join('/')}` : null
+}
+/** A stored claim, or a path the host has already canonicalized: an absolute path is literal (`app/[id]/page.tsx`),
+ * while text that was never resolved keeps the conservative reading. `*` is the only wildcard either way. */
+export const normalizeClaim = (path: string): string => {
+  const value = path.trim().replace(/\\/g, '/')
+  return value.startsWith('/') ? normalizeLiteralOwned(value) ?? '*' : normalizeOwned(value)
+}
+export const overlaps = (a: string, b: string): boolean => { const x = normalizeClaim(a), y = normalizeClaim(b); return x === '*' || y === '*' || x === y || x.startsWith(`${y}/`) || y.startsWith(`${x}/`) }
 const terminal = (t: SwarmTask): boolean => ['completed', 'failed', 'cancelled'].includes(t.state)
 /** A stall/escalation is not proof that a live agent stopped writing. */
 const occupied = (t: SwarmTask): boolean => t.endedAt === null && (t.state === 'reserved' || t.state === 'running' || (!terminal(t) && (t.agentId !== null || (t.state === 'stalled' && t.startedAt !== null))))
@@ -52,7 +68,10 @@ const cycle = (s: Swarm, input: TaskInput): boolean => {
 export const submitTask = (s: Swarm, raw: TaskInput, at: number): { swarm: Swarm; task: SwarmTask; duplicate: boolean } => {
   // free text is filtered before it is compared or kept
   const input: TaskInput = { ...raw, role: redactSecrets(raw.role), objective: redactSecrets(raw.objective), ...(raw.scope === undefined ? {} : { scope: redactSecrets(raw.scope) }), ...(raw.spawnReason === undefined ? {} : { spawnReason: redactSecrets(raw.spawnReason) }), ...(raw.effortReason === undefined ? {} : { effortReason: redactSecrets(raw.effortReason) }) }
-  const owned = [...new Set((input.owned?.length ? input.owned : ['*']).map(normalizeOwned))].sort()
+  // A reader's claim is literal once canonicalized, so a bracketed path stays narrow; a writer keeps the conservative
+  // reading, and nothing that could be a lock is narrowed here.
+  const claimOf = (path: string) => (input.mode === 'write' ? normalizeOwned(path) : normalizeClaim(path))
+  const owned = [...new Set((input.owned?.length ? input.owned : ['*']).map(claimOf))].sort()
   const same = s.tasks.find(t => t.id === input.id || (!terminal(t) && t.tier === input.tier && t.mode === (input.mode ?? 'read') && t.objective.trim() === input.objective.trim() && t.scope === (input.scope ?? '') && t.wave === (input.wave ?? s.wave) && t.parentTask === (input.parentTask ?? null) && JSON.stringify([...t.dependencies].sort()) === JSON.stringify([...(input.dependencies ?? [])].sort()) && JSON.stringify(t.owned) === JSON.stringify(owned)))
   if (same) return { swarm: event({ ...s, requested: s.requested + 1 }, 'duplicate', same.id, at, input.id), task: same, duplicate: true }
   if (!input.id.trim() || !input.objective.trim()) throw new Error('Task ID and objective required')
@@ -303,6 +322,6 @@ export const acknowledgeHandback = (s: Swarm, agentId: string, message: string, 
 export const ownershipAllows = (s: Swarm, id: string, path: string, mode: 'read' | 'write' = 'write'): boolean => {
   const t = s.tasks.find(t => t.id === id)
   if (!t || !hasActiveOwnership(t) || (mode === 'write' && t.mode !== 'write')) return false
-  const claim = normalizeOwned(path)
+  const claim = normalizeClaim(path)
   return t.owned.some(p => p === '*' || (claim !== '*' && (claim === p || claim.startsWith(`${p}/`))))
 }

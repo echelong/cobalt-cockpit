@@ -8,7 +8,7 @@
 // in variables (timers, the mounted waveform) is rebuilt as events arrive.
 // No bookkeeping in this file may fail a tool call: it runs under `quiet`.
 
-import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, uncertainSpawn, refusedAfterDispatch, spawnRefusal, uncertainHoldNote, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, acknowledgeHandback, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, overlaps, ownershipAllows, hasActiveOwnership, setAppliedEffort, setLaunchEffort, SONNET_LED_SWARM } from './swarm'
+import { emptySwarm, configureSwarm, submitTask, admitTask, bindAgent, uncertainSpawn, refusedAfterDispatch, spawnRefusal, uncertainHoldNote, finishTask, resolveEscalation, setWave, escalateTask, verifyTask, reportResult, acknowledgeHandback, requestCancel, releaseReservation, summarizeSwarm, markStalled, heartbeat, normalizeOwned, normalizeClaim, overlaps, ownershipAllows, hasActiveOwnership, setAppliedEffort, setLaunchEffort, SONNET_LED_SWARM } from './swarm'
 import type { Swarm, SwarmTask, ModelTier, Wave, Verification } from './swarm'
 import { agentsText, shortResource, swarmHint, taskText } from './inspector'
 import { readyText } from './readiness'
@@ -247,9 +247,21 @@ const SWARM_TOOL = {
     effort: { type: 'string', enum: ['AUTO','low','medium','high','xhigh','max'], description: 'assign/escalate: the reasoning level this task deserves, or AUTO to choose from the task' }, effort_reason: { type: 'string', description: 'assign/escalate: why that level was chosen' },
   }, required: ['action'] },
 } as const
-// Canonicalize both assignment and use. Unknown aliases conservatively lock all.
-const canonicalIn = async ($: EngineInterface, base: string, path: string): Promise<string> => {
-  // `~` is the engine's to expand, not a directory under cwd: it is unknown, so everything.
+// Canonicalize both assignment and use. `realpath` never expands a pattern and this process does not run a shell, so
+// brackets and braces are ordinary characters in a file name: `app/[id]/page.tsx` is a path, not a glob. `*` and `?`
+// stay patterns, and `~` is the engine's to expand, not a directory under cwd.
+const canonicalPathIn = async ($: EngineInterface, base: string, path: string): Promise<string | null> => {
+  if (!path || path.startsWith('~') || /[*?]/.test(path)) return null
+  try {
+    const r = await $.process.run(['realpath','-m','--', path.startsWith('/') ? path : `${base}/${path}`], { timeoutMs: 2000 })
+    if (r.exitCode !== 0 || r.isStdoutTruncated) return null
+    const canonical = normalizeClaim(r.stdout.trim())
+    return canonical === '*' ? null : canonical
+  } catch { return null }
+}
+const canonicalIn = async ($: EngineInterface, base: string, path: string): Promise<string> => (await canonicalPathIn($, base, path)) ?? '*'
+/** The old, conservative reading for a write claim: a pattern or an unresolvable path locks the whole repository. */
+const canonicalWideIn = async ($: EngineInterface, base: string, path: string): Promise<string> => {
   if (!path || /[*?\[\]{}]/.test(path) || path.startsWith('~')) return '*'
   try {
     const r = await $.process.run(['realpath','-m','--', path.startsWith('/') ? path : `${base}/${path}`], { timeoutMs: 2000 })
@@ -257,7 +269,7 @@ const canonicalIn = async ($: EngineInterface, base: string, path: string): Prom
   } catch { return '*' }
 }
 const RESUME_REFUSED = 'SWARM / resuming an agent is refused while orchestration is on: nothing shows it may safely run again. This call started no run and opened or released no claim. Further work needs a new task; if that is refused, /cockpit agents shows what holds it.'
-const canonicalResource = async ($: EngineInterface, path: string): Promise<string> => canonicalIn($, cwd, path)
+const canonicalResource = async ($: EngineInterface, path: string): Promise<string> => canonicalWideIn($, cwd, path)
 const swarmState = (l: Ledger): Swarm => l.swarm ?? emptySwarm()
 /** Holds the commander's shell, custom tools and overlapping writes. An Opus task does not. */
 const holdsEffects = (t: SwarmTask): boolean => t.tier !== 'OPUS' && t.endedAt === null && (['reserved','running'].includes(t.state) || (!['completed','failed','cancelled'].includes(t.state) && (t.agentId !== null || t.startedAt !== null)))
@@ -901,13 +913,30 @@ const serveSwarm = async ($: EngineInterface, e: Record<string, unknown>): Promi
       if (!/^[\w.-]{1,80}$/.test(id) || !['OPUS','SONNET','HAIKU'].includes(String(e['tier']))) throw new Error('Valid task_id and tier required')
       if (e['tier'] === 'OPUS' && isSonnetLed()) throw new Error('OPUS / in SONNET_LED an Opus task is admitted only through action consult, with a ground and an evidence packet')
       const named = list('owned_resources')
-      const owned = await Promise.all(named.map(p => canonicalResource($, p)))
-      // A claim that is a pattern, starts with "~" or does not resolve has always been taken as the whole repository: the
-      // safe reading for a lock, and a wide one for a reader. It is not narrowed here, and it is no longer silent.
-      const widened = named.filter((p, i) => p.trim() !== '*' && owned[i] === '*').length
-      const scopeNote = widened > 0 ? ` SCOPE / ${widened} of the owned_resources could not be kept narrow (a pattern, "~" or a path that did not resolve), so this task's claim is *: it may read, and it locks, the whole repository. Cancel it and assign literal paths under a new task_id to keep it narrow.` : named.length === 0 ? ' SCOPE / no owned_resources were named, so this task\'s claim is *: the whole repository.' : ''
+      const mode = e['mode'] === 'write' ? 'write' : 'read'
+      let owned: string[]
+      let scopeNote = ''
+      if (mode === 'read') {
+        // A reader is never widened: an ambiguous or unresolvable claim is refused, and `*` is only what the commander wrote.
+        if (named.length === 0) throw new Error('READ SCOPE / a read task needs owned_resources. Write "*" to claim the whole repository, or literal paths to keep the claim narrow. Nothing was assigned.')
+        owned = []
+        const refused: string[] = []
+        for (const p of named) {
+          if (p.trim() === '*') { owned.push('*'); continue }
+          const canonical = await canonicalPathIn($, cwd, p)
+          if (canonical === null) refused.push(p.trim().startsWith('~') ? 'a home path' : /[*?]/.test(p) ? 'a pattern' : 'a path that did not resolve')
+          else owned.push(canonical)
+        }
+        if (refused.length > 0) throw new Error(`READ SCOPE / ${refused.length === 1 ? 'one owned_resources entry' : `${refused.length} owned_resources entries`} could not be kept narrow (${[...new Set(refused)].join(', ')}). A reader is never widened to the whole repository: write "*" to claim it, or literal paths (a bracketed name is literal; "*" and "?" are patterns). Nothing was assigned.`)
+        if (owned.every(p => p === '*')) scopeNote = ' SCOPE / this read task claims *, the whole repository, as you wrote it.'
+      } else {
+        // A write claim that cannot be kept narrow still locks the whole repository: the conservative reading for a lock.
+        owned = await Promise.all(named.map(p => canonicalResource($, p)))
+        const widened = named.filter((p, i) => p.trim() !== '*' && owned[i] === '*').length
+        scopeNote = widened > 0 ? ` SCOPE / ${widened} of the owned_resources could not be kept narrow (a pattern, "~" or a path that did not resolve), so this task's claim is *: it may read, and it locks, the whole repository. Cancel it and assign literal paths under a new task_id to keep it narrow.` : named.length === 0 ? ' SCOPE / no owned_resources were named, so this task\'s claim is *: the whole repository.' : ''
+      }
       let isRepeat = false
-      const assignedSwarm = await changeSwarm($, held => { const made = submitTask(held, { id, tier: e['tier'] as ModelTier, role: str('role'), objective: str('objective'), scope: str('scope'), dependencies:list('dependencies'), owned, mode: e['mode'] === 'write' ? 'write' : 'read', parentTask: typeof e['parent_task'] === 'string' ? e['parent_task'] : null, spawnReason: str('spawn_reason'), ...(isEffortRequest(e['effort']) ? { effort: e['effort'] } : {}), ...(typeof e['effort_reason'] === 'string' ? { effortReason: str('effort_reason') } : {}) }, at); isRepeat = made.duplicate; const submitted = made.swarm; if (jsonBytes(submitted.tasks.map(t=>({ ...t,result:null,escalation:null }))) > 192_000) throw new Error('Ownership metadata storage budget reached; finish/archive work before assigning more'); return submitted })
+      const assignedSwarm = await changeSwarm($, held => { const made = submitTask(held, { id, tier: e['tier'] as ModelTier, role: str('role'), objective: str('objective'), scope: str('scope'), dependencies:list('dependencies'), owned, mode, parentTask: typeof e['parent_task'] === 'string' ? e['parent_task'] : null, spawnReason: str('spawn_reason'), ...(isEffortRequest(e['effort']) ? { effort: e['effort'] } : {}), ...(typeof e['effort_reason'] === 'string' ? { effortReason: str('effort_reason') } : {}) }, at); isRepeat = made.duplicate; const submitted = made.swarm; if (jsonBytes(submitted.tasks.map(t=>({ ...t,result:null,escalation:null }))) > 192_000) throw new Error('Ownership metadata storage budget reached; finish/archive work before assigning more'); return submitted })
       const assigned = assignedSwarm.tasks.find(t => t.id === id)
       // a task id is never reused: assigning one that has already ended assigns nothing, and saying "cancelled; use Agent" would mislead
       if (isRepeat && assigned && ['completed', 'failed', 'cancelled'].includes(assigned.state)) return { result: `Task ${id} already exists and is ${assigned.state}; nothing was assigned. A task id is never reused: assign the work under a new task_id.` }

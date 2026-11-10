@@ -226,20 +226,24 @@ describe('through the real swarm tool: advice only', () => {
     expect(led).toContain('An Opus view is asked for with action consult, on a ground that holds.')
     expect(String((await assign($, 'direct', { tier: 'OPUS', role: 'Architect' })).result)).toContain('only through action consult')
   })
-  test('a claim that could not be kept narrow is said to be the whole repository', options, async ($, on) => {
+  test('a read claim is never widened: an ambiguous entry is refused, and "*" is only what the commander wrote', options, async ($, on) => {
     world(on); const held = hostState(on, {}); await start($)
     const literal = String((await assign($, 'narrow', { owned_resources: ['/work/example/hooks'] })).result)
     expect(literal).not.toContain('SCOPE /')
+    // a bracketed name is a literal path, not a pattern: it is claimed narrowly
+    const bracket = String((await assign($, 'bracket', { owned_resources: ['app/[id]/page.tsx'] })).result)
+    expect(bracket).toContain('Task bracket queued')
+    expect(swarmOf(held).tasks.find(t => t.id === 'bracket')?.owned[0]).toContain('/app/[id]/page.tsx')
     const explicit = String((await assign($, 'whole', { owned_resources: ['*'] })).result)
-    expect(explicit).not.toContain('SCOPE /')
-    for (const [id, claim] of [['glob', 'src/**/*.ts'], ['bracket', 'app/[id]/page.tsx'], ['home', '~/notes'], ['brace', 'src/{a,b}.ts']] as const) {
+    expect(explicit).toContain('SCOPE / this read task claims *, the whole repository, as you wrote it.')
+    for (const [id, claim, why] of [['glob', 'src/**/*.ts', 'a pattern'], ['question', 'src/?.ts', 'a pattern'], ['home', '~/notes', 'a home path']] as const) {
       const reply = String((await assign($, id, { owned_resources: ['/work/example/hooks', claim] })).result)
-      expect([id, reply.includes('SCOPE / 1 of the owned_resources could not be kept narrow')]).toEqual([id, true])
-      expect(reply).toContain("this task's claim is *")
-      expect(swarmOf(held).tasks.find(t => t.id === id)?.owned).toContain('*')
+      expect([id, reply.includes('READ SCOPE /'), reply.includes(why), reply.includes('Nothing was assigned.')]).toEqual([id, true, true, true])
+      expect(swarmOf(held).tasks.some(t => t.id === id)).toBe(false)
     }
     const none = String((await assign($, 'unnamed', { owned_resources: [] })).result)
-    expect(none).toContain("SCOPE / no owned_resources were named, so this task's claim is *")
+    expect(none).toContain('READ SCOPE / a read task needs owned_resources')
+    expect(swarmOf(held).tasks.some(t => t.id === 'unnamed')).toBe(false)
   })
   test('what is spawned is the commander\'s tier, within the configured pools', options, async ($, on) => {
     const w = world(on); const held = hostState(on, {}); await start($)

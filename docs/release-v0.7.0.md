@@ -1,6 +1,6 @@
-# Cobalt Cockpit v0.7.0 — diff-aware verification candidate
+# Cobalt Cockpit v0.7.0 — diff-aware verification
 
-**Status: release candidate, not published.** Owner approval is required before any publication. This candidate is isolated on branch `v0.7.0-diffcov` in a separate worktree from `de3e361af180c9ab6d49613648a77d8d45228410`; the owner's `main` checkout is untouched.
+**Status: published.** The annotated tag `v0.7.0` points at `943f41f9564aa707609b4ecdad51f7aecdeafdc6` on `main`, and this page is the body of the GitHub Release for that tag. The work was prepared on branch `v0.7.0-diffcov` from `de3e361af180c9ab6d49613648a77d8d45228410` and is now on `main`.
 
 ## What this release adds
 
@@ -60,7 +60,7 @@
 - The feature is unavailable rather than weakened when the platform does not enforce the measurement memory limit, when Git is too old, when filters/partial clone make identity unreliable, or when a required safety property cannot be established.
 - When disabled, no capture, Git inspection, report reading or added process work occurs.
 
-## Changed paths in this candidate
+## Changed paths in this release
 
 Modified: `.claude-plugin/marketplace.json`, `.claude-plugin/plugin.json`, `CHANGELOG.md`, `PRIVACY.md`, `README.md`, `SECURITY.md`, `docs/README.md`, `docs/configuration.md`, `docs/design-v0.7.0-diff-aware-verification.md`, `docs/roadmap-v0.7.0-diff-aware-verification.md`, `hooks/diffcov-capture.ts`, `hooks/register.tsx`, `scripts/audit-public.py`, `tests/diffcov-capture.test.ts`.
 
@@ -75,12 +75,13 @@ The audit script's only change is its exact-version assertion, from `0.6.6` to `
 - The plugin manifest and marketplace entry both read `0.7.0` in this candidate.
 - A v0.6.6 store is read as before; the new capture key is absent until the owner enables the layer and an eligible run is observed.
 
-## Publication plan (owner only)
+## Publication
 
-1. Review the exact candidate commit and this page.
-2. Run the final strict validation, capability-shape, public audit, whitespace, Gitleaks and TYPE gates on the exact candidate.
-3. Publish only after the owner's explicit approval, using the repository's normal reviewed release path; do not force-push or rewrite history.
-4. Verify the marketplace and manifest versions agree and that the Cline adapter is unaffected.
+1. The owner reviewed the exact commit and this page.
+2. The final strict validation, capability-shape, public audit, whitespace, Gitleaks and TYPE gates were run on the exact candidate; the results and the gaps are in the table above.
+3. Publication used the repository's normal reviewed release path for the existing annotated tag; history was not force-pushed or rewritten for it.
+4. The marketplace and manifest versions agreed at `0.7.0`, and the Cline adapter was unaffected.
+5. The GitHub Release for the existing `v0.7.0` tag was created later, after publication, from this page. No second tag was created.
 
 ## Rollback plan
 

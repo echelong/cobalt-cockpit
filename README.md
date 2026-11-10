@@ -586,7 +586,7 @@ claude plugin install cobalt-cockpit@cobalt-cockpit
 
 **2. Restart** Claude Code, open `/cockpit`, and inspect `/cockpit version`. By default Cockpit **observes**; orchestration enforcement is opt-in.
 
-**Which code you have.** This page describes the **0.7.0 release candidate**, not a published release. The candidate adds the opt-in, advisory `/cockpit coverage diff` and its three options; it leaves every existing gate, DONE decision, guard, review, release rule, ownership rule and permission unchanged. If it is not published, the installed release remains 0.6.6. The candidate is isolated; publishing requires the owner's approval ([release notes](docs/release-v0.7.0.md), [CHANGELOG](CHANGELOG.md)).
+**Which code you have.** This page describes **0.8.0**. It keeps the opt-in, advisory `/cockpit coverage diff` from 0.7.0, refuses a read claim that cannot be kept narrow instead of widening it to `*`, and adds generated-file exclusion reporting to the coverage report. It leaves every existing gate, DONE decision, guard, review, release rule, ownership rule and permission unchanged ([release notes](docs/release-v0.7.0.md), [CHANGELOG](CHANGELOG.md), [v0.8.0 implementation notes](docs/implementation-v0.8.0.md)).
 
 **3. Optional: enforce orchestration** with the supported configuration CLI:
 

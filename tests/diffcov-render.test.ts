@@ -372,6 +372,13 @@ describe('review entries: ranges break only after a comma, and the count of line
     expect(text).toContain(`no observed test run changed this report; 54 lines in 52 ranges, the first ${MAX_RANGES} listed`)
     expect(renderDiffEvidence(viewOf(classify([file('src/a.ts', 'x\n')], notObserved, []), notObserved), 80)).toContain('no observed test run changed this report; 1 line\n')
   })
+  test('generated files are reported apart, and their lines are excluded rather than measured', () => {
+    const notObserved: Evidence = { state: 'UNBOUND', why: 'RUN_NOT_OBSERVED' }
+    const files = [file('src/schema.gen.ts', '// @generated\nx\n'), file('src/client.ts', 'x\n', { generatedByAttribute: true }), file('src/ok.ts', 'x\n')]
+    const text = renderDiffEvidence(viewOf(classify(files, notObserved, []), notObserved), 100).replace(/\s+/g, ' ')
+    expect(text).toContain('Generated: 2 files excluded (1 attribute, 1 marker); their changed lines are counted as excluded, not measured.')
+    expect(text).toContain('EXCLUDED / NON-EXECUTABLE')
+  })
   test('a hand-built reason with no words is escaped like any other value', () => {
     const notObserved: Evidence = { state: 'UNBOUND', why: 'RUN_NOT_OBSERVED' }
     const v = viewOf(classify([file('src/a.ts', 'x\n')], notObserved, []), notObserved)

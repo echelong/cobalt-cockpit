@@ -1,6 +1,6 @@
 # Security follow-ups recorded after v0.6.1
 
-Status: the P0 below is fixed on `main` by the security hotfix in the CHANGELOG's 0.6.1 entry (see its section); the read-claim item is investigated and still not changed. Neither item was part of v0.6.1 as first released. That release fixed the three faults its review reproduced ([Corrections to earlier rules](implementation-v0.6.1.md#corrections-to-earlier-rules)) and changed neither of the things below. Each needs its own design, review and tests before any code.
+Status: the P0 below is fixed on `main` by the security hotfix in the CHANGELOG's 0.6.1 entry (see its section); the read-claim item is fixed in v0.8.0 ([implementation notes](implementation-v0.8.0.md)). Neither item was part of v0.6.1 as first released. That release fixed the three faults its review reproduced ([Corrections to earlier rules](implementation-v0.6.1.md#corrections-to-earlier-rules)) and changed neither of the things below. Each needs its own design, review and tests before any code.
 
 ## P0: a guard that throws refuses nothing
 
@@ -55,3 +55,11 @@ const refusal = await guard($, call).catch(() => null)
 Checked against the code: the widening happens in two places that agree, `canonicalIn` (`hooks/register.tsx`) and `normalizeOwned` (`hooks/swarm.ts`), and `submitTask` turns an empty list into `*`. Each of these reaches a reader as `*`: a literal path with brackets (`app/[id]/page.tsx`), any `* ? { }`, a leading `~`, a path `realpath -m` does not resolve, an empty list, and a `..` that climbs above the root. The reply to `assign` says so after the fact; nothing refuses. `realpath -m` is GNU coreutils; a host whose `realpath` lacks `-m` (older macOS, some BusyBox builds) fails the call, `canonicalIn` returns `*`, and every named claim widens: no such host has been tested here.
 
 Why it was not changed in the hotfix: refusing a read claim that cannot be kept narrow is a behaviour change for every commander that assigns a reader with no `owned_resources` (the default today is `*`), with literal-bracket paths (they need a way to be written that is not a pattern), and for Ledgers that already hold widened claims. It changes the contract of `assign`, and it needs its own design (an explicit `*` spelling for readers, a literal-path escape, a fallback where `realpath -m` is missing, and how stored claims are read), review and tests. Writers keep the conservative lock throughout; nothing in this list weakens it. Target invariant for that work: a reader never holds `*` unless the commander wrote `*`.
+
+### Decision (v0.8.0): refused, not widened
+
+- A read claim that cannot be kept narrow is refused whole; nothing is assigned and the reply says which entries failed and what to write. `"*"` is the only way a reader receives `*`.
+- A bracketed or braced name is a literal path: `realpath` expands no pattern and no shell runs, so `app/[id]/page.tsx` is claimed as written. `*` and `?` stay patterns and are refused for a reader.
+- Where `realpath -m` is unavailable the named claim is refused (`a path that did not resolve`), never widened. No such host was tested.
+- Write claims keep the conservative whole-repository lock unchanged. Stored claims are not migrated; a task assigned before the upgrade keeps what it was given until it ends.
+- Tests: `tests/swarm-claims.test.ts`; the reply change is covered in `tests/routing.test.ts`. Full record: [implementation-v0.8.0.md](implementation-v0.8.0.md).
