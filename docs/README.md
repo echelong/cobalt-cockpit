@@ -29,6 +29,7 @@ The root [README](../README.md) is the front page. These files hold the detail.
 
 | Version | Page |
 | --- | --- |
+| 0.9.0 | [Cobalt Recall research spike (fixture-only)](implementation-v0.9.0.md) |
 | 0.8.0 | [Read claims and generated-file reporting](implementation-v0.8.0.md) |
 | 0.7.0 | [Diff-aware verification release notes](release-v0.7.0.md) |
 | 0.6.6 | [Completion evidence and reporting](verification.md#what-done-rests-on) |
@@ -66,10 +67,10 @@ The root [README](../README.md) is the front page. These files hold the detail.
 | [delivery-v0.5.0-hardening.md](delivery-v0.5.0-hardening.md) | Delivery report: v0.5.0 release hardening |
 | [delivery-sonnet-led.md](delivery-sonnet-led.md) | Delivery report: the Sonnet-led profile |
 | [roadmap-security-followups.md](roadmap-security-followups.md) | Security follow-ups recorded after v0.6.1: a P0 on a guard that throws refusing nothing (fixed by the 0.6.1 security hotfix), and read claims widening to `*` (not changed) |
-| [roadmap-v0.7.0-diff-aware-verification.md](roadmap-v0.7.0-diff-aware-verification.md) | Roadmap, v0.7.0: evidence that correlates changed lines with measured coverage (implemented in the isolated candidate, not published) |
+| [roadmap-v0.7.0-diff-aware-verification.md](roadmap-v0.7.0-diff-aware-verification.md) | Roadmap, v0.7.0: evidence that correlates changed lines with measured coverage (published in v0.7.0) |
 | [design-v0.7.0-diff-aware-verification.md](design-v0.7.0-diff-aware-verification.md) | Design, v0.7.0: approved decisions, host and coverage-tool measurements, and the implemented phases |
-| [release-v0.7.0.md](release-v0.7.0.md) | v0.7.0 candidate release notes, verification evidence, limitations and rollback |
-| [roadmap-cobalt-recall-xerj.md](roadmap-cobalt-recall-xerj.md) | Future research proposal: optional Cobalt Recall, XERJ/Corpus Hub integration, source-linked decision memory, NobodyWho retrieval gating, privacy and evidence-freshness benchmarks (not implemented; no release assigned) |
+| [release-v0.7.0.md](release-v0.7.0.md) | v0.7.0 release notes, verification evidence, limitations and rollback |
+| [roadmap-cobalt-recall-xerj.md](roadmap-cobalt-recall-xerj.md) | Future research proposal: optional Cobalt Recall, XERJ/Corpus Hub integration, source-linked decision memory, NobodyWho retrieval gating, privacy and evidence-freshness benchmarks (research spike performed in v0.9.0; integration not approved; no release assigned) |
 | [roadmap-v0.6.3-guard-calibration.md](roadmap-v0.6.3-guard-calibration.md) | Roadmap, v0.6.3: human labels on recorded incidents and a simulation of the alert policy against them, to inform the decision to enable alerts (implemented in v0.6.3: [implementation-v0.6.3.md](implementation-v0.6.3.md)) |
 | [roadmap-v0.6.2-persistent-attention.md](roadmap-v0.6.2-persistent-attention.md) | Roadmap, v0.6.2: acknowledged incidents whose conditions are still open, in the alert digest (implemented in v0.6.2: [implementation-v0.6.2.md](implementation-v0.6.2.md)) |
 | [roadmap-v0.5.3-verification-intelligence.md](roadmap-v0.5.3-verification-intelligence.md) | A proposal for verification intelligence |

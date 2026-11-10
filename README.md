@@ -586,7 +586,7 @@ claude plugin install cobalt-cockpit@cobalt-cockpit
 
 **2. Restart** Claude Code, open `/cockpit`, and inspect `/cockpit version`. By default Cockpit **observes**; orchestration enforcement is opt-in.
 
-**Which code you have.** This page describes **0.8.0**. It keeps the opt-in, advisory `/cockpit coverage diff` from 0.7.0, refuses a read claim that cannot be kept narrow instead of widening it to `*`, and adds generated-file exclusion reporting to the coverage report. It leaves every existing gate, DONE decision, guard, review, release rule, ownership rule and permission unchanged ([release notes](docs/release-v0.7.0.md), [CHANGELOG](CHANGELOG.md), [v0.8.0 implementation notes](docs/implementation-v0.8.0.md)).
+**Which code you have.** This page describes **0.9.0**. It keeps the opt-in, advisory `/cockpit coverage diff` from 0.7.0 and the 0.8.0 refusal of a read claim that cannot be kept narrow, and adds a **Cobalt Recall research spike**: a fixture-only citer that is permanently off, with no retrieval backend, corpus, network call or gate change ([v0.9.0 research note](docs/implementation-v0.9.0.md), [v0.8.0 implementation notes](docs/implementation-v0.8.0.md), [CHANGELOG](CHANGELOG.md)). It leaves every existing gate, DONE decision, guard, review, release rule, ownership rule and permission unchanged.
 
 **3. Optional: enforce orchestration** with the supported configuration CLI:
 
