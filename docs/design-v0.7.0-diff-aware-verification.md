@@ -2,7 +2,7 @@
 
 > Part of the [Cobalt Cockpit documentation](README.md). The milestone: [roadmap-v0.7.0-diff-aware-verification.md](roadmap-v0.7.0-diff-aware-verification.md).
 
-Status: **Phases 2–4 are implemented in the v0.7.0 release candidate.** Phase 1 supplies the pure parsers, renderer, capture policy and binding rules; Phase 1.5 supplies the report presentation; Phase 2 adds Git selection, path safety, source identity and no-follow report reading; Phase 3 adds the three person-only options and capture around observed test commands; Phase 4 adds `/cockpit coverage diff`. The layer is off by default and remains advisory: it changes no gate, DONE decision, review, release, guard, ownership rule or permission. It is implemented through bounded local Git, `stat` and report reads; no test is ever started to obtain coverage. This design was published in v0.7.0; v0.8.0 keeps the layer advisory and adds generated-file exclusion reporting to the same report.
+Status: **Phases 2–4 are implemented in v0.7.0.** Phase 1 supplies the pure parsers, renderer, capture policy and binding rules; Phase 1.5 supplies the report presentation; Phase 2 adds Git selection, path safety, source identity and no-follow report reading; Phase 3 adds the three person-only options and capture around observed test commands; Phase 4 adds `/cockpit coverage diff`. The layer is off by default and remains advisory: it changes no gate, DONE decision, review, release, guard, ownership rule or permission. It is implemented through bounded local Git, `stat` and report reads; no test is ever started to obtain coverage. This design was published in v0.7.0; v0.8.0 keeps the layer advisory and adds generated-file exclusion reporting to the same report.
 
 | | |
 | --- | --- |

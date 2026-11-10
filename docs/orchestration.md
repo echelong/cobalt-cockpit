@@ -24,7 +24,7 @@ Task ownership is an admission rule Cockpit applies inside one session, while it
 
 The observations below ran on Claude Code 2.1.296 and 2.1.316 on Linux, on commit `7d52ab2` or released 0.6.5 where they say so, and otherwise on the code that introduced the behaviour they describe. It does not describe a future release.
 
-**Which version does what.** Installing the plugin gives 0.9.0. The last column is the code in 0.6.6 from the change that followed `7d52ab2`, which 0.9.0 keeps; 0.9.0 also refuses a read claim that cannot be kept narrow instead of widening it to `*`. The v0.9.0 Cobalt Recall research spike is fixture-only and changes none of the behaviour in this table.
+**Which version does what.** Installing the plugin gives 1.0.0. The last column is the code in 0.6.6 from the change that followed `7d52ab2`, which 1.0.0 keeps; 1.0.0 also refuses a read claim that cannot be kept narrow instead of widening it to `*`. The v0.9.0 Cobalt Recall research spike remains fixture-only, and 1.0.0 changes none of the behaviour in this table.
 
 | Behaviour | Released 0.6.5 | `main` at `7d52ab2` | `main` after `7d52ab2` (in 0.6.6) |
 |---|---|---|---|

@@ -29,6 +29,7 @@ The root [README](../README.md) is the front page. These files hold the detail.
 
 | Version | Page |
 | --- | --- |
+| 1.0.0 | [Release hardening and what 1.0 means](implementation-v1.0.0.md) |
 | 0.9.0 | [Cobalt Recall research spike (fixture-only)](implementation-v0.9.0.md) |
 | 0.8.0 | [Read claims and generated-file reporting](implementation-v0.8.0.md) |
 | 0.7.0 | [Diff-aware verification release notes](release-v0.7.0.md) |
@@ -61,6 +62,7 @@ The root [README](../README.md) is the front page. These files hold the detail.
 | [release-v0.5.0.md](release-v0.5.0.md) | v0.5.0 release notes |
 | [release-v0.4.0.md](release-v0.4.0.md) | v0.4.0 release notes |
 | [release-v0.1.1.md](release-v0.1.1.md) | v0.1.1 release notes |
+| [release-checklist-v1.0.0.md](release-checklist-v1.0.0.md) | v1.0.0 release gates and observed results |
 | [release-checklist-v0.5.3.md](release-checklist-v0.5.3.md) | v0.5.3 release gates, including the manual TypeScript attestation |
 | [release-checklist-v0.5.2.md](release-checklist-v0.5.2.md) | v0.5.2 release checklist |
 | [delivery-v0.5.0-router.md](delivery-v0.5.0-router.md) | Delivery report: the session router, with its measurements |
@@ -81,6 +83,6 @@ These pages are preparation and evidence. None of them reports an acceptance by 
 
 | Page | What it is |
 | --- | --- |
-| [marketplace-submission.md](marketplace-submission.md) | Submission preparation for the v0.5.3 candidate |
+| [marketplace-submission.md](marketplace-submission.md) | Historical v0.5.3 submission preparation (not current; the current release is 1.0.0) |
 | [submission-compliance-v0.5.3.md](submission-compliance-v0.5.3.md) | v0.5.3 submission compliance evidence |
 | [upstream-issue-host-declarations.md](upstream-issue-host-declarations.md) | A draft issue for the host about plugin declarations (not filed) |

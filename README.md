@@ -586,7 +586,7 @@ claude plugin install cobalt-cockpit@cobalt-cockpit
 
 **2. Restart** Claude Code, open `/cockpit`, and inspect `/cockpit version`. By default Cockpit **observes**; orchestration enforcement is opt-in.
 
-**Which code you have.** This page describes **0.9.0**. It keeps the opt-in, advisory `/cockpit coverage diff` from 0.7.0 and the 0.8.0 refusal of a read claim that cannot be kept narrow, and adds a **Cobalt Recall research spike**: a fixture-only citer that is permanently off, with no retrieval backend, corpus, network call or gate change ([v0.9.0 research note](docs/implementation-v0.9.0.md), [v0.8.0 implementation notes](docs/implementation-v0.8.0.md), [CHANGELOG](CHANGELOG.md)). It leaves every existing gate, DONE decision, guard, review, release rule, ownership rule and permission unchanged.
+**Which code you have.** This page describes **1.0.0**, the first stable release: observation and advisory evidence, with no new runtime capability. It keeps the opt-in, advisory `/cockpit coverage diff` from 0.7.0, the 0.8.0 refusal of a read claim that cannot be kept narrow, and the **Cobalt Recall research spike** from 0.9.0, which remains fixture-only and research-only ([v0.9.0 research note](docs/implementation-v0.9.0.md), [v0.8.0 implementation notes](docs/implementation-v0.8.0.md), [CHANGELOG](CHANGELOG.md)). 1.0 adds no feature, command, option or network call; it leaves every existing gate, DONE decision, guard, review, release rule, ownership rule and permission unchanged. See [What 1.0 means](#what-10-means) and [the v1.0.0 release record](docs/implementation-v1.0.0.md).
 
 **3. Optional: enforce orchestration** with the supported configuration CLI:
 
@@ -642,6 +642,18 @@ Linux and macOS terminals use standard text/Braille rendering; Kitty or WezTerm 
 Sounds try PipeWire, PulseAudio, ALSA, ffplay, mpv, SoX, Canberra, macOS afplay, then a terminal bell. Missing/failing players fall back to silence. `/cockpit mute` disables cues. macOS behavior is covered by the engine test harness, not a physical macOS run. Windows is not tested. Mods may be disabled by organizational policy; this dashboard is intended for Claude Code, not claude.ai/Cowork.
 
 </details>
+
+## What 1.0 means
+
+**1.0 is stable observation and advisory evidence, not a new capability or a security certification.** It is the first stable release of the Cockpit described in this page. It adds no feature, command, option or network call.
+
+- **The six gates and DONE rules are unchanged.** CODE, TEST, TYPE, BUILD, SECURITY and GIT, the goal check and what DONE rests on are exactly as [docs/verification.md](docs/verification.md) describes. DONE remains a completion status, not independent verification.
+- **Ownership remains an admission rule within one session, not a lock.** It does not survive `/clear`, cross sessions or stop a running agent. Do not replace overlapping work while an agent is running or ownership is uncertain.
+- **Diff-aware coverage and Cobalt Recall are advisory or research-only.** `/cockpit coverage diff` is off by default and changes no gate; the Recall spike is fixture-only and permanently off, with integration NO-GO.
+- **D12/D13 remain NO-GO.** No general C1a ownership solution; sweep stays off by default; claims are not deleted solely on end events; `OWNER_ATTESTED` is not proof of termination.
+- **The Claude Code plugin and the Cline adapter are separate tracks.** `cline/` is not part of this plugin release or its evidence.
+
+The full statement, release record and observed gate results: [docs/implementation-v1.0.0.md](docs/implementation-v1.0.0.md).
 
 ## Explore commands
 

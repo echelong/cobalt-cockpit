@@ -1,4 +1,4 @@
-# Sonnet-led profile (unreleased, after 0.4.0)
+# Sonnet-led profile (v0.5)
 
 **Sonnet builds. Haiku scouts. Opus reviews. NobodyWho advises.**
 

@@ -1,7 +1,9 @@
-# Submission preparation — v0.5.3 candidate
+# Submission preparation — v0.5.3 (historical)
+
+> Historical record: this page describes the v0.5.3 submission preparation. It is not the current release or submission state; the current release is v1.0.0, and no directory submission is part of it.
 
 Source repository: `https://github.com/echelong/cobalt-cockpit`.
-Plugin folder: repository root. Published version remains `0.5.2` until release gates close. The final submission version must match both archived manifests.
+Plugin folder: repository root. The version prepared for that submission was `0.5.3`; this page is kept as the record of that preparation.
 Name: Cobalt Cockpit. Identifier: `cobalt-cockpit`. License: MIT.
 Use the manifest description as the listing description.
 
